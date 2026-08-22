@@ -1313,6 +1313,11 @@ pub async fn run(
     // catch-up path pass `tokio::sync::watch::channel(0u64).0` (a
     // sender with no receivers — send_modify is then a no-op).
     transport_epoch_tx: tokio::sync::watch::Sender<u64>,
+    // ZEB-971: shared snapshot of zenoh's own transport-peer view — the same
+    // ~5s zid poll that bumps the transport epoch publishes into it, and the
+    // relay-acceptor watchdog's demand gate reads it. Also drives the
+    // zombie-link reconcile (supervisor `Connected` vs zenoh reality).
+    zenoh_transport_peers: std::sync::Arc<crate::network_health::ZenohTransportPeers>,
     // ZEB-702 T3 (Component B): `Arc<dyn RepublishDirty>` over every
     // owner-scoped dataset engine — all 12: owner-state, fleet-net, dm-inbox,
     // dm-outhold, owner-trust, fleet-keys, owner-quorum-req,
@@ -4097,7 +4102,12 @@ pub async fn run(
     // Used to derive hop distance: ZID in this set → hop 1, else → hop 2.
     // Eagerly populated so capacity updates arriving before the first refresh
     // aren't misclassified as hop 2.
-    let mut direct_peer_zids: std::collections::HashSet<String> = direct_link_zids(&session).await;
+    let (boot_peer_zids, boot_router_zids) = direct_link_zids_by_hat(&session).await;
+    let mut direct_peer_zids: std::collections::HashSet<String> = boot_peer_zids
+        .iter()
+        .cloned()
+        .chain(boot_router_zids.iter().cloned())
+        .collect();
     // ZEB-622: previous zid-poll snapshot, kept SEPARATE from the overwrite-
     // style `direct_peer_zids` above (whose hop-distance consumers need the
     // current-snapshot semantics). SEEDED from the same boot-time snapshot
@@ -4108,6 +4118,15 @@ pub async fn run(
     // reconnect after a drop re-fires (unlike the old accumulating seen-set).
     let mut transport_prev_zids: std::collections::HashSet<String> = direct_peer_zids.clone();
     let mut peer_refresh_counter: u64 = 0;
+    // ZEB-971: publish the boot-time snapshot eagerly (same reasoning as the
+    // eager `direct_peer_zids` above — a watchdog sample before the first
+    // refresh must not misread live peers as zero demand). Hats kept split:
+    // peers are demand, routers are visible-but-not-demand (CodeAnt PR #721).
+    zenoh_transport_peers.replace(boot_peer_zids, boot_router_zids);
+    // ZEB-971: per-peer consecutive-absent-poll counts for the zombie-link
+    // reconcile. Bounded by the supervisor's Connected set (pruned each poll).
+    let mut zombie_absent_streaks: std::collections::HashMap<[u8; 32], u32> =
+        std::collections::HashMap::new();
 
     // ZEB-418 P2 Task 7 (D16): periodic routing-record re-publish, counted
     // in 250ms timer ticks (same pattern as `peer_refresh_counter`).
@@ -4830,8 +4849,12 @@ pub async fn run(
                 // session-info calls under high message traffic.
                 peer_refresh_counter += 1;
                 if peer_refresh_counter.is_multiple_of(20) {
-                    let refreshed: Vec<String> =
-                        direct_link_zids(&session).await.into_iter().collect();
+                    let (peer_zids, router_zids) = direct_link_zids_by_hat(&session).await;
+                    let refreshed: Vec<String> = peer_zids
+                        .iter()
+                        .cloned()
+                        .chain(router_zids.iter().cloned())
+                        .collect();
                     // ZEB-622: any up-edge (a zid absent last poll, present now)
                     // bumps the transport epoch — community root-fetch /
                     // channel-backfill / mail-root latches re-arm (their drivers
@@ -4843,6 +4866,37 @@ pub async fn run(
                     // (now the fresh snapshot); mirror it into the hop-distance set,
                     // which tracks the same snapshot.
                     direct_peer_zids = transport_prev_zids.clone();
+                    // ZEB-971: publish the snapshot for the watchdog's demand
+                    // gate — hats split, peers-only count as demand (CodeAnt
+                    // PR #721) …
+                    zenoh_transport_peers.replace(peer_zids, router_zids);
+                    // … and reconcile zombie supervisor slots against it: a
+                    // peer the supervisor holds `Connected` with no zenoh
+                    // transport behind it (2 consecutive polls, ≥60s old)
+                    // means the drop edge was missed — kick `Dropped` so the
+                    // backoff ladder re-dials. This is the layer the 0.2.9
+                    // incident actually needed: a zombie `Connected`
+                    // suppresses the very re-dial that heals the link, no
+                    // matter what the relay watchdog does.
+                    if let Some(handle) = reconnect_supervisor.as_ref() {
+                        let kicks = zombie_link_kicks(
+                            &handle.states_snapshot(),
+                            &transport_prev_zids,
+                            &mut zombie_absent_streaks,
+                            crate::network_health::now_ms(),
+                        );
+                        for peer in kicks {
+                            tracing::warn!(
+                                peer = %hex::encode(&peer[..4]),
+                                "ZEB-971: supervisor Connected but zenoh transport gone — \
+                                 kicking re-dial (zombie link)"
+                            );
+                            handle.kick(
+                                peer,
+                                crate::reconnect_supervisor::ReconnectTrigger::Dropped,
+                            );
+                        }
+                    }
                 }
 
                 // ZEB-418 P2 Task 7 (D16): periodic routing-record
@@ -8634,19 +8688,92 @@ where
 /// behavior. See CodeRabbit R2 on PR #125.
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// ZEB-912: all directly-linked zids, regardless of the REMOTE session's mode.
-/// zenoh's session info partitions direct links by remote whatami (`peers_zid`
-/// vs `routers_zid` — an all-router mesh under HARMONY_ZENOH_MODE=router
-/// reports every link in `routers_zid`, probe-verified in the R3 spike doc).
-/// Hop-distance classification and ZEB-622 up-edge detection care about
-/// "directly linked", not the remote's mode — reading only `peers_zid` would
-/// silently blind both on router-mode runs.
-async fn direct_link_zids(session: &zenoh::Session) -> std::collections::HashSet<String> {
+/// Zenoh's directly-linked zids by remote hat: `(peer_zids, router_zids)`.
+///
+/// ZEB-912: zenoh's session info partitions direct links by remote whatami
+/// (`peers_zid` vs `routers_zid` — an all-router mesh under
+/// HARMONY_ZENOH_MODE=router reports every link in `routers_zid`,
+/// probe-verified in the R3 spike doc). Hop-distance classification and
+/// ZEB-622 up-edge detection care about "directly linked", not the remote's
+/// mode, so those consumers merge the two sets.
+///
+/// ZEB-971 (CodeAnt PR #721): the split exists because the watchdog's demand
+/// gate must NOT merge them — a router-hat transport is infrastructure, not a
+/// relay puller. Consequence on router-mode experimental runs: every link
+/// reads router-hat, demand reads zero, and the watchdog stays quiet — the
+/// safe failure direction (no auto-remediation) versus false self-restarts.
+async fn direct_link_zids_by_hat(
+    session: &zenoh::Session,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
     let info = session.info();
-    let mut set: std::collections::HashSet<String> =
+    let peers: std::collections::HashSet<String> =
         info.peers_zid().await.map(|z| z.to_string()).collect();
-    set.extend(info.routers_zid().await.map(|z| z.to_string()));
-    set
+    let routers: std::collections::HashSet<String> =
+        info.routers_zid().await.map(|z| z.to_string()).collect();
+    (peers, routers)
+}
+
+/// ZEB-971: minimum age of a supervisor `Connected` stamp before the zombie
+/// reconcile may judge it — `mark_connected` fires on the registry swap, up to
+/// one full zid poll (~5s) before the transport shows up in zenoh's own view,
+/// and a young link must never be kicked over that ordering.
+const ZOMBIE_MIN_CONNECTED_AGE_MS: u64 = 60_000;
+/// ZEB-971: consecutive absent polls (~5s apart) required before a kick, so a
+/// single racy snapshot cannot kick a healthy peer.
+const ZOMBIE_REQUIRED_ABSENT_POLLS: u32 = 2;
+
+/// ZEB-971: zombie-link reconcile — the safety net for a missed drop edge.
+///
+/// The reconnect supervisor marks a peer `Connected` on the zenoh-over-iroh
+/// registry swap and only re-dials after the drop-watcher's `Dropped` kick. In
+/// the 0.2.9 field incident that drop edge never fired: the supervisor held
+/// `Connected` for a peer asleep 26.8h, which both fed the watchdog a zombie
+/// `connected=1` AND suppressed the very re-dial that would have healed the
+/// link when the peer woke. This detector cross-checks every `Connected` slot
+/// against zenoh's OWN transport view (`peers_zid`, which cannot go zombie —
+/// dead links drop out at the zenoh link lease): `Connected` with the peer's
+/// deterministic zid absent for [`ZOMBIE_REQUIRED_ABSENT_POLLS`] consecutive
+/// polls, and the `Connected` stamp at least [`ZOMBIE_MIN_CONNECTED_AGE_MS`]
+/// old, means the transport is gone and the supervisor doesn't know — return
+/// the peer for a `ReconnectTrigger::Dropped` kick so its backoff ladder
+/// re-dials (which also re-runs iroh discovery, curing post-sleep stale
+/// addresses).
+///
+/// `absent_streaks` persists across polls; entries survive only for peers
+/// still `Connected` AND still absent, so the map stays bounded by the
+/// supervisor's Connected set. A kicked peer's streak resets — if the kick
+/// loses a race and the peer is genuinely healthy, it must re-earn the full
+/// streak before another kick.
+fn zombie_link_kicks(
+    states: &[([u8; 32], crate::reconnect_supervisor::PeerStateWire)],
+    zenoh_zids: &std::collections::HashSet<String>,
+    absent_streaks: &mut std::collections::HashMap<[u8; 32], u32>,
+    now_ms: u64,
+) -> Vec<[u8; 32]> {
+    use crate::reconnect_supervisor::PeerStateWire;
+    let mut kicks = Vec::new();
+    let mut next_streaks = std::collections::HashMap::new();
+    for (peer, state) in states {
+        let PeerStateWire::Connected { since_ms } = state else {
+            continue;
+        };
+        if zenoh_zids.contains(&crate::iroh_dial_driver::deterministic_zid_hex(peer)) {
+            continue; // healthy — any armed streak resets by omission
+        }
+        let streak = absent_streaks.get(peer).copied().unwrap_or(0) + 1;
+        if streak >= ZOMBIE_REQUIRED_ABSENT_POLLS
+            && now_ms.saturating_sub(*since_ms) >= ZOMBIE_MIN_CONNECTED_AGE_MS
+        {
+            kicks.push(*peer);
+        } else {
+            next_streaks.insert(*peer, streak);
+        }
+    }
+    *absent_streaks = next_streaks;
+    kicks
 }
 
 /// ZEB-622: up-edge detector over zid-poll snapshots. Replaces the accumulating
@@ -8729,6 +8856,113 @@ mod mail_root_outcome_tests {
             map_mail_root_outcome(&Err("boom".to_string())),
             RootFetch::NoReply
         );
+    }
+}
+
+#[cfg(test)]
+mod zombie_link_reconcile_tests {
+    use super::zombie_link_kicks;
+    use crate::iroh_dial_driver::deterministic_zid_hex;
+    use crate::reconnect_supervisor::PeerStateWire;
+    use std::collections::{HashMap, HashSet};
+
+    const OLD_ENOUGH: u64 = 1_000_000; // connected long before `NOW`
+    const NOW: u64 = 10_000_000;
+
+    fn peer(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    fn connected(since_ms: u64) -> PeerStateWire {
+        PeerStateWire::Connected { since_ms }
+    }
+
+    fn zids_of(peers: &[[u8; 32]]) -> HashSet<String> {
+        peers.iter().map(deterministic_zid_hex).collect()
+    }
+
+    /// The 0.2.9 zombie shape: supervisor `Connected`, zenoh transport gone.
+    /// One absent poll is not enough (a mid-poll race must not kick a healthy
+    /// peer); the second consecutive absent poll fires.
+    #[test]
+    fn zombie_kicked_on_second_consecutive_absent_poll() {
+        let states = vec![(peer(1), connected(OLD_ENOUGH))];
+        let zids = HashSet::new(); // zenoh sees nobody
+        let mut streaks = HashMap::new();
+        assert_eq!(
+            zombie_link_kicks(&states, &zids, &mut streaks, NOW),
+            Vec::<[u8; 32]>::new(),
+            "first absent poll only arms the streak"
+        );
+        assert_eq!(
+            zombie_link_kicks(&states, &zids, &mut streaks, NOW),
+            vec![peer(1)],
+            "second absent poll kicks the zombie"
+        );
+        assert!(
+            streaks.is_empty(),
+            "a kick resets the streak (the supervisor owns the peer now)"
+        );
+    }
+
+    /// A transport that is present in zenoh's view is healthy — never kicked,
+    /// and any armed streak resets.
+    #[test]
+    fn present_zid_resets_streak() {
+        let states = vec![(peer(1), connected(OLD_ENOUGH))];
+        let mut streaks = HashMap::new();
+        zombie_link_kicks(&states, &HashSet::new(), &mut streaks, NOW); // streak 1
+        zombie_link_kicks(&states, &zids_of(&[peer(1)]), &mut streaks, NOW); // present
+        assert_eq!(
+            zombie_link_kicks(&states, &HashSet::new(), &mut streaks, NOW),
+            Vec::<[u8; 32]>::new(),
+            "absence after a present poll starts a FRESH streak"
+        );
+    }
+
+    /// A just-formed connection is exempt: `mark_connected` can precede the
+    /// transport appearing in zenoh's ~5s poll, so a young `Connected` must
+    /// ride out the age gate no matter the streak.
+    #[test]
+    fn young_connection_not_kicked_until_min_age() {
+        let just_now = NOW - 1_000; // 1s old — far under the age gate
+        let states = vec![(peer(1), connected(just_now))];
+        let zids = HashSet::new();
+        let mut streaks = HashMap::new();
+        for _ in 0..5 {
+            assert_eq!(
+                zombie_link_kicks(&states, &zids, &mut streaks, NOW),
+                Vec::<[u8; 32]>::new(),
+                "age gate holds regardless of streak"
+            );
+        }
+    }
+
+    /// Non-Connected supervisor states are the supervisor's business (already
+    /// re-dialing or parked) — ignored, and their stale streak entries pruned
+    /// so the map stays bounded by the Connected set.
+    #[test]
+    fn non_connected_states_ignored_and_streaks_pruned() {
+        let mut streaks = HashMap::from([(peer(1), 1u32), (peer(9), 1u32)]);
+        let states = vec![
+            (
+                peer(1),
+                PeerStateWire::Retrying {
+                    attempt: 1,
+                    retry_in_ms: 500,
+                },
+            ),
+            (peer(2), connected(OLD_ENOUGH)),
+        ];
+        assert_eq!(
+            zombie_link_kicks(&states, &HashSet::new(), &mut streaks, NOW),
+            Vec::<[u8; 32]>::new()
+        );
+        assert!(
+            !streaks.contains_key(&peer(1)) && !streaks.contains_key(&peer(9)),
+            "streaks for non-Connected / departed peers are pruned"
+        );
+        assert_eq!(streaks.get(&peer(2)), Some(&1), "the Connected peer armed");
     }
 }
 

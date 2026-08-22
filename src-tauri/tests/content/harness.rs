@@ -268,6 +268,7 @@ pub async fn spawn_test_runtime_with_pins(
                     harmony_app::content_store::CommunityServeAllowlist::new(), // ZEB-395: empty allowlist (no community roots published in these tests)
                     None, // ZEB-418 P2: routing_republish not exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-434: transport-epoch watch not exercised
+                    std::sync::Arc::new(harmony_app::network_health::ZenohTransportPeers::new()), // ZEB-971: watchdog demand cache not exercised
                     Vec::new(), // ZEB-702 T3: republish_on_epoch — no engines exercised
                     tokio::sync::watch::channel(0u64).0, // ZEB-599: presence-resync watch not exercised
                     None, // ZEB-618: mail-root persist pair not exercised
