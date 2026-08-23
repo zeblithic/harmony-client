@@ -133,9 +133,7 @@ struct ContactsHandles {
 
 /// Snapshot the dataset handles under the sync NodeState mutex; release it
 /// before any await (the notes-commands pattern).
-fn snapshot_handles(
-    state: &std::sync::Mutex<crate::NodeState>,
-) -> Result<ContactsHandles, String> {
+fn snapshot_handles(state: &std::sync::Mutex<crate::NodeState>) -> Result<ContactsHandles, String> {
     let g = state
         .lock()
         .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -143,7 +141,10 @@ fn snapshot_handles(
         doc: g.contacts_doc.clone().ok_or(CONTACTS_NOT_LOADED_MSG)?,
         tracker: g.contacts_tracker.clone().ok_or(CONTACTS_NOT_LOADED_MSG)?,
         adopt_floor: g.hlc_adopt_floor.clone(),
-        device_id: g.contacts_device_id.clone().ok_or(CONTACTS_NOT_LOADED_MSG)?,
+        device_id: g
+            .contacts_device_id
+            .clone()
+            .ok_or(CONTACTS_NOT_LOADED_MSG)?,
         sync: g.contacts_sync.clone().ok_or(CONTACTS_NOT_LOADED_MSG)?,
     })
 }
@@ -154,7 +155,9 @@ fn validate_field(
     max_len: usize,
     what: &str,
 ) -> Result<Option<String>, String> {
-    let trimmed = value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let trimmed = value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     if let Some(v) = &trimmed {
         if v.chars().count() > max_len {
             return Err(format!("{what} too long (max {max_len} characters)"));
@@ -240,8 +243,7 @@ pub(crate) fn migrate_friend_nicknames_to_contacts(
     if contacts_path.exists() || !legacy_nicknames_path.exists() {
         return;
     }
-    let legacy =
-        crate::friend_nicknames::FriendNicknames::load_or_default(legacy_nicknames_path);
+    let legacy = crate::friend_nicknames::FriendNicknames::load_or_default(legacy_nicknames_path);
     let mut doc = ContactsDoc::default();
     for (hex, e) in &legacy.entries {
         // Synthesize the HLC from the legacy LWW key: preserves the relative
@@ -315,6 +317,7 @@ pub async fn set_contact_notes(
 mod tests {
     use super::*;
 
+    #[allow(clippy::type_complexity)] // test fixture tuple, named at the two call layers
     fn fixtures() -> (
         Arc<Mutex<ContactsDoc>>,
         Arc<Mutex<ReplayTracker<String, Hlc>>>,
@@ -391,10 +394,17 @@ mod tests {
     async fn noop_writes_mint_no_hlc() {
         let (doc, tracker, floor) = fixtures();
         // Pure clear on an absent entry: no mint.
-        let (view, changed) =
-            set_contact_field_core(&doc, &tracker, &floor, "dev-A", "aa", Some(None), Some(None))
-                .await
-                .unwrap();
+        let (view, changed) = set_contact_field_core(
+            &doc,
+            &tracker,
+            &floor,
+            "dev-A",
+            "aa",
+            Some(None),
+            Some(None),
+        )
+        .await
+        .unwrap();
         assert!(!changed);
         assert!(view.is_none());
         assert!(
@@ -569,7 +579,10 @@ mod tests {
 
         assert!(legacy_path.exists(), "legacy untouched when contacts exist");
         let doc = crate::contacts_persist::load(&contacts_path).unwrap();
-        assert!(doc.get("aabb").is_none(), "no import into an existing store");
+        assert!(
+            doc.get("aabb").is_none(),
+            "no import into an existing store"
+        );
     }
 
     #[test]
@@ -581,7 +594,10 @@ mod tests {
             &dir.path().join("friend_nicknames.json"),
             "dev-A",
         );
-        assert!(!contacts_path.exists(), "no store materialized from nothing");
+        assert!(
+            !contacts_path.exists(),
+            "no store materialized from nothing"
+        );
     }
 
     /// Two-engine cross-DEVICE convergence proofs for the Contacts dataset —
@@ -758,10 +774,9 @@ mod tests {
                 || {
                     let b_doc = Arc::clone(&b_doc);
                     async move {
-                        contacts_list_core(&b_doc)
-                            .await
-                            .iter()
-                            .any(|c| c.owner_id_hex == "aabb" && c.petname.as_deref() == Some("Koya"))
+                        contacts_list_core(&b_doc).await.iter().any(|c| {
+                            c.owner_id_hex == "aabb" && c.petname.as_deref() == Some("Koya")
+                        })
                     }
                 },
                 Duration::from_secs(5),
@@ -780,8 +795,24 @@ mod tests {
             let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
             let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
 
-            set_pet(&a.doc, &a.tracker, &a.adopt_floor, "dev-A", "aa11", "from-A").await;
-            set_pet(&b.doc, &b.tracker, &b.adopt_floor, "dev-B", "bb22", "from-B").await;
+            set_pet(
+                &a.doc,
+                &a.tracker,
+                &a.adopt_floor,
+                "dev-A",
+                "aa11",
+                "from-A",
+            )
+            .await;
+            set_pet(
+                &b.doc,
+                &b.tracker,
+                &b.adopt_floor,
+                "dev-B",
+                "bb22",
+                "from-B",
+            )
+            .await;
             a.engine.flush_now().await.unwrap();
             b.engine.flush_now().await.unwrap();
 
@@ -888,7 +919,10 @@ mod tests {
                 Duration::from_secs(5),
             )
             .await;
-            assert!(converged, "concurrent edits did not converge to one LWW winner");
+            assert!(
+                converged,
+                "concurrent edits did not converge to one LWW winner"
+            );
 
             teardown(a.engine, b.engine, fwd).await;
         }
@@ -901,7 +935,15 @@ mod tests {
             let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
             let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
 
-            set_pet(&a.doc, &a.tracker, &a.adopt_floor, "dev-A", "aabb", "ephemeral").await;
+            set_pet(
+                &a.doc,
+                &a.tracker,
+                &a.adopt_floor,
+                "dev-A",
+                "aabb",
+                "ephemeral",
+            )
+            .await;
             a.engine.flush_now().await.unwrap();
             {
                 let b_doc = Arc::clone(&b.doc);

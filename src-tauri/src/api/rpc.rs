@@ -2566,7 +2566,9 @@ mod tests {
                         "{cmd}: expected the dataset-not-loaded seam error, got: {msg}"
                     );
                 }
-                Ok(v) => panic!("{cmd}: expected dataset-not-loaded on default NodeState, got {v:?}"),
+                Ok(v) => {
+                    panic!("{cmd}: expected dataset-not-loaded on default NodeState, got {v:?}")
+                }
             }
         }
     }

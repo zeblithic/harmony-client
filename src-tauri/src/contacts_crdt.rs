@@ -149,7 +149,12 @@ impl ContactsDoc {
     /// Whether an annotation write would visibly change the doc. The command
     /// layer calls this under the doc lock BEFORE minting an HLC, so no-op
     /// writes never advance the tracker.
-    pub fn would_change(&self, owner_id_hex: &str, petname: &FieldWrite, notes: &FieldWrite) -> bool {
+    pub fn would_change(
+        &self,
+        owner_id_hex: &str,
+        petname: &FieldWrite,
+        notes: &FieldWrite,
+    ) -> bool {
         !matches!(
             self.plan(&owner_id_hex.to_lowercase(), petname, notes),
             AnnotationPlan::NoOp
@@ -292,9 +297,19 @@ mod tests {
     fn partial_write_preserves_other_field() {
         let mut d = ContactsDoc::default();
         set_pet(&mut d, "aa", "Koya", hlc(1, "A"), 5);
-        assert!(d.apply_annotation("aa", None, Some(Some("met at the garden".into())), hlc(2, "A"), 6));
+        assert!(d.apply_annotation(
+            "aa",
+            None,
+            Some(Some("met at the garden".into())),
+            hlc(2, "A"),
+            6
+        ));
         let e = d.get("aa").unwrap();
-        assert_eq!(e.petname.as_deref(), Some("Koya"), "petname untouched by a notes-only write");
+        assert_eq!(
+            e.petname.as_deref(),
+            Some("Koya"),
+            "petname untouched by a notes-only write"
+        );
         assert_eq!(e.notes.as_deref(), Some("met at the garden"));
         assert_eq!(e.first_seen_ms, 5, "first_seen survives edits");
     }
@@ -316,14 +331,20 @@ mod tests {
         let mut d = ContactsDoc::default();
         set_pet(&mut d, "aa", "Koya", hlc(1, "A"), 5);
         assert!(d.apply_annotation("aa", Some(Some("   ".into())), None, hlc(2, "A"), 6));
-        assert!(d.get("aa").is_none(), "whitespace petname clears; empty record tombstones");
+        assert!(
+            d.get("aa").is_none(),
+            "whitespace petname clears; empty record tombstones"
+        );
     }
 
     #[test]
     fn clear_on_absent_entry_is_noop_returns_false() {
         let mut d = ContactsDoc::default();
         assert!(!d.apply_annotation("aa", Some(None), Some(None), hlc(1, "A"), 5));
-        assert!(d.contacts.is_empty(), "no entry materialized by a pure clear");
+        assert!(
+            d.contacts.is_empty(),
+            "no entry materialized by a pure clear"
+        );
     }
 
     #[test]
@@ -346,7 +367,10 @@ mod tests {
         assert!(d.get("aa").is_none());
         assert!(set_pet(&mut d, "aa", "Koya again", hlc(3, "A"), 999));
         let e = d.get("aa").expect("resurrected");
-        assert_eq!(e.first_seen_ms, 100, "first_seen preserved across un-tombstone");
+        assert_eq!(
+            e.first_seen_ms, 100,
+            "first_seen preserved across un-tombstone"
+        );
         assert_eq!(e.created_at, created, "created_at preserved");
         assert_eq!(e.notes, None, "fields start blank after resurrection");
     }
@@ -367,14 +391,20 @@ mod tests {
         );
         assert!(!d.would_change("aa", &Some(Some("Koya".into())), &None));
         assert!(d.would_change("aa", &Some(Some("Other".into())), &None));
-        assert!(!d.would_change("zz", &Some(None), &Some(None)), "pure clear on absent");
+        assert!(
+            !d.would_change("zz", &Some(None), &Some(None)),
+            "pure clear on absent"
+        );
     }
 
     #[test]
     fn stale_update_is_ignored() {
         let mut d = ContactsDoc::default();
         set_pet(&mut d, "aa", "new", hlc(5, "A"), 1);
-        assert!(!set_pet(&mut d, "aa", "old", hlc(1, "B"), 2), "stale write is a no-op");
+        assert!(
+            !set_pet(&mut d, "aa", "old", hlc(1, "B"), 2),
+            "stale write is a no-op"
+        );
         assert_eq!(d.get("aa").unwrap().petname.as_deref(), Some("new"));
     }
 
@@ -460,10 +490,19 @@ mod tests {
         let mut local = ContactsDoc::default();
         set_pet(&mut local, "aa", "honest", hlc(now_ms, "A"), now_ms);
         let mut remote = ContactsDoc::default();
-        set_pet(&mut remote, "aa", "later-edit", hlc(now_ms + 1000, "B"), now_ms);
+        set_pet(
+            &mut remote,
+            "aa",
+            "later-edit",
+            hlc(now_ms + 1000, "B"),
+            now_ms,
+        );
         let out = local.merge_from(remote);
         assert!(out.changed);
-        assert_eq!(local.get("aa").unwrap().petname.as_deref(), Some("later-edit"));
+        assert_eq!(
+            local.get("aa").unwrap().petname.as_deref(),
+            Some("later-edit")
+        );
     }
 
     #[test]

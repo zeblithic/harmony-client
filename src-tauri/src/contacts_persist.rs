@@ -283,7 +283,10 @@ mod tests {
         std::fs::write(&path, [0xFF_u8, 0x01, 0x02]).unwrap(); // unknown schema
         let doc = load_doc_or_recover(&path).unwrap();
         assert_eq!(doc, ContactsDoc::default(), "recovers to a fresh empty doc");
-        assert!(!path.exists(), "corrupt file moved aside, not left in place");
+        assert!(
+            !path.exists(),
+            "corrupt file moved aside, not left in place"
+        );
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())

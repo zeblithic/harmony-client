@@ -6445,8 +6445,8 @@ pub async fn start_node_inner(
                                             replay_path: contacts_replay_path,
                                         },
                                     ),
-                                    lookup_key_tag:
-                                        crate::contacts_commands::CONTACTS_DATASET.as_bytes(),
+                                    lookup_key_tag: crate::contacts_commands::CONTACTS_DATASET
+                                        .as_bytes(),
                                     debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
                                     publish_seen: true,
                                     on_applied: Some(std::sync::Arc::new(move || {
@@ -6466,12 +6466,11 @@ pub async fn start_node_inner(
                         contacts_tracker_opt = Some(std::sync::Arc::clone(&contacts_tracker));
                         contacts_sync_engine_opt = Some(std::sync::Arc::clone(&contacts_sync));
                         contacts_device_id_opt = Some(device_id.clone());
-                        contacts_sync_handles_opt =
-                            Some(crate::event_loop::DatasetSyncHandles {
-                                addr_hex: owner_addr_hex.clone(),
-                                outbound_rx: contacts_out_rx,
-                                inbound_tx: contacts_in_tx,
-                            });
+                        contacts_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: contacts_out_rx,
+                            inbound_tx: contacts_in_tx,
+                        });
 
                         tracing::info!("BOOT-PROBE 04b: contacts engine constructed");
                         // ── ZEB-418 SP2 P1: dm-inbox fleet-sync engine + ingestion ─
