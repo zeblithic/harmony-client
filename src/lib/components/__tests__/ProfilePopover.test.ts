@@ -6,6 +6,8 @@ import type {
   ProfileBroadcastService,
   ProfileMembershipBroadcastInfo,
 } from '../../profile-broadcast-service';
+import { knownPeersState } from '../../known-peers-state.svelte';
+import { buildKnownPeersIndex, EMPTY_KNOWN_PEERS } from '../../name-collision';
 
 // Stub the Tauri event API: production loads it via dynamic import to
 // listen for `profile-broadcast-received`, but in tests there's no
@@ -546,5 +548,67 @@ describe('ProfilePopover contact editor (ZEB-977)', () => {
     // SIGNED card name and full hex — never the petname.
     expect(screen.getByText('CardName')).toBeTruthy();
     expect(screen.getByText(CARD_OWNER)).toBeTruthy();
+  });
+});
+
+// ZEB-979: impersonation-risk drill-down — the popover is where the user
+// lands to investigate a marked name, so it must spell the situation out
+// with BOTH hexes visible.
+describe('ProfilePopover collision drill-down (ZEB-979)', () => {
+  const KNOWN_HEX = 'aaaa1111aaaa1111aaaa1111aaaa1111';
+  const STRANGER_HEX = 'dddd4444dddd4444dddd4444dddd4444';
+
+  afterEach(() => {
+    knownPeersState.index = EMPTY_KNOWN_PEERS;
+    cleanup();
+  });
+
+  it('warns on a stranger card whose name collides with a known peer, with both hexes', () => {
+    knownPeersState.index = buildKnownPeersIndex([
+      { label: 'Jake', ownerIdHex: KNOWN_HEX },
+    ]);
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card' as const,
+        card: { ownerIdHex: STRANGER_HEX, displayName: 'Jake' },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    const warning = screen.getByTestId('collision-warning');
+    expect(warning.textContent).toContain('different identity');
+    expect(warning.textContent).toContain('Jake');
+    expect(warning.textContent).toContain(KNOWN_HEX);
+    expect(warning.textContent).toContain(STRANGER_HEX);
+  });
+
+  it('shows no warning on the known peer\'s own card', () => {
+    knownPeersState.index = buildKnownPeersIndex([
+      { label: 'Jake', ownerIdHex: KNOWN_HEX },
+    ]);
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card' as const,
+        card: { ownerIdHex: KNOWN_HEX, displayName: 'Jake' },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.queryByTestId('collision-warning')).toBeNull();
+  });
+
+  it('shows no warning when the index is empty', () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card' as const,
+        card: { ownerIdHex: STRANGER_HEX, displayName: 'Jake' },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.queryByTestId('collision-warning')).toBeNull();
   });
 });

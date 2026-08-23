@@ -9,6 +9,8 @@
   } from '../profile-broadcast-service';
   import Avatar from './Avatar.svelte';
   import type { ContactsService } from '../contacts-service';
+  import { detectCollision } from '../name-collision';
+  import { knownPeersState } from '../known-peers-state.svelte';
 
   /**
    * ZEB-341: owner_id card payload for the click-to-view surface. Distinct
@@ -156,6 +158,21 @@
     // role line matches the roster badge for power levels between tiers.
     return power >= 100 ? 'Admin' : power >= 50 ? 'Moderator' : 'Member';
   }
+
+  // ZEB-979: impersonation-risk drill-down. The popover is where a user
+  // lands to investigate a collision-marked name, so it spells out the
+  // situation with BOTH hexes. Source is 'card' — the popover renders the
+  // signed card name. Known peers (and self, via App's extraKnownHexes)
+  // are exempt inside detectCollision.
+  const cardCollision = $derived(
+    mode === 'owner-card' && card
+      ? detectCollision(
+          { label: card.displayName, source: 'card' },
+          card.ownerIdHex,
+          knownPeersState.index,
+        )
+      : undefined,
+  );
 
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -362,6 +379,21 @@
       </button>
     </div>
   </div>
+  {#if cardCollision}
+    <!-- ZEB-979: same-name/different-identity warning. Full hexes on
+         purpose — prefix truncation would let a chosen-prefix identity
+         defeat the very comparison this block exists to enable. -->
+    <div class="popover-collision" role="alert" data-testid="collision-warning">
+      <div class="collision-headline">
+        ⚠ This is a <strong>different identity</strong> from the
+        “{cardCollision.knownLabel}” you know.
+      </div>
+      <div class="collision-hexes">
+        <span>The {cardCollision.knownLabel} you know: <code>{cardCollision.knownHex}</code></span>
+        <span>This identity: <code>{card.ownerIdHex}</code></span>
+      </div>
+    </div>
+  {/if}
   {#if card.power !== undefined}
     <div class="popover-role">{roleLabel(card.power)}</div>
   {/if}
@@ -493,6 +525,34 @@
     font-size: 12px;
     color: var(--text-muted);
     margin-top: 2px;
+  }
+
+  /* ZEB-979: impersonation-risk drill-down block. */
+  .popover-collision {
+    margin-bottom: 12px;
+    padding: 8px 10px;
+    border: 1px solid var(--warning, #d97706);
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--warning, #d97706) 12%, transparent);
+  }
+
+  .collision-headline {
+    margin-bottom: 6px;
+  }
+
+  .collision-hexes {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    color: var(--text-muted);
+  }
+
+  .collision-hexes code {
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    word-break: break-all;
   }
 
   .popover-address {
