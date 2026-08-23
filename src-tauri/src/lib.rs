@@ -174,6 +174,7 @@ pub mod community_voting_tier3;
 pub mod community_voting_tier3_crypto;
 pub mod community_voting_tier3_nizk;
 pub mod connectivity_settings;
+pub mod contacts_crdt;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
