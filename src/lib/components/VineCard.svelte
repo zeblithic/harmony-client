@@ -187,7 +187,7 @@
   <div class="meta">
     <div class="creator-row">
       <Avatar address={vine.creatorAddress} size={26} displayName={creatorLabel} />
-      <span class="creator-name"><PeerName name={creatorName} /></span>
+      <span class="creator-name"><PeerName name={creatorName} ownerIdHex={vine.creatorAddress} /></span>
       {#if degreeLabel}
         <span
           class="degree-chip"
@@ -225,9 +225,9 @@
             class="attribution-link"
             onclick={handleViewOriginal}
             aria-label="view original by {originalLabel}"
-          >view original by <PeerName name={originalName} /></button>
+          >view original by <PeerName name={originalName} ownerIdHex={vine.originalCreatorAddress} /></button>
         {:else}
-          view original by <PeerName name={originalName} />
+          view original by <PeerName name={originalName} ownerIdHex={vine.originalCreatorAddress} />
         {/if}
       </span>
     {/if}

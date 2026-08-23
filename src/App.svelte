@@ -64,7 +64,9 @@
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
   import { createInitialSyncTracker } from './lib/community-initial-sync';
   import { FriendService, contactsFromFriends } from './lib/friend-service';
-  import { ContactsService, petnameMapFromContacts } from './lib/contacts-service';
+  import { ContactsService, petnameMapFromContacts, type ContactView } from './lib/contacts-service';
+  import { buildKnownPeersIndex, type KnownPeerEntry } from './lib/name-collision';
+  import { knownPeersState } from './lib/known-peers-state.svelte';
   import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
@@ -1780,9 +1782,27 @@
   // contacts-changed (local writes and fleet-sync merges from the owner's
   // other devices) keeps this fresh.
   let contactPetnames: Map<string, string> = $state(new Map());
+  // ZEB-979: the raw contact rows too — the collision index needs the set of
+  // contact owner_ids (to pull their CARD names as known-name claims), which
+  // the petname map alone discards (notes-only contacts have no petname).
+  let contactViews: ContactView[] = $state([]);
+  // Monotonic commit guard, same shape (and same reason) as the
+  // dmContacts guard below: hydration and contacts-changed can overlap,
+  // and an older contacts_list reply resolving late must not overwrite a
+  // newer committed map — the collision index (ZEB-979) reads this state,
+  // so a stale overwrite would resurrect deleted known-name claims
+  // (CodeRabbit PR #726). Failures are inert: they never bump the
+  // committed seq, so an older in-flight success still lands.
+  let contactsRefreshSeq = 0;
+  let contactsCommittedSeq = 0;
   async function refreshContactPetnames(): Promise<void> {
+    const seq = ++contactsRefreshSeq;
     try {
-      contactPetnames = petnameMapFromContacts(await contactsService.list());
+      const rows = await contactsService.list();
+      if (seq <= contactsCommittedSeq) return; // a newer success already committed
+      contactsCommittedSeq = seq;
+      contactPetnames = petnameMapFromContacts(rows);
+      contactViews = rows;
     } catch (e) {
       // Expected pre-owner-load ("contacts dataset not loaded") and in mock
       // mode (no adapter). Keep the last known-good map rather than wiping.
@@ -1821,6 +1841,52 @@
   // edits (those emit friend-list-changed too). Listener set is cleared
   // by friendService.destroy() on unmount.
   friendService.onFriendsChanged(() => void refreshDmContacts());
+  // ZEB-979 (CodeRabbit PR #726): subscribe contact owners' profile cards.
+  // `resolveCard` only resolves owners some MemberCardService bucket has
+  // subscribed; a contact who is not ALSO a friend / roster member / mail
+  // participant / vine author would otherwise never load a card, so their
+  // verified card name would silently never become a known-name claim in
+  // the collision index below. Same contract as the `vines` bucket
+  // (ZEB-978) and `feedAuthors` (ZEB-962).
+  $effect(() => {
+    void memberCardService.setBucket(
+      'contacts',
+      contactViews.map((c) => c.ownerIdHex),
+    );
+  });
+  // ── ZEB-979: known-peers collision index ────────────────────────────
+  // Rebuilt whenever any name pool changes; consumed by PeerName.svelte
+  // (via the module store) to mark third-party names that skeleton-match a
+  // name you know under a DIFFERENT identity. Pools strongest-claim-first
+  // (a skeleton tie keeps the first entry, which names the warning):
+  //   1. petnames — names YOU assigned (contacts dataset);
+  //   2. Active friends — ZEB-419 nickname ?? published display (dmContacts
+  //      already merges that precedence);
+  //   3. contacts' verified CARD names — a known peer's published name is a
+  //      claim on that string even if you never petnamed them.
+  // `resolveCard` reads `cardVersion`, so card arrivals re-run this effect;
+  // the other pools are $state reassignments. Own hexes ride along as
+  // extraKnownHexes so a self render can never collide with a petname you
+  // assigned to someone else.
+  $effect(() => {
+    const entries: KnownPeerEntry[] = [];
+    for (const [hex, petname] of contactPetnames) {
+      entries.push({ label: petname, ownerIdHex: hex });
+    }
+    if (dmContacts) {
+      for (const [hex, profile] of dmContacts) {
+        entries.push({ label: profile.displayName, ownerIdHex: hex });
+      }
+    }
+    for (const c of contactViews) {
+      const cardName = resolveCard(c.ownerIdHex)?.displayName;
+      if (cardName) entries.push({ label: cardName, ownerIdHex: c.ownerIdHex });
+    }
+    knownPeersState.index = buildKnownPeersIndex(
+      entries,
+      [selfOwnerId, myAddress].filter((h): h is string => !!h),
+    );
+  });
   // ── ZEB-236: DM-invite corner toast ─────────────────────────────────
   // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
   // pattern as FriendService. `dmInviteQueue` holds pending inbound DM

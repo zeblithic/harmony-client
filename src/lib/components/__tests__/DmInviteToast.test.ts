@@ -1,6 +1,8 @@
 import { render, fireEvent } from '@testing-library/svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import DmInviteToast from '../DmInviteToast.svelte';
+import { knownPeersState } from '../../known-peers-state.svelte';
+import { buildKnownPeersIndex, EMPTY_KNOWN_PEERS } from '../../name-collision';
 
 const invite = { spaceIdHex: 'a1', inviterOwnerIdHex: 'deadbeefdeadbeefdeadbeefdeadbeef',
   kind: 'd' as const, memberOwnerIdsHex: [], createdAtMs: 1, receivedAtMs: 2 };
@@ -59,5 +61,52 @@ describe('DmInviteToast', () => {
     const name = getByText('Zebby');
     expect(name.closest('.peer-name')?.getAttribute('data-name-source')).toBe('petname');
     expect(container.querySelector('.petname-badge')).not.toBeNull();
+  });
+});
+
+// ZEB-979: DM invites are a first-contact surface — the victim has the least
+// context exactly here, so the inviter's PeerName must be collision-armed.
+describe('DmInviteToast collision mark (ZEB-979)', () => {
+  const KNOWN_HEX = 'aaaa1111aaaa1111aaaa1111aaaa1111';
+
+  afterEach(() => {
+    knownPeersState.index = EMPTY_KNOWN_PEERS;
+  });
+
+  it('marks an inviter whose card name collides with a known peer', () => {
+    knownPeersState.index = buildKnownPeersIndex([
+      { label: 'Zeb', ownerIdHex: KNOWN_HEX },
+    ]);
+    const { container } = render(DmInviteToast, {
+      props: {
+        invite,
+        onAccept: vi.fn(),
+        onDecline: vi.fn(),
+        onLater: vi.fn(),
+        // The inviter (deadbeef…) published a card named like the Zeb you know.
+        resolveCard: (id: string) =>
+          id === invite.inviterOwnerIdHex ? { displayName: 'Zeb', statusText: '' } : undefined,
+      },
+    });
+    const marked = container.querySelector('[data-collision="true"]');
+    expect(marked).toBeTruthy();
+    expect(marked?.textContent).toContain('Zeb');
+  });
+
+  it('does not mark the known peer inviting you themselves', () => {
+    knownPeersState.index = buildKnownPeersIndex([
+      { label: 'Zeb', ownerIdHex: invite.inviterOwnerIdHex },
+    ]);
+    const { container } = render(DmInviteToast, {
+      props: {
+        invite,
+        onAccept: vi.fn(),
+        onDecline: vi.fn(),
+        onLater: vi.fn(),
+        resolveCard: (id: string) =>
+          id === invite.inviterOwnerIdHex ? { displayName: 'Zeb', statusText: '' } : undefined,
+      },
+    });
+    expect(container.querySelector('[data-collision]')).toBeNull();
   });
 });
