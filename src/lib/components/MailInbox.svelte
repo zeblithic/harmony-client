@@ -139,7 +139,7 @@
             onSelectEmail?.(entry.messageCid);
           }}
         >
-          <span class="mail-sender"><PeerName name={senderName(entry.senderAddress)} /></span>
+          <span class="mail-sender"><PeerName name={senderName(entry.senderAddress)} ownerIdHex={entry.senderAddress} /></span>
           <span class="mail-subject">{entry.subjectSnippet || '(no subject)'}</span>
           <span class="mail-time">{formatTime(entry.timestamp, $dayClock, $timeFormatPrefs)}</span>
           <div class="mail-actions">

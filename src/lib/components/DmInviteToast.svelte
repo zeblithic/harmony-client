@@ -72,7 +72,7 @@
   >
     <div class="invite-info">
       <span class="invite-title">DM invite</span>
-      <span class="invite-body">From <PeerName name={resolveMentionLabel(invite.inviterOwnerIdHex, resolveNickname, resolveCard)} /> ({kindLabel(invite.kind)})</span>
+      <span class="invite-body">From <PeerName name={resolveMentionLabel(invite.inviterOwnerIdHex, resolveNickname, resolveCard)} ownerIdHex={invite.inviterOwnerIdHex} /> ({kindLabel(invite.kind)})</span>
     </div>
     <div class="invite-actions">
       <button

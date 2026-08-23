@@ -531,11 +531,11 @@
   .popover-collision {
     margin-bottom: 12px;
     padding: 8px 10px;
-    border: 1px solid var(--warning, #d97706);
+    border: 1px solid var(--warning);
     border-radius: 6px;
     font-size: 12px;
     color: var(--text-primary);
-    background: color-mix(in srgb, var(--warning, #d97706) 12%, transparent);
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
 
   .collision-headline {

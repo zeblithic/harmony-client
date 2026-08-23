@@ -98,12 +98,12 @@
     <div class="reader-header">
       <h2 class="subject">{message.subject || '(no subject)'}</h2>
       <div class="meta">
-        <span class="from">From: <code><PeerName name={mailPeerName(message.senderAddress)} /></code></span>
+        <span class="from">From: <code><PeerName name={mailPeerName(message.senderAddress)} ownerIdHex={message.senderAddress} /></code></span>
         <span class="date">{formatDate(message.timestamp, $timeFormatPrefs)}</span>
       </div>
       {#if message.recipients.length > 0}
         <div class="recipients">
-          To: {#each message.recipients as r, i}{#if i > 0}{', '}{/if}<PeerName name={mailPeerName(r.address)} />{/each}
+          To: {#each message.recipients as r, i}{#if i > 0}{', '}{/if}<PeerName name={mailPeerName(r.address)} ownerIdHex={r.address} />{/each}
         </div>
       {/if}
     </div>

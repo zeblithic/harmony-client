@@ -214,7 +214,7 @@
                 <ul>
                     {#each pending as p (p.eventId)}
                         <li class="join-row">
-                            <span class="joiner"><PeerName name={resolveMentionLabel(p.joinerAddr, resolveNickname, resolveCard, () => p.inviteeHint)} /></span>
+                            <span class="joiner"><PeerName name={resolveMentionLabel(p.joinerAddr, resolveNickname, resolveCard, () => p.inviteeHint)} ownerIdHex={p.joinerAddr} /></span>
                             <span class="time">since {formatHlc(p.pendingAtHlc, $timeFormatPrefs)}</span>
                             <button class="reject-btn" type="button" onclick={() => kickJoiner(p.joinerAddr)}>
                                 Reject (kick)
@@ -237,7 +237,7 @@
                 <ul>
                     {#each recent as r (r.joinEventId)}
                         <li class="join-row">
-                            <span class="joiner"><PeerName name={resolveMentionLabel(r.joinerAddr, resolveNickname, resolveCard)} /></span>
+                            <span class="joiner"><PeerName name={resolveMentionLabel(r.joinerAddr, resolveNickname, resolveCard)} ownerIdHex={r.joinerAddr} /></span>
                             <span class="time">at {formatHlc(r.countersignedAtHlc, $timeFormatPrefs)}</span>
                         </li>
                     {/each}

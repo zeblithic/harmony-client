@@ -100,7 +100,7 @@
     width: 0.7em;
     height: 0.62em;
     margin-left: 0.3em;
-    background: var(--warning, #d97706);
+    background: var(--warning);
     clip-path: polygon(50% 0, 100% 100%, 0 100%);
     vertical-align: baseline;
   }
