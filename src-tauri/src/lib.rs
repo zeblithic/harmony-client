@@ -6513,7 +6513,10 @@ pub async fn start_node_inner(
                         // re-stamps every entry at `now`).
                         let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
                             let mut doc =
-                                crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
+                                crate::dm_inbox_persist::load_doc_or_recover(
+                                    &dataset_cipher,
+                                    &dm_inbox_path,
+                                )
                                     .map_err(|e| format!("load dm-inbox doc: {e}"))?;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -6525,6 +6528,7 @@ pub async fn start_node_inner(
                             // the removed entries' stamps.
                             doc.restore_expired(
                                 crate::dm_inbox_persist::load_expired_or_recover(
+                                    &dataset_cipher,
                                     &dm_inbox_expired_path,
                                 )
                                 .map_err(|e| format!("load dm-inbox expired: {e}"))?,
@@ -6532,6 +6536,7 @@ pub async fn start_node_inner(
                             );
                             doc.restore_first_observed(
                                 crate::dm_inbox_persist::load_first_observed_or_recover(
+                                    &dataset_cipher,
                                     &dm_inbox_first_observed_path,
                                 )
                                 .map_err(|e| format!("load dm-inbox first-observed: {e}"))?,
@@ -6543,6 +6548,7 @@ pub async fn start_node_inner(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::dm_inbox_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &dm_inbox_replay_path,
                                 )
                                 .map_err(|e| format!("load dm-inbox replay: {e}"))?,
@@ -6598,6 +6604,7 @@ pub async fn start_node_inner(
                                             replay_path: dm_inbox_replay_path,
                                             first_observed_path: dm_inbox_first_observed_path,
                                             expired_path: dm_inbox_expired_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"dm-inbox-v1",
@@ -6841,7 +6848,10 @@ pub async fn start_node_inner(
                         // re-stamps every entry at `now`).
                         let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
                             let mut doc =
-                                crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
+                                crate::relay_hold_persist::load_doc_or_recover(
+                                    &dataset_cipher,
+                                    &relay_hold_path,
+                                )
                                     .map_err(|e| format!("load relay-hold doc: {e}"))?;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -6854,6 +6864,7 @@ pub async fn start_node_inner(
                             // their stamps.
                             doc.restore_expired(
                                 crate::relay_hold_persist::load_expired_or_recover(
+                                    &dataset_cipher,
                                     &relay_hold_expired_path,
                                 )
                                 .map_err(|e| format!("load relay-hold expired: {e}"))?,
@@ -6861,6 +6872,7 @@ pub async fn start_node_inner(
                             );
                             doc.restore_first_observed(
                                 crate::relay_hold_persist::load_first_observed_or_recover(
+                                    &dataset_cipher,
                                     &relay_hold_first_observed_path,
                                 )
                                 .map_err(|e| format!("load relay-hold first-observed: {e}"))?,
@@ -6872,6 +6884,7 @@ pub async fn start_node_inner(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::relay_hold_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &relay_hold_replay_path,
                                 )
                                 .map_err(|e| format!("load relay-hold replay: {e}"))?,
@@ -6902,6 +6915,7 @@ pub async fn start_node_inner(
                                             replay_path: relay_hold_replay_path,
                                             first_observed_path: relay_hold_first_observed_path,
                                             expired_path: relay_hold_expired_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"relay-hold-v1",
@@ -7008,13 +7022,14 @@ pub async fn start_node_inner(
                         let dm_outhold_replay_path = identity_dir
                             .join(crate::dm_outhold_persist::DM_OUTHOLD_REPLAY_FILENAME);
                         let dm_outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::dm_outhold_persist::load_doc_or_recover(&dm_outhold_path)
+                            crate::dm_outhold_persist::load_doc_or_recover(&dataset_cipher, &dm_outhold_path)
                                 .map_err(|e| format!("load dm-outhold doc: {e}"))?,
                         ));
                         let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::dm_outhold_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &dm_outhold_replay_path,
                                 )
                                 .map_err(|e| format!("load dm-outhold replay: {e}"))?,
@@ -7045,6 +7060,7 @@ pub async fn start_node_inner(
                                         crate::dm_outhold_persist::DmOutholdPersist {
                                             doc_path: dm_outhold_path,
                                             replay_path: dm_outhold_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"dm-outhold-v1",
