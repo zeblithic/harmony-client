@@ -4,7 +4,7 @@
   import VineCard from './VineCard.svelte';
   import ReshareConfirmDialog from './ReshareConfirmDialog.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
-  import { pickCenterIndex, isOwnOriginalVine } from '../vine-utils';
+  import { pickCenterIndex, isOwnOriginalVine, resolveVineCreatorName } from '../vine-utils';
 
   type FeedFilter = 'all' | 'unviewed';
   type FeedTab = 'following' | 'discover';
@@ -33,6 +33,8 @@
     onSetShareFollows,
     getShareVinesPublicly,
     onSetShareVinesPublicly,
+    resolveNickname,
+    resolveCard,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -74,6 +76,10 @@
     getShareVinesPublicly?: () => Promise<boolean>;
     /** ZEB-811: flip the backend share_vines_publicly setting (Tune sheet). */
     onSetShareVinesPublicly?: (on: boolean) => Promise<void>;
+    /** ZEB-978: local petname for an owner_id — top ladder rung. */
+    resolveNickname?: (id: string) => string | undefined;
+    /** ZEB-978: verified broadcast profile card — second ladder rung. */
+    resolveCard?: (id: string) => { displayName: string } | undefined;
   } = $props();
 
   let feedFilter = $state<FeedFilter>('all');
@@ -209,9 +215,11 @@
     return map;
   });
 
-  // ZEB-671: addr → display name for provenance lines. Descriptor
-  // creator names are the same source every card already renders;
-  // unknown addresses fall back to a truncated hex.
+  // ZEB-671: addr → wire descriptor name, feeding the ladder's WIRE rung
+  // only. ZEB-978: provenance lines resolve through the shared ladder
+  // (petname ► card ► wire ► hex) so a descriptor's free-text creatorName
+  // can't spoof a name here any more than it can on the card itself;
+  // unknown addresses keep the truncated-hex "…" form.
   let nameByAddr = $derived.by(() => {
     const m = new Map<string, string>();
     for (const v of [...followedVines, ...discoverVines]) {
@@ -221,7 +229,12 @@
   });
 
   function nameOf(addr: string): string {
-    return nameByAddr.get(addr) ?? `${addr.slice(0, 8)}…`;
+    const r = resolveVineCreatorName(
+      { creatorAddress: addr, creatorName: nameByAddr.get(addr) ?? '' },
+      resolveNickname,
+      resolveCard,
+    );
+    return r.source === 'hex' ? `${r.label}…` : r.label;
   }
 
   function degreeLabelOf(v: VineVideo): string | null {
@@ -232,9 +245,9 @@
   function viaLabelOf(v: VineVideo): string | null {
     const via = v.via;
     if (!via || via.length === 0) return null;
-    if (v.degree === 2) return `${nameOf(via[0])} follows @${v.creatorName}`;
+    if (v.degree === 2) return `${nameOf(via[0])} follows @${nameOf(v.creatorAddress)}`;
     if (v.degree === 3 && via.length >= 2) {
-      return `${nameOf(via[0])} → @${nameOf(via[1])} → @${v.creatorName}`;
+      return `${nameOf(via[0])} → @${nameOf(via[1])} → @${nameOf(v.creatorAddress)}`;
     }
     return null;
   }
@@ -656,6 +669,8 @@
             {onViewOriginal}
             degreeLabel={activeTab === 'discover' ? degreeLabelOf(vine) : null}
             viaLabel={activeTab === 'discover' ? viaLabelOf(vine) : null}
+            {resolveNickname}
+            {resolveCard}
           />
         </div>
       {/each}

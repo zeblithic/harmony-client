@@ -4530,6 +4530,8 @@
       onPlayTargetConsumed={() => { viewOriginalTarget = null; }}
       resolveVideo={resolveVideoFn}
       ownAddress={myAddress || undefined}
+      {resolveNickname}
+      {resolveCard}
       getShareFollows={tauriAdapter ? async () => (await currentVineSettings()).shareFollows : undefined}
       onSetShareFollows={tauriAdapter ? async (on: boolean) => { await setVineSetting({ shareFollows: on }); } : undefined}
       getShareVinesPublicly={tauriAdapter ? async () => (await currentVineSettings()).shareVinesPublicly : undefined}

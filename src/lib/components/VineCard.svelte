@@ -1,8 +1,13 @@
 <script lang="ts">
   import type { VineVideo } from '../types';
   import Avatar from './Avatar.svelte';
+  import PeerName from './PeerName.svelte';
   import { relativeTime } from '../file-utils';
-  import { vineCreatorLabel, vineOriginalCreatorLabel, formatVineDuration } from '../vine-utils';
+  import {
+    resolveVineCreatorName,
+    resolveVineOriginalCreatorName,
+    formatVineDuration,
+  } from '../vine-utils';
 
   let {
     vine, isPlaying = false, isViewed, videoUrl = null, duration = null,
@@ -13,6 +18,7 @@
     canDelete = false, deleting = false, onDelete,
     onViewOriginal,
     degreeLabel = null, viaLabel = null,
+    resolveNickname, resolveCard,
   }: {
     vine: VineVideo;
     /** True when this card is the feed's single playing card. */
@@ -51,6 +57,10 @@
     degreeLabel?: string | null;
     /** ZEB-671: provenance line ("Devin follows @ravi"); null hides it. */
     viaLabel?: string | null;
+    /** ZEB-978: local petname for an owner_id — top ladder rung. */
+    resolveNickname?: (id: string) => string | undefined;
+    /** ZEB-978: verified broadcast profile card — second ladder rung. */
+    resolveCard?: (id: string) => { displayName: string } | undefined;
   } = $props();
 
   let videoEl = $state<HTMLVideoElement | null>(null);
@@ -58,9 +68,16 @@
   let viewed = $derived(isViewed ?? vine.viewed);
   let showReshareCount = $derived(!vine.reshareOf && reshareCount > 0);
   let timeStr = $derived(relativeTime(vine.createdAt * 1000));
-  // ZEB-561: never render a blank creator/resharer.
-  let creatorLabel = $derived(vineCreatorLabel(vine.creatorName, vine.creatorAddress));
-  let originalLabel = $derived(vineOriginalCreatorLabel(vine));
+  // ZEB-978: names resolve through the shared ladder (petname ► card ►
+  // wire ► hex) — the wire creatorName is unverified publisher text and
+  // must never outrank a local petname or the verified card (spoof
+  // defense). ZEB-561's never-blank floors live inside the resolvers.
+  // `.label` serves the text-only sites (aria, Avatar, onFollow); the
+  // visible name spans render through <PeerName> for provenance styling.
+  let creatorName = $derived(resolveVineCreatorName(vine, resolveNickname, resolveCard));
+  let creatorLabel = $derived(creatorName.label);
+  let originalName = $derived(resolveVineOriginalCreatorName(vine, resolveNickname, resolveCard));
+  let originalLabel = $derived(originalName.label);
 
   // Imperative play/pause on playing-state transitions. The `autoplay`
   // attribute only acts at element load, so a paused neighbor promoted to
@@ -170,7 +187,7 @@
   <div class="meta">
     <div class="creator-row">
       <Avatar address={vine.creatorAddress} size={26} displayName={creatorLabel} />
-      <span class="creator-name">{creatorLabel}</span>
+      <span class="creator-name"><PeerName name={creatorName} /></span>
       {#if degreeLabel}
         <span
           class="degree-chip"
@@ -198,6 +215,8 @@
       <p class="vine-title">{vine.title}</p>
     {/if}
     {#if vine.reshareOf}
+      <!-- Resharer stays plain `.label` text: it duplicates the provenance-
+           styled <PeerName> in the creator row directly above. -->
       <span class="attribution-row">
         <span aria-hidden="true">↻</span> {creatorLabel} reshared ·
         {#if onViewOriginal}
@@ -206,9 +225,9 @@
             class="attribution-link"
             onclick={handleViewOriginal}
             aria-label="view original by {originalLabel}"
-          >view original by {originalLabel}</button>
+          >view original by <PeerName name={originalName} /></button>
         {:else}
-          view original by {originalLabel}
+          view original by <PeerName name={originalName} />
         {/if}
       </span>
     {/if}

@@ -5,6 +5,8 @@
  * standing up a VineService (no adapter, no reactive `$state`, no Tauri).
  */
 import type { VineVideo } from './types';
+import { nonEmpty, type ResolvedName } from './display-label';
+import { resolveAuthorLabel } from './mention-render';
 
 /**
  * Resolve the true-origin attribution to attach when resharing `vine`.
@@ -96,6 +98,81 @@ export function vineCreatorLabel(
 export function vineOriginalCreatorLabel(vine: VineVideo): string {
   const name = vine.originalCreatorName?.trim() || vine.creatorName;
   return vineCreatorLabel(name, vine.originalCreatorAddress ?? vine.creatorAddress);
+}
+
+/**
+ * ZEB-978: THE vine author-name resolver — the display-name ladder
+ * (petname ► verified card ► wire ► hex) applied to a vine's creator.
+ *
+ * `creatorAddress` is signature-bound at cache admission (ZEB-673), so it is
+ * an authenticated identity in the same namespace every other ladder surface
+ * keys on. `creatorName` is free text the publisher chose — any descriptor
+ * can carry any name, so it must never outrank a name YOU assigned (petname)
+ * or a name the peer verifiably published (card). It enters the shared
+ * {@link resolveAuthorLabel} ladder as the wire rung, just above the hex
+ * floor, and visual sites render the result through `PeerName.svelte` so a
+ * wire name is visibly unverified.
+ *
+ * Two vine-specific floors on top of the shared ladder (both preserve
+ * ZEB-561's never-blank contract):
+ *
+ * - The `self` sentinel short-circuits to `ownDisplayName`, which can be
+ *   blank on an offline publish — degrade to the hex floor, never blank.
+ * - `wireToVine` bakes `creatorAddress.slice(0, 8)` into a blank wire name
+ *   at ingest; a wire rung that just echoes the address prefix IS the hex
+ *   floor and is tagged `hex` (mono style), not `wire` (unverified style).
+ */
+export function resolveVineCreatorName(
+  vine: Pick<VineVideo, 'creatorAddress' | 'creatorName'>,
+  resolveNickname?: (id: string) => string | undefined,
+  resolveCard?: (id: string) => { displayName: string } | undefined,
+): ResolvedName {
+  const r = resolveAuthorLabel(
+    { address: vine.creatorAddress, displayName: vine.creatorName ?? '' },
+    resolveNickname,
+    resolveCard,
+  );
+  const hexFloor = vine.creatorAddress.slice(0, 8);
+  if (r.source === 'self' && nonEmpty(r.label) === undefined) {
+    return { label: hexFloor, source: 'hex' };
+  }
+  if (r.source === 'wire') {
+    const trimmed = r.label.trim();
+    return { label: trimmed, source: trimmed === hexFloor ? 'hex' : 'wire' };
+  }
+  return r;
+}
+
+/**
+ * ZEB-978: ladder-resolved "view original by …" label for a reshare's origin
+ * creator.
+ *
+ * The ladder (petname ► card) runs ONLY against `originalCreatorAddress` —
+ * when the origin address is absent there is nothing to verify a local name
+ * against, and resolving on the fallback `creatorAddress` would let a
+ * petname for the RESHARER label the ORIGINAL creator (a mis-credit worse
+ * than showing the wire snapshot). The wire/hex floors keep
+ * {@link vineOriginalCreatorLabel}'s display chain exactly: a present
+ * `originalCreatorName` even when its paired address is absent (Qodo #337),
+ * else the source vine's `creatorName`, else the truncated-hex floor.
+ */
+export function resolveVineOriginalCreatorName(
+  vine: VineVideo,
+  resolveNickname?: (id: string) => string | undefined,
+  resolveCard?: (id: string) => { displayName: string } | undefined,
+): ResolvedName {
+  const wireName = vine.originalCreatorName?.trim() || vine.creatorName;
+  const addr = nonEmpty(vine.originalCreatorAddress);
+  if (addr !== undefined) {
+    return resolveVineCreatorName(
+      { creatorAddress: addr, creatorName: wireName },
+      resolveNickname,
+      resolveCard,
+    );
+  }
+  const name = nonEmpty(wireName);
+  if (name !== undefined) return { label: name.trim(), source: 'wire' };
+  return { label: vine.creatorAddress.slice(0, 8), source: 'hex' };
 }
 
 /**

@@ -653,6 +653,16 @@ describe('feed-level delete (ZEB-670 creator tombstone)', () => {
       expect(screen.getByText(/devin-ad… → @Ravi → @Ada/)).toBeTruthy();
     });
 
+    it('resolves provenance names through the petname ladder (ZEB-978)', () => {
+      // The via-root has no descriptor (only an address) but a petname names
+      // it; the creator's petname beats the wire creatorName ("Ravi").
+      renderDiscover({
+        resolveNickname: (id: string) =>
+          id === 'devin-addr' ? 'Dev' : id === 'ravi-addr' ? 'Ravi (climbing)' : undefined,
+      });
+      expect(screen.getByText('Dev follows @Ravi (climbing)')).toBeTruthy();
+    });
+
     it('keeps own offline-fallback publishes visible without a degree', () => {
       const own: VineVideo = {
         id: 'own-01', creatorAddress: 'self', creatorName: 'You',

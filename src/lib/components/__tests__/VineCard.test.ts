@@ -185,3 +185,73 @@ describe('VineCard delete verb + removed stub (ZEB-670)', () => {
     expect(screen.getByText(/reshared/)).toBeTruthy();
   });
 });
+
+// ── ZEB-978: author label resolves through the shared ladder ────────────
+
+describe('VineCard author ladder (ZEB-978)', () => {
+  const ADDR = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  const spoof: VineVideo = { ...vine, creatorAddress: ADDR, creatorName: 'Trusted Friend' };
+
+  it('renders a petname over the wire creatorName, badged as petname', () => {
+    render(VineCard, props({
+      vine: spoof,
+      resolveNickname: (id: string) => (id === ADDR ? 'Actual Rando' : undefined),
+    }));
+    expect(screen.queryByText('Trusted Friend')).toBeNull();
+    const name = screen.getByText('Actual Rando');
+    expect(name.closest('[data-name-source]')?.getAttribute('data-name-source')).toBe('petname');
+  });
+
+  it('renders the verified card name when no petname is assigned', () => {
+    render(VineCard, props({
+      vine: spoof,
+      resolveCard: (id: string) => (id === ADDR ? { displayName: 'Zebulon' } : undefined),
+    }));
+    expect(screen.queryByText('Trusted Friend')).toBeNull();
+    const name = screen.getByText('Zebulon');
+    expect(name.closest('[data-name-source]')?.getAttribute('data-name-source')).toBe('card');
+  });
+
+  it('marks a wire-only creatorName as unverified', () => {
+    render(VineCard, props({ vine: spoof }));
+    const name = screen.getByText('Trusted Friend');
+    expect(name.closest('[data-name-source]')?.getAttribute('data-name-source')).toBe('wire');
+  });
+
+  it('resolves the reshare attribution through the ORIGINAL creator address', () => {
+    const reshare: VineVideo = {
+      ...vine, id: 'vine-rs2', reshareOf: 'vine-00',
+      creatorAddress: ADDR, creatorName: 'Resharer',
+      originalCreatorAddress: 'feedfacecafebeef0123456789abcdef',
+      originalCreatorName: 'Wire Snapshot',
+    };
+    render(VineCard, props({
+      vine: reshare,
+      onViewOriginal: vi.fn(),
+      resolveNickname: (id: string) =>
+        (id === 'feedfacecafebeef0123456789abcdef' ? 'Origin Pet' : undefined),
+    }));
+    expect(screen.getByRole('button', { name: 'view original by Origin Pet' })).toBeTruthy();
+    expect(screen.queryByText(/Wire Snapshot/)).toBeNull();
+  });
+
+  it('uses the resolved label in the card aria-label', () => {
+    render(VineCard, props({
+      vine: spoof,
+      resolveNickname: (id: string) => (id === ADDR ? 'Actual Rando' : undefined),
+    }));
+    expect(screen.getByRole('button', { name: /First vine by Actual Rando/ })).toBeTruthy();
+  });
+
+  it('passes the resolved label to onFollow (stored name = the name you know them by)', async () => {
+    const onFollow = vi.fn();
+    render(VineCard, props({
+      vine: spoof,
+      showFollowButton: true,
+      onFollow,
+      resolveNickname: (id: string) => (id === ADDR ? 'Actual Rando' : undefined),
+    }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Follow Actual Rando' }));
+    expect(onFollow).toHaveBeenCalledWith(ADDR, 'Actual Rando');
+  });
+});
