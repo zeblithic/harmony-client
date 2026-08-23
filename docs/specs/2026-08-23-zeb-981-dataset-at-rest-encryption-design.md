@@ -53,8 +53,10 @@ purely at-rest.
    datasets already require to sync at all. Epoch-independent like friend
    secrets → no multi-epoch decrypt candidates, and a tag failure is never
    "rotated epoch".
-2. **Scope: all 10 mirror-family datasets in this PR**, via a new shared
-   module (see table below). `owner_state.cbor` / `owner_state_crdt.cbor`
+2. **Scope: all 8 mirror-family datasets in this PR**, via a new shared
+   module (see table below; amended from 10 during planning — the two
+   resolved checkpoints moved `fleet_peer_seed` and `fleet_keys` out, see
+   Out of scope). `owner_state.cbor` / `owner_state_crdt.cbor`
    stay out — they run in keyless local-only mode (ZEB-905) and are written
    by non-fleet paths; follow-up ticket.
 3. **AEAD tag failure on load → quarantine + self-heal**, same policy as
@@ -64,7 +66,7 @@ purely at-rest.
 
 ## Why this is safe on the boot path
 
-All 23 dataset files (10 docs, 9 replay trackers, 4 sidecars) load
+All 20 dataset files (8 docs, 8 replay trackers, 4 sidecars) load
 synchronously inside
 `start_node_inner`'s fleet band (`lib.rs:6160`,
 `if let Some((kt, keys)) = fleet_crypto`):
@@ -207,24 +209,28 @@ struct gains `keys: Arc<KeyTree>` (the pinned epoch-0 `kt`).
 | `relay_optin_persist.rs` | `relay_optin.cbor`, `relay_optin_replay.cbor` | |
 | `fleet_net_persist.rs` | `fleet_net.cbor`, `fleet_net_replay.cbor` | |
 | `community_device_intro_persist.rs` | `community_device_intro.cbor`, `community_device_intro_replay.cbor` | |
-| `fleet_peer_seed_persist.rs` | `fleet_peer_seed.cbor` | no `FleetPersist` impl; see checkpoint 1 |
-| `fleet_key_epoch.rs` | `fleet_keys.cbor`, `fleet_keys_replay.cbor` | see checkpoint 2 |
 
 Replay trackers and tombstone sidecars encrypt uniformly (ticket: "cheapest
 is to encrypt uniformly" — one format, one code path).
 
-**Implementation checkpoints (verify during planning):**
+**Checkpoint resolutions (2026-08-23, during planning):** both checkpoints
+resolved as scope removals — see the first two Out-of-scope entries.
 
-1. **`fleet_peer_seed.cbor` is written from `pairing/persist.rs:36`**, not
-   from the fleet band. Verify the joiner has its KeyTree installed before
-   that write fires; if a write path exists where no KeyTree is present yet,
-   that write must be deferred until after key installation (it already
-   cannot be *used* before then).
-2. **`fleet_keys.cbor` (epoch-carrier) is non-circular:** it loads at
-   BOOT-PROBE 08-fleet-keys (`lib.rs:7609`), strictly after the pinned
-   epoch-0 tree is constructed (`lib.rs:5797-5889`), and only installs
-   *additional* epochs. Sealing the carrier under epoch-0 is therefore safe;
-   confirm no other reader touches it earlier.
+**Out of scope:**
+
+- `fleet_peer_seed.cbor` — plaintext at rest is deliberate (module doc:
+  dialing coordinates, not a secret, same class as `fleet_net.cbor`, and
+  captured over the SAS channel) and its write site
+  (`pairing/persist.rs::persist_peer_seed`) can run before the Joiner's
+  KeyTree is installed. Encrypting it buys nothing and adds a
+  pairing-ordering hazard. (Resolved checkpoint 1.)
+- `fleet_keys.cbor` + replay — content documented non-secret (sealed blobs +
+  signed metadata; `fleet_key_epoch.rs:342`), and its recovery contract is
+  deliberately NOT the ZEB-460 mirror (any failure → warn + default, no
+  quarantine, no error propagation — the doc re-replicates from any
+  sibling), with PR #455 signature-verification logic this change must not
+  perturb. Forcing it into the shared module would change its semantics for
+  zero confidentiality gain. (Resolved checkpoint 2.)
 
 **Out of scope (follow-ups):**
 
@@ -261,7 +267,7 @@ the ZEB-460 contract) updated to construct a test cipher from
 `KeyTree::derive(&[0u8; 32])`; sidecar-ordering tests unchanged.
 
 **Integration:** existing headless e2e flows exercise boot decrypt
-implicitly (every boot now opens ~23 sealed files). No new e2e needed.
+implicitly (every boot now opens ~20 sealed files). No new e2e needed.
 
 ## PR shape
 
