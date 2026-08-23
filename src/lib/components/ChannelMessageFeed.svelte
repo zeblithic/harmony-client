@@ -5,6 +5,7 @@
   import type { VotingAdapter } from '../voting-adapter';
   import type { PollMeta } from '../types/voting';
   import Avatar from './Avatar.svelte';
+  import PeerName from './PeerName.svelte';
   import PollMessage from './PollMessage.svelte';
   import MessageAttachments from './MessageAttachments.svelte';
   import ReactionEmojiImage from './ReactionEmojiImage.svelte';
@@ -476,10 +477,13 @@
   // displayName (ZEB-774) ► truncated owner hex. Read through the resolvers so the
   // reactive nickname map / card Map / roster re-render the author label
   // automatically.
-  function authorLabel(author: string): string {
-    // Shared ladder (ZEB-432/ZEB-588/ZEB-774): nickname ► profile-card name ►
-    // roster name ► hex.
+  function authorName(author: string) {
+    // Shared ladder (ZEB-432/ZEB-588/ZEB-774): petname ► profile-card name ►
+    // roster name ► hex — with provenance (ZEB-977) for <PeerName>.
     return resolveMentionLabel(author, resolveNickname, resolveCard, resolveRosterName);
+  }
+  function authorLabel(author: string): string {
+    return authorName(author).label;
   }
 
   // ZEB-536 — is the local member currently reacting with `emoji` on `msg`?
@@ -890,9 +894,9 @@
                   type="button"
                   class="author author-btn"
                   onclick={(e) => handleAuthorClick(msg.author, e)}
-                >{authorLabel(msg.author)}</button>
+                ><PeerName name={authorName(msg.author)} /></button>
               {:else}
-                <span class="author">{authorLabel(msg.author)}</span>
+                <span class="author"><PeerName name={authorName(msg.author)} /></span>
               {/if}
               <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()} title={formatFullTimestamp(msg.at.wallMs, $timeFormatPrefs)}>{formatTimestamp(msg.at, $dayClock, $timeFormatPrefs)}</time>
               {#if row.isPreFork}
@@ -914,7 +918,7 @@
               <p class="body">{#each tokenizeBody(bodyToText(msg.body)) as seg}{#if seg.type === 'mention'}<span
                     class="mention"
                     class:self={seg.ownerId === ownAddress}
-                    data-testid="mention">@{resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard, resolveRosterName)}</span>{:else}{seg.text}{/if}{/each}</p>
+                    data-testid="mention">@<PeerName name={resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard, resolveRosterName)} /></span>{:else}{seg.text}{/if}{/each}</p>
             {/if}
             {#if msg.attachments && msg.attachments.length > 0}
               <MessageAttachments

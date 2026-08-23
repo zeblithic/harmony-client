@@ -42,7 +42,7 @@
 
   let senderNames = $derived(
     [
-      ...new Set(messages.map((m) => resolveAuthorLabel(m.sender, resolveNickname, resolveCard))),
+      ...new Set(messages.map((m) => resolveAuthorLabel(m.sender, resolveNickname, resolveCard).label)),
     ].join(', ')
   );
 

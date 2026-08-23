@@ -35,8 +35,29 @@ describe('DmInviteToast', () => {
           id === invite.inviterOwnerIdHex ? { displayName: 'Zeb', statusText: '' } : undefined,
       },
     });
-    expect(getByText(/From Zeb/)).toBeTruthy();
+    // ZEB-977: the name renders inside <PeerName>, so "From" and the label
+    // are separate elements — assert on the resolved name node itself.
+    expect(getByText('Zeb')).toBeTruthy();
     // The hex must not show once the card name resolves.
     expect(queryByText(/deadbeef/)).toBeNull();
+  });
+
+  // ZEB-977: the petname rung outranks the card name, provenance-styled.
+  it('prefers the local petname over the card name and badges it', () => {
+    const { getByText, container } = render(DmInviteToast, {
+      props: {
+        invite,
+        onAccept: vi.fn(),
+        onDecline: vi.fn(),
+        onLater: vi.fn(),
+        resolveNickname: (id: string) =>
+          id === invite.inviterOwnerIdHex ? 'Zebby' : undefined,
+        resolveCard: (id: string) =>
+          id === invite.inviterOwnerIdHex ? { displayName: 'Zeb', statusText: '' } : undefined,
+      },
+    });
+    const name = getByText('Zebby');
+    expect(name.closest('.peer-name')?.getAttribute('data-name-source')).toBe('petname');
+    expect(container.querySelector('.petname-badge')).not.toBeNull();
   });
 });

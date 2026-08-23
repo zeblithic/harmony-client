@@ -3,6 +3,7 @@
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import CountChip from './governance/CountChip.svelte';
+    import PeerName from './PeerName.svelte';
     // ZEB-946: the "since …" HLC timestamp honors the owner's time-format prefs.
     import { formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
     import { timeFormatPrefs } from '../time-format-service';
@@ -213,7 +214,7 @@
                 <ul>
                     {#each pending as p (p.eventId)}
                         <li class="join-row">
-                            <span class="joiner">{resolveMentionLabel(p.joinerAddr, resolveNickname, resolveCard, () => p.inviteeHint)}</span>
+                            <span class="joiner"><PeerName name={resolveMentionLabel(p.joinerAddr, resolveNickname, resolveCard, () => p.inviteeHint)} /></span>
                             <span class="time">since {formatHlc(p.pendingAtHlc, $timeFormatPrefs)}</span>
                             <button class="reject-btn" type="button" onclick={() => kickJoiner(p.joinerAddr)}>
                                 Reject (kick)
@@ -236,7 +237,7 @@
                 <ul>
                     {#each recent as r (r.joinEventId)}
                         <li class="join-row">
-                            <span class="joiner">{resolveMentionLabel(r.joinerAddr, resolveNickname, resolveCard)}</span>
+                            <span class="joiner"><PeerName name={resolveMentionLabel(r.joinerAddr, resolveNickname, resolveCard)} /></span>
                             <span class="time">at {formatHlc(r.countersignedAtHlc, $timeFormatPrefs)}</span>
                         </li>
                     {/each}

@@ -381,7 +381,7 @@
   /** ZEB-907: ONE label per row via the shared ladder, used by the render
    *  AND the search filter so a rendered name is always findable. */
   function memberLabel(m: CommunityMember): string {
-    return resolveMentionLabel(m.address, resolveNickname, resolveCard, () => m.displayName);
+    return resolveMentionLabel(m.address, resolveNickname, resolveCard, () => m.displayName).label;
   }
 
   let filteredMembers = $derived(

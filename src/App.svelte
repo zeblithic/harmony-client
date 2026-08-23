@@ -669,7 +669,7 @@
       incomingCall = {
         callId: p.callId,
         spaceId: p.spaceId,
-        callerName: resolveMemberName(resolveNickname(p.callerOwner), card?.displayName) ?? p.callerOwner.slice(0, 8),
+        callerName: resolveMemberName(resolveNickname(p.callerOwner), card?.displayName)?.label ?? p.callerOwner.slice(0, 8),
         ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
       };
       // ZEB-356: escalate to the OS if the window is unfocused (no-op if focused).
@@ -699,7 +699,7 @@
     const gst = groupCall ? get(groupCall.state) : null;
     if (gst && gst.phase === 'incoming' && gst.callId === p.callId) {
       const card = resolveCard(p.callerOwner);
-      const name = resolveMemberName(resolveNickname(p.callerOwner), card?.displayName) ?? p.callerOwner.slice(0, 8);
+      const name = resolveMemberName(resolveNickname(p.callerOwner), card?.displayName)?.label ?? p.callerOwner.slice(0, 8);
       const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
       // T13: raise the in-app ring toast (cleared when the group phase leaves
       // 'incoming' via the subscription in buildVoiceSession).
@@ -4108,7 +4108,7 @@
         // Settings per-peer trust list shows a blank row for every DM peer.
         .map((m) => [
           m.sender.address,
-          { ...m.sender, displayName: resolveAuthorLabel(m.sender, resolveNickname, resolveCard) },
+          { ...m.sender, displayName: resolveAuthorLabel(m.sender, resolveNickname, resolveCard).label },
         ])
     );
     for (const node of navNodes) {
@@ -4202,6 +4202,7 @@
     <DmInviteToast
       invite={dmInviteQueue[0]}
       {resolveCard}
+      {resolveNickname}
       onAccept={() => handleDmInviteAccept(dmInviteQueue[0].spaceIdHex)}
       onDecline={() => handleDmInviteDecline(dmInviteQueue[0].spaceIdHex)}
       onLater={() => {
@@ -4542,6 +4543,8 @@
     <FileBrowser
       service={fileManagerService}
       adapter={tauriAdapter}
+      {resolveNickname}
+      {resolveCard}
       {currentFolderCid}
       selectedCid={selectedFileCid}
       selectedSidecarId={selectedFileSidecarId}
@@ -4587,6 +4590,8 @@
         availableGrantFriends={availableFileGrantFriends}
         onGrantRead={handleFileGrant}
         onRevokeRead={handleFileRevoke}
+        {resolveNickname}
+        {resolveCard}
       />
     {:else}
       <div class="file-detail-empty">
@@ -4627,6 +4632,7 @@
         syncState={mailSyncState}
         syncError={mailSyncError}
         {resolveCard}
+        {resolveNickname}
         onRefresh={() => { mailService.refresh().catch(() => {}); }}
         onSelectEmail={async (cid) => {
           selectedMailCid = cid;
@@ -4676,6 +4682,7 @@
       loading={mailDetailLoading}
       error={mailDetailError}
       {resolveCard}
+      {resolveNickname}
       onReply={(_cid, msgId) => {
         composeReplyTo = msgId;
         composeInitialTo = selectedMailDetail?.senderAddress ?? '';
@@ -4786,6 +4793,8 @@
       <DmCreateDialog
         profiles={pickerContacts}
         friendSourced={isTauri()}
+        {resolveNickname}
+        {resolveCard}
         initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}

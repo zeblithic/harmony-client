@@ -378,7 +378,7 @@
   bind:open={dialogOpen}
   action={dialogAction}
   targetName={dialogTarget
-    ? resolveMentionLabel(dialogTarget.address, resolveNickname, resolveCard, () => dialogTarget!.displayName)
+    ? resolveMentionLabel(dialogTarget.address, resolveNickname, resolveCard, () => dialogTarget!.displayName).label
     : ''}
   {communityName}
   onConfirm={onDialogConfirm}

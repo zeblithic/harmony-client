@@ -9,7 +9,7 @@
  * → short hex.
  */
 
-import { nonEmpty } from './display-label';
+import { nonEmpty, type ResolvedName } from './display-label';
 
 export type BodySegment =
   | { type: 'text'; text: string }
@@ -48,19 +48,24 @@ export function tokenizeBody(text: string): BodySegment[] {
  *  mirrors the 4-rung ladder in `MemberRow.svelte`. Callers that don't thread it
  *  keep the original 3-rung behavior.
  *
- *  Returns the BARE label (no leading '@'); the mention render template adds it. */
+ *  Returns the BARE label (no leading '@'); the mention render template adds it.
+ *
+ *  ZEB-977: returns a `ResolvedName` — the label plus WHERE it came from — so
+ *  visual sites can style by provenance via `PeerName.svelte` (a card-sourced
+ *  name must never render in petname style). Text-only contexts use `.label`. */
 export function resolveMentionLabel(
   ownerId: string,
   resolveNickname?: (id: string) => string | undefined,
   resolveCard?: (id: string) => { displayName: string } | undefined,
   resolveRosterName?: (id: string) => string | undefined,
-): string {
-  return (
-    nonEmpty(resolveNickname?.(ownerId)) ??
-    nonEmpty(resolveCard?.(ownerId)?.displayName) ??
-    nonEmpty(resolveRosterName?.(ownerId)) ??
-    ownerId.slice(0, 8)
-  );
+): ResolvedName {
+  const petname = nonEmpty(resolveNickname?.(ownerId));
+  if (petname !== undefined) return { label: petname, source: 'petname' };
+  const card = nonEmpty(resolveCard?.(ownerId)?.displayName);
+  if (card !== undefined) return { label: card, source: 'card' };
+  const roster = nonEmpty(resolveRosterName?.(ownerId));
+  if (roster !== undefined) return { label: roster, source: 'roster' };
+  return { label: ownerId.slice(0, 8), source: 'hex' };
 }
 
 /** Sentinel `Peer.address` for locally-authored messages (`message-service`
@@ -82,17 +87,24 @@ const SELF_ADDRESS = 'self';
  * the label fill in as cards and nicknames arrive. DM authors deliberately
  * carry no baked name (`message-service.ts`), so an unresolved DM peer lands
  * on the hex rung here rather than being frozen there at ingest.
+ *
+ * ZEB-977: returns a `ResolvedName` (label + provenance) — the wire-supplied
+ * `senderName` rung surfaces as `source: 'wire'` so visual sites can mark it
+ * unverified, and only the petname rung can earn the petname badge.
  */
 export function resolveAuthorLabel(
   sender: { address: string; displayName: string },
   resolveNickname?: (id: string) => string | undefined,
   resolveCard?: (id: string) => { displayName: string } | undefined,
-): string {
-  if (sender.address === SELF_ADDRESS) return sender.displayName;
-  return (
-    nonEmpty(resolveNickname?.(sender.address)) ??
-    nonEmpty(resolveCard?.(sender.address)?.displayName) ??
-    nonEmpty(sender.displayName) ??
-    sender.address.slice(0, 8)
-  );
+): ResolvedName {
+  if (sender.address === SELF_ADDRESS) {
+    return { label: sender.displayName, source: 'self' };
+  }
+  const petname = nonEmpty(resolveNickname?.(sender.address));
+  if (petname !== undefined) return { label: petname, source: 'petname' };
+  const card = nonEmpty(resolveCard?.(sender.address)?.displayName);
+  if (card !== undefined) return { label: card, source: 'card' };
+  const wire = nonEmpty(sender.displayName);
+  if (wire !== undefined) return { label: wire, source: 'wire' };
+  return { label: sender.address.slice(0, 8), source: 'hex' };
 }

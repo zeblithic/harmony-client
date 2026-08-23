@@ -3,8 +3,8 @@
   import type { PendingDmInviteDto } from '../dm-invite-service';
   // ZEB-961: resolve the inviter's broadcast card name when available (a
   // non-friend inviter can still have published a profile card), else short hex.
-  import { nonEmpty } from '../display-label';
-  import { shortId } from '../short-addr';
+  import { resolveMentionLabel } from '../mention-render';
+  import PeerName from './PeerName.svelte';
   import type { ResolvedCard } from '../member-card-service';
 
   let {
@@ -13,12 +13,16 @@
     onDecline,
     onLater,
     resolveCard,
+    resolveNickname,
   }: {
     invite: PendingDmInviteDto;
     onAccept: () => void | Promise<void>;
     onDecline: () => void | Promise<void>;
     onLater: () => void;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    // ZEB-977: petname rung — THE first-contact spoof surface; your name for a
+    // known identity must outrank whatever the inviter published.
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
   } = $props();
 
   // Map the SpaceKind wire tag ('d'/'g') to a human label; fall back to the
@@ -68,7 +72,7 @@
   >
     <div class="invite-info">
       <span class="invite-title">DM invite</span>
-      <span class="invite-body">From {nonEmpty(resolveCard?.(invite.inviterOwnerIdHex)?.displayName) ?? shortId(invite.inviterOwnerIdHex)} ({kindLabel(invite.kind)})</span>
+      <span class="invite-body">From <PeerName name={resolveMentionLabel(invite.inviterOwnerIdHex, resolveNickname, resolveCard)} /> ({kindLabel(invite.kind)})</span>
     </div>
     <div class="invite-actions">
       <button

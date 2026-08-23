@@ -51,38 +51,38 @@ describe('resolveMentionLabel', () => {
     id === ID_A ? { displayName: 'CardA' } : id === ID_B ? { displayName: 'CardB' } : undefined;
 
   it('prefers local nickname', () => {
-    expect(resolveMentionLabel(ID_A, nick, card)).toBe('NickA');
+    expect(resolveMentionLabel(ID_A, nick, card)).toEqual({ label: 'NickA', source: 'petname' });
   });
 
   it('falls back to broadcast displayName', () => {
-    expect(resolveMentionLabel(ID_B, nick, card)).toBe('CardB');
+    expect(resolveMentionLabel(ID_B, nick, card)).toEqual({ label: 'CardB', source: 'card' });
   });
 
   it('falls back to short hex when nothing resolves', () => {
-    expect(resolveMentionLabel(ID_A, undefined, undefined)).toBe('aaaaaaaa');
+    expect(resolveMentionLabel(ID_A, undefined, undefined)).toEqual({ label: 'aaaaaaaa', source: 'hex' });
   });
 
   it('treats empty/whitespace nickname or name as absent', () => {
-    expect(resolveMentionLabel(ID_A, () => '  ', () => ({ displayName: '' }))).toBe('aaaaaaaa');
-    expect(resolveMentionLabel(ID_A, () => '   ', () => ({ displayName: 'Real' }))).toBe('Real');
+    expect(resolveMentionLabel(ID_A, () => '  ', () => ({ displayName: '' }))).toEqual({ label: 'aaaaaaaa', source: 'hex' });
+    expect(resolveMentionLabel(ID_A, () => '   ', () => ({ displayName: 'Real' }))).toEqual({ label: 'Real', source: 'card' });
   });
 
   // ZEB-774: roster-DTO displayName rung, between the live card and short hex.
   const roster = (id: string) => (id === ID_B ? 'RosterB' : undefined);
 
   it('falls back to the roster-DTO name when nickname and card are absent', () => {
-    expect(resolveMentionLabel(ID_B, undefined, undefined, roster)).toBe('RosterB');
+    expect(resolveMentionLabel(ID_B, undefined, undefined, roster)).toEqual({ label: 'RosterB', source: 'roster' });
   });
 
   it('prefers nickname and card over the roster-DTO name', () => {
     // ID_A has a nickname (NickA) and a card (CardA); the roster rung must lose.
-    expect(resolveMentionLabel(ID_A, nick, card, () => 'RosterA')).toBe('NickA');
+    expect(resolveMentionLabel(ID_A, nick, card, () => 'RosterA')).toEqual({ label: 'NickA', source: 'petname' });
     // A card but no nickname: card still wins over roster.
-    expect(resolveMentionLabel(ID_B, undefined, card, () => 'RosterB')).toBe('CardB');
+    expect(resolveMentionLabel(ID_B, undefined, card, () => 'RosterB')).toEqual({ label: 'CardB', source: 'card' });
   });
 
   it('falls back to short hex when the roster name is also absent/blank', () => {
-    expect(resolveMentionLabel(ID_A, undefined, undefined, () => undefined)).toBe('aaaaaaaa');
-    expect(resolveMentionLabel(ID_A, undefined, undefined, () => '  ')).toBe('aaaaaaaa');
+    expect(resolveMentionLabel(ID_A, undefined, undefined, () => undefined)).toEqual({ label: 'aaaaaaaa', source: 'hex' });
+    expect(resolveMentionLabel(ID_A, undefined, undefined, () => '  ')).toEqual({ label: 'aaaaaaaa', source: 'hex' });
   });
 });

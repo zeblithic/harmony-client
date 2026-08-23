@@ -28,7 +28,8 @@ describe('nonEmpty', () => {
 });
 
 // resolveMemberName is the name-ONLY ladder for the call/voice cluster: it
-// prefers a non-blank nickname over a non-blank card name, returning `undefined`
+// prefers a non-blank petname over a non-blank card name (as a ResolvedName
+// with provenance — ZEB-977), returning `undefined`
 // when neither is present so each call/voice leaf keeps its own established hex
 // format (bars: 6-char+ellipsis; toasts: slice(0,8)) rather than being forced
 // onto the identity ladder's slice(0,8). It takes the two candidate names as
@@ -36,15 +37,15 @@ describe('nonEmpty', () => {
 // second lookup.
 describe('resolveMemberName', () => {
   it('prefers the friend nickname over the published card name', () => {
-    expect(resolveMemberName('Ziggy', 'CardName')).toBe('Ziggy');
+    expect(resolveMemberName('Ziggy', 'CardName')).toEqual({ label: 'Ziggy', source: 'petname' });
   });
 
   it('falls through to the card name when there is no nickname', () => {
-    expect(resolveMemberName(undefined, 'CardName')).toBe('CardName');
+    expect(resolveMemberName(undefined, 'CardName')).toEqual({ label: 'CardName', source: 'card' });
   });
 
   it('treats a whitespace-only nickname as absent and falls through to the card', () => {
-    expect(resolveMemberName('   ', 'CardName')).toBe('CardName');
+    expect(resolveMemberName('   ', 'CardName')).toEqual({ label: 'CardName', source: 'card' });
   });
 
   it('returns undefined when nickname and card are both blank/absent (leaf hex applies)', () => {

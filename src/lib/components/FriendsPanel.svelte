@@ -37,6 +37,7 @@
   import { relativeTime } from '../file-utils';
   import { nonEmpty } from '../display-label';
   import Avatar from './Avatar.svelte';
+  import PeerName from './PeerName.svelte';
   import type { ResolvedCard } from '../member-card-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
 
@@ -804,12 +805,21 @@
   function cardAvatarUrl(ownerIdHex: string): string | undefined {
     return resolveCard?.(ownerIdHex)?.avatarUrl;
   }
-  // Label ladder: personal nickname ► live card name ► frozen link hint ►
+  // Label ladder: personal petname ► live card name ► frozen link hint ►
   // short owner_id. The short-hex line under the name stays the verifiable id.
+  // ZEB-977: provenance-aware (petname badge via <PeerName>); the frozen link
+  // hint is wire-class trust, same bucket as a roster name.
+  function friendName(f: FriendDto): import('../display-label').ResolvedName {
+    const petname = nonEmpty(f.nickname);
+    if (petname !== undefined) return { label: petname, source: 'petname' };
+    const card = cardName(f.ownerIdHex);
+    if (card !== undefined) return { label: card, source: 'card' };
+    const hint = nonEmpty(f.display);
+    if (hint !== undefined) return { label: hint, source: 'roster' };
+    return { label: shortId(f.ownerIdHex), source: 'hex' };
+  }
   function friendLabel(f: FriendDto): string {
-    return (
-      nonEmpty(f.nickname) ?? cardName(f.ownerIdHex) ?? nonEmpty(f.display) ?? shortId(f.ownerIdHex)
-    );
+    return friendName(f).label;
   }
   // Pending requests have no nickname rung (you nickname a peer after accepting).
   function requestLabel(r: PendingFriendRequestDto): string {
@@ -878,7 +888,7 @@
             size={28}
           />
           <div class="friend-id">
-            <span class="friend-name" data-testid="friend-name-{f.ownerIdHex}">{friendLabel(f)}</span>
+            <span class="friend-name" data-testid="friend-name-{f.ownerIdHex}"><PeerName name={friendName(f)} /></span>
             <button
               type="button"
               class="friend-addr identity-btn"

@@ -5,6 +5,7 @@
   import { dayClock } from '../day-clock';
   import { timeFormatPrefs } from '../time-format-service';
   import Avatar from './Avatar.svelte';
+  import PeerName from './PeerName.svelte';
   import { resolveAuthorLabel } from '../mention-render';
   import type { ResolvedCard } from '../member-card-service';
 
@@ -22,7 +23,8 @@
   // ZEB-943: format against the app-wide day clock so the label reclassifies at
   // local midnight without a remount (day-clock.ts). No per-message timer.
   let timeStr = $derived(formatMessageTimestamp(message.timestamp, $dayClock, $timeFormatPrefs));
-  let senderLabel = $derived(resolveAuthorLabel(message.sender, resolveNickname, resolveCard));
+  let senderName = $derived(resolveAuthorLabel(message.sender, resolveNickname, resolveCard));
+  let senderLabel = $derived(senderName.label);
 
   type LoadState = 'blocked' | 'confirming' | 'cooldown';
   let loadState = $state<LoadState>('blocked');
@@ -73,7 +75,7 @@
       size={20}
       onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
-    <span class="card-sender">{senderLabel}</span>
+    <span class="card-sender"><PeerName name={senderName} /></span>
     <time class="card-time" datetime={new Date(message.timestamp).toISOString()} title={formatFullTimestamp(message.timestamp, $timeFormatPrefs)}>{timeStr}</time>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
   </button>

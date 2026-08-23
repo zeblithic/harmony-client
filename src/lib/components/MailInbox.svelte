@@ -8,7 +8,8 @@
   import { dayClock } from '../day-clock';
   // ZEB-961: resolve the sender owner_id to its broadcast card name when
   // available, else the shared short-hex (first8…) — no local shortAddr copy.
-  import { nonEmpty } from '../display-label';
+  import { resolveMentionLabel } from '../mention-render';
+  import PeerName from './PeerName.svelte';
   import { shortId } from '../short-addr';
   import type { ResolvedCard } from '../member-card-service';
 
@@ -20,6 +21,7 @@
     syncState = 'idle',
     syncError = null,
     resolveCard,
+    resolveNickname,
     onRefresh,
     onSelectEmail,
     onFolderChange,
@@ -34,6 +36,8 @@
     syncState?: 'idle' | 'syncing' | 'error';
     syncError?: string | null;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    // ZEB-977: petname rung (see MailReader).
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
     onRefresh?: () => void;
     onSelectEmail?: (cid: string) => void;
     onFolderChange?: (folder: MailFolderKind) => void;
@@ -41,6 +45,15 @@
     onMarkRead?: (cid: string) => void;
     onMoveTrash?: (cid: string) => void;
   } = $props();
+
+  // ZEB-977: full ladder (petname ► card ► hex); this surface's established
+  // hex form is the shared shortId (first8 + ellipsis), so swap it onto the
+  // hex rung rather than the ladder's bare slice(0, 8).
+  function senderName(address: string) {
+    const resolved = resolveMentionLabel(address, resolveNickname, resolveCard);
+    return resolved.source === 'hex' ? { ...resolved, label: shortId(address) } : resolved;
+  }
+
 
   const folders: { kind: MailFolderKind; label: string }[] = [
     { kind: 'inbox', label: 'Inbox' },
@@ -126,7 +139,7 @@
             onSelectEmail?.(entry.messageCid);
           }}
         >
-          <span class="mail-sender">{nonEmpty(resolveCard?.(entry.senderAddress)?.displayName) ?? shortId(entry.senderAddress)}</span>
+          <span class="mail-sender"><PeerName name={senderName(entry.senderAddress)} /></span>
           <span class="mail-subject">{entry.subjectSnippet || '(no subject)'}</span>
           <span class="mail-time">{formatTime(entry.timestamp, $dayClock, $timeFormatPrefs)}</span>
           <div class="mail-actions">
