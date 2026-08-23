@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { ResolvedName } from '../display-label';
+  import { detectCollision } from '../name-collision';
+  import { knownPeersState } from '../known-peers-state.svelte';
 
   /**
    * ZEB-977: THE component that renders a resolved peer name, styled by
@@ -9,8 +11,24 @@
    * roster / wire) can never render in the style of a name you assigned.
    * The badge is a CSS-drawn element, not a text glyph, so a published name
    * containing a lookalike character cannot imitate it either.
+   *
+   * ZEB-979: pass `ownerIdHex` to arm collision detection — a third-party
+   * name (card/roster/wire) that skeleton-matches a name you know (petname
+   * or a known peer's card name) under a DIFFERENT identity gets a warning
+   * mark. The mark is the opposite polarity of the petname badge (warning
+   * vs trust) and visually disjoint from it, so the ZEB-977 invariant holds.
    */
-  let { name, title }: { name: ResolvedName; title?: string } = $props();
+  let {
+    name,
+    title,
+    ownerIdHex,
+  }: { name: ResolvedName; title?: string; ownerIdHex?: string } = $props();
+
+  const collision = $derived(
+    ownerIdHex !== undefined
+      ? detectCollision(name, ownerIdHex, knownPeersState.index)
+      : undefined,
+  );
 
   const sourceTitle: Record<ResolvedName['source'], string> = {
     petname: 'Name you assigned',
@@ -29,7 +47,13 @@
   class:hex={name.source === 'hex'}
   title={title ?? sourceTitle[name.source]}
   data-name-source={name.source}
->{#if name.source === 'petname'}<span class="petname-badge" aria-hidden="true"></span>{/if}{name.label}</span>
+  data-collision={collision ? 'true' : undefined}
+>{#if name.source === 'petname'}<span class="petname-badge" aria-hidden="true"></span>{/if}{name.label}{#if collision}<span
+    class="collision-mark"
+    role="img"
+    aria-label={`Warning: different identity from the ${collision.knownLabel} you know`}
+    title={`Different identity from the ${collision.knownLabel} you know`}
+  ></span>{/if}</span>
 
 <style>
   .peer-name {
@@ -63,5 +87,21 @@
   .peer-name.hex {
     font-family: var(--font-mono, monospace);
     color: var(--text-muted);
+  }
+
+  /* ZEB-979: impersonation-risk mark — a CSS-drawn amber triangle, an
+     element (never a character) for the same reason as the petname badge:
+     a published name containing "⚠"-alikes gets no styling from it. The
+     warning polarity keeps it visually disjoint from the (trust-polarity)
+     petname badge, which additionally can never co-occur with it: the badge
+     requires source 'petname' and detection excludes that source. */
+  .collision-mark {
+    display: inline-block;
+    width: 0.7em;
+    height: 0.62em;
+    margin-left: 0.3em;
+    background: var(--warning, #d97706);
+    clip-path: polygon(50% 0, 100% 100%, 0 100%);
+    vertical-align: baseline;
   }
 </style>
