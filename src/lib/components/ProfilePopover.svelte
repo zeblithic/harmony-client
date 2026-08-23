@@ -633,7 +633,7 @@
     gap: 6px;
     margin-top: 8px;
     padding-top: 8px;
-    border-top: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+    border-top: 1px solid var(--border);
   }
   .contact-label {
     font-size: 11px;
@@ -648,9 +648,9 @@
     font: inherit;
     font-size: 12px;
     padding: 4px 6px;
-    border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+    border: 1px solid var(--border);
     border-radius: 4px;
-    background: var(--bg-secondary, transparent);
+    background: var(--bg-secondary);
     color: inherit;
     resize: vertical;
   }
@@ -665,7 +665,7 @@
     border: none;
     border-radius: 4px;
     background: var(--accent);
-    color: var(--bg-primary, #fff);
+    color: var(--on-accent);
     cursor: pointer;
   }
   .contact-save:disabled {
