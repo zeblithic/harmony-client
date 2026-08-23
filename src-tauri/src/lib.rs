@@ -7419,6 +7419,7 @@ pub async fn start_node_inner(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::owner_trust_sync::load_trust_replay_or_recover(
+                                    &device_cipher,
                                     &trust_replay_path,
                                 ),
                             ),
@@ -7454,6 +7455,7 @@ pub async fn start_node_inner(
                                         crate::owner_trust_sync::TrustPersist {
                                             identity_dir: identity_dir.clone(),
                                             replay_path: trust_replay_path,
+                                            cipher: device_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
@@ -7507,12 +7509,16 @@ pub async fn start_node_inner(
                         let quorum_replay_path = identity_dir
                             .join(crate::owner_quorum_sync::OWNER_QUORUM_REPLAY_FILENAME);
                         let owner_quorum_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::owner_quorum_sync::load_quorum_doc_or_recover(&quorum_doc_path),
+                            crate::owner_quorum_sync::load_quorum_doc_or_recover(
+                                &device_cipher,
+                                &quorum_doc_path,
+                            ),
                         ));
                         let owner_quorum_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::owner_quorum_sync::load_quorum_replay_or_recover(
+                                    &device_cipher,
                                     &quorum_replay_path,
                                 ),
                             ),
@@ -7539,6 +7545,7 @@ pub async fn start_node_inner(
                                         crate::owner_quorum_sync::QuorumPersist {
                                             doc_path: quorum_doc_path,
                                             replay_path: quorum_replay_path,
+                                            cipher: device_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag:

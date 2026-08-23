@@ -614,56 +614,86 @@ pub fn verified_decliners(
         .collect()
 }
 
-/// Save the doc atomically (schema byte + canonical CBOR).
-pub fn save_quorum_doc(path: &Path, doc: &QuorumReqDoc) -> Result<(), String> {
+/// Save the doc atomically, sealed (ZEB-982 v3 envelope).
+pub fn save_quorum_doc(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    doc: &QuorumReqDoc,
+) -> Result<(), String> {
     let mut bytes = vec![OWNER_QUORUM_SCHEMA_V1];
     into_writer(doc, &mut bytes)
         .map_err(|e| format!("encode quorum doc {}: {e}", path.display()))?;
-    crate::owner_state_persist::save_atomically(path, &bytes).map_err(|e| e.to_string())
+    crate::device_dataset_file::write_image(cipher, path, OWNER_QUORUM_DOC_FILENAME, &bytes)
+        .map_err(|e| e.to_string())
 }
 
 /// Load the doc, recovering to empty on ANY failure. A lost doc is benign:
 /// pending requests re-arrive through replication (or the user retries),
 /// and the trust doc — the only authority — is untouched. Corrupt files
 /// are quarantined (renamed aside) for manual inspection.
-pub fn load_quorum_doc_or_recover(path: &Path) -> QuorumReqDoc {
-    load_schema_v1_or_recover(path, "quorum doc")
+pub fn load_quorum_doc_or_recover(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> QuorumReqDoc {
+    load_schema_v1_or_recover(cipher, path, OWNER_QUORUM_DOC_FILENAME, "quorum doc")
 }
 
 /// Replay-tracker file body (schema byte precedes this on disk).
 #[derive(Default, Serialize, Deserialize)]
 struct QuorumReplayFileV1(BTreeMap<String, Hlc>);
 
-/// Save the replay tracker atomically (schema byte + canonical CBOR).
-pub fn save_quorum_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), String> {
+/// Save the replay tracker atomically, sealed (ZEB-982 v3 envelope).
+pub fn save_quorum_replay(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    tracker: &BTreeMap<String, Hlc>,
+) -> Result<(), String> {
     let mut bytes = vec![OWNER_QUORUM_SCHEMA_V1];
     into_writer(&QuorumReplayFileV1(tracker.clone()), &mut bytes)
         .map_err(|e| format!("encode quorum replay {}: {e}", path.display()))?;
-    crate::owner_state_persist::save_atomically(path, &bytes).map_err(|e| e.to_string())
+    crate::device_dataset_file::write_image(cipher, path, OWNER_QUORUM_REPLAY_FILENAME, &bytes)
+        .map_err(|e| e.to_string())
 }
 
 /// Load the replay tracker, recovering to empty on ANY failure (re-merging
 /// an already-known publish is idempotent through the union merge).
-pub fn load_quorum_replay_or_recover(path: &Path) -> BTreeMap<String, Hlc> {
-    load_schema_v1_or_recover::<QuorumReplayFileV1>(path, "quorum replay").0
+pub fn load_quorum_replay_or_recover(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> BTreeMap<String, Hlc> {
+    load_schema_v1_or_recover::<QuorumReplayFileV1>(
+        cipher,
+        path,
+        OWNER_QUORUM_REPLAY_FILENAME,
+        "quorum replay",
+    )
+    .0
 }
 
 /// Shared schema-byte + quarantine load recipe (donor:
 /// `owner_trust_sync::load_trust_replay_or_recover`).
 fn load_schema_v1_or_recover<T: serde::de::DeserializeOwned + Default>(
+    cipher: &crate::device_dataset_file::DeviceCipher,
     path: &Path,
+    filename: &str,
     what: &str,
 ) -> T {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
-        Err(e) => {
+    let image = match crate::device_dataset_file::read_image(cipher, path, filename) {
+        Ok(None) => return T::default(),
+        Ok(Some(img)) => img,
+        Err(crate::device_dataset_file::ImageError::Io(e)) => {
             tracing::warn!(path = %path.display(), error = %e,
                 "{what} read failed; starting empty");
             return T::default();
         }
+        // AEAD/envelope failure is content-corrupt: same quarantine path as
+        // corrupt CBOR (ZEB-982 — the aside file now holds ciphertext).
+        Err(crate::device_dataset_file::ImageError::Crypto(e)) => {
+            quarantine(path, what, &e);
+            return T::default();
+        }
     };
-    let decoded = match bytes.split_first() {
+    let decoded = match image.bytes.split_first() {
         Some((&OWNER_QUORUM_SCHEMA_V1, rest)) => from_reader::<T, _>(rest),
         _ => Err(ciborium::de::Error::Semantic(
             None,
@@ -671,7 +701,10 @@ fn load_schema_v1_or_recover<T: serde::de::DeserializeOwned + Default>(
         )),
     };
     match decoded {
-        Ok(t) => t,
+        Ok(t) => {
+            crate::device_dataset_file::reseal_if_legacy(cipher, path, filename, &image);
+            t
+        }
         Err(e) => {
             quarantine(path, what, &e.to_string());
             T::default()
@@ -703,6 +736,8 @@ fn quarantine(path: &Path, what: &str, err: &str) {
 pub struct QuorumPersist {
     pub doc_path: PathBuf,
     pub replay_path: PathBuf,
+    /// ZEB-982: seals both files at rest.
+    pub cipher: crate::device_dataset_file::DeviceCipher,
 }
 
 impl FleetPersist<QuorumReqDoc> for QuorumPersist {
@@ -711,8 +746,8 @@ impl FleetPersist<QuorumReqDoc> for QuorumPersist {
         state: &QuorumReqDoc,
         tracker: &BTreeMap<String, Hlc>,
     ) -> Result<(), SyncError> {
-        save_quorum_doc(&self.doc_path, state).map_err(SyncError::Persist)?;
-        save_quorum_replay(&self.replay_path, tracker).map_err(SyncError::Persist)?;
+        save_quorum_doc(&self.cipher, &self.doc_path, state).map_err(SyncError::Persist)?;
+        save_quorum_replay(&self.cipher, &self.replay_path, tracker).map_err(SyncError::Persist)?;
         Ok(())
     }
 }
@@ -2254,6 +2289,7 @@ mod tests {
                 persist: Arc::new(crate::owner_trust_sync::TrustPersist {
                     identity_dir: dir.path().join(name),
                     replay_path: dir.path().join(format!("{name}-trust-replay.cbor")),
+                    cipher: crate::device_dataset_file::test_cipher(),
                 }),
                 lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
                 debounce_ms: 50,
@@ -2279,6 +2315,7 @@ mod tests {
                 persist: Arc::new(QuorumPersist {
                     doc_path: dir.path().join(format!("{name}-quorum.cbor")),
                     replay_path: dir.path().join(format!("{name}-quorum-replay.cbor")),
+                    cipher: crate::device_dataset_file::test_cipher(),
                 }),
                 lookup_key_tag: OWNER_QUORUM_LOOKUP_TAG,
                 debounce_ms: 50,
@@ -2849,6 +2886,7 @@ mod tests {
             persist: Arc::new(crate::owner_trust_sync::TrustPersist {
                 identity_dir: dir.path().join("trust"),
                 replay_path: dir.path().join("trust-replay.cbor"),
+                cipher: crate::device_dataset_file::test_cipher(),
             }),
             lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
             debounce_ms: 25,
@@ -2877,6 +2915,7 @@ mod tests {
             persist: Arc::new(QuorumPersist {
                 doc_path: dir.path().join(OWNER_QUORUM_DOC_FILENAME),
                 replay_path: dir.path().join(OWNER_QUORUM_REPLAY_FILENAME),
+                cipher: crate::device_dataset_file::test_cipher(),
             }),
             lookup_key_tag: OWNER_QUORUM_LOOKUP_TAG,
             debounce_ms: 25,
@@ -3725,22 +3764,23 @@ mod tests {
         let persist = QuorumPersist {
             doc_path: doc_path.clone(),
             replay_path: replay_path.clone(),
+            cipher: crate::device_dataset_file::test_cipher(),
         };
         FleetPersist::persist(&persist, &doc, &tracker).unwrap();
-        assert_eq!(load_quorum_doc_or_recover(&doc_path), doc);
+        assert_eq!(load_quorum_doc_or_recover(&crate::device_dataset_file::test_cipher(), &doc_path), doc);
         assert_eq!(
-            load_quorum_replay_or_recover(&replay_path).get("device-a"),
+            load_quorum_replay_or_recover(&crate::device_dataset_file::test_cipher(), &replay_path).get("device-a"),
             tracker.get("device-a")
         );
 
         // Missing → default; corrupt → quarantined + default.
         assert_eq!(
-            load_quorum_doc_or_recover(&dir.path().join("nope.cbor")),
+            load_quorum_doc_or_recover(&crate::device_dataset_file::test_cipher(), &dir.path().join("nope.cbor")),
             QuorumReqDoc::default()
         );
         std::fs::write(&doc_path, b"definitely not cbor").unwrap();
         assert_eq!(
-            load_quorum_doc_or_recover(&doc_path),
+            load_quorum_doc_or_recover(&crate::device_dataset_file::test_cipher(), &doc_path),
             QuorumReqDoc::default()
         );
         assert!(!doc_path.exists(), "corrupt file quarantined aside");

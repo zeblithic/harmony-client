@@ -4034,6 +4034,7 @@ mod revoke_tests {
                 persist: std::sync::Arc::new(crate::owner_trust_sync::TrustPersist {
                     identity_dir: dir.path().to_path_buf(),
                     replay_path: persist_dir.path().join("trust_replay.cbor"),
+                    cipher: crate::device_dataset_file::test_cipher(),
                 }),
                 lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
                 debounce_ms: 25,
