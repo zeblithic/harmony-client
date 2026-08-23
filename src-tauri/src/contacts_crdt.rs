@@ -191,6 +191,14 @@ impl ContactsDoc {
                     .contacts
                     .get_mut(&key)
                     .expect("Tombstone plan implies an existing entry");
+                // Drop the annotation payload: a tombstone only needs its
+                // stamps. Retained values would keep the cleared petname/notes
+                // in plaintext contacts.cbor and replicate them across the
+                // fleet forever (tombstones are never GC'd) — and two
+                // tombstones with different residual fields would spuriously
+                // report `changed` on merge.
+                e.petname = None;
+                e.notes = None;
                 e.updated_at = at.clone();
                 e.deleted_at = Some(at);
                 true
@@ -320,9 +328,16 @@ mod tests {
         set_pet(&mut d, "aa", "Koya", hlc(1, "A"), 5);
         assert!(d.apply_annotation("aa", Some(None), None, hlc(2, "A"), 6));
         assert!(d.get("aa").is_none(), "entry hidden once both fields empty");
+        let raw = d.contacts.get("aa").unwrap();
         assert!(
-            d.contacts.get("aa").unwrap().deleted_at.is_some(),
+            raw.deleted_at.is_some(),
             "tombstone retained for convergence"
+        );
+        assert_eq!(
+            (raw.petname.as_deref(), raw.notes.as_deref()),
+            (None, None),
+            "tombstone carries NO annotation payload — cleared values must not \
+             persist to disk or replicate across the fleet"
         );
     }
 

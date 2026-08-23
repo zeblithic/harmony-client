@@ -63,14 +63,22 @@ export class ContactsService {
 
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return;
+    // Claim the slot synchronously (duplicate-init guard for concurrent
+    // callers), but RELEASE it if listener registration fails — otherwise the
+    // service would sit falsely connected forever, never receiving
+    // contacts-changed, and no retry could fix it.
     this.adapter = adapter;
-
-    const unlistenChanged = await adapter.listen('contacts-changed', () => {
-      // Snapshot before iterating so a listener that unsubscribes itself
-      // during notification doesn't mutate the live set mid-loop.
-      for (const cb of [...this.contactsChangedListeners]) cb();
-    });
-    this.unlisteners.push(unlistenChanged);
+    try {
+      const unlistenChanged = await adapter.listen('contacts-changed', () => {
+        // Snapshot before iterating so a listener that unsubscribes itself
+        // during notification doesn't mutate the live set mid-loop.
+        for (const cb of [...this.contactsChangedListeners]) cb();
+      });
+      this.unlisteners.push(unlistenChanged);
+    } catch (e) {
+      this.adapter = null;
+      throw e instanceof Error ? e : new Error(String(e));
+    }
   }
 
   /**

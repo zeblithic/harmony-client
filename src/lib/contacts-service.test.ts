@@ -105,6 +105,16 @@ describe('ContactsService', () => {
   it('rejects before connectAdapter with a named-command error', async () => {
     await expect(service.list()).rejects.toThrow('ContactsService.contacts_list');
   });
+
+  it('stays retryable when listener registration fails (no falsely-connected state)', async () => {
+    const failing = makeAdapter();
+    (failing.listen as any).mockRejectedValueOnce('listen backend down');
+    await expect(service.connectAdapter(failing)).rejects.toThrow('listen backend down');
+    // The failed attempt must not leave the service "connected": a retry with
+    // a working adapter installs the listener normally.
+    await service.connectAdapter(adapter);
+    expect(adapter.listeners.has('contacts-changed')).toBe(true);
+  });
 });
 
 describe('petnameMapFromContacts', () => {

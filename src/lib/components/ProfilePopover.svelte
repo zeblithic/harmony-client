@@ -120,18 +120,33 @@
     };
   });
   async function saveContact(): Promise<void> {
-    if (!card || !contactsService || contactBusy) return;
+    // Snapshot the target + drafts BEFORE the first await: if the popover
+    // retargets to a different identity mid-save, the second IPC must not
+    // apply this form's notes to the new target — and the status line must
+    // not report onto the wrong card.
+    const target = card?.ownerIdHex;
+    const service = contactsService;
+    if (!target || !service || contactBusy) return;
+    const petname = petnameDraft.trim() || null;
+    const notes = notesDraft.trim() || null;
     contactBusy = true;
     contactStatus = null;
+    // Two independent IPCs; report per-step so a notes failure after a
+    // successful petname write is honest about what actually persisted.
+    let status: string;
     try {
-      await contactsService.setPetname(card.ownerIdHex, petnameDraft.trim() || null);
-      await contactsService.setNotes(card.ownerIdHex, notesDraft.trim() || null);
-      contactStatus = 'Saved';
+      await service.setPetname(target, petname);
+      try {
+        await service.setNotes(target, notes);
+        status = 'Saved';
+      } catch (e) {
+        status = `Petname saved; notes failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
     } catch (e) {
-      contactStatus = e instanceof Error ? e.message : String(e);
-    } finally {
-      contactBusy = false;
+      status = e instanceof Error ? e.message : String(e);
     }
+    if (card?.ownerIdHex === target) contactStatus = status;
+    contactBusy = false;
   }
 
   const SOUND_LABELS = { quiet: 'Quiet', standard: 'Standard', loud: 'Loud' } as const;

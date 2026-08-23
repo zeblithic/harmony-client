@@ -90,19 +90,26 @@ fn contact_setters_take_camelcase_args_via_plain_commands() {
     // camelCase keys onto these), and — paired with the crate-wide
     // `no_tauri_command_uses_snake_case_rename` scan — that they carry NO
     // `rename_all` override, so the JS keys stay camelCase.
-    assert!(
-        src.contains("pub async fn set_contact_petname(")
-            && src.contains("pub async fn set_contact_notes("),
-        "contact setter IPCs not found in src/contacts_commands.rs",
-    );
-    assert!(
-        src.contains("owner_id_hex: String,")
-            && src.contains("petname: Option<String>,")
-            && src.contains("notes: Option<String>,"),
-        "contact setters must declare snake_case Rust params `owner_id_hex` + \
-         `petname`/`notes` so the frontend's camelCase keys map through Tauri \
-         (ZEB-414 / ZEB-977)",
-    );
+    // Assert on each signature's own parameter list, not the whole file: the
+    // shared helpers in this module declare the same param names, so a
+    // file-wide `contains` would keep passing after a rename on the commands.
+    for (name, field) in [
+        ("set_contact_petname", "petname: Option<String>"),
+        ("set_contact_notes", "notes: Option<String>"),
+    ] {
+        let start = src
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} IPC not found in src/contacts_commands.rs"));
+        let sig_end = src[start..]
+            .find(')')
+            .unwrap_or_else(|| panic!("{name} signature not terminated"));
+        let sig = &src[start..start + sig_end];
+        assert!(
+            sig.contains("owner_id_hex: String") && sig.contains(field),
+            "{name} must declare snake_case params `owner_id_hex` + `{field}` so the \
+             frontend's camelCase keys map through Tauri (ZEB-414 / ZEB-977); got: {sig}"
+        );
+    }
 }
 
 #[test]

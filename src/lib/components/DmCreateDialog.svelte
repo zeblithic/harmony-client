@@ -59,10 +59,15 @@
   let filteredProfiles = $derived.by(() => {
     const q = searchQuery.toLowerCase();
     return Array.from(profiles.entries())
-      // Match the address too, not just the name: a contact with a blank card
-      // name is shown BY its (short) address, so that identifier must be
-      // typeable to find them.
-      .filter(([addr, p]) => (p.displayName ?? '').toLowerCase().includes(q) || addr.toLowerCase().includes(q))
+      // Match the RESOLVED label (petname ► card ► baked ► hex — what the row
+      // actually shows), the baked profile name, AND the address: whatever a
+      // user can see or knows must be typeable to find the contact.
+      .filter(
+        ([addr, p]) =>
+          contactName(addr, p).label.toLowerCase().includes(q) ||
+          (p.displayName ?? '').toLowerCase().includes(q) ||
+          addr.toLowerCase().includes(q),
+      )
       .filter(([addr, _p]) => !selected.includes(addr))
       .slice(0, 50);
   });

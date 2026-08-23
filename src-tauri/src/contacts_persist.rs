@@ -171,7 +171,7 @@ pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
             let pos = cursor.position() as usize;
             if pos != payload.len() {
                 return Err(SyncError::CborDecode(format!(
-                    "trailing bytes after contacts value: consumed {} of {}",
+                    "trailing bytes after contacts replay value: consumed {} of {}",
                     pos,
                     payload.len()
                 )));

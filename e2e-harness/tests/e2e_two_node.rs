@@ -3813,7 +3813,13 @@ async fn contacts_petname_survives_restart_and_clears() {
 
     poll_until(Duration::from_secs(120), || async {
         let rows = alice.rpc("contacts_list", json!({})).await?;
-        for c in rows.as_array().cloned().unwrap_or_default() {
+        // A non-array response is a DTO/schema regression — fail loudly now,
+        // not after the polling timeout.
+        let contacts = rows
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("contacts_list returned a non-array response: {rows}"))?
+            .clone();
+        for c in contacts {
             let hex = c.get("ownerIdHex").and_then(|v| v.as_str()).ok_or_else(|| {
                 anyhow::anyhow!("contact row missing `ownerIdHex` (DTO/schema mismatch?): {c}")
             })?;
@@ -3853,8 +3859,7 @@ async fn contacts_petname_survives_restart_and_clears() {
         let rows = alice.rpc("contacts_list", json!({})).await?;
         let present = rows
             .as_array()
-            .cloned()
-            .unwrap_or_default()
+            .ok_or_else(|| anyhow::anyhow!("contacts_list returned a non-array response: {rows}"))?
             .iter()
             .any(|c| c.get("ownerIdHex").and_then(|v| v.as_str()) == Some(stranger));
         Ok((!present).then_some(()))

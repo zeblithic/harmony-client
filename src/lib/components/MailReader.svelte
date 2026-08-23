@@ -103,7 +103,7 @@
       </div>
       {#if message.recipients.length > 0}
         <div class="recipients">
-          To: {message.recipients.map(r => mailPeerName(r.address).label).join(', ')}
+          To: {#each message.recipients as r, i}{#if i > 0}{', '}{/if}<PeerName name={mailPeerName(r.address)} />{/each}
         </div>
       {/if}
     </div>

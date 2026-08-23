@@ -243,14 +243,40 @@ pub(crate) fn migrate_friend_nicknames_to_contacts(
     if contacts_path.exists() || !legacy_nicknames_path.exists() {
         return;
     }
-    let legacy = crate::friend_nicknames::FriendNicknames::load_or_default(legacy_nicknames_path);
+    // Error-preserving read — NOT `load_or_default`, which maps a corrupt or
+    // unreadable file to an empty set. Here that would save an empty contacts
+    // doc and rename the legacy file away, permanently discarding recoverable
+    // nicknames. On any read/parse failure: leave the legacy file untouched
+    // (a later fix or build can retry) and skip the migration.
+    let legacy: crate::friend_nicknames::FriendNicknames = match std::fs::read(
+        legacy_nicknames_path,
+    )
+    .map_err(|e| e.to_string())
+    .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                path = %legacy_nicknames_path.display(),
+                "contacts migration: legacy nicknames unreadable; leaving file in place (no import, no rename)"
+            );
+            return;
+        }
+    };
     let mut doc = ContactsDoc::default();
+    let now = now_ms();
     for (hex, e) in &legacy.entries {
         // Synthesize the HLC from the legacy LWW key: preserves the relative
         // ordering among imported entries and loses (correctly) to any real
         // post-migration edit, whose minted HLC is current wall-clock.
+        // Clamped to the local clock: a legacy stamp written under a skewed
+        // clock would otherwise sit in the future and permanently reject
+        // every later edit (`set_contact_field_core`'s superseded gate never
+        // mints past it, and sibling merges skew-reject it). Only the LWW key
+        // is clamped; `first_seen_ms` keeps the legacy timestamp.
         let at = Hlc {
-            wall_ms: e.updated_ms,
+            wall_ms: e.updated_ms.min(now),
             logical: 0,
             device_id: device_id.to_string(),
         };
@@ -600,6 +626,81 @@ mod tests {
         );
     }
 
+    /// A far-future legacy `updated_ms` (skewed clock at write time) must be
+    /// clamped at import: an unclamped stamp would out-LWW every freshly
+    /// minted HLC forever, making the imported entry permanently uneditable
+    /// (`set_contact_field_core`'s superseded gate) — and sibling merges
+    /// would skew-reject it.
+    #[tokio::test]
+    async fn migration_clamps_future_legacy_stamp_and_stays_editable() {
+        let dir = tempfile::tempdir().unwrap();
+        let contacts_path = dir.path().join("contacts.cbor");
+        let legacy_path = dir.path().join("friend_nicknames.json");
+        let far_future = super::now_ms() + 400 * 24 * 60 * 60 * 1000;
+        let mut legacy = crate::friend_nicknames::FriendNicknames::default();
+        legacy.set("aabb", Some("SkewedImport"), far_future);
+        legacy.save(&legacy_path).unwrap();
+
+        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+
+        let imported = crate::contacts_persist::load(&contacts_path).unwrap();
+        let entry = imported.contacts.get("aabb").expect("imported");
+        assert!(
+            entry.updated_at.wall_ms <= super::now_ms(),
+            "imported LWW stamp clamped to the local clock"
+        );
+        assert_eq!(
+            entry.first_seen_ms, far_future,
+            "first_seen keeps the legacy timestamp; only the LWW key clamps"
+        );
+
+        // The load-bearing consequence: the imported entry is still editable
+        // through the real write path.
+        let doc = Arc::new(Mutex::new(imported));
+        let tracker: Arc<Mutex<ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(ReplayTracker::new("dev-A".into())));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let (view, changed) = set_contact_field_core(
+            &doc,
+            &tracker,
+            &floor,
+            "dev-A",
+            "aabb",
+            Some(Some("Edited".into())),
+            None,
+        )
+        .await
+        .expect("imported entry must remain editable");
+        assert!(changed);
+        assert_eq!(view.unwrap().petname.as_deref(), Some("Edited"));
+    }
+
+    /// A corrupt legacy file must abort the migration WITHOUT renaming it —
+    /// `load_or_default`-style empty-on-corrupt would save an empty store and
+    /// rename the recoverable bytes away permanently.
+    #[test]
+    fn migration_leaves_corrupt_legacy_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let contacts_path = dir.path().join("contacts.cbor");
+        let legacy_path = dir.path().join("friend_nicknames.json");
+        std::fs::write(&legacy_path, b"not json at all").unwrap();
+
+        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+
+        assert!(
+            legacy_path.exists(),
+            "corrupt legacy file left in place for recovery"
+        );
+        assert!(
+            !dir.path().join("friend_nicknames.json.migrated").exists(),
+            "no rename on a failed parse"
+        );
+        assert!(
+            !contacts_path.exists(),
+            "no empty store written over a failed import"
+        );
+    }
+
     /// Two-engine cross-DEVICE convergence proofs for the Contacts dataset —
     /// a port of the notes `two_engine_sync` suite: two real
     /// `FleetSyncEngine<ContactsDoc>` instances configured as `start_node`
@@ -659,7 +760,7 @@ mod tests {
                 publisher_tx: out_tx,
                 subscriber_rx: in_rx,
                 persist: Arc::new(NoopContactsPersist),
-                lookup_key_tag: b"contacts-v1",
+                lookup_key_tag: super::super::CONTACTS_DATASET.as_bytes(),
                 debounce_ms: DEFAULT_DEBOUNCE_MS,
                 publish_seen: true,
                 on_applied: None,
