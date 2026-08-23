@@ -1786,9 +1786,21 @@
   // contact owner_ids (to pull their CARD names as known-name claims), which
   // the petname map alone discards (notes-only contacts have no petname).
   let contactViews: ContactView[] = $state([]);
+  // Monotonic commit guard, same shape (and same reason) as the
+  // dmContacts guard below: hydration and contacts-changed can overlap,
+  // and an older contacts_list reply resolving late must not overwrite a
+  // newer committed map — the collision index (ZEB-979) reads this state,
+  // so a stale overwrite would resurrect deleted known-name claims
+  // (CodeRabbit PR #726). Failures are inert: they never bump the
+  // committed seq, so an older in-flight success still lands.
+  let contactsRefreshSeq = 0;
+  let contactsCommittedSeq = 0;
   async function refreshContactPetnames(): Promise<void> {
+    const seq = ++contactsRefreshSeq;
     try {
       const rows = await contactsService.list();
+      if (seq <= contactsCommittedSeq) return; // a newer success already committed
+      contactsCommittedSeq = seq;
       contactPetnames = petnameMapFromContacts(rows);
       contactViews = rows;
     } catch (e) {
@@ -1829,6 +1841,19 @@
   // edits (those emit friend-list-changed too). Listener set is cleared
   // by friendService.destroy() on unmount.
   friendService.onFriendsChanged(() => void refreshDmContacts());
+  // ZEB-979 (CodeRabbit PR #726): subscribe contact owners' profile cards.
+  // `resolveCard` only resolves owners some MemberCardService bucket has
+  // subscribed; a contact who is not ALSO a friend / roster member / mail
+  // participant / vine author would otherwise never load a card, so their
+  // verified card name would silently never become a known-name claim in
+  // the collision index below. Same contract as the `vines` bucket
+  // (ZEB-978) and `feedAuthors` (ZEB-962).
+  $effect(() => {
+    void memberCardService.setBucket(
+      'contacts',
+      contactViews.map((c) => c.ownerIdHex),
+    );
+  });
   // ── ZEB-979: known-peers collision index ────────────────────────────
   // Rebuilt whenever any name pool changes; consumed by PeerName.svelte
   // (via the module store) to mark third-party names that skeleton-match a

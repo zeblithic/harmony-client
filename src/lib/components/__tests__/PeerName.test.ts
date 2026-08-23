@@ -25,6 +25,18 @@ describe('PeerName collision mark (ZEB-979)', () => {
     const mark = getByRole('img');
     expect(mark.getAttribute('aria-label')).toContain('different identity');
     expect(mark.getAttribute('aria-label')).toContain('Jake');
+    // The mark renders BEFORE the label: host surfaces ellipsis-truncate
+    // long names, and a trailing mark would be clipped into the hidden
+    // overflow on exactly the padded names an attacker chooses (PR #726).
+    // Compare document positions — Svelte places anchor nodes between the
+    // #if block and the label text, so sibling hops are not reliable.
+    const labelNode = Array.from(span?.childNodes ?? []).find(
+      (n) => n.textContent === 'Jake',
+    );
+    expect(labelNode).toBeTruthy();
+    expect(
+      mark.compareDocumentPosition(labelNode!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it('marks a homoglyph collision (Cyrillic а)', () => {

@@ -108,16 +108,31 @@ const HOMOGLYPHS: Record<string, string> = {
 };
 
 /**
+ * Full-case-fold expansions that `toLowerCase()` misses (CodeRabbit +
+ * CodeAnt PR #726): lowercasing is NOT Unicode case folding. `ß` survives
+ * `toLowerCase()` while `SS` becomes `ss` — so `Straße` and `STRASSE` would
+ * skeleton apart — and Greek final sigma `ς` stays distinct from medial `σ`.
+ * Applied in the same per-char pass as the homoglyph map (values may expand
+ * to multiple chars). `ẞ` (U+1E9E) needs no entry: `toLowerCase()` already
+ * takes it to `ß`, which this table then expands.
+ */
+const CASE_FOLDS: Record<string, string> = {
+  ß: 'ss', // U+00DF
+  ς: 'σ', // U+03C2 → medial sigma
+};
+
+/**
  * Canonical comparison key for a display name. Two names with the same
  * skeleton are treated as "the same name" for collision purposes.
  * Order matters: NFKC first (folds fullwidth/ligature forms into ASCII so
- * case-fold and the homoglyph table see plain letters), then case-fold, then
- * invisible-strip, then homoglyph mapping, then whitespace collapse.
+ * case-fold and the homoglyph table see plain letters), then case-fold
+ * (`toLowerCase` + the CASE_FOLDS expansions above), then invisible-strip,
+ * then homoglyph mapping, then whitespace collapse.
  */
 export function nameSkeleton(name: string): string {
   const folded = name.normalize('NFKC').toLowerCase().replace(INVISIBLES, '');
   let out = '';
-  for (const ch of folded) out += HOMOGLYPHS[ch] ?? ch;
+  for (const ch of folded) out += CASE_FOLDS[ch] ?? HOMOGLYPHS[ch] ?? ch;
   return out.replace(/\s+/g, ' ').trim();
 }
 

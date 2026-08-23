@@ -48,12 +48,12 @@
   title={title ?? sourceTitle[name.source]}
   data-name-source={name.source}
   data-collision={collision ? 'true' : undefined}
->{#if name.source === 'petname'}<span class="petname-badge" aria-hidden="true"></span>{/if}{name.label}{#if collision}<span
+>{#if name.source === 'petname'}<span class="petname-badge" aria-hidden="true"></span>{/if}{#if collision}<span
     class="collision-mark"
     role="img"
     aria-label={`Warning: different identity from the ${collision.knownLabel} you know`}
     title={`Different identity from the ${collision.knownLabel} you know`}
-  ></span>{/if}</span>
+  ></span>{/if}{name.label}</span>
 
 <style>
   .peer-name {
@@ -94,12 +94,16 @@
      a published name containing "⚠"-alikes gets no styling from it. The
      warning polarity keeps it visually disjoint from the (trust-polarity)
      petname badge, which additionally can never co-occur with it: the badge
-     requires source 'petname' and detection excludes that source. */
+     requires source 'petname' and detection excludes that source.
+     Rendered BEFORE the label: several host surfaces ellipsis-truncate long
+     names (MailInbox, DmInviteToast), and a trailing mark on a long
+     colliding name would be clipped into the hidden overflow — exactly the
+     names an attacker pads (CodeRabbit PR #726). */
   .collision-mark {
     display: inline-block;
     width: 0.7em;
     height: 0.62em;
-    margin-left: 0.3em;
+    margin-right: 0.3em;
     background: var(--warning);
     clip-path: polygon(50% 0, 100% 100%, 0 100%);
     vertical-align: baseline;

@@ -49,6 +49,16 @@ describe('nameSkeleton (ZEB-979)', () => {
     expect(nameSkeleton('  Jake   E  ')).toBe('jake e');
   });
 
+  it('applies full case folding where toLowerCase falls short (PR #726)', () => {
+    // ß survives toLowerCase; SS does not — both must land on 'ss'.
+    expect(nameSkeleton('Straße')).toBe('strasse');
+    expect(nameSkeleton('STRASSE')).toBe('strasse');
+    // Capital sharp s (U+1E9E) lowercases to ß, then expands.
+    expect(nameSkeleton('ẞ')).toBe('ss');
+    // Greek final sigma folds onto medial sigma.
+    expect(nameSkeleton('ς')).toBe(nameSkeleton('σ'));
+  });
+
   it('reduces blank input to the empty skeleton', () => {
     expect(nameSkeleton('')).toBe('');
     expect(nameSkeleton('   ')).toBe('');
