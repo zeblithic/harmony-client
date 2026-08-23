@@ -197,6 +197,7 @@ pub mod event_loop;
 pub mod feed_authority;
 pub mod file_sharing;
 pub mod file_stream_crypto;
+pub mod device_dataset_file;
 pub mod fleet_dataset_file;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
