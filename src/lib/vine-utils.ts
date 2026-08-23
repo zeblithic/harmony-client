@@ -5,6 +5,8 @@
  * standing up a VineService (no adapter, no reactive `$state`, no Tauri).
  */
 import type { VineVideo } from './types';
+import { nonEmpty, type ResolvedName } from './display-label';
+import { resolveAuthorLabel } from './mention-render';
 
 /**
  * Resolve the true-origin attribution to attach when resharing `vine`.
@@ -59,43 +61,107 @@ export function resolveOriginalCreator(vine: VineVideo): {
 }
 
 /**
- * Non-blank display label for a vine's creator/resharer (ZEB-561).
+ * ZEB-978: THE vine author-name resolver — the display-name ladder
+ * (petname ► verified card ► wire ► hex) applied to a vine's creator.
  *
- * The wire descriptor's `creatorName` can be empty: a reshare or publish issued
- * via the headless `reshare_vine` / `publish_vine` RPC with `creatorName`
- * omitted carries `creatorName=""` (the backend has no persisted social display
- * name to default from), so a viewer would otherwise render a blank resharer.
- * Never show blank — fall back to a truncated owner-hex, the same final rung the
- * member/message surfaces use (`name || address.slice(0, 8)`).
+ * `creatorAddress` is signature-bound at cache admission (ZEB-673), so it is
+ * an authenticated identity in the same namespace every other ladder surface
+ * keys on. `creatorName` is free text the publisher chose — any descriptor
+ * can carry any name, so it must never outrank a name YOU assigned (petname)
+ * or a name the peer verifiably published (card). It enters the shared
+ * {@link resolveAuthorLabel} ladder as the wire rung, just above the hex
+ * floor, and visual sites render the result through `PeerName.svelte` so a
+ * wire name is visibly unverified.
+ *
+ * Two vine-specific floors on top of the shared ladder (both preserve
+ * ZEB-561's never-blank contract):
+ *
+ * - The `self` sentinel short-circuits to `ownDisplayName`, which can be
+ *   blank on an offline publish — degrade to the hex floor, never blank.
+ * - `wireToVine` bakes `creatorAddress.slice(0, 8)` into a blank wire name
+ *   at ingest; a wire rung that just echoes the address prefix IS the hex
+ *   floor and is tagged `hex` (mono style), not `wire` (unverified style).
  */
-export function vineCreatorLabel(
-  name: string | null | undefined,
-  address: string,
-): string {
-  const trimmed = name?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : address.slice(0, 8);
+export function resolveVineCreatorName(
+  vine: Pick<VineVideo, 'creatorAddress' | 'creatorName'>,
+  resolveNickname?: (id: string) => string | undefined,
+  resolveCard?: (id: string) => { displayName: string } | undefined,
+): ResolvedName {
+  const r = resolveAuthorLabel(
+    { address: vine.creatorAddress, displayName: vine.creatorName ?? '' },
+    resolveNickname,
+    resolveCard,
+  );
+  const hexFloor = vine.creatorAddress.slice(0, 8);
+  if (r.source === 'self' && nonEmpty(r.label) === undefined) {
+    return { label: hexFloor, source: 'hex' };
+  }
+  if (r.source === 'wire') {
+    const trimmed = r.label.trim();
+    return { label: trimmed, source: trimmed === hexFloor ? 'hex' : 'wire' };
+  }
+  return r;
 }
 
 /**
- * Non-blank "originally by …" label for a reshare's origin creator (Qodo PR
- * #337).
+ * ZEB-978: ladder-resolved "view original by …" label for a reshare's origin
+ * creator.
  *
- * Display-layered fallback: the origin's `originalCreatorName` when present,
- * else the source vine's `creatorName`, else the truncated owner-hex floor.
- *
- * NOTE this is deliberately NOT {@link resolveOriginalCreator}. That resolver
- * enforces a both-or-neither pairing because it governs reshare *propagation* —
- * propagating an `originalCreatorAddress` of one identity with an
- * `originalCreatorName` of another would mis-credit. A name-only *display*
- * ("originally by X") shows no address, so there is no mixing risk: a present
- * `originalCreatorName` should be shown even if its paired address is absent
- * (the established attribution contract, asserted by VineCard/VineFeed tests).
- * We only add the missing rung Qodo flagged — fall back to `creatorName` (never
- * a truncated hex) before the floor when `originalCreatorName` is empty.
+ * The ladder (petname ► card) runs ONLY against `originalCreatorAddress` —
+ * when the origin address is absent there is nothing to verify a local name
+ * against, and resolving on the fallback `creatorAddress` would let a
+ * petname for the RESHARER label the ORIGINAL creator (a mis-credit worse
+ * than showing the wire snapshot). Wire floors: a present
+ * `originalCreatorName` shows even when its paired address is absent (a
+ * name-only display has no pair-mixing risk — Qodo #337); on a RESHARE the
+ * source vine's `creatorName` names the resharer and must never stand in as
+ * the origin's wire candidate (CodeAnt PR #725 — a malformed pair with the
+ * name blank would credit the resharer as the original creator), so a
+ * reshare degrades to the origin's petname/card/hex instead. Only a
+ * non-reshare (creator IS the origin) falls back to `creatorName`.
  */
-export function vineOriginalCreatorLabel(vine: VineVideo): string {
-  const name = vine.originalCreatorName?.trim() || vine.creatorName;
-  return vineCreatorLabel(name, vine.originalCreatorAddress ?? vine.creatorAddress);
+export function resolveVineOriginalCreatorName(
+  vine: VineVideo,
+  resolveNickname?: (id: string) => string | undefined,
+  resolveCard?: (id: string) => { displayName: string } | undefined,
+): ResolvedName {
+  const wireName =
+    vine.originalCreatorName?.trim()
+    || (vine.reshareOf != null ? '' : vine.creatorName);
+  const addr = nonEmpty(vine.originalCreatorAddress);
+  if (addr !== undefined) {
+    return resolveVineCreatorName(
+      { creatorAddress: addr, creatorName: wireName },
+      resolveNickname,
+      resolveCard,
+    );
+  }
+  const name = nonEmpty(wireName);
+  if (name !== undefined) return { label: name.trim(), source: 'wire' };
+  return { label: vine.creatorAddress.slice(0, 8), source: 'hex' };
+}
+
+/**
+ * ZEB-978 (CodeRabbit PR #725): the unique non-self identity addresses a vine
+ * feed renders names for — creators, reshare origin creators, and Discover
+ * `via` hops — for the `vines` card-subscription bucket. `resolveCard` only
+ * resolves owners some MemberCardService bucket has subscribed (same
+ * contract `feedAuthorOwnerIds` serves for channel feeds, ZEB-962): without a
+ * bucket, a vine author with a verified card but no community/DM/friend
+ * overlap would silently stay on the unverified wire rung. The `'self'`
+ * sentinel is not an owner_id and is excluded.
+ */
+export function vineIdentityOwnerIds(vines: VineVideo[]): string[] {
+  const owners = new Set<string>();
+  const add = (addr: string | undefined) => {
+    if (addr && addr !== 'self') owners.add(addr);
+  };
+  for (const v of vines) {
+    add(v.creatorAddress);
+    add(v.originalCreatorAddress);
+    for (const hop of v.via ?? []) add(hop);
+  }
+  return [...owners];
 }
 
 /**

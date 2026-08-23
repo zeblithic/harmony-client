@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveOriginalCreator,
-  vineCreatorLabel,
-  vineOriginalCreatorLabel,
+  resolveVineCreatorName,
+  resolveVineOriginalCreatorName,
+  vineIdentityOwnerIds,
   pickCenterIndex,
   formatVineDuration,
   isOwnOriginalVine,
@@ -99,86 +100,6 @@ describe('resolveOriginalCreator', () => {
   });
 });
 
-describe('vineCreatorLabel', () => {
-  it('returns the name verbatim when present', () => {
-    expect(vineCreatorLabel('Alice', '685e4ba7deadbeef')).toBe('Alice');
-  });
-
-  it('falls back to truncated owner-hex when the name is empty (ZEB-561)', () => {
-    // A reshare/publish via the headless RPC with creatorName omitted carries
-    // "" — the viewer must never render a blank resharer.
-    expect(vineCreatorLabel('', '685e4ba7deadbeef')).toBe('685e4ba7');
-  });
-
-  it('falls back when the name is whitespace-only', () => {
-    expect(vineCreatorLabel('   ', '685e4ba7deadbeef')).toBe('685e4ba7');
-  });
-
-  it('falls back when the name is null or undefined', () => {
-    expect(vineCreatorLabel(null, '685e4ba7deadbeef')).toBe('685e4ba7');
-    expect(vineCreatorLabel(undefined, '685e4ba7deadbeef')).toBe('685e4ba7');
-  });
-
-  it('trims surrounding whitespace from a real name', () => {
-    expect(vineCreatorLabel('  Bob  ', 'addr')).toBe('Bob');
-  });
-});
-
-describe('vineOriginalCreatorLabel', () => {
-  it('uses the true-origin name when a reshare carries both originalCreator fields', () => {
-    const v = vine({
-      reshareOf: 'vine-orig',
-      creatorAddress: 'addr-resharer',
-      creatorName: 'Resharer',
-      originalCreatorAddress: 'addr-alice',
-      originalCreatorName: 'Alice',
-    });
-    expect(vineOriginalCreatorLabel(v)).toBe('Alice');
-  });
-
-  it('shows originalCreatorName even when its paired address is absent (display, not propagation)', () => {
-    // A name-only attribution display has no address/name mixing risk, so a
-    // present originalCreatorName must be shown — NOT dropped to creatorName the
-    // way resolveOriginalCreator's both-or-neither propagation rule would.
-    const v = vine({
-      reshareOf: 'vine-orig',
-      creatorAddress: 'a1b2c3d4',
-      creatorName: 'Resharer',
-      originalCreatorName: 'Original Person',
-      // originalCreatorAddress intentionally absent
-    });
-    expect(vineOriginalCreatorLabel(v)).toBe('Original Person');
-  });
-
-  it('falls back to the source creator NAME (not hex) when originalCreatorName is missing (Qodo #337 regression)', () => {
-    // A legacy/partial reshare payload with only a creatorName: must show that
-    // name, NOT a truncated address — the regression Qodo flagged.
-    const v = vine({
-      reshareOf: 'vine-orig',
-      creatorAddress: '685e4ba7deadbeef',
-      creatorName: 'Carol',
-      originalCreatorAddress: 'addr-alice',
-      // originalCreatorName intentionally unset (partial payload)
-    });
-    expect(vineOriginalCreatorLabel(v)).toBe('Carol');
-  });
-
-  it('uses the creator name for a non-reshare vine', () => {
-    const v = vine({ creatorAddress: 'addr-dan', creatorName: 'Dan' });
-    expect(vineOriginalCreatorLabel(v)).toBe('Dan');
-  });
-
-  it('falls back to truncated hex only when both resolved name and creator name are blank', () => {
-    const v = vine({
-      reshareOf: 'vine-orig',
-      creatorAddress: '685e4ba7deadbeef',
-      creatorName: '',
-      // no originalCreator* → resolver returns the (blank) source creator pair
-    });
-    expect(vineOriginalCreatorLabel(v)).toBe('685e4ba7');
-  });
-});
-
 describe('pickCenterIndex (ZEB-612 S2)', () => {
   it('returns -1 for an empty list', () => {
     expect(pickCenterIndex([], 300)).toBe(-1);
@@ -231,5 +152,138 @@ describe('isOwnOriginalVine (ZEB-612 S2 — extracted from VinePlayer)', () => {
 
   it('false for own RESHARE (reshares of own content are re-resharable)', () => {
     expect(isOwnOriginalVine(vine({ creatorAddress: 'self', reshareOf: 'orig' }))).toBe(false);
+  });
+});
+
+// ── ZEB-978: ladder-resolved vine author names ─────────────────────────
+
+describe('resolveVineCreatorName (ZEB-978)', () => {
+  const ADDR = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  const pet = (id: string) => (id === ADDR ? 'Zeb (work)' : undefined);
+  const card = (id: string) => (id === ADDR ? { displayName: 'Zebulon' } : undefined);
+
+  it('prefers a local petname over the wire creatorName (spoof defense)', () => {
+    const v = vine({ creatorAddress: ADDR, creatorName: 'Fake Friend' });
+    expect(resolveVineCreatorName(v, pet, card)).toEqual({ label: 'Zeb (work)', source: 'petname' });
+  });
+
+  it('prefers the verified card name when no petname is assigned', () => {
+    const v = vine({ creatorAddress: ADDR, creatorName: 'Fake Friend' });
+    expect(resolveVineCreatorName(v, undefined, card)).toEqual({ label: 'Zebulon', source: 'card' });
+  });
+
+  it('demotes the wire creatorName to the unverified wire rung', () => {
+    const v = vine({ creatorAddress: ADDR, creatorName: 'Whoever' });
+    expect(resolveVineCreatorName(v)).toEqual({ label: 'Whoever', source: 'wire' });
+  });
+
+  it('trims the wire rung (never renders padded names)', () => {
+    const v = vine({ creatorAddress: ADDR, creatorName: '  Bob  ' });
+    expect(resolveVineCreatorName(v)).toEqual({ label: 'Bob', source: 'wire' });
+  });
+
+  it('falls to the hex floor when the wire name is blank (ZEB-561 never-blank)', () => {
+    const v = vine({ creatorAddress: ADDR, creatorName: '   ' });
+    expect(resolveVineCreatorName(v)).toEqual({ label: ADDR.slice(0, 8), source: 'hex' });
+  });
+
+  it('tags an ingest-baked hex prefix as hex, not as an unverified wire name', () => {
+    // wireToVine defaults a blank wire name to creatorAddress.slice(0, 8);
+    // that string is the hex floor wearing wire clothes — tag it honestly.
+    const v = vine({ creatorAddress: ADDR, creatorName: ADDR.slice(0, 8) });
+    expect(resolveVineCreatorName(v)).toEqual({ label: ADDR.slice(0, 8), source: 'hex' });
+  });
+
+  it("short-circuits the 'self' sentinel to the locally-known label", () => {
+    const v = vine({ creatorAddress: 'self', creatorName: 'You' });
+    expect(resolveVineCreatorName(v, pet, card)).toEqual({ label: 'You', source: 'self' });
+  });
+
+  it('never renders a blank self label (offline publish, empty ownDisplayName)', () => {
+    const v = vine({ creatorAddress: 'self', creatorName: '' });
+    expect(resolveVineCreatorName(v)).toEqual({ label: 'self', source: 'hex' });
+  });
+});
+
+describe('resolveVineOriginalCreatorName (ZEB-978)', () => {
+  const ORIG = 'feedfacecafebeef0123456789abcdef';
+  const RESHARER = '00112233445566778899aabbccddeeff';
+
+  it('ladder-resolves the ORIGINAL creator address (petname beats snapshot name)', () => {
+    const v = vine({
+      creatorAddress: RESHARER, creatorName: 'Resharer',
+      reshareOf: 'vine-o', originalCreatorAddress: ORIG, originalCreatorName: 'Snapshot Name',
+    });
+    const pet = (id: string) => (id === ORIG ? 'My Friend' : undefined);
+    expect(resolveVineOriginalCreatorName(v, pet)).toEqual({ label: 'My Friend', source: 'petname' });
+  });
+
+  it('a petname for the RESHARER must never label the original (mis-credit guard)', () => {
+    const v = vine({
+      creatorAddress: RESHARER, creatorName: 'Resharer',
+      reshareOf: 'vine-o', originalCreatorAddress: ORIG, originalCreatorName: 'Snapshot Name',
+    });
+    const resharerPet = (id: string) => (id === RESHARER ? 'My Buddy' : undefined);
+    expect(resolveVineOriginalCreatorName(v, resharerPet)).toEqual({ label: 'Snapshot Name', source: 'wire' });
+  });
+
+  it('without an origin ADDRESS the ladder never runs — name-only wire display', () => {
+    // vineOriginalCreatorLabel contract (Qodo #337): a present name shows even
+    // when its paired address is absent; but with no address there is nothing
+    // to verify a petname/card against, so resolvers must not be consulted —
+    // in particular not against the RESHARER's address.
+    const v = vine({
+      creatorAddress: RESHARER, creatorName: 'Resharer',
+      reshareOf: 'vine-o', originalCreatorName: 'Orig Person',
+    });
+    const resharerPet = (id: string) => (id === RESHARER ? 'My Buddy' : undefined);
+    expect(resolveVineOriginalCreatorName(v, resharerPet)).toEqual({ label: 'Orig Person', source: 'wire' });
+  });
+
+  it("a RESHARE's creatorName never stands in for a missing origin name (CodeAnt PR #725)", () => {
+    // originalCreatorAddress present, name blank: feeding the resharer's
+    // creatorName into the origin's wire rung would credit the resharer as
+    // the original creator. Degrade to the ORIGIN's hex floor instead.
+    const v = vine({
+      creatorAddress: RESHARER, creatorName: 'Resharer',
+      reshareOf: 'vine-o', originalCreatorAddress: ORIG,
+    });
+    expect(resolveVineOriginalCreatorName(v)).toEqual({ label: ORIG.slice(0, 8), source: 'hex' });
+    // …but the origin's petname/card still win when known.
+    const pet = (id: string) => (id === ORIG ? 'My Friend' : undefined);
+    expect(resolveVineOriginalCreatorName(v, pet)).toEqual({ label: 'My Friend', source: 'petname' });
+  });
+
+  it('a reshare with no origin info at all degrades to hex, never the resharer name', () => {
+    const bare = vine({ creatorAddress: RESHARER, creatorName: 'Carol', reshareOf: 'vine-o' });
+    expect(resolveVineOriginalCreatorName(bare)).toEqual({ label: RESHARER.slice(0, 8), source: 'hex' });
+  });
+
+  it("a NON-reshare's creator IS the origin — creatorName stays the wire candidate", () => {
+    const original = vine({ creatorAddress: RESHARER, creatorName: 'Carol' });
+    expect(resolveVineOriginalCreatorName(original)).toEqual({ label: 'Carol', source: 'wire' });
+    const blank = vine({ creatorAddress: RESHARER, creatorName: '' });
+    expect(resolveVineOriginalCreatorName(blank)).toEqual({ label: RESHARER.slice(0, 8), source: 'hex' });
+  });
+});
+
+describe('vineIdentityOwnerIds (ZEB-978, CodeRabbit PR #725)', () => {
+  it('unions creators, reshare origins, and via hops; excludes self and blanks', () => {
+    const vines = [
+      vine({ creatorAddress: 'addr-a', via: ['addr-hop1', 'addr-hop2'] }),
+      vine({
+        creatorAddress: 'addr-b', reshareOf: 'o',
+        originalCreatorAddress: 'addr-orig',
+      }),
+      vine({ creatorAddress: 'self' }),
+      vine({ creatorAddress: 'addr-a' }), // duplicate
+    ];
+    expect(vineIdentityOwnerIds(vines).sort()).toEqual(
+      ['addr-a', 'addr-b', 'addr-hop1', 'addr-hop2', 'addr-orig'],
+    );
+  });
+
+  it('returns an empty list for an empty feed (bucket clears)', () => {
+    expect(vineIdentityOwnerIds([])).toEqual([]);
   });
 });

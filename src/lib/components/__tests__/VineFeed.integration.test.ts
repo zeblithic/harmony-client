@@ -110,9 +110,11 @@ describe('VineFeed Integration', () => {
   it('shows reshare attribution with the resharer and the view-original verb', () => {
     renderFeed();
     // v4: Alice reshared Bob's vine — "↻ Alice reshared · view original by Bob"
-    // (plain text variant: no onViewOriginal wired in this render).
-    expect(screen.getByText(/Alice reshared ·/)).toBeTruthy();
-    expect(screen.getByText(/view original by Bob/)).toBeTruthy();
+    // (plain text variant: no onViewOriginal wired in this render). ZEB-978:
+    // the origin name renders inside <PeerName>, so assert on the row's full
+    // textContent rather than a single text node.
+    const row = screen.getByText(/Alice reshared ·/);
+    expect(row.textContent).toContain('view original by Bob');
   });
 
   // ── 2. Unviewed count ─────────────────────────────────────────────
