@@ -8,6 +8,7 @@
     ProfileMembershipBroadcastInfo,
   } from '../profile-broadcast-service';
   import Avatar from './Avatar.svelte';
+  import type { ContactsService } from '../contacts-service';
 
   /**
    * ZEB-341: owner_id card payload for the click-to-view surface. Distinct
@@ -41,6 +42,8 @@
     profileBroadcastService,
     resolveCommunityName,
     onViewProfile,
+    contactsService,
+    selfOwnerIdHex,
   }: {
     /** 'reticulum' = existing avatar-click profile popover; 'owner-card' =
      *  ZEB-341 owner_id card popover. */
@@ -66,7 +69,70 @@
      *  card's owner_id. App.svelte (T10) owns the openProfileOwnerId state this
      *  sets. Omitted → the "View full profile" action is hidden. */
     onViewProfile?: (ownerIdHex: string) => void;
+    /** ZEB-977: owner-card mode only. When provided, the popover offers the
+     *  petname + private-notes editor for ANY identity (the drill-down is
+     *  reachable from every roster row / message author, which is what makes
+     *  contacts editable "anywhere"). Omitted → read-only popover. */
+    contactsService?: ContactsService;
+    /** ZEB-977: suppresses the annotation editor on the user's own card. */
+    selfOwnerIdHex?: string;
   } = $props();
+
+  // ── ZEB-977: petname + notes editor state (owner-card mode) ──────────
+  let petnameDraft = $state('');
+  let notesDraft = $state('');
+  let contactLoaded = $state(false);
+  let contactBusy = $state(false);
+  let contactStatus = $state<string | null>(null);
+  let canAnnotate = $derived(
+    mode === 'owner-card' &&
+      !!card &&
+      !!contactsService &&
+      card.ownerIdHex !== selfOwnerIdHex
+  );
+  $effect(() => {
+    // Re-load drafts when the popover retargets to a different identity.
+    const target = canAnnotate ? card?.ownerIdHex : undefined;
+    contactLoaded = false;
+    contactStatus = null;
+    petnameDraft = '';
+    notesDraft = '';
+    if (!target || !contactsService) return;
+    let cancelled = false;
+    void contactsService
+      .list()
+      .then((rows) => {
+        if (cancelled) return;
+        const entry = rows.find((r) => r.ownerIdHex === target.toLowerCase());
+        petnameDraft = entry?.petname ?? '';
+        notesDraft = entry?.notes ?? '';
+        contactLoaded = true;
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        // Pre-owner-load ("contacts dataset not loaded") → editor stays
+        // usable with blank drafts; a save will surface the real error.
+        console.debug('[harmony-client] contact drafts load skipped:', e instanceof Error ? e.message : String(e));
+        contactLoaded = true;
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
+  async function saveContact(): Promise<void> {
+    if (!card || !contactsService || contactBusy) return;
+    contactBusy = true;
+    contactStatus = null;
+    try {
+      await contactsService.setPetname(card.ownerIdHex, petnameDraft.trim() || null);
+      await contactsService.setNotes(card.ownerIdHex, notesDraft.trim() || null);
+      contactStatus = 'Saved';
+    } catch (e) {
+      contactStatus = e instanceof Error ? e.message : String(e);
+    } finally {
+      contactBusy = false;
+    }
+  }
 
   const SOUND_LABELS = { quiet: 'Quiet', standard: 'Standard', loud: 'Loud' } as const;
 
@@ -286,6 +352,45 @@
   {/if}
   {#if card.membershipStatus === 'banned'}
     <div class="popover-status-flag">Banned</div>
+  {/if}
+  {#if canAnnotate}
+    <!-- ZEB-977: local annotations. Deliberately SEPARATE from the identity
+         section above — the signed card name + full hex stay the untouched
+         drill-down truth; these fields are labeled as yours alone. -->
+    <div class="popover-contact" data-testid="contact-editor">
+      <div class="contact-label">Your petname &amp; notes <span class="contact-privacy">(only you see these)</span></div>
+      <input
+        type="text"
+        class="contact-petname"
+        placeholder="Petname"
+        aria-label="Your petname for this person"
+        maxlength="64"
+        bind:value={petnameDraft}
+        disabled={!contactLoaded || contactBusy}
+      />
+      <textarea
+        class="contact-notes"
+        placeholder="Private notes — how you know them, why you trust them…"
+        aria-label="Your private notes about this person"
+        maxlength="4096"
+        rows="2"
+        bind:value={notesDraft}
+        disabled={!contactLoaded || contactBusy}
+      ></textarea>
+      <div class="contact-actions">
+        <button
+          type="button"
+          class="contact-save"
+          onclick={() => void saveContact()}
+          disabled={!contactLoaded || contactBusy}
+        >
+          {contactBusy ? 'Saving…' : 'Save'}
+        </button>
+        {#if contactStatus}
+          <span class="contact-status" role="status">{contactStatus}</span>
+        {/if}
+      </div>
+    </div>
   {/if}
   {#if onViewProfile}
     <button
@@ -519,5 +624,56 @@
     font-size: 12px;
     color: var(--text-secondary);
     padding: 3px 0;
+  }
+
+  /* ZEB-977: petname + notes editor */
+  .popover-contact {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  }
+  .contact-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  .contact-privacy {
+    font-weight: 400;
+  }
+  .contact-petname,
+  .contact-notes {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 6px;
+    border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+    border-radius: 4px;
+    background: var(--bg-secondary, transparent);
+    color: inherit;
+    resize: vertical;
+  }
+  .contact-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .contact-save {
+    font-size: 12px;
+    padding: 3px 10px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--bg-primary, #fff);
+    cursor: pointer;
+  }
+  .contact-save:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .contact-status {
+    font-size: 11px;
+    color: var(--text-muted);
   }
 </style>

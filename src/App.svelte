@@ -4738,6 +4738,8 @@
   <ProfilePopover
     mode="owner-card"
     card={popoverCard}
+    {contactsService}
+    selfOwnerIdHex={selfOwnerId ?? undefined}
     x={popoverCardX}
     y={popoverCardY}
     onClose={() => (popoverCard = null)}
