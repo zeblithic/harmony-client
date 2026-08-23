@@ -75,6 +75,20 @@ pub fn test_cipher() -> DeviceCipher {
     DeviceCipher::derive(&[7u8; 32]).expect("test device cipher derives")
 }
 
+/// Pre-populate the [`get_or_derive`] memo with [`test_cipher`] for
+/// `identity_dir`, so tests exercising the free-function owner-state paths
+/// (which derive lazily) neither need an identity store nor a real seed.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn install_test_cipher(identity_dir: &Path) {
+    let memo_key = identity_dir
+        .canonicalize()
+        .unwrap_or_else(|_| identity_dir.to_path_buf());
+    memo()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(memo_key, test_cipher());
+}
+
 /// Memoized derive for free-function call sites that cannot be threaded a
 /// cipher (e.g. `owner_state::read_persisted_owner_id`'s convenience
 /// wrapper). Keyed by canonicalized identity-dir path so multi-profile
@@ -86,19 +100,36 @@ pub fn test_cipher() -> DeviceCipher {
 /// Callers that must not create an identity as a side effect (the chain
 /// fresh-generates when no identity exists) should check their target
 /// file's existence FIRST and skip the derive when it is absent.
-pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
+fn memo() -> &'static Mutex<HashMap<PathBuf, DeviceCipher>> {
     static MEMO: LazyLock<Mutex<HashMap<PathBuf, DeviceCipher>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    &MEMO
+}
+
+pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
     let memo_key = identity_dir
         .canonicalize()
         .unwrap_or_else(|_| identity_dir.to_path_buf());
-    let mut memo = MEMO.lock().expect("device cipher memo lock");
-    if let Some(cipher) = memo.get(&memo_key) {
+    if let Some(cipher) = memo()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&memo_key)
+    {
         return Ok(cipher.clone());
     }
+    // Deliberately NOT holding the memo lock across the seed read: the read
+    // can block on the identity flock, pay an Argon2id derive, or take the
+    // fresh-generate path (which acquires IDENTITY_FILE_WRITE_LOCK) — none
+    // of that may nest inside another lock. Two racers derive the same key
+    // (`with_identity_write_guards` makes generation atomic, so the loser
+    // reads the winner's seed) and the second insert is an identical
+    // overwrite.
     let seed = crate::identity::read_seed_from_disk(&identity_dir.join("identity.key"))?;
     let cipher = DeviceCipher::derive(&seed).map_err(|e| e.to_string())?;
-    memo.insert(memo_key, cipher.clone());
+    memo()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(memo_key, cipher.clone());
     Ok(cipher)
 }
 
@@ -187,6 +218,22 @@ pub fn read_image(
     }
 }
 
+/// Seal `inner` into the complete v3 on-disk byte form (sentinel-prefixed).
+/// For families that keep their own write primitive (e.g. `owner_state.rs`'s
+/// `write_atomic_0600`); everything else uses [`write_image`].
+pub fn seal_image(
+    cipher: &DeviceCipher,
+    filename: &str,
+    inner: &[u8],
+) -> Result<Vec<u8>, String> {
+    let sealed = seal_device_file(&cipher.key, filename, inner)
+        .map_err(|e| format!("seal {filename}: {e}"))?;
+    let mut bytes = Vec::with_capacity(1 + sealed.len());
+    bytes.push(SEALED_DEVICE_SCHEMA_V3);
+    bytes.extend_from_slice(&sealed);
+    Ok(bytes)
+}
+
 /// Seal `inner` and write the v3 envelope atomically (parent-dir creation +
 /// crash-durable rename via `owner_state_persist::save_atomically`).
 pub fn write_image(
@@ -195,11 +242,7 @@ pub fn write_image(
     filename: &str,
     inner: &[u8],
 ) -> Result<(), std::io::Error> {
-    let sealed = seal_device_file(&cipher.key, filename, inner)
-        .map_err(|e| std::io::Error::other(format!("seal {filename}: {e}")))?;
-    let mut bytes = Vec::with_capacity(1 + sealed.len());
-    bytes.push(SEALED_DEVICE_SCHEMA_V3);
-    bytes.extend_from_slice(&sealed);
+    let bytes = seal_image(cipher, filename, inner).map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

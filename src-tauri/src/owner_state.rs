@@ -515,6 +515,80 @@ impl std::fmt::Debug for LoadedOwnerState {
     }
 }
 
+/// ZEB-982: read the `owner_state.cbor` inner image through the
+/// device-sealed envelope. Envelope errors map onto this module's existing
+/// error-string families — `Io` → "failed to read …", `Crypto` →
+/// "owner_state.cbor is corrupt: …" — so the boot-fatal contract and the
+/// ZEB-835/836 reset escape see exactly the shapes they saw before sealing.
+///
+/// The device cipher is acquired LAZILY, only when the file is actually
+/// sealed: a legacy plaintext file parses with no identity store at all
+/// (pre-982 behavior, load-bearing for store-less fixture tests and for
+/// this fn never creating a node identity as a read side effect), while a
+/// sealed file implies the device had a working store when it sealed it —
+/// so a derive failure there is surfaced as its own message, not "corrupt".
+fn read_owner_state_image(
+    identity_dir: &Path,
+) -> Result<Option<crate::device_dataset_file::Image>, String> {
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    let raw = match std::fs::read(&cbor_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", cbor_path.display())),
+    };
+    if raw.first() != Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3) {
+        return Ok(Some(crate::device_dataset_file::Image {
+            bytes: zeroize::Zeroizing::new(raw),
+            was_legacy: true,
+        }));
+    }
+    let cipher = crate::device_dataset_file::get_or_derive(identity_dir).map_err(|e| {
+        format!("owner_state.cbor is sealed but the device key is unavailable: {e}")
+    })?;
+    match crate::device_dataset_file::read_image(&cipher, &cbor_path, OWNER_STATE_FILENAME) {
+        Ok(opt) => Ok(opt),
+        Err(crate::device_dataset_file::ImageError::Io(e)) => {
+            Err(format!("failed to read {}: {e}", cbor_path.display()))
+        }
+        Err(crate::device_dataset_file::ImageError::Crypto(e)) => {
+            Err(format!("owner_state.cbor is corrupt: {e}"))
+        }
+    }
+}
+
+/// ZEB-982 eager migration: seal a legacy plaintext `owner_state.cbor`
+/// byte-for-byte, preserving the 0600 mode via [`write_atomic_0600`].
+/// Best-effort — a failure warns and leaves the plaintext for the next load.
+///
+/// Only called from load paths that are boot-serial or hold
+/// `OWNER_STATE_WRITE_LOCK` — never from the lock-free pure readers
+/// ([`read_persisted_owner_id`] / [`read_enrolled_device_vk_hex`]), where a
+/// reseal could race a concurrent locked writer and resurrect stale bytes.
+/// The window only exists on the single first post-upgrade load: boot's
+/// serial `load_owner_state` migrates the file before any engine or command
+/// path runs, after which `was_legacy` stays false and no reseal writes occur.
+fn reseal_owner_state_if_legacy(identity_dir: &Path, image: &crate::device_dataset_file::Image) {
+    if !image.was_legacy {
+        return;
+    }
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    let sealed = match crate::device_dataset_file::get_or_derive(identity_dir).and_then(|c| {
+        crate::device_dataset_file::seal_image(&c, OWNER_STATE_FILENAME, &image.bytes)
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "ZEB-982: could not seal legacy owner_state.cbor");
+            return;
+        }
+    };
+    if let Err(e) = write_atomic_0600(&cbor_path, &sealed) {
+        tracing::warn!(
+            error = %e,
+            "ZEB-982: legacy owner_state.cbor could not be re-sealed; leaving in place"
+        );
+    }
+}
+
 /// Load the persisted OwnerState if present. Returns `Ok(None)` for the
 /// natural un-minted state (no `.cbor` file). Returns `Err` for corrupt
 /// files or inconsistent state (`.cbor` present but signing key missing).
@@ -525,14 +599,13 @@ pub fn load_owner_state(
     identity_dir: &Path,
     keychain: Option<KeychainStore>,
 ) -> Result<Option<LoadedOwnerState>, String> {
-    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-    if !cbor_path.exists() {
-        return Ok(None);
-    }
-    let cbor_bytes = std::fs::read(&cbor_path)
-        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    let image = match read_owner_state_image(identity_dir)? {
+        Some(img) => img,
+        None => return Ok(None),
+    };
     let state: OwnerState =
-        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+        cbor::from_bytes(&image.bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+    reseal_owner_state_if_legacy(identity_dir, &image);
 
     // ZEB-189: the secret helpers only need "attempt the OS keychain?" — derive
     // the gate once. (`load_fleet_keytree` below still takes `Option` — its
@@ -618,6 +691,13 @@ pub fn save_owner_state_atomic(
     // rotate/write_seed waits behind e.g. a first-access macOS permission
     // prompt. Never a deadlock (order stays consistent), and identity writes are
     // rare, so the coarser blocking is acceptable.
+    //
+    // ZEB-982: the device cipher MUST be derived BEFORE this guard is taken.
+    // `get_or_derive` → `read_seed_from_disk` can hit the fresh-generate path
+    // (no `identity.key` yet — a bare test dir, or a first-boot mint race),
+    // which acquires this same non-reentrant IDENTITY_FILE_WRITE_LOCK inside
+    // `with_identity_write_guards` — deriving under the guard self-deadlocks.
+    let device_cipher = crate::device_dataset_file::get_or_derive(identity_dir)?;
     let _identity_file_guard = crate::identity::IDENTITY_FILE_WRITE_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -681,8 +761,15 @@ pub fn save_owner_state_atomic(
         }
         let cbor_bytes = cbor::to_canonical(state)
             .map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
+        // ZEB-982: seal under the device key (derived above, before the
+        // identity-file guard — see the deadlock note there).
+        let sealed = crate::device_dataset_file::seal_image(
+            &device_cipher,
+            OWNER_STATE_FILENAME,
+            &cbor_bytes,
+        )?;
         let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-        write_atomic_0600(&cbor_path, &cbor_bytes)
+        write_atomic_0600(&cbor_path, &sealed)
             .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
         Ok(())
     };
@@ -750,8 +837,11 @@ pub fn save_owner_state_atomic(
 pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Result<(), String> {
     let cbor_bytes =
         cbor::to_canonical(state).map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
+    let cipher = crate::device_dataset_file::get_or_derive(identity_dir)?;
+    let sealed =
+        crate::device_dataset_file::seal_image(&cipher, OWNER_STATE_FILENAME, &cbor_bytes)?;
     let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-    write_atomic_0600(&cbor_path, &cbor_bytes)
+    write_atomic_0600(&cbor_path, &sealed)
         .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
     Ok(())
 }
@@ -763,9 +853,17 @@ pub fn save_owner_state_cbor_only(identity_dir: &Path, state: &OwnerState) -> Re
 /// mutations don't require.
 pub fn load_owner_state_cbor(identity_dir: &Path) -> Result<OwnerState, String> {
     let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-    let cbor_bytes = std::fs::read(&cbor_path)
-        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
-    cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))
+    // A missing file stays an Err here (unlike `load_owner_state`) — the
+    // FileOnly trust-mutation callers require existing state.
+    let image = read_owner_state_image(identity_dir)?.ok_or_else(|| {
+        format!("failed to read {}: file not found", cbor_path.display())
+    })?;
+    let state: OwnerState =
+        cbor::from_bytes(&image.bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+    // Callers hold OWNER_STATE_WRITE_LOCK (this fn's contract), so eager
+    // migration is race-free here.
+    reseal_owner_state_if_legacy(identity_dir, &image);
+    Ok(state)
 }
 
 /// Derive the local device's 16-byte id from its ed25519 signing key.
@@ -877,14 +975,17 @@ pub fn remint_owner_from_seed(
 /// *before* deciding whether `--force` is required — a check that needs the
 /// recorded owner_id but neither the device key nor the master seed.
 pub fn read_persisted_owner_id(identity_dir: &Path) -> Result<Option<[u8; 16]>, String> {
-    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-    if !cbor_path.exists() {
-        return Ok(None);
-    }
-    let cbor_bytes = std::fs::read(&cbor_path)
-        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    // Pure reader: parses the (sealed) file but never rewrites it — see
+    // `reseal_owner_state_if_legacy` for why lock-free readers must not
+    // migrate. ZEB-982 note: decrypting needs the device cipher, whose
+    // process-wide memo is warmed at boot; only cold CLI contexts pay the
+    // one-time seed read here.
+    let image = match read_owner_state_image(identity_dir)? {
+        Some(img) => img,
+        None => return Ok(None),
+    };
     let state: OwnerState =
-        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+        cbor::from_bytes(&image.bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
     Ok(Some(state.owner_id))
 }
 
@@ -893,21 +994,26 @@ pub fn read_persisted_owner_id(identity_dir: &Path) -> Result<Option<[u8; 16]>, 
 /// `NodeState.fleet_net_enrolled`, but read on demand so it reflects enrollments
 /// that landed AFTER boot (e.g. a device just paired in this session).
 ///
-/// Keychain-free by design (sibling of [`read_persisted_owner_id`]): it only
-/// parses the public `OwnerState` CBOR, so it's safe to call on hot validation
-/// paths like `set_butler_pin` without touching the credential store. Returns an
-/// empty set when no identity has been minted yet.
+/// Hot-path safe (sibling of [`read_persisted_owner_id`]): it parses the
+/// public `OwnerState` CBOR without loading the device/seed secrets. Since
+/// ZEB-982 the file is device-sealed, so decrypting needs the seed-derived
+/// cipher — but that cipher's process-wide memo is warmed at boot, so hot
+/// validation paths like `set_butler_pin` still never block on the
+/// credential store. Returns an empty set when no identity has been minted
+/// yet.
 pub fn read_enrolled_device_vk_hex(
     identity_dir: &Path,
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-    if !cbor_path.exists() {
-        return Ok(std::collections::BTreeSet::new());
-    }
-    let cbor_bytes = std::fs::read(&cbor_path)
-        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    // Pure reader — no reseal (see `read_persisted_owner_id`). The hot-path
+    // promise in the doc above holds post-boot because the device-cipher
+    // memo is warmed by boot's `load_owner_state`; no per-call credential-
+    // store access happens.
+    let image = match read_owner_state_image(identity_dir)? {
+        Some(img) => img,
+        None => return Ok(std::collections::BTreeSet::new()),
+    };
     let state: OwnerState =
-        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+        cbor::from_bytes(&image.bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
     Ok(state
         .enrollments
         .values()
@@ -2021,6 +2127,9 @@ mod persistence_tests {
         use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
 
         let dir = tempdir().unwrap();
+        // ZEB-982: saves seal under the device cipher; no identity store in
+        // this fixture, so install the deterministic test cipher.
+        crate::device_dataset_file::install_test_cipher(dir.path());
 
         // Empty/unminted dir → empty set (no owner_state.cbor yet).
         assert!(
