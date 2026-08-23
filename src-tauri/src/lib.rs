@@ -6160,6 +6160,11 @@ pub async fn start_node_inner(
                     // keyless (local-only) boot skips it as one unit.
                     if let Some((kt, keys)) = fleet_crypto.clone() {
                         tracing::info!("BOOT-PROBE 02: iroh/pkarr/profile sections done, entering mint sync engine");
+                        // ZEB-981: sealing context for dataset files at rest —
+                        // pinned epoch-0 tree, shared by every fleet dataset
+                        // persist constructed in this band.
+                        let dataset_cipher =
+                            crate::fleet_dataset_file::DatasetCipher::new(kt.clone());
                         // ── Mint Phase 2 sync engine ─────────────────────────────
                         //
                         // Construct MintSyncEngine now that kt, device_id, and
@@ -6331,13 +6336,16 @@ pub async fn start_node_inner(
                         let notes_replay_path =
                             identity_dir.join(crate::notes_persist::NOTES_REPLAY_FILENAME);
                         let notes_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::notes_persist::load_doc_or_recover(&notes_path)
+                            crate::notes_persist::load_doc_or_recover(&dataset_cipher, &notes_path)
                                 .map_err(|e| format!("load notes doc: {e}"))?,
                         ));
                         let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
-                                crate::notes_persist::load_replay_or_recover(&notes_replay_path)
+                                crate::notes_persist::load_replay_or_recover(
+                                    &dataset_cipher,
+                                    &notes_replay_path,
+                                )
                                     .map_err(|e| format!("load notes replay: {e}"))?,
                             ),
                         ));
@@ -6363,6 +6371,7 @@ pub async fn start_node_inner(
                                         crate::notes_persist::NotesPersist {
                                             doc_path: notes_path,
                                             replay_path: notes_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"notes-v1",
@@ -6403,18 +6412,23 @@ pub async fn start_node_inner(
                         // runs only while contacts.cbor does not exist yet, then
                         // renames the legacy file so it can never re-import.
                         crate::contacts_commands::migrate_friend_nicknames_to_contacts(
+                            &dataset_cipher,
                             &contacts_path,
                             &app_data_dir.join("friend_nicknames.json"),
                             &device_id,
                         );
                         let contacts_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::contacts_persist::load_doc_or_recover(&contacts_path)
+                            crate::contacts_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &contacts_path,
+                            )
                                 .map_err(|e| format!("load contacts doc: {e}"))?,
                         ));
                         let contacts_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::contacts_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &contacts_replay_path,
                                 )
                                 .map_err(|e| format!("load contacts replay: {e}"))?,
@@ -6444,6 +6458,7 @@ pub async fn start_node_inner(
                                         crate::contacts_persist::ContactsPersist {
                                             doc_path: contacts_path,
                                             replay_path: contacts_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: crate::contacts_commands::CONTACTS_DATASET

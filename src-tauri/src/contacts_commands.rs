@@ -236,6 +236,7 @@ pub(crate) async fn set_contact_notes_impl(
 /// Failures are logged, never fatal: a failed import leaves the legacy file
 /// in place for the next boot to retry.
 pub(crate) fn migrate_friend_nicknames_to_contacts(
+    cipher: &crate::fleet_dataset_file::DatasetCipher,
     contacts_path: &std::path::Path,
     legacy_nicknames_path: &std::path::Path,
     device_id: &str,
@@ -282,7 +283,7 @@ pub(crate) fn migrate_friend_nicknames_to_contacts(
         };
         doc.apply_annotation(hex, Some(Some(e.nickname.clone())), None, at, e.updated_ms);
     }
-    if let Err(err) = crate::contacts_persist::save(contacts_path, &doc) {
+    if let Err(err) = crate::contacts_persist::save(cipher, contacts_path, &doc) {
         tracing::error!(
             error = %err,
             "contacts migration: save failed; legacy nicknames left in place"
@@ -574,9 +575,14 @@ mod tests {
         legacy.set("ccdd", Some("Priya"), 222);
         legacy.save(&legacy_path).unwrap();
 
-        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+        super::migrate_friend_nicknames_to_contacts(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+            &legacy_path,
+            "dev-A",
+        );
 
-        let doc = crate::contacts_persist::load(&contacts_path).unwrap();
+        let doc = crate::contacts_persist::load(&crate::fleet_dataset_file::test_cipher(), &contacts_path).unwrap();
         assert_eq!(
             doc.get("aabb").unwrap().petname.as_deref(),
             Some("Koya"),
@@ -595,16 +601,25 @@ mod tests {
     fn migration_skips_when_contacts_exist() {
         let dir = tempfile::tempdir().unwrap();
         let contacts_path = dir.path().join("contacts.cbor");
-        crate::contacts_persist::save(&contacts_path, &ContactsDoc::default()).unwrap();
+        crate::contacts_persist::save(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+            &ContactsDoc::default(),
+        ).unwrap();
         let legacy_path = dir.path().join("friend_nicknames.json");
         let mut legacy = crate::friend_nicknames::FriendNicknames::default();
         legacy.set("aabb", Some("Koya"), 111);
         legacy.save(&legacy_path).unwrap();
 
-        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+        super::migrate_friend_nicknames_to_contacts(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+            &legacy_path,
+            "dev-A",
+        );
 
         assert!(legacy_path.exists(), "legacy untouched when contacts exist");
-        let doc = crate::contacts_persist::load(&contacts_path).unwrap();
+        let doc = crate::contacts_persist::load(&crate::fleet_dataset_file::test_cipher(), &contacts_path).unwrap();
         assert!(
             doc.get("aabb").is_none(),
             "no import into an existing store"
@@ -616,6 +631,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contacts_path = dir.path().join("contacts.cbor");
         super::migrate_friend_nicknames_to_contacts(
+            &crate::fleet_dataset_file::test_cipher(),
             &contacts_path,
             &dir.path().join("friend_nicknames.json"),
             "dev-A",
@@ -641,9 +657,14 @@ mod tests {
         legacy.set("aabb", Some("SkewedImport"), far_future);
         legacy.save(&legacy_path).unwrap();
 
-        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+        super::migrate_friend_nicknames_to_contacts(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+            &legacy_path,
+            "dev-A",
+        );
 
-        let imported = crate::contacts_persist::load(&contacts_path).unwrap();
+        let imported = crate::contacts_persist::load(&crate::fleet_dataset_file::test_cipher(), &contacts_path).unwrap();
         let entry = imported.contacts.get("aabb").expect("imported");
         assert!(
             entry.updated_at.wall_ms <= super::now_ms(),
@@ -685,7 +706,12 @@ mod tests {
         let legacy_path = dir.path().join("friend_nicknames.json");
         std::fs::write(&legacy_path, b"not json at all").unwrap();
 
-        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+        super::migrate_friend_nicknames_to_contacts(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+            &legacy_path,
+            "dev-A",
+        );
 
         assert!(
             legacy_path.exists(),
