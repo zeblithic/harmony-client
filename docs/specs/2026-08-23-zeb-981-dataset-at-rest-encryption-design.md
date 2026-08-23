@@ -81,7 +81,7 @@ synchronously inside
   unattended deployments configure today.
 - **No per-file KDF.** The key is HKDF-derived once at KeyTree construction;
   per-file work is one ChaCha20-Poly1305 pass (~29 bytes overhead). A
-  per-file Argon2id would be 13 × 64 MiB serially on the critical path —
+  per-file Argon2id would be 20 × 64 MiB serially on the critical path —
   ruled out.
 
 ## Crypto surface
@@ -145,21 +145,35 @@ duplication **once**, generic over the file struct:
 pub struct DatasetCipher { keys: Arc<KeyTree> }
 
 /// Load a dataset file: NotFound → default; v1 → parse plaintext, then
-/// eagerly re-save as v2 (see Migration); v2 → open envelope, parse inner.
-/// CborDecode/tag-failure/unknown-version/empty → quarantine + default.
-/// Transient I/O → propagate untouched (ZEB-460).
-pub fn load_or_recover<T>(cipher: &DatasetCipher, path: &Path, label: &'static str)
-    -> Result<T, SyncError>
-where T: DeserializeOwned + Default;
+/// eagerly re-seal the ORIGINAL v1 image as v2, byte-for-byte (see
+/// Migration); v2 → open envelope, parse inner.
+/// CborDecode/tag-failure/unknown-version/empty/implausible-size →
+/// quarantine + default. Transient I/O → propagate untouched (ZEB-460).
+pub fn load_or_recover<T: DeserializeOwned + Default>(
+    cipher: &DatasetCipher, path: &Path, label: &'static str, inner_schema: u8,
+) -> Result<T, SyncError>;
+
+/// Strict variant: missing → default; any failure → Err; never writes.
+pub fn load<T: DeserializeOwned + Default>(
+    cipher: &DatasetCipher, path: &Path, label: &'static str, inner_schema: u8,
+) -> Result<T, SyncError>;
 
 /// Serialize + seal + atomic-write (tempfile, fsync, rename, parent-dir
 /// fsync via owner_state_persist::save_atomically).
-pub fn save<T: Serialize>(cipher: &DatasetCipher, path: &Path, label: &'static str,
-    value: &T) -> Result<(), SyncError>;
+pub fn save<T: Serialize>(
+    cipher: &DatasetCipher, path: &Path, label: &'static str, inner_schema: u8,
+    value: &T,
+) -> Result<(), SyncError>;
 ```
 
-(Exact generic shape may adjust to fit the per-dataset `FileV1` wrapper
-structs during planning; the contract above is fixed.)
+`inner_schema` is the dataset's legacy content-schema byte (1 everywhere
+today; `0x02` is reserved for the envelope). Migration never re-serializes:
+`load_or_recover` retains the raw legacy image and seals exactly those bytes,
+so non-canonical encodings or fields the deserialized type does not retain
+survive verbatim (pinned by a losslessness test). A coarse plausibility cap
+(256 MiB, checked against file metadata before the bytes are read) keeps an
+implausibly large corrupted/planted file off the boot path's memory — far
+above any real dataset, and it takes the same quarantine+self-heal path.
 
 Per-dataset modules shrink to: filename/label constants, their `FileV1`
 struct(s), thin wrappers over the shared module, and their `FleetPersist`
@@ -266,8 +280,20 @@ resolved as scope removals — see the first two Out-of-scope entries.
 the ZEB-460 contract) updated to construct a test cipher from
 `KeyTree::derive(&[0u8; 32])`; sidecar-ordering tests unchanged.
 
+**Keychain isolation:** none of these tests touch identity persistence — the
+test cipher is built directly from `KeyTree::derive` and no path reaches
+`KeychainStore::new()` (the ZEB-428 constructor gate and
+`tests/keychain_isolation.rs` are untouched). No `HARMONY_PASSPHRASE` is
+needed; the OS keychain is never opened.
+
 **Integration:** existing headless e2e flows exercise boot decrypt
 implicitly (every boot now opens ~20 sealed files). No new e2e needed.
+
+**Gates (run from `src-tauri/`):** `cargo fmt --all -- --check`;
+`cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`;
+`cargo nextest run --locked --workspace --all-targets --features test-fixtures`.
+No executable Rust doctests are added (the workspace has none), so no
+separate `cargo test --doc` run is required.
 
 ## PR shape
 
