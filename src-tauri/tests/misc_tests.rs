@@ -16,6 +16,8 @@
 //!
 //! Run just this group: `cargo nextest run -E 'binary(misc_tests)'`.
 
+#[path = "misc/backup_staleness_dir.rs"]
+mod backup_staleness_dir;
 #[path = "misc/community_open_join_cross_wan_integration.rs"]
 mod community_open_join_cross_wan_integration;
 #[path = "misc/community_presence_two_engine_integration.rs"]

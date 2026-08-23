@@ -54899,11 +54899,16 @@ pub struct BackupStaleness {
 
 /// Tauri IPC: compute the backup-staleness banner state.
 ///
-/// Reads `owner_state_crdt.cbor` + `last_backup.json` from `app_data_dir()`
-/// and runs `crate::backup_state::should_warn_about_stale_backup` with the
-/// current wall clock. `dismiss_until_ms` is the localStorage-backed
-/// dismissal expiry passed from the frontend — when `Some(t)` and `t >
-/// now_wall_ms`, the banner is suppressed regardless of staleness.
+/// ZEB-975: reads `owner_state_crdt.cbor` + `last_backup.json` from the
+/// IDENTITY dir (`resolve_identity_dir()`, profile-aware via the identity
+/// key path) — the same directory the boot engine persists the CRDT to and
+/// the recovery export writes `last_backup.json` to. It previously read
+/// Tauri's `app_data_dir()`, which no writer of either file uses, so the
+/// banner always evaluated an empty state and could never fire.
+///
+/// `dismiss_until_ms` is the localStorage-backed dismissal expiry passed
+/// from the frontend — when `Some(t)` and `t > now_wall_ms`, the banner is
+/// suppressed regardless of staleness.
 ///
 /// Missing `owner_state_crdt.cbor` (fresh install before any owner-state
 /// writes) defaults to an empty `OwnerState` — `should_warn_about_stale_backup`
@@ -54916,34 +54921,15 @@ pub struct BackupStaleness {
 /// Rust keeps NO mutable dismiss state — the frontend owns it in
 /// localStorage. See `src/lib/backup-service.ts`.
 #[tauri::command]
-async fn get_backup_staleness(
-    app: tauri::AppHandle,
-    dismiss_until_ms: Option<u64>,
-) -> Result<BackupStaleness, String> {
-    use tauri::Manager;
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?;
-    // Single source of truth for the CRDT path — same file the engine
-    // boots from and the same file the backup export sidecar reads.
-    let state_path = crate::recovery_cli::owner_state_path(&app_data_dir);
-    let last_path = app_data_dir.join("last_backup.json");
-
+async fn get_backup_staleness(dismiss_until_ms: Option<u64>) -> Result<BackupStaleness, String> {
+    let harmony_dir = crate::owner_commands::resolve_identity_dir()?;
     crate::identity_commands::run_blocking(move || {
-        let state = crate::owner_state_persist::load_crdt(&state_path)
-            .unwrap_or_else(|_| crate::owner_state_crdt::OwnerState::default());
-        let last = crate::backup_state::load_last_backup(&last_path).unwrap_or(None);
         let now_wall_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let r = crate::backup_state::should_warn_about_stale_backup(
-            now_wall_ms,
-            last.as_ref(),
-            &state,
-            dismiss_until_ms,
-        );
+        let r =
+            crate::backup_state::staleness_from_dir(&harmony_dir, now_wall_ms, dismiss_until_ms);
         Ok(BackupStaleness {
             is_stale: r.is_stale,
             days_since: r.days_since,
