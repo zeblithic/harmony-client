@@ -2583,6 +2583,106 @@ mod tests {
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
     }
 
+    /// ZEB-975 regression: the staleness evaluator must read the SAME
+    /// directory the writers write — the harmony/identity dir. Before the
+    /// fix, `get_backup_staleness` resolved Tauri's app-data dir, which no
+    /// writer ever touches, so the banner always evaluated an empty
+    /// `OwnerState` with no backup record (never stale, forever).
+    ///
+    /// Writes through the REAL paths — `export_recovery_file_pair_with_keychain`
+    /// for `last_backup.json` and `owner_state_persist::save_crdt` (the same
+    /// fn the boot engine uses) for the CRDT — then asserts the reader sees
+    /// them, and that the pre-fix dir shape (a dir nothing wrote) reports the
+    /// dead-banner default instead.
+    #[test]
+    #[serial]
+    fn staleness_from_dir_sees_real_export_and_engine_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xEE; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &identity_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // The export stamped `last_backup.json` with the real wall clock;
+        // read it back so the assertions below are exact, not racy.
+        let backup_at = crate::backup_state::load_last_backup(&super::last_backup_path(dir.path()))
+            .unwrap()
+            .expect("export writes last_backup.json")
+            .at
+            .wall_ms;
+
+        // Plant a mutation AFTER the backup via the engine's own persist fn.
+        // (`plant_owner_state` writes an EMPTY state, so insert a real Space —
+        // `last_mutation_wall_ms` scans HLC-bearing entries, not file mtimes.)
+        let state_path = super::owner_state_path(dir.path());
+        let mut state = crate::owner_state_persist::load_crdt(&state_path).unwrap();
+        let mutated_at = crate::owner_state_types::Hlc {
+            wall_ms: backup_at + 86_400_000,
+            logical: 0,
+            device_id: "test".into(),
+        };
+        let sp = crate::owner_state_types::Space {
+            id: crate::owner_state_types::SpaceId([7; 16]),
+            kind: crate::owner_state_types::SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "post-backup".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: mutated_at.clone(),
+            updated_at: mutated_at,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            read_receipt_pref: None,
+            pending_join_at: None,
+        };
+        state.spaces.insert(sp.id, sp);
+        crate::owner_state_persist::save_crdt(&state_path, &state).unwrap();
+
+        // 20 days later, with post-backup mutations: stale, 20 days since.
+        let now = backup_at + 20 * 86_400_000;
+        let r = crate::backup_state::staleness_from_dir(dir.path(), now, None);
+        assert!(r.is_stale, "reader must see the writers' files: {r:?}");
+        assert_eq!(r.days_since, 20);
+
+        // The ZEB-975 failure shape: pointed at a dir nothing writes (what
+        // resolving app-data amounted to), the evaluator sees defaults and
+        // can never report staleness.
+        let unwritten = tempfile::tempdir().unwrap();
+        let r = crate::backup_state::staleness_from_dir(unwritten.path(), now, None);
+        assert!(
+            !r.is_stale,
+            "a dir with no owner-state/backup files reports the dead-banner default: {r:?}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
     #[test]
     #[serial]
     fn restore_refuses_state_overwrite_without_force_leaves_identity_untouched() {

@@ -174,6 +174,34 @@ pub fn should_warn_about_stale_backup(
     }
 }
 
+/// ZEB-975: evaluate staleness from the directory the WRITERS use.
+///
+/// `harmony_dir` is the identity dir (`~/.harmony[/profiles/<p>]`) — the
+/// directory hosting `owner_state_crdt.cbor` (written by the boot engine and
+/// `recovery_cli` restore) and `last_backup.json` (written by the export
+/// path). Production resolves it via `owner_commands::resolve_identity_dir()`;
+/// tests pass a tempdir they exported into. Keeping load + decide in one
+/// dir-keyed helper makes "reader follows writer" a testable property — the
+/// pre-fix reader resolved Tauri's app-data dir here, which nothing writes,
+/// so the staleness banner could never fire.
+///
+/// Missing/corrupt files degrade exactly like the fresh-install case: an
+/// unreadable CRDT evaluates as an empty `OwnerState`, a missing
+/// `last_backup.json` as "never backed up" — both feed the grace-window
+/// logic in [`should_warn_about_stale_backup`].
+pub fn staleness_from_dir(
+    harmony_dir: &Path,
+    now_wall_ms: u64,
+    dismiss_until_wall_ms: Option<u64>,
+) -> StalenessResult {
+    let state =
+        crate::owner_state_persist::load_crdt(&crate::recovery_cli::owner_state_path(harmony_dir))
+            .unwrap_or_else(|_| OwnerState::default());
+    let last =
+        load_last_backup(&crate::recovery_cli::last_backup_path(harmony_dir)).unwrap_or(None);
+    should_warn_about_stale_backup(now_wall_ms, last.as_ref(), &state, dismiss_until_wall_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
