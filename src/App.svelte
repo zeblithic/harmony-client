@@ -95,7 +95,7 @@
   } from './lib/notes-return';
   import { MailService } from './lib/mail-service';
   import { VineService } from './lib/vine-service';
-  import { resolveOriginalCreator } from './lib/vine-utils';
+  import { resolveOriginalCreator, vineIdentityOwnerIds } from './lib/vine-utils';
   import { NavService } from './lib/nav-service';
   import { ChannelNavSyncService } from './lib/channel-nav-sync';
   import { AvatarResolver } from './lib/avatar-resolver';
@@ -968,6 +968,19 @@
     followedAddresses = new Set(vineService.followedAddresses);
     vineGetReaction = (vineId: string) => vineService.getReaction(vineId);
   };
+
+  // ZEB-978 (CodeRabbit #725): VineFeed/VineCard resolve author names via
+  // `resolveCard`, which only resolves owners the MemberCardService has
+  // subscribed — reconcile every vine creator / reshare origin / Discover
+  // `via` hop into a dedicated `vines` bucket (same contract as the
+  // `feedAuthors` bucket, ZEB-962). Union semantics leave the other buckets
+  // untouched, and feed changes clear+refill only this bucket.
+  $effect(() => {
+    void memberCardService.setBucket(
+      'vines',
+      vineIdentityOwnerIds([...followedVines, ...discoverVines]),
+    );
+  });
 
   function handleMarkVineViewed(id: string) {
     vineService.markViewed(id);
