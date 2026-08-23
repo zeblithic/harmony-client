@@ -4328,6 +4328,7 @@ mod tests {
                 crdt: dir.path().join("crdt.cbor"),
                 replay: dir.path().join("replay.cbor"),
             },
+            crate::device_dataset_file::test_cipher(),
             50, // short debounce for the test
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));

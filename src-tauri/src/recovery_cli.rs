@@ -641,7 +641,10 @@ pub fn export_recovery_file_pair_with_keychain(
     // exists() check above and this read) must roll back the just-written
     // HRMR so the operator isn't stranded with a mismatched half-pair.
     // C5: also restore .bak files for both HRMR and HRSS.
-    let state = match load_crdt(&state_path) {
+    let state = match crate::device_dataset_file::get_or_derive(harmony_dir)
+        .map_err(|e| e.to_string())
+        .and_then(|cipher| load_crdt(&cipher, &state_path).map_err(|e| e.to_string()))
+    {
         Ok(s) => s,
         Err(e) => {
             let _ = std::fs::remove_file(out);
@@ -822,7 +825,14 @@ pub fn restore_recovery_file_pair_with_keychain(
         // genuine error, but the message must make the partial-success
         // state explicit so the operator can recover (their identity is
         // restored; only the state sidecar didn't land).
-        if let Err(e) = crate::owner_state_persist::save_atomically(&state_path, &snap.tree) {
+        // ZEB-982: seal under the cipher derived from the seed written just
+        // above — NOT get_or_derive, whose memo the seed write invalidated;
+        // deriving directly from the in-hand seed is race-free and lock-free.
+        let cipher = crate::device_dataset_file::DeviceCipher::derive(&seed_bytes)
+            .map_err(|e| format!("identity restored but owner-state write failed: {e}"))?;
+        if let Err(e) =
+            crate::device_dataset_file::write_image(&cipher, &state_path, crate::owner_state_persist::CRDT_FILENAME, &snap.tree)
+        {
             return Err(format!(
                 "identity restored but owner-state write failed: {e}"
             ));
@@ -831,7 +841,7 @@ pub fn restore_recovery_file_pair_with_keychain(
         // A reload failure here MUST NOT convert a successful state save
         // into surfaced Err (per metadata-before-irreversible-write); we
         // degrade gracefully to "0 spaces" in the stderr report.
-        load_crdt(&state_path)
+        load_crdt(&cipher, &state_path)
             .ok()
             .map(|s| s.spaces.len())
             .unwrap_or(0)
@@ -2136,7 +2146,10 @@ mod tests {
     fn plant_owner_state(harmony_dir: &Path) {
         let state = OwnerState::default();
         let state_path = super::owner_state_path(harmony_dir);
-        crate::owner_state_persist::save_crdt(&state_path, &state).unwrap();
+        // Seal under the SAME per-dir cipher the code under test derives —
+        // a fixed test cipher would AEAD-fail in export/restore paths.
+        let cipher = crate::device_dataset_file::get_or_derive(harmony_dir).unwrap();
+        crate::owner_state_persist::save_crdt(&cipher, &state_path, &state).unwrap();
     }
 
     #[test]
@@ -2462,7 +2475,11 @@ mod tests {
             pending_join_at: None,
         };
         state.spaces.insert(sp.id, sp);
-        crate::owner_state_persist::save_crdt(&super::owner_state_path(dir.path()), &state)
+        crate::owner_state_persist::save_crdt(
+            &crate::device_dataset_file::get_or_derive(dir.path()).unwrap(),
+            &super::owner_state_path(dir.path()),
+            &state,
+        )
             .unwrap();
 
         // force=true overwrites.
@@ -2630,7 +2647,8 @@ mod tests {
         // (`plant_owner_state` writes an EMPTY state, so insert a real Space —
         // `last_mutation_wall_ms` scans HLC-bearing entries, not file mtimes.)
         let state_path = super::owner_state_path(dir.path());
-        let mut state = crate::owner_state_persist::load_crdt(&state_path).unwrap();
+        let cipher = crate::device_dataset_file::get_or_derive(dir.path()).unwrap();
+        let mut state = crate::owner_state_persist::load_crdt(&cipher, &state_path).unwrap();
         let mutated_at = crate::owner_state_types::Hlc {
             wall_ms: backup_at + 86_400_000,
             logical: 0,
@@ -2661,7 +2679,7 @@ mod tests {
             pending_join_at: None,
         };
         state.spaces.insert(sp.id, sp);
-        crate::owner_state_persist::save_crdt(&state_path, &state).unwrap();
+        crate::owner_state_persist::save_crdt(&cipher, &state_path, &state).unwrap();
 
         // 20 days later, with post-backup mutations: stale, 20 days since.
         let now = backup_at + 20 * 86_400_000;
@@ -2878,7 +2896,7 @@ mod tests {
     /// the first export. The second export will:
     ///   1. Move the old recovery.bin aside as `.bak` (move_aside).
     ///   2. Successfully write the new HRMR.
-    ///   3. Fail at `load_crdt(&state_path)` (the corrupt CBOR).
+    ///   3. Fail at `load_crdt(...)` (the corrupt CBOR).
     ///   4. Hit the rollback path — which under the fix restores the
     ///      .bak file back to the original recovery.bin location.
     ///

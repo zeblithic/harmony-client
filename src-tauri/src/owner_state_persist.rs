@@ -203,9 +203,32 @@ impl From<CrdtFileV2> for OwnerState {
     }
 }
 
-pub fn save_crdt(path: &Path, state: &OwnerState) -> Result<(), PersistError> {
+/// ZEB-982: filename labels binding the AAD of the sealed envelopes. These
+/// are the canonical basenames in the identity dir; sealed copies at other
+/// paths (temp files, backups) still open because the AAD binds the LABEL,
+/// not the path.
+pub const CRDT_FILENAME: &str = "owner_state_crdt.cbor";
+pub const REPLAY_FILENAME: &str = "state_root_replay.cbor";
+
+/// Map an envelope failure onto this module's error contract: transient
+/// read I/O stays `Io` (never discards state), everything content-shaped
+/// is `Corrupt` — which callers already treat as boot-fatal (`lib.rs`
+/// loads with `?`), preserving the no-quarantine owner-family contract.
+fn image_err(e: crate::device_dataset_file::ImageError) -> PersistError {
+    match e {
+        crate::device_dataset_file::ImageError::Io(io) => PersistError::Io(io),
+        crate::device_dataset_file::ImageError::Crypto(_) => PersistError::Corrupt,
+    }
+}
+
+pub fn save_crdt(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    state: &OwnerState,
+) -> Result<(), PersistError> {
     let bytes = canonicalize(state)?;
-    save_atomically(path, &bytes)
+    crate::device_dataset_file::write_image(cipher, path, CRDT_FILENAME, &bytes)
+        .map_err(PersistError::Io)
 }
 
 /// Encode `OwnerState` to its on-disk canonical byte representation
@@ -223,17 +246,32 @@ pub fn canonicalize(state: &OwnerState) -> Result<Vec<u8>, PersistError> {
     Ok(bytes)
 }
 
-pub fn load_crdt(path: &Path) -> Result<OwnerState, PersistError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OwnerState::default()),
-        Err(e) => return Err(e.into()),
+pub fn load_crdt(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> Result<OwnerState, PersistError> {
+    let image = match crate::device_dataset_file::read_image(cipher, path, CRDT_FILENAME)
+        .map_err(image_err)?
+    {
+        Some(img) => img,
+        None => return Ok(OwnerState::default()),
     };
+    let bytes = &image.bytes;
     if bytes.is_empty() {
         return Err(PersistError::Corrupt);
     }
     let version = bytes[0];
     let payload = &bytes[1..];
+    let state = load_crdt_inner(path, version, payload)?;
+    // Eager byte-lossless migration AFTER the inner parse succeeded (a
+    // rejected image must never be laundered into a valid envelope).
+    // Boot's serial load migrates before any engine runs, so this write
+    // cannot race a live writer; best-effort — failure warns inside.
+    crate::device_dataset_file::reseal_if_legacy(cipher, path, CRDT_FILENAME, &image);
+    Ok(state)
+}
+
+fn load_crdt_inner(path: &Path, version: u8, payload: &[u8]) -> Result<OwnerState, PersistError> {
     match version {
         CRDT_FILE_SCHEMA_V2 => {
             let mut cursor = Cursor::new(payload);
@@ -274,25 +312,35 @@ const REPLAY_FILE_SCHEMA_V1: u8 = 1;
 #[derive(Serialize, Deserialize)]
 struct ReplayFileV1(BTreeMap<String, Hlc>);
 
-pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), PersistError> {
+pub fn save_replay(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    tracker: &BTreeMap<String, Hlc>,
+) -> Result<(), PersistError> {
     let file = ReplayFileV1(tracker.clone());
     let mut bytes = vec![REPLAY_FILE_SCHEMA_V1];
     into_writer(&file, &mut bytes).map_err(|e| PersistError::CborEncode(e.to_string()))?;
-    save_atomically(path, &bytes)
+    crate::device_dataset_file::write_image(cipher, path, REPLAY_FILENAME, &bytes)
+        .map_err(PersistError::Io)
 }
 
-pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, PersistError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(e.into()),
+pub fn load_replay(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, PersistError> {
+    let image = match crate::device_dataset_file::read_image(cipher, path, REPLAY_FILENAME)
+        .map_err(image_err)?
+    {
+        Some(img) => img,
+        None => return Ok(BTreeMap::new()),
     };
+    let bytes = &image.bytes;
     if bytes.is_empty() {
         return Err(PersistError::Corrupt);
     }
     let version = bytes[0];
     let payload = &bytes[1..];
-    match version {
+    let tracker = match version {
         REPLAY_FILE_SCHEMA_V1 => {
             let mut cursor = Cursor::new(payload);
             let file: ReplayFileV1 =
@@ -300,10 +348,13 @@ pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, PersistError> {
             if (cursor.position() as usize) != payload.len() {
                 return Err(PersistError::Corrupt);
             }
-            Ok(file.0)
+            file.0
         }
-        v => Err(PersistError::UnknownSchemaVersion(v)),
-    }
+        v => return Err(PersistError::UnknownSchemaVersion(v)),
+    };
+    // See load_crdt: migrate only after a successful parse; best-effort.
+    crate::device_dataset_file::reseal_if_legacy(cipher, path, REPLAY_FILENAME, &image);
+    Ok(tracker)
 }
 
 #[cfg(test)]
@@ -314,6 +365,64 @@ mod tests {
         ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, ReadMarker, Space,
         SpaceId, SpaceKind,
     };
+
+    /// ZEB-982: a legacy plaintext CRDT file (first byte = CRDT_FILE_SCHEMA_V2
+    /// — the exact value the sealed sentinel must never be confused with)
+    /// loads, is eagerly re-sealed byte-losslessly, and reloads identically.
+    #[test]
+    fn legacy_plaintext_crdt_migrates_to_sealed_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        let cipher = crate::device_dataset_file::test_cipher();
+
+        let mut state = OwnerState::default();
+        state.tombstones.insert(SpaceId([9; 16]));
+        let legacy_image = canonicalize(&state).unwrap();
+        assert_eq!(legacy_image[0], CRDT_FILE_SCHEMA_V2, "collision-critical");
+        std::fs::write(&path, &legacy_image).unwrap();
+
+        let loaded = load_crdt(&cipher, &path).unwrap();
+        assert!(loaded.tombstones.contains(&SpaceId([9; 16])));
+
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk[0], 3, "file now carries the sealed sentinel");
+        let img = crate::device_dataset_file::read_image(&cipher, &path, CRDT_FILENAME)
+            .unwrap()
+            .unwrap();
+        assert!(!img.was_legacy);
+        assert_eq!(&img.bytes[..], &legacy_image[..], "inner image verbatim");
+        let reloaded = load_crdt(&cipher, &path).unwrap();
+        assert!(reloaded.tombstones.contains(&SpaceId([9; 16])));
+    }
+
+    /// ZEB-982 contract pin: a sealed-corrupt CRDT file is a hard error —
+    /// never quarantined, never defaulted (the owner family has no peer
+    /// re-sync to recover discarded state from).
+    #[test]
+    fn sealed_corrupt_crdt_is_hard_error_no_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        let cipher = crate::device_dataset_file::test_cipher();
+        save_crdt(&cipher, &path, &OwnerState::default()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            load_crdt(&cipher, &path),
+            Err(PersistError::Corrupt)
+        ));
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["owner_state_crdt.cbor".to_string()],
+            "no quarantine sidecar, file left in place: {entries:?}"
+        );
+    }
 
     #[test]
     fn save_atomically_creates_file_with_bytes() {
@@ -417,8 +526,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
         let original = sample_state();
-        save_crdt(&path, &original).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &original).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(loaded, original);
     }
 
@@ -426,7 +535,7 @@ mod tests {
     fn crdt_load_missing_file_returns_empty_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("never_written.cbor");
-        let loaded = load_crdt(&path).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(loaded, OwnerState::default());
     }
 
@@ -458,8 +567,8 @@ mod tests {
         assert!(matches!(outcome, ApplyOutcome::Inserted));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(loaded.friend_graph, s.friend_graph);
         assert!(!loaded.friend_graph.is_empty());
     }
@@ -475,8 +584,8 @@ mod tests {
         assert!(s.apply_revoked_dm_device(owner, [0x22; 32]));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(loaded.revoked_dm_devices, s.revoked_dm_devices);
         assert_eq!(loaded.revoked_dm_devices.get(&owner).unwrap().len(), 2);
     }
@@ -503,8 +612,8 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(loaded.received_file_grants, s.received_file_grants);
         assert_eq!(
             loaded.received_file_grants.get(&cid).unwrap().file_size,
@@ -525,8 +634,8 @@ mod tests {
         s.burn_gc([0x5du8; 32]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(loaded.burned_content, s.burned_content);
         assert_eq!(loaded.burned_content.len(), 2);
     }
@@ -546,8 +655,8 @@ mod tests {
             .insert([0x5fu8; 32], 1_700_000_000_042);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(
             loaded.dismissed_received_grants,
             s.dismissed_received_grants
@@ -563,8 +672,8 @@ mod tests {
         let s = OwnerState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert!(loaded.dismissed_received_grants.is_empty());
     }
 
@@ -576,8 +685,8 @@ mod tests {
         let s = OwnerState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert!(loaded.received_file_grants.is_empty());
     }
 
@@ -589,8 +698,8 @@ mod tests {
         let s = OwnerState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert!(loaded.revoked_dm_devices.is_empty());
     }
 
@@ -602,8 +711,8 @@ mod tests {
         let s = OwnerState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner_state_crdt.cbor");
-        save_crdt(&path, &s).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert!(loaded.friend_graph.is_empty());
     }
 
@@ -614,8 +723,8 @@ mod tests {
         let mut original: BTreeMap<String, Hlc> = BTreeMap::new();
         original.insert("alice-laptop".into(), hlc(100));
         original.insert("bob-phone".into(), hlc(200));
-        save_replay(&path, &original).unwrap();
-        let loaded = load_replay(&path).unwrap();
+        save_replay(&crate::device_dataset_file::test_cipher(), &path, &original).unwrap();
+        let loaded = load_replay(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(loaded, original);
     }
 
@@ -623,7 +732,7 @@ mod tests {
     fn replay_load_missing_file_returns_empty_map() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("never_written.cbor");
-        let loaded = load_replay(&path).unwrap();
+        let loaded = load_replay(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -633,7 +742,7 @@ mod tests {
         let path = dir.path().join("future.cbor");
         // 0xFF is reserved-future; v1 is 0x01.
         std::fs::write(&path, [0xFF_u8, 0x00, 0x01]).unwrap();
-        let err = load_crdt(&path).expect_err("should error");
+        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(err, PersistError::UnknownSchemaVersion(0xFF)));
     }
 
@@ -645,7 +754,7 @@ mod tests {
         // (V1 is now the discard path, so we use V2 to exercise the
         // CBOR-decode error path.)
         std::fs::write(&path, [CRDT_FILE_SCHEMA_V2, 0xA1, 0x66]).unwrap();
-        let err = load_crdt(&path).expect_err("should error");
+        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(
             err,
             PersistError::CborDecode(_) | PersistError::Corrupt
@@ -660,7 +769,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("phase3a.cbor");
         std::fs::write(&path, [CRDT_FILE_SCHEMA_V1, 0x42, 0x43, 0x44]).unwrap();
-        let loaded = load_crdt(&path).expect("V1 load returns Ok with default state, not error");
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect("V1 load returns Ok with default state, not error");
         assert!(
             loaded.spaces.is_empty(),
             "V1 load should produce empty spaces"
@@ -688,7 +797,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.cbor");
         std::fs::write(&path, []).unwrap();
-        let err = load_crdt(&path).expect_err("should error");
+        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(err, PersistError::Corrupt));
     }
 
@@ -697,7 +806,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future_replay.cbor");
         std::fs::write(&path, [0xFE_u8]).unwrap();
-        let err = load_replay(&path).expect_err("should error");
+        let err = load_replay(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(err, PersistError::UnknownSchemaVersion(0xFE)));
     }
 
@@ -706,11 +815,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("with_tail.cbor");
         // Save a valid file, then append a junk byte.
-        save_crdt(&path, &OwnerState::default()).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &OwnerState::default()).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.push(0xFF);
         std::fs::write(&path, bytes).unwrap();
-        let err = load_crdt(&path).expect_err("should error");
+        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(err, PersistError::Corrupt));
     }
 
@@ -806,8 +915,8 @@ mod tests {
         );
 
         // Round-trip through the production file-based save/load path.
-        save_crdt(&path, &state).unwrap();
-        let loaded = load_crdt(&path).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &state).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
 
         // -- Space fields --
         let loaded_space = loaded
@@ -874,7 +983,7 @@ mod tests {
         // skip_serializing_if will omit the field entirely, mimicking
         // a pre-Task-8 file on disk.
         let state_no_cache = OwnerState::default();
-        save_crdt(&path, &state_no_cache).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &state_no_cache).unwrap();
 
         // Confirm the field key was omitted by scanning raw bytes for
         // the literal UTF-8 of the CBOR text key (CBOR text strings
@@ -888,7 +997,7 @@ mod tests {
         );
 
         // Loading must succeed with an empty cache, not error.
-        let loaded = load_crdt(&path).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert!(
             loaded.owner_device_cache.is_empty(),
             "pre-Task-8 V2 files must load with empty owner_device_cache",
@@ -910,7 +1019,7 @@ mod tests {
         // skip_serializing_if = "BTreeMap::is_empty" omits the field
         // entirely, mimicking a pre-Task-1 file on disk.
         let state_no_libs = OwnerState::default();
-        save_crdt(&path, &state_no_libs).unwrap();
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &state_no_libs).unwrap();
 
         // Confirm the field key was omitted by scanning raw bytes
         // for the literal UTF-8 of the CBOR text key (CBOR text
@@ -924,7 +1033,7 @@ mod tests {
 
         // Loading must succeed with an empty BTreeMap, not error on
         // missing field.
-        let loaded = load_crdt(&path).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert!(
             loaded.libraries.is_empty(),
             "pre-Task-1 V2 files must load with empty libraries",

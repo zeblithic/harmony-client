@@ -2073,6 +2073,39 @@ mod persistence_tests {
         );
     }
 
+    /// ZEB-982: a legacy plaintext `owner_state.cbor` (bare canonical CBOR,
+    /// no schema byte) loads through the lock-holding doc reader, is eagerly
+    /// re-sealed byte-losslessly, and the pure readers see the sealed file.
+    #[test]
+    fn legacy_plaintext_owner_state_migrates_to_sealed_on_load() {
+        let dir = tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
+        let MintResult { state, .. } = mint_owner(1_700_000_222).unwrap();
+        let legacy_image = cbor::to_canonical(&state).unwrap();
+        std::fs::write(dir.path().join(OWNER_STATE_FILENAME), &legacy_image).unwrap();
+
+        let loaded = load_owner_state_cbor(dir.path()).unwrap();
+        assert_eq!(loaded.owner_id, state.owner_id);
+
+        let on_disk = std::fs::read(dir.path().join(OWNER_STATE_FILENAME)).unwrap();
+        assert_eq!(on_disk[0], 3, "file now carries the sealed sentinel");
+        let img = crate::device_dataset_file::read_image(
+            &crate::device_dataset_file::test_cipher(),
+            &dir.path().join(OWNER_STATE_FILENAME),
+            OWNER_STATE_FILENAME,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&img.bytes[..], &legacy_image[..], "inner image verbatim");
+
+        // Pure readers parse the sealed file (and never rewrite it).
+        assert_eq!(
+            read_persisted_owner_id(dir.path()).unwrap(),
+            Some(state.owner_id)
+        );
+        assert!(!read_enrolled_device_vk_hex(dir.path()).unwrap().is_empty());
+    }
+
     #[test]
     #[serial]
     fn cbor_only_persists_state_without_touching_keychain() {

@@ -155,8 +155,8 @@ fn grant_records_persist_reload() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("crdt-v2.bin");
-    save_crdt(&path, &state).expect("save_crdt");
-    let reloaded = load_crdt(&path).expect("load_crdt");
+    save_crdt(&harmony_app::device_dataset_file::test_cipher(), &path, &state).expect("save_crdt");
+    let reloaded = load_crdt(&harmony_app::device_dataset_file::test_cipher(), &path).expect("load_crdt");
 
     assert_eq!(
         reloaded.file_grants.get(&cid),

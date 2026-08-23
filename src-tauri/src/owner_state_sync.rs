@@ -77,6 +77,10 @@ pub struct PersistPaths {
 /// `owner_publish_envelope_is_byte_identical_to_legacy`).
 struct OwnerStatePersist {
     paths: PersistPaths,
+    /// ZEB-982: device cipher sealing both files at rest. Derived from the
+    /// node identity seed, so it exists in local-only (keys: None) mode too
+    /// — sealed persistence stays key-FREE with respect to fleet crypto.
+    cipher: crate::device_dataset_file::DeviceCipher,
 }
 
 impl FleetPersist<OwnerState> for OwnerStatePersist {
@@ -85,9 +89,9 @@ impl FleetPersist<OwnerState> for OwnerStatePersist {
         state: &OwnerState,
         tracker: &BTreeMap<String, Hlc>,
     ) -> Result<(), SyncError> {
-        crate::owner_state_persist::save_crdt(&self.paths.crdt, state)
+        crate::owner_state_persist::save_crdt(&self.cipher, &self.paths.crdt, state)
             .map_err(|e| SyncError::Persist(e.to_string()))?;
-        crate::owner_state_persist::save_replay(&self.paths.replay, tracker)
+        crate::owner_state_persist::save_replay(&self.cipher, &self.paths.replay, tracker)
             .map_err(|e| SyncError::Persist(e.to_string()))?;
         Ok(())
     }
@@ -129,6 +133,7 @@ impl SyncEngine {
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
         paths: PersistPaths,
+        cipher: crate::device_dataset_file::DeviceCipher,
         debounce_ms: u64,
         adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     ) -> Self {
@@ -154,7 +159,7 @@ impl SyncEngine {
             content_store,
             publisher_tx,
             subscriber_rx,
-            persist: Arc::new(OwnerStatePersist { paths }),
+            persist: Arc::new(OwnerStatePersist { paths, cipher }),
             lookup_key_tag: OWNER_STATE_ROOT_BLOB_TAG,
             debounce_ms,
             // CRITICAL: keeps the owner-state wire byte-identical. With
@@ -746,6 +751,7 @@ mod debounce_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             50, // shorter debounce for tests
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -778,6 +784,7 @@ mod debounce_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             100, // 100ms debounce
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -814,6 +821,7 @@ mod debounce_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000, // very long debounce — flush_now must beat it
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -855,6 +863,7 @@ mod debounce_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000, // long debounce — only flush_now can persist within the test
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -897,7 +906,7 @@ mod debounce_tests {
         engine.flush_now().await.unwrap();
 
         // Reload from disk as boot would — the Space must be present.
-        let reloaded = load_crdt(&crdt_path).unwrap();
+        let reloaded = load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path).unwrap();
         assert!(
             reloaded.spaces.contains_key(&SpaceId([42; 16])),
             "flush_now must persist owner-state so a crash after mint can't lose it"
@@ -922,6 +931,7 @@ mod debounce_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             200,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -956,6 +966,7 @@ mod debounce_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000, // long debounce — shutdown must short-circuit it
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -983,6 +994,7 @@ mod debounce_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1022,6 +1034,7 @@ mod skeleton_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             DEFAULT_DEBOUNCE_MS,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1117,6 +1130,7 @@ mod wire_identity_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1256,6 +1270,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000, // long debounce — keep self-publishes out of the way
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1306,6 +1321,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1383,6 +1399,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000, // long debounce — keep self-publishes out of the way
             adopt_floor.clone(),
         );
@@ -1481,6 +1498,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             adopt_floor.clone(),
         );
@@ -1600,6 +1618,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1650,6 +1669,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1731,6 +1751,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1824,6 +1845,7 @@ mod subscriber_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -1892,6 +1914,7 @@ mod subscriber_tests {
                 pub_tx.clone(),
                 sub_rx,
                 paths.clone(),
+                crate::device_dataset_file::test_cipher(),
                 5000,
                 crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             );
@@ -1919,7 +1942,7 @@ mod subscriber_tests {
         // Round 2: boot a fresh engine, load tracker from disk,
         // verify peer-bob's HLC is 5000. Then send an OLDER publish
         // and confirm rejection.
-        let tracker_loaded = crate::owner_state_persist::load_replay(&paths.replay).unwrap();
+        let tracker_loaded = crate::owner_state_persist::load_replay(&crate::device_dataset_file::test_cipher(), &paths.replay).unwrap();
         assert_eq!(tracker_loaded.get("peer-bob").unwrap().wall_ms, 5000);
 
         let (_pub_tx2, _pub_rx2) = mpsc::channel(16);
@@ -1938,6 +1961,7 @@ mod subscriber_tests {
             _pub_tx2,
             sub_rx2,
             paths.clone(),
+            crate::device_dataset_file::test_cipher(),
             5000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -2008,6 +2032,7 @@ mod publisher_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             50,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -2167,6 +2192,7 @@ mod integration_tests {
             a_pub_tx,
             a_sub_rx,
             paths("a", &dir),
+            crate::device_dataset_file::test_cipher(),
             50,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -2179,6 +2205,7 @@ mod integration_tests {
             b_pub_tx,
             b_sub_rx,
             paths("b", &dir),
+            crate::device_dataset_file::test_cipher(),
             50,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -4364,6 +4391,7 @@ mod cas_op_protocol_tests {
                 crdt: dir.path().join("crdt.cbor"),
                 replay: dir.path().join("replay.cbor"),
             },
+            crate::device_dataset_file::test_cipher(),
             50,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );

@@ -133,6 +133,23 @@ pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
     Ok(cipher)
 }
 
+/// Drop any memoized cipher for `identity_dir`. MUST be called after the
+/// node identity seed backing `<identity_dir>/identity.key` is overwritten
+/// (recovery restore): the memo is keyed by directory, not seed value, so a
+/// stale entry would keep sealing under the pre-restore key while the next
+/// boot derives the new one — leaving every sealed file unreadable. Wired
+/// into `identity::write_seed_to_disk_with_keychain` so any future seed
+/// writer inherits the invalidation.
+pub fn invalidate(identity_dir: &Path) {
+    let memo_key = identity_dir
+        .canonicalize()
+        .unwrap_or_else(|_| identity_dir.to_path_buf());
+    memo()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&memo_key);
+}
+
 /// Envelope-layer failure, classified so each family can map it onto its
 /// existing corrupt-vs-transient branch: `Io` is the read failing (the
 /// bytes may be fine — do not discard state over it), `Crypto` is the bytes

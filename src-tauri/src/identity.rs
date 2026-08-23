@@ -3292,9 +3292,18 @@ pub fn write_seed_to_disk_with_keychain(
     // Hold both the in-process and cross-process identity-write guards across
     // the whole probe-and-write. Shared with `rotate_passphrase` and the
     // first-boot generate path so all three mutually exclude (ZEB-179 / ZEB-735).
-    with_identity_write_guards(identity_path, move || {
+    let result = with_identity_write_guards(identity_path, move || {
         write_seed_probe_and_write(identity_path, seed, force, keychain)
-    })
+    });
+    // ZEB-982: a rewritten seed changes the device dataset cipher — drop any
+    // memoized cipher for this identity dir so later seals derive fresh. Runs
+    // OUTSIDE the guards (the memo must never nest inside the identity locks).
+    if result.is_ok() {
+        if let Some(dir) = identity_path.parent() {
+            crate::device_dataset_file::invalidate(dir);
+        }
+    }
+    result
 }
 
 /// The probe-and-write body of [`write_seed_to_disk_with_keychain`], run inside
