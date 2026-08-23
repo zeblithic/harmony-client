@@ -6,6 +6,8 @@
   import type { ResolvedCard } from '../member-card-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
   import { nonEmpty } from '../display-label';
+  import { resolveMentionLabel } from '../mention-render';
+  import PeerName from './PeerName.svelte';
   // ZEB-972: three-state presence (online / stale / offline) + shared dot copy.
   import { presenceDotLabel, type PresenceDisplay } from '../presence-service';
   import { timeFormatPrefs } from '../time-format-service';
@@ -68,13 +70,11 @@
   // cardVersion-backed closures, so reading them here (in the template + the
   // ordering $derived) re-renders this panel automatically as cards fill in —
   // without this ladder the always-visible Members panel only ever showed hex.
+  function memberName(m: CommunityMember) {
+    return resolveMentionLabel(m.address, resolveNickname, resolveCard, () => m.displayName);
+  }
   function memberLabel(m: CommunityMember): string {
-    return (
-      nonEmpty(resolveNickname?.(m.address)) ??
-      nonEmpty(resolveCard?.(m.address)?.displayName) ??
-      nonEmpty(m.displayName) ??
-      m.address.slice(0, 8)
-    );
+    return memberName(m).label;
   }
 
   // Filter to joined members only — left/kicked/invited members render
@@ -194,11 +194,11 @@
                 class:self={m.address === ownAddress}
                 onclick={(e) => handleOpenCard(m, e)}
               >
-                {memberLabel(m)}
+                <PeerName name={memberName(m)} />
               </button>
             {:else}
               <span class="name" class:self={m.address === ownAddress}>
-                {memberLabel(m)}
+                <PeerName name={memberName(m)} />
               </span>
             {/if}
             <span class="role" data-role={powerToRole(m.power)}>{powerToRole(m.power)}</span>

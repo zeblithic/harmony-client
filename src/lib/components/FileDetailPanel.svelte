@@ -28,6 +28,8 @@
     availableGrantFriends = [],
     onGrantRead,
     onRevokeRead,
+    resolveNickname,
+    resolveCard,
   }: {
     detail: ContentDetail;
     /** Vines referencing this CID (client-computed, real descriptors). */
@@ -51,6 +53,9 @@
     availableGrantFriends?: { address: string; displayName: string | null }[];
     onGrantRead?: (address: string) => Promise<void>;
     onRevokeRead?: (address: string) => Promise<void>;
+    /** ZEB-977: petname + live-card rungs, threaded through to ShareList. */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => import('../member-card-service').ResolvedCard | undefined;
   } = $props();
 
   // ZEB-669 S3: frontend proxy gate for backup eligibility — the backend
@@ -224,6 +229,8 @@
         isEncrypted={detail.encrypted}
         onGrant={onGrantRead}
         onRevoke={onRevokeRead}
+        {resolveNickname}
+        {resolveCard}
       />
     </section>
   {/if}

@@ -317,18 +317,18 @@ describe('FriendService', () => {
     });
   });
 
-  it('setNickname invokes set_friend_nickname with ownerIdHex + nickname (null clears)', async () => {
+  it('setNickname invokes set_contact_petname with ownerIdHex + petname (null clears)', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue(undefined);
     await service.setNickname('aabb', 'Koya');
-    expect(adapter.invoke).toHaveBeenCalledWith('set_friend_nickname', {
+    expect(adapter.invoke).toHaveBeenCalledWith('set_contact_petname', {
       ownerIdHex: 'aabb',
-      nickname: 'Koya',
+      petname: 'Koya',
     });
     await service.setNickname('ccdd', null);
-    expect(adapter.invoke).toHaveBeenLastCalledWith('set_friend_nickname', {
+    expect(adapter.invoke).toHaveBeenLastCalledWith('set_contact_petname', {
       ownerIdHex: 'ccdd',
-      nickname: null,
+      petname: null,
     });
   });
 

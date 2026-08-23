@@ -252,7 +252,7 @@ export class CallSession {
     this.spaceId = spaceId;
     this.patch({
       phase: 'incoming', callId, peerOwnerHex: callerOwnerHex,
-      peerDisplayName: resolveMemberName(this.deps.resolveNickname?.(callerOwnerHex), this.deps.resolveCard?.(callerOwnerHex)?.displayName) ?? null,
+      peerDisplayName: resolveMemberName(this.deps.resolveNickname?.(callerOwnerHex), this.deps.resolveCard?.(callerOwnerHex)?.displayName)?.label ?? null,
       muted: true, deafened: false, pttMode: false, pttHeld: false,
       startedAt: null, endReason: null,
     });
@@ -275,7 +275,7 @@ export class CallSession {
     const name = resolveMemberName(
       this.deps.resolveNickname?.(s.peerOwnerHex),
       this.deps.resolveCard?.(s.peerOwnerHex)?.displayName,
-    ) ?? null;
+    )?.label ?? null;
     if (name !== s.peerDisplayName) this.patch({ peerDisplayName: name });
   }
 

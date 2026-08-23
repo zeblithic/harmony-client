@@ -292,7 +292,7 @@ export class GroupCallSession {
         ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
         : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
       const card = this.deps.resolveCard?.(r.ownerHex);
-      const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName);
+      const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName)?.label;
       out.push({ ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking, state: 'in-call',
         ...(displayName ? { displayName } : {}),
         ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}) });
@@ -300,7 +300,7 @@ export class GroupCallSession {
     for (const ownerHex of members) {
       if (live.has(ownerHex) || ownerHex === this.deps.selfOwnerHex) continue;
       const card = this.deps.resolveCard?.(ownerHex);
-      const displayName = resolveMemberName(this.deps.resolveNickname?.(ownerHex), card?.displayName);
+      const displayName = resolveMemberName(this.deps.resolveNickname?.(ownerHex), card?.displayName)?.label;
       out.push({ ownerHex, deviceHex: '', muted: true, speaking: false,
         state: this.declinedOwners.has(ownerHex) ? 'declined' : 'ringing',
         ...(displayName ? { displayName } : {}),

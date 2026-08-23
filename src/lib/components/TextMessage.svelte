@@ -8,6 +8,7 @@
   import { dayClock } from '../day-clock';
   import { timeFormatPrefs } from '../time-format-service';
   import Avatar from './Avatar.svelte';
+  import PeerName from './PeerName.svelte';
 
   let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete, resolveNickname, resolveCard, seenAt }: {
     message: Message;
@@ -93,9 +94,10 @@
   // the only thing standing between a DM bubble and a raw hex prefix — and
   // because it reads the resolvers on every render, the label fills in live
   // the moment the peer's card arrives.
-  let authorLabel = $derived(resolveAuthorLabel(message.sender, resolveNickname, resolveCard));
+  let authorName = $derived(resolveAuthorLabel(message.sender, resolveNickname, resolveCard));
+  let authorLabel = $derived(authorName.label);
   let parentAuthorLabel = $derived(
-    parentMessage ? resolveAuthorLabel(parentMessage.sender, resolveNickname, resolveCard) : ''
+    parentMessage ? resolveAuthorLabel(parentMessage.sender, resolveNickname, resolveCard).label : ''
   );
 
   function isBlocked(attachment: import('../types').MediaAttachment): boolean {
@@ -118,7 +120,7 @@
   />
   <div class="message-content">
     <div class="message-header">
-      <span class="sender-name">{authorLabel}</span>
+      <span class="sender-name"><PeerName name={authorName} /></span>
       <time class="timestamp" datetime={new Date(message.timestamp).toISOString()} title={formatFullTimestamp(message.timestamp, $timeFormatPrefs)}>{timeStr}</time>
       {#if canDelete}
         <button

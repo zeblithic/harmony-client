@@ -24,7 +24,7 @@
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
-  const participantLabel = (p: Peer) => resolveAuthorLabel(p, resolveNickname, resolveCard);
+  const participantLabel = (p: Peer) => resolveAuthorLabel(p, resolveNickname, resolveCard).label;
 
   let el: HTMLButtonElement | undefined = $state();
 

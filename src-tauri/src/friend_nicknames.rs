@@ -1,11 +1,17 @@
 //! ZEB-419: local-only, per-owner friend nicknames.
 //!
+//! **LEGACY (ZEB-977):** superseded by the fleet-synced contacts dataset
+//! (`contacts_crdt.rs` / `contacts_commands.rs`). This module is read only by
+//! the one-time migration (`contacts_commands::migrate_friend_nicknames_to_
+//! contacts`), which imports `friend_nicknames.json` into `contacts.cbor` and
+//! renames the legacy file to `*.json.migrated`. No live write path remains.
+//!
 //! A purely-local label the user attaches to a friend for their own reference.
-//! NEVER published, broadcast, or synced in this phase — the privacy guarantee
-//! ("nobody sees the nickname you give a contact") is structural: these bytes
-//! live in their OWN file, outside `OwnerState.friend_graph` (the published
-//! CRDT). Entries carry a monotonic `updated_ms` LWW key so the ZEB-417
-//! fleet-sync substrate can later adopt the whole map as a replicated dataset.
+//! NEVER published or broadcast — the privacy guarantee ("nobody sees the
+//! nickname you give a contact") is structural: these bytes live in their OWN
+//! file, outside `OwnerState.friend_graph` (the published CRDT). Entries carry
+//! a monotonic `updated_ms` LWW key, which the migration turns into the
+//! imported entries' HLC wall clock.
 //!
 //! Persistence mirrors `connectivity_settings.rs`: `load_or_default` tolerates a
 //! missing/corrupt file (→ empty), `save` writes atomically (temp + rename).

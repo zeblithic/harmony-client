@@ -6,7 +6,8 @@
   import { timeFormatPrefs } from '../time-format-service';
   // ZEB-961: resolve sender/recipient owner_ids to their broadcast card names
   // when available, else the shared short-hex (first8…last4) — no local copy.
-  import { nonEmpty } from '../display-label';
+  import { resolveMentionLabel } from '../mention-render';
+  import PeerName from './PeerName.svelte';
   import { shortAddr } from '../short-addr';
   import type { ResolvedCard } from '../member-card-service';
 
@@ -15,6 +16,7 @@
     loading = false,
     error = null,
     resolveCard,
+    resolveNickname,
     onReply,
     onBack,
   }: {
@@ -22,9 +24,19 @@
     loading?: boolean;
     error?: string | null;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    // ZEB-977: petname rung — a spoof-prone first-contact surface must show
+    // YOUR name for a known sender, provenance-styled.
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
     onReply?: (messageCid: string, messageId: string) => void;
     onBack?: () => void;
   } = $props();
+
+  // ZEB-977: full ladder (petname ► card ► hex) for mail peers. shortAddr's
+  // longer hex form is preserved as the hex-rung label for this surface.
+  function mailPeerName(address: string) {
+    const resolved = resolveMentionLabel(address, resolveNickname, resolveCard);
+    return resolved.source === 'hex' ? { ...resolved, label: shortAddr(address) } : resolved;
+  }
 
   function formatDate(timestamp: number, prefs: TimeFormatPrefs): string {
     // Keep the single locale-native combined format (its date/time separator is
@@ -86,12 +98,12 @@
     <div class="reader-header">
       <h2 class="subject">{message.subject || '(no subject)'}</h2>
       <div class="meta">
-        <span class="from">From: <code>{nonEmpty(resolveCard?.(message.senderAddress)?.displayName) ?? shortAddr(message.senderAddress)}</code></span>
+        <span class="from">From: <code><PeerName name={mailPeerName(message.senderAddress)} /></code></span>
         <span class="date">{formatDate(message.timestamp, $timeFormatPrefs)}</span>
       </div>
       {#if message.recipients.length > 0}
         <div class="recipients">
-          To: {message.recipients.map(r => nonEmpty(resolveCard?.(r.address)?.displayName) ?? shortAddr(r.address)).join(', ')}
+          To: {#each message.recipients as r, i}{#if i > 0}{', '}{/if}<PeerName name={mailPeerName(r.address)} />{/each}
         </div>
       {/if}
     </div>

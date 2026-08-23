@@ -489,6 +489,24 @@ struct OwnerIdHexArgs {
     owner_id_hex: String,
 }
 
+/// ZEB-977: set/clear the local petname for any identity.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetContactPetnameArgs {
+    owner_id_hex: String,
+    #[serde(default)]
+    petname: Option<String>,
+}
+
+/// ZEB-977: set/clear the local private notes for any identity.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetContactNotesArgs {
+    owner_id_hex: String,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
 /// ZEB-236: accept/decline a staged DM invite, keyed by hex `SpaceId`.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1410,6 +1428,39 @@ pub fn build_registry() -> RpcRegistry {
         AddFriendByKeyArgs,
         |state, _sink, a| async move {
             crate::cancel_outbound_friend_request_impl(state, a.identity_pub_hex).await
+        }
+    );
+
+    // Contacts (ZEB-977): owner-private petname + notes for ANY identity.
+    rpc!(m, "contacts_list", EmptyArgs, |state, _sink, _a| {
+        async move { crate::contacts_commands::contacts_list_impl(state).await }
+    });
+    rpc!(
+        m,
+        "set_contact_petname",
+        SetContactPetnameArgs,
+        |state, sink, a| async move {
+            crate::contacts_commands::set_contact_petname_impl(
+                state,
+                sink.as_ref(),
+                a.owner_id_hex,
+                a.petname,
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "set_contact_notes",
+        SetContactNotesArgs,
+        |state, sink, a| async move {
+            crate::contacts_commands::set_contact_notes_impl(
+                state,
+                sink.as_ref(),
+                a.owner_id_hex,
+                a.notes,
+            )
+            .await
         }
     );
 
@@ -2477,6 +2528,51 @@ mod tests {
         }
     }
 
+    /// ZEB-977: dispatch proof for the three contacts verbs — registered,
+    /// camelCase arg shape accepted, and each write impl deterministically
+    /// fails at the "contacts dataset not loaded" seam on a default
+    /// NodeState (which is exactly the proof that registration + arg
+    /// parsing succeeded).
+    #[tokio::test]
+    async fn contacts_rpcs_are_registered_and_wired() {
+        let reg = build_registry();
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("contacts_list", serde_json::Value::Null),
+            (
+                "set_contact_petname",
+                serde_json::json!({
+                    "ownerIdHex": "ab".repeat(16),
+                    "petname": "Koya",
+                }),
+            ),
+            (
+                "set_contact_notes",
+                serde_json::json!({
+                    "ownerIdHex": "ab".repeat(16),
+                    "notes": "met at the garden",
+                }),
+            ),
+        ];
+        for (cmd, args) in cases {
+            let state = Arc::new(Mutex::new(NodeState::default()));
+            match reg.dispatch(cmd, state, test_sink(), args).await {
+                Err(RpcError::UnknownCommand) => panic!("{cmd} must be registered"),
+                Err(RpcError::BadArgs(msg)) => {
+                    panic!("{cmd}: arg struct rejected the wire shape: {msg}")
+                }
+                Err(RpcError::Command(msg)) => {
+                    assert!(
+                        msg.contains("contacts dataset not loaded"),
+                        "{cmd}: expected the dataset-not-loaded seam error, got: {msg}"
+                    );
+                }
+                Ok(v) => {
+                    panic!("{cmd}: expected dataset-not-loaded on default NodeState, got {v:?}")
+                }
+            }
+        }
+    }
+
     /// ZEB-714: dispatch proof for the five admin-recovery verbs — each
     /// must be registered and its camelCase arg struct must accept the
     /// wire shape. On a default NodeState every impl deterministically
@@ -3245,6 +3341,10 @@ mod tests {
             // ZEB-783: outbound mirror of the inbound inbox.
             "list_outbound_friend_requests",
             "cancel_outbound_friend_request",
+            // contacts (ZEB-977)
+            "contacts_list",
+            "set_contact_petname",
+            "set_contact_notes",
             // DM invites (ZEB-236)
             "list_pending_dm_invites",
             "accept_dm_invite",

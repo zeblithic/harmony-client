@@ -5,6 +5,8 @@
   import { presenceDotLabel, type PresenceDisplay } from '../presence-service';
   import Avatar from './Avatar.svelte';
   import { nonEmpty } from '../display-label';
+  import { resolveMentionLabel } from '../mention-render';
+  import PeerName from './PeerName.svelte';
   // ZEB-946: the joined-date label honors the owner's date-order preference.
   import { formatDateOnly } from '../time-format';
   import { timeFormatPrefs } from '../time-format-service';
@@ -159,17 +161,16 @@
     kebabActions(viewer.power, member.power, member.status, isSelf, viewer.isLastAdmin, thresholds)
   );
   let label = $derived(tierLabel(member.power, member.status));
-  // ZEB-432 label ladder (mirrors FriendsPanel): local friend nickname
-  // (ZEB-419) ► broadcast profile-card name (ZEB-341) ► backend-provided
-  // member.displayName ► truncated owner hex. Read through both resolvers inside
-  // $derived so the reactive nickname map / card Map upgrades re-render
-  // automatically — no one-time snapshot.
-  let displayName = $derived(
-    nonEmpty(resolveNickname?.(member.address)) ??
-      nonEmpty(resolveCard?.(member.address)?.displayName) ??
-      nonEmpty(member.displayName) ??
-      member.address.slice(0, 8)
+  // ZEB-432/ZEB-977 label ladder via the SHARED resolveMentionLabel: local
+  // petname ► broadcast profile-card name (ZEB-341) ► backend-provided
+  // member.displayName ► truncated owner hex — with provenance, so the row
+  // renders through <PeerName> (petname badge only on names YOU assigned).
+  // Read through both resolvers inside $derived so the reactive petname map /
+  // card Map upgrades re-render automatically — no one-time snapshot.
+  let resolvedName = $derived(
+    resolveMentionLabel(member.address, resolveNickname, resolveCard, () => member.displayName)
   );
+  let displayName = $derived(resolvedName.label);
   // ZEB-432 (PR #240 review): the owner-card popover is the identity drill-down,
   // so it shows the SIGNED profile-card name — never the local nickname. A
   // private label must not masquerade as the cryptographic identity (mirrors
@@ -273,10 +274,10 @@
   <div class="member-info">
     {#if onOpenCard}
       <button type="button" class="name name-btn" onclick={handleNameClick}>
-        {displayName}{isSelf ? ' (you)' : ''}
+        <PeerName name={resolvedName} />{isSelf ? ' (you)' : ''}
       </button>
     {:else}
-      <span class="name">{displayName}{isSelf ? ' (you)' : ''}</span>
+      <span class="name"><PeerName name={resolvedName} />{isSelf ? ' (you)' : ''}</span>
     {/if}
     <span class="addr">{member.address}</span>
   </div>

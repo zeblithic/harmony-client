@@ -1,7 +1,10 @@
 <script lang="ts">
   import type { FileGrant } from '../types';
   import Avatar from './Avatar.svelte';
-  import { nonEmpty } from '../display-label';
+  import PeerName from './PeerName.svelte';
+  import { nonEmpty, type ResolvedName } from '../display-label';
+  import { resolveMentionLabel } from '../mention-render';
+  import type { ResolvedCard } from '../member-card-service';
   import { shortAddr } from '../short-addr';
 
   let {
@@ -10,6 +13,8 @@
     isEncrypted,
     onGrant,
     onRevoke,
+    resolveNickname,
+    resolveCard,
   }: {
     /** The owner's grant list for the current file. `null` until
      *  `listGrants` resolves — the list self-hides rather than rendering a
@@ -26,7 +31,19 @@
     isEncrypted: boolean;
     onGrant: (address: string) => Promise<void>;
     onRevoke: (address: string) => Promise<void>;
+    /** ZEB-977: petname + live-card rungs for grantee rows (the baked
+     *  grant.displayName is a stale capture — roster class). */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
+
+  // ZEB-977: full ladder — petname ► live card ► baked hint ► shortAddr.
+  function peerName(address: string, bakedHint: string | null | undefined): ResolvedName {
+    const resolved = resolveMentionLabel(address, resolveNickname, resolveCard, () =>
+      bakedHint ?? undefined,
+    );
+    return resolved.source === 'hex' ? { ...resolved, label: shortAddr(address) } : resolved;
+  }
 
   // A grantee's card displayName has no non-blank publish constraint, so it can
   // be "" / "   ". Guard every name with nonEmpty() and fall back to the shared
@@ -119,16 +136,16 @@
           <li class="peer-row">
             <Avatar
               address={grant.granteeAddress}
-              displayName={nonEmpty(grant.displayName) ?? shortAddr(grant.granteeAddress)}
+              displayName={peerName(grant.granteeAddress, grant.displayName).label}
               size={28}
             />
-            <span class="peer-name">{nonEmpty(grant.displayName) ?? shortAddr(grant.granteeAddress)}</span>
+            <span class="peer-name"><PeerName name={peerName(grant.granteeAddress, grant.displayName)} /></span>
             <span class="peer-role">can view</span>
             <span class="peer-icon" aria-hidden="true">&#x1F513;</span>
             <button
               type="button"
               class="remove-btn"
-              aria-label="Revoke {nonEmpty(grant.displayName) ?? shortAddr(grant.granteeAddress)}"
+              aria-label="Revoke {peerName(grant.granteeAddress, grant.displayName).label}"
               disabled={revokePending === grant.granteeAddress}
               onclick={() => handleRevoke(grant.granteeAddress)}
             >
@@ -159,7 +176,7 @@
         >
           <option value="" disabled selected>Share with...</option>
           {#each pickableFriends as friend (friend.address)}
-            <option value={friend.address}>{nonEmpty(friend.displayName) ?? shortAddr(friend.address)}</option>
+            <option value={friend.address}>{peerName(friend.address, friend.displayName).label}</option>
           {/each}
         </select>
       </div>

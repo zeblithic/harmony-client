@@ -1,6 +1,9 @@
 <script lang="ts">
   import type { Profile } from '../types';
-  import { nonEmpty } from '../display-label';
+  import { nonEmpty, type ResolvedName } from '../display-label';
+  import { resolveMentionLabel } from '../mention-render';
+  import PeerName from './PeerName.svelte';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     profiles,
@@ -9,6 +12,8 @@
     initialKind = 'dm',
     onConvertToCommunity,
     friendSourced = true,
+    resolveNickname,
+    resolveCard,
   }: {
     profiles: Map<string, Profile>;
     onSubmit: (args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) => void;
@@ -30,7 +35,21 @@
      *  the matching empty-state guidance — "add a friend" is wrong advice
      *  when the list is presence-fed. */
     friendSourced?: boolean;
+    /** ZEB-977: petname + live-card rungs for the contact rows — this picker
+     *  is a first-contact-adjacent surface, so provenance styling matters. */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
+
+  // ZEB-977: full ladder for a picker row — petname ► live card ► the baked
+  // Profile.displayName (roster class; contactsFromFriends bakes nickname ►
+  // display ► short-hex) ► short address.
+  function contactName(addr: string, profile: Profile | undefined): ResolvedName {
+    const resolved = resolveMentionLabel(addr, resolveNickname, resolveCard, () =>
+      profile?.displayName,
+    );
+    return resolved.source === 'hex' ? { ...resolved, label: shortAddr(addr) } : resolved;
+  }
 
   const MAX_RECIPIENTS = 15;
 
@@ -40,10 +59,15 @@
   let filteredProfiles = $derived.by(() => {
     const q = searchQuery.toLowerCase();
     return Array.from(profiles.entries())
-      // Match the address too, not just the name: a contact with a blank card
-      // name is shown BY its (short) address, so that identifier must be
-      // typeable to find them.
-      .filter(([addr, p]) => (p.displayName ?? '').toLowerCase().includes(q) || addr.toLowerCase().includes(q))
+      // Match the RESOLVED label (petname ► card ► baked ► hex — what the row
+      // actually shows), the baked profile name, AND the address: whatever a
+      // user can see or knows must be typeable to find the contact.
+      .filter(
+        ([addr, p]) =>
+          contactName(addr, p).label.toLowerCase().includes(q) ||
+          (p.displayName ?? '').toLowerCase().includes(q) ||
+          addr.toLowerCase().includes(q),
+      )
       .filter(([addr, _p]) => !selected.includes(addr))
       .slice(0, 50);
   });
@@ -70,8 +94,7 @@
     if (!canSubmit) return;
     const truncate = (s: string, n: number) =>
       s.length > n ? s.slice(0, n - 1) + '…' : s;
-    const labelFor = (addr: string) =>
-      nonEmpty(profiles.get(addr)?.displayName) ?? shortAddr(addr);
+    const labelFor = (addr: string) => contactName(addr, profiles.get(addr)).label;
     const name =
       kind === 'dm'
         ? `DM with ${labelFor(selected[0])}`
@@ -104,9 +127,9 @@
           type="button"
           class="chip"
           onclick={() => toggleSelect(addr)}
-          aria-label={`Remove ${nonEmpty(profile?.displayName) ?? shortAddr(addr)}`}
+          aria-label={`Remove ${contactName(addr, profile).label}`}
         >
-          {nonEmpty(profile?.displayName) ?? shortAddr(addr)} ✕
+          <PeerName name={contactName(addr, profile)} /> ✕
         </button>
       {/each}
     </div>
@@ -115,7 +138,7 @@
   <div class="contact-list">
     {#each filteredProfiles as [addr, profile] (addr)}
       <button type="button" class="contact" onclick={() => toggleSelect(addr)}>
-        {nonEmpty(profile.displayName) ?? shortAddr(addr)}
+        <PeerName name={contactName(addr, profile)} />
       </button>
     {/each}
     {#if filteredProfiles.length === 0}

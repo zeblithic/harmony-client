@@ -219,7 +219,7 @@
       .filter((m) => m.status === 'joined')
       .map((m) => ({
         ownerId: m.address,
-        label: resolveMentionLabel(m.address, resolveNickname, resolveCard, resolveRosterName),
+        label: resolveMentionLabel(m.address, resolveNickname, resolveCard, resolveRosterName).label,
       })),
   );
 
@@ -515,7 +515,7 @@
     myAddress={ownAddress}
     resolveName={(addr) =>
       members.find((m) => m.address === addr)?.displayName ??
-      resolveMentionLabel(addr, resolveNickname, resolveCard)}
+      resolveMentionLabel(addr, resolveNickname, resolveCard).label}
     onOpenRecoverySettings={() => (settingsModalOpen = true)}
   />
 

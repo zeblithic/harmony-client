@@ -3746,3 +3746,127 @@ async fn s15_severed_joiner_learns_roster_from_snapshot() {
     run.mark_success();
     drop((a, b, c, a_home, b_home, c_home));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZEB-977: contacts (petname + private notes for ANY identity) over the real
+// node + RPC surface. Proves: (1) an arbitrary valid owner_id — NO friend
+// relationship — is annotatable (the ZEB-419 active-friend gate is gone);
+// (2) annotations survive a graceful restart (identity-dir contacts.cbor);
+// (3) clearing both fields removes the entry.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contacts_petname_survives_restart_and_clears() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let mut run = RunDir::new("contacts").expect("run dir");
+    let home = fresh_home("contacts");
+    let mut cfg = NodeConfig::new(PathBuf::from(home.path()), "alice");
+    cfg.log_dir = Some(run.log_dir());
+
+    let mut alice = NodeHandle::spawn(cfg.clone()).await.expect("spawn");
+    mint(&alice).await.expect("mint");
+
+    // An arbitrary identity alice has never met — decidedly not a friend.
+    let stranger = "abadcafeabadcafeabadcafeabadcafe";
+
+    // The contacts dataset is wired during the post-mint node start; poll the
+    // first write rather than racing it ("contacts dataset not loaded" is the
+    // not-yet-started seam, not a failure).
+    poll_until(Duration::from_secs(60), || async {
+        match alice
+            .rpc(
+                "set_contact_petname",
+                json!({ "ownerIdHex": stranger, "petname": "Garden Stranger" }),
+            )
+            .await
+        {
+            Ok(v) => {
+                // ContactView is camelCase on the wire.
+                let pet = v.get("petname").and_then(|p| p.as_str());
+                anyhow::ensure!(
+                    pet == Some("Garden Stranger"),
+                    "set_contact_petname returned a view without the petname: {v}"
+                );
+                Ok(Some(()))
+            }
+            Err(e) if e.to_string().contains("contacts dataset not loaded") => Ok(None),
+            Err(e) => Err(e),
+        }
+    })
+    .await
+    .expect("petname settable on a NON-friend once the dataset loads");
+
+    alice
+        .rpc(
+            "set_contact_notes",
+            json!({ "ownerIdHex": stranger, "notes": "met at the town hall" }),
+        )
+        .await
+        .expect("notes settable on a non-friend");
+
+    // Graceful shutdown → relaunch: the annotation must rehydrate from
+    // contacts.cbor in the identity dir.
+    alice.shutdown().await.expect("graceful shutdown");
+    drop(alice);
+    let alice = NodeHandle::spawn(cfg).await.expect("relaunch");
+
+    poll_until(Duration::from_secs(120), || async {
+        let rows = alice.rpc("contacts_list", json!({})).await?;
+        // A non-array response is a DTO/schema regression — fail loudly now,
+        // not after the polling timeout.
+        let contacts = rows
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("contacts_list returned a non-array response: {rows}"))?
+            .clone();
+        for c in contacts {
+            let hex = c.get("ownerIdHex").and_then(|v| v.as_str()).ok_or_else(|| {
+                anyhow::anyhow!("contact row missing `ownerIdHex` (DTO/schema mismatch?): {c}")
+            })?;
+            if hex == stranger {
+                anyhow::ensure!(
+                    c.get("petname").and_then(|v| v.as_str()) == Some("Garden Stranger"),
+                    "petname did not survive the restart: {c}"
+                );
+                anyhow::ensure!(
+                    c.get("notes").and_then(|v| v.as_str()) == Some("met at the town hall"),
+                    "notes did not survive the restart: {c}"
+                );
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .expect("contact annotation rehydrated after restart");
+
+    // Clearing BOTH fields removes the entry from the live list.
+    alice
+        .rpc(
+            "set_contact_petname",
+            json!({ "ownerIdHex": stranger, "petname": null }),
+        )
+        .await
+        .expect("clear petname");
+    alice
+        .rpc(
+            "set_contact_notes",
+            json!({ "ownerIdHex": stranger, "notes": null }),
+        )
+        .await
+        .expect("clear notes");
+    poll_until(Duration::from_secs(30), || async {
+        let rows = alice.rpc("contacts_list", json!({})).await?;
+        let present = rows
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("contacts_list returned a non-array response: {rows}"))?
+            .iter()
+            .any(|c| c.get("ownerIdHex").and_then(|v| v.as_str()) == Some(stranger));
+        Ok((!present).then_some(()))
+    })
+    .await
+    .expect("clearing both fields removes the contact entry");
+
+    run.mark_success();
+    drop((alice, home));
+}

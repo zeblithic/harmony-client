@@ -36,8 +36,8 @@
   }
 
   function describeEvent(ev: ModerationEvent): string {
-    const actor = resolveMentionLabel(ev.actorAddr, resolveNickname, resolveCard);
-    const target = resolveMentionLabel(ev.targetAddr, resolveNickname, resolveCard);
+    const actor = resolveMentionLabel(ev.actorAddr, resolveNickname, resolveCard).label;
+    const target = resolveMentionLabel(ev.targetAddr, resolveNickname, resolveCard).label;
     if (ev.kind === 'kick') {
       const suffix = ev.reason ? ` ("${ev.reason}")` : '';
       return `${actor} kicked ${target}${suffix}`;

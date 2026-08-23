@@ -428,3 +428,123 @@ describe('ProfilePopover blank-name guard (ZEB-962)', () => {
     expect(screen.getByText('Name unavailable')).toBeTruthy();
   });
 });
+
+
+// ── ZEB-977: petname + private-notes editor (owner-card mode) ────────────
+describe('ProfilePopover contact editor (ZEB-977)', () => {
+  afterEach(cleanup);
+
+  const CARD_OWNER = 'ab'.repeat(16);
+  const ownerCard = {
+    ownerIdHex: CARD_OWNER,
+    displayName: 'CardName',
+    statusText: '',
+  };
+
+  function makeContactsService(entry?: { petname?: string; notes?: string }) {
+    return {
+      list: vi.fn(async () =>
+        entry
+          ? [{ ownerIdHex: CARD_OWNER, ...entry, firstSeenMs: 1, updatedMs: 2 }]
+          : [],
+      ),
+      setPetname: vi.fn(async () => null),
+      setNotes: vi.fn(async () => null),
+    } as any;
+  }
+
+  it('renders the editor for another identity and saves petname + notes', async () => {
+    const contactsService = makeContactsService();
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: ownerCard,
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+        contactsService,
+        selfOwnerIdHex: '00'.repeat(16),
+      } as any,
+    });
+    const editor = await screen.findByTestId('contact-editor');
+    expect(editor).toBeTruthy();
+    const petInput = screen.getByLabelText('Your petname for this person');
+    const notesInput = screen.getByLabelText('Your private notes about this person');
+    await waitFor(() => expect(petInput).not.toBeDisabled());
+    await fireEvent.input(petInput, { target: { value: 'Koya' } });
+    await fireEvent.input(notesInput, { target: { value: 'garden club' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => {
+      expect(contactsService.setPetname).toHaveBeenCalledWith(CARD_OWNER, 'Koya');
+      expect(contactsService.setNotes).toHaveBeenCalledWith(CARD_OWNER, 'garden club');
+    });
+  });
+
+  it('preloads existing drafts and clears with null on blank save', async () => {
+    const contactsService = makeContactsService({ petname: 'Old', notes: 'old notes' });
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: ownerCard,
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+        contactsService,
+        selfOwnerIdHex: '00'.repeat(16),
+      } as any,
+    });
+    const petInput = (await screen.findByLabelText(
+      'Your petname for this person',
+    )) as HTMLInputElement;
+    await waitFor(() => expect(petInput.value).toBe('Old'));
+    await fireEvent.input(petInput, { target: { value: '   ' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => {
+      expect(contactsService.setPetname).toHaveBeenCalledWith(CARD_OWNER, null);
+    });
+  });
+
+  it('hides the editor on the SELF card and when no service is wired', async () => {
+    const { unmount } = render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: ownerCard,
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+        contactsService: makeContactsService(),
+        selfOwnerIdHex: CARD_OWNER, // the card IS us
+      } as any,
+    });
+    expect(screen.queryByTestId('contact-editor')).toBeNull();
+    unmount();
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: ownerCard,
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      } as any,
+    });
+    expect(screen.queryByTestId('contact-editor')).toBeNull();
+  });
+
+  it('keeps the signed identity section untouched: card name + full hex still shown', async () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: ownerCard,
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+        contactsService: makeContactsService({ petname: 'Koya' }),
+        selfOwnerIdHex: '00'.repeat(16),
+      } as any,
+    });
+    // The drill-down convention (ZEB-419/PR #240): identity section shows the
+    // SIGNED card name and full hex — never the petname.
+    expect(screen.getByText('CardName')).toBeTruthy();
+    expect(screen.getByText(CARD_OWNER)).toBeTruthy();
+  });
+});

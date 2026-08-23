@@ -1277,6 +1277,11 @@ pub async fn run(
     // `harmony/owner/{addr_hex}/ds/community-device-intro-v1`. `None` when no
     // owner identity is loaded (and in test callers that bypass `start_node`).
     mut community_device_intro_sync_handles: Option<DatasetSyncHandles>,
+    // ZEB-977: the contacts dataset channel pair (contacts-v1 — per-identity
+    // petname + private notes), bridged to Zenoh on
+    // `harmony/owner/{addr_hex}/ds/contacts-v1`. `None` when no owner
+    // identity is loaded (and in test callers that bypass `start_node`).
+    mut contacts_sync_handles: Option<DatasetSyncHandles>,
     // ZEB-321 Phase 1 Task 8: bundle of iroh-transport resources built in
     // `start_node`. When `Some`, the event loop spawns the link-manager
     // accept loop + publisher driver as background tasks; when `None`
@@ -2742,6 +2747,23 @@ pub async fn run(
             "community-device-intro-v1",
             "community-device-intro-sync-degraded",
             crate::community_device_intro_ingest::COMMUNITY_DEVICE_INTRO_DATASET_MAX_BYTES,
+        )
+        .await;
+    }
+
+    // ── ZEB-977: contacts fleet-sync Zenoh adapter ───────────────────────
+    // Same plumbing as the datasets above. Replicates the owner-private
+    // contacts annotations (petname + notes per identity) across the owner's
+    // own fleet — never beyond it. `None` when no owner identity is loaded.
+    if let Some(handles) = contacts_sync_handles.take() {
+        spawn_dataset_sync_zenoh_adapter(
+            &session,
+            &app,
+            &closing,
+            handles,
+            crate::contacts_commands::CONTACTS_DATASET,
+            "contacts-sync-degraded",
+            crate::contacts_commands::CONTACTS_DATASET_MAX_BYTES,
         )
         .await;
     }

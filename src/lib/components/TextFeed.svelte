@@ -192,7 +192,7 @@
         // ZEB-839: same render-time ladder as the bubbles — a baked
         // `sender.displayName` is absent on DM authors.
         map.set(id, {
-          sender: resolveAuthorLabel(rootMsg.sender, resolveNickname, resolveCard),
+          sender: resolveAuthorLabel(rootMsg.sender, resolveNickname, resolveCard).label,
           text: rootMsg.text,
         });
       }

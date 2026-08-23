@@ -53,6 +53,8 @@
   let {
     service,
     adapter = null,
+    resolveNickname,
+    resolveCard,
     currentFolderCid = null,
     selectedCid = null,
     selectedSidecarId = null,
@@ -78,6 +80,9 @@
     onDownloadReceived,
     sharedUnreadCount = 0,
   }: {
+    /** ZEB-977: threaded to SharedWithMeList for granter names. */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => import('../member-card-service').ResolvedCard | undefined;
     service: FileManagerService;
     adapter?: TauriAdapter | null;
     currentFolderCid?: string | null;
@@ -1129,7 +1134,7 @@
   {:else if section === 'published'}
     <PublishedView items={publishedItems} />
   {:else}
-    <SharedWithMeList files={receivedFiles} onDownload={onDownloadReceived} />
+    <SharedWithMeList files={receivedFiles} onDownload={onDownloadReceived} {resolveNickname} {resolveCard} />
   {/if}
 </div>
 

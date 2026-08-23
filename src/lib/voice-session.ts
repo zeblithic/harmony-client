@@ -689,7 +689,7 @@ export class VoiceSession {
           ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
           : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
         const card = this.deps.resolveCard?.(r.ownerHex);
-        const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName);
+        const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName)?.label;
         return {
           ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking,
           modMuted: this.modMutedOwners.has(r.ownerHex),

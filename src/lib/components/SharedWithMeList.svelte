@@ -1,10 +1,15 @@
 <script lang="ts">
   import type { ReceivedFile } from '../types';
   import { formatBytes, relativeTime } from '../file-utils';
+  import { resolveMentionLabel } from '../mention-render';
+  import PeerName from './PeerName.svelte';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     files,
     onDownload,
+    resolveNickname,
+    resolveCard,
   }: {
     /** Files shared with this user by other owners. `null` until
      *  `list_received_grants` resolves — render a neutral placeholder, NOT
@@ -13,7 +18,17 @@
      *  never `[]`. */
     files: ReceivedFile[] | null;
     onDownload: (file: ReceivedFile) => void;
+    /** ZEB-977: petname + live-card rungs for the granter name; the baked
+     *  `granterDisplay` (a grant-time capture) is the roster-class fallback. */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
+
+  function granterName(file: ReceivedFile) {
+    return resolveMentionLabel(file.granterAddress, resolveNickname, resolveCard, () =>
+      file.granterDisplay,
+    );
+  }
 </script>
 
 <section class="shared-with-me" aria-label="Shared with me">
@@ -27,7 +42,7 @@
         <li class="swm-row">
           <div class="swm-meta">
             <span class="swm-name">{file.fileName}</span>
-            <span class="swm-sub">Shared by {file.granterDisplay} · {formatBytes(file.fileSize)} · {relativeTime(file.receivedAt)}</span>
+            <span class="swm-sub">Shared by <PeerName name={granterName(file)} /> · {formatBytes(file.fileSize)} · {relativeTime(file.receivedAt)}</span>
           </div>
           <button type="button" class="swm-download" onclick={() => onDownload(file)}>
             Download
