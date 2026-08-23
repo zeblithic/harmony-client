@@ -4885,6 +4885,25 @@ pub async fn start_node_inner(
         > = None;
         let mut notes_device_id_opt: Option<String> = None;
         let mut notes_sync_handles_opt: Option<crate::event_loop::NotesSyncHandles> = None;
+        // ZEB-977: contacts fleet-sync engine + its NodeState handles. Built
+        // alongside the notes engine when an owner identity loads; lifted to
+        // outer scope so the NodeState assignment and the event_loop::run
+        // call site can reach them. Mirrors the notes opts above.
+        let mut contacts_doc_opt: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::contacts_crdt::ContactsDoc>>,
+        > = None;
+        let mut contacts_tracker_opt: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut contacts_sync_engine_opt: Option<
+            std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::contacts_crdt::ContactsDoc>>,
+        > = None;
+        let mut contacts_device_id_opt: Option<String> = None;
+        let mut contacts_sync_handles_opt: Option<crate::event_loop::DatasetSyncHandles> = None;
         // ZEB-418 SP2 P1: dm-inbox fleet-sync engine + its NodeState handles.
         // Built alongside the notes engine when an owner identity loads;
         // lifted to outer scope so the NodeState assignment (dm_inbox_doc/
@@ -6367,6 +6386,94 @@ pub async fn start_node_inner(
                         });
 
                         tracing::info!("BOOT-PROBE 04: notes engine constructed");
+                        // ── ZEB-977: Contacts fleet-sync engine ─────────────────
+                        //
+                        // Owner-private per-identity annotations (petname +
+                        // notes). Mirrors the notes wiring above site-for-site:
+                        // channel pair bridged to Zenoh by event_loop on the
+                        // `harmony/owner/{addr_hex}/ds/contacts-v1` topic, same
+                        // kt / device_id / content_store / adopt_floor.
+                        let contacts_path =
+                            identity_dir.join(crate::contacts_persist::CONTACTS_FILENAME);
+                        let contacts_replay_path =
+                            identity_dir.join(crate::contacts_persist::CONTACTS_REPLAY_FILENAME);
+                        // One-time migration from the ZEB-419 friend-nickname
+                        // store (beside connectivity-settings.json in app-data):
+                        // runs only while contacts.cbor does not exist yet, then
+                        // renames the legacy file so it can never re-import.
+                        crate::contacts_commands::migrate_friend_nicknames_to_contacts(
+                            &contacts_path,
+                            &app_data_dir.join("friend_nicknames.json"),
+                            &device_id,
+                        );
+                        let contacts_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::contacts_persist::load_doc_or_recover(&contacts_path)
+                                .map_err(|e| format!("load contacts doc: {e}"))?,
+                        ));
+                        let contacts_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::contacts_persist::load_replay_or_recover(
+                                    &contacts_replay_path,
+                                )
+                                .map_err(|e| format!("load contacts replay: {e}"))?,
+                            ),
+                        ));
+                        let (contacts_out_tx, contacts_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (contacts_in_tx, contacts_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let contacts_merger: crate::fleet_sync::Merger<
+                            crate::contacts_crdt::ContactsDoc,
+                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        let contacts_app = app.clone();
+                        let contacts_sync =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&contacts_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: contacts_merger,
+                                    replay_tracker: std::sync::Arc::clone(&contacts_tracker),
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: contacts_out_tx,
+                                    subscriber_rx: contacts_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::contacts_persist::ContactsPersist {
+                                            doc_path: contacts_path,
+                                            replay_path: contacts_replay_path,
+                                        },
+                                    ),
+                                    lookup_key_tag:
+                                        crate::contacts_commands::CONTACTS_DATASET.as_bytes(),
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: Some(std::sync::Arc::new(move || {
+                                        contacts_app
+                                            .emit("contacts-changed", serde_json::Value::Null);
+                                        // FriendsPanel joins petnames into its
+                                        // rows; a remote merge changes them too.
+                                        contacts_app
+                                            .emit("friend-list-changed", serde_json::Value::Null);
+                                    })),
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
+                            ));
+                        contacts_doc_opt = Some(std::sync::Arc::clone(&contacts_doc));
+                        contacts_tracker_opt = Some(std::sync::Arc::clone(&contacts_tracker));
+                        contacts_sync_engine_opt = Some(std::sync::Arc::clone(&contacts_sync));
+                        contacts_device_id_opt = Some(device_id.clone());
+                        contacts_sync_handles_opt =
+                            Some(crate::event_loop::DatasetSyncHandles {
+                                addr_hex: owner_addr_hex.clone(),
+                                outbound_rx: contacts_out_rx,
+                                inbound_tx: contacts_in_tx,
+                            });
+
+                        tracing::info!("BOOT-PROBE 04b: contacts engine constructed");
                         // ── ZEB-418 SP2 P1: dm-inbox fleet-sync engine + ingestion ─
                         //
                         // Butler dm-inbox dataset (spec §5): deposited-but-not-
@@ -13647,6 +13754,9 @@ pub async fn start_node_inner(
                 // ZEB-417 SP1: thread the Notes adapter handles into
                 // event_loop::run (mirrors mint).
                 let notes_sync_handles_for_loop = notes_sync_handles_opt;
+                // ZEB-977: thread the contacts adapter handles into
+                // event_loop::run (mirrors notes).
+                let contacts_sync_handles_for_loop = contacts_sync_handles_opt;
                 // ZEB-418 SP2 P1: thread the dm-inbox adapter handles into
                 // event_loop::run (mirrors notes).
                 let dm_inbox_sync_handles_for_loop = dm_inbox_sync_handles_opt;
@@ -13736,6 +13846,9 @@ pub async fn start_node_inner(
                         v.push(e);
                     }
                     if let Some(e) = notes_sync_engine_opt.clone() {
+                        v.push(e);
+                    }
+                    if let Some(e) = contacts_sync_engine_opt.clone() {
                         v.push(e);
                     }
                     // ZEB-702: relay-hold/relay-optin are owner-scoped datasets
@@ -13849,6 +13962,7 @@ pub async fn start_node_inner(
                                 quorum_sync_handles_for_loop,
                                 fleet_keys_sync_handles_for_loop,
                                 community_device_intro_sync_handles_for_loop,
+                                contacts_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                                 dial_telemetry_into_loop,
                                 serve_allowlist_for_loop,
@@ -14166,6 +14280,13 @@ pub async fn start_node_inner(
                         guard.notes_tracker = notes_tracker_opt.clone();
                         guard.notes_sync = notes_sync_engine_opt.clone();
                         guard.notes_device_id = notes_device_id_opt.clone();
+                        // ZEB-977: store the contacts dataset handles so the
+                        // contacts_* IPC commands can read/mutate the doc +
+                        // tracker and call notify_dirty() after a write.
+                        guard.contacts_doc = contacts_doc_opt.clone();
+                        guard.contacts_tracker = contacts_tracker_opt.clone();
+                        guard.contacts_sync = contacts_sync_engine_opt.clone();
+                        guard.contacts_device_id = contacts_device_id_opt.clone();
                         // ZEB-418 SP2 P1: store the dm-inbox dataset handles
                         // (no IPC surface in P1 — stop_inner and the deposit/
                         // ingest paths constructed above are the consumers).
@@ -14716,6 +14837,10 @@ pub async fn start_node_inner(
                                 if let Some(e) = guard.notes_sync.as_ref() {
                                     fleet_sync_registry.register(FleetDoc::Notes, e.sync_stats());
                                 }
+                                if let Some(e) = guard.contacts_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::Contacts, e.sync_stats());
+                                }
                                 if let Some(e) = guard.dm_inbox_sync.as_ref() {
                                     fleet_sync_registry.register(FleetDoc::DmInbox, e.sync_stats());
                                 }
@@ -14918,6 +15043,9 @@ pub async fn start_node_inner(
             // success path above already stashed a `.clone()` into NodeState,
             // so moving the original out here is safe (mirrors mint).
             notes_sync_engine_opt,
+            // ZEB-977: same carry-out for the Contacts FleetSyncEngine
+            // (mirrors notes).
+            contacts_sync_engine_opt,
             // ZEB-418 SP2 P1: same carry-out for the dm-inbox FleetSyncEngine
             // (mirrors notes; its shutdown on the cleanup path also stops the
             // ingest sweeper by dropping the engine task's nudge sender).
@@ -14981,6 +15109,7 @@ pub async fn start_node_inner(
         dfrost_log_registry_for_cleanup,
         mint_engine_for_cleanup,
         notes_engine_for_cleanup,
+        contacts_engine_for_cleanup,
         dm_inbox_engine_for_cleanup,
         community_device_intro_engine_for_cleanup,
         dm_outhold_engine_for_cleanup,
@@ -15093,6 +15222,15 @@ pub async fn start_node_inner(
                 tracing::error!(
                     error = %e,
                     "Notes FleetSyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // ZEB-977: same rationale for the Contacts FleetSyncEngine.
+        if let Some(contacts_engine) = contacts_engine_for_cleanup {
+            if let Err(e) = contacts_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "Contacts FleetSyncEngine cleanup after start_node failure"
                 );
             }
         }
@@ -68059,20 +68197,20 @@ pub fn list_friends_inner(state: &crate::owner_state_crdt::OwnerState) -> Vec<Fr
         .collect()
 }
 
-/// ZEB-419: overlay local nicknames onto a projected friend list. Pure so it's
+/// ZEB-977 (supersedes ZEB-419's `apply_nicknames`): overlay local petnames
+/// from the contacts dataset onto a projected friend list. Pure so it's
 /// unit-testable without a NodeState harness; the `list_friends` IPC calls it
-/// after `list_friends_inner`. Nicknames are an ACTIVE-friend-only feature, so a
-/// stored nickname is overlaid only onto `Active` rows — a non-active row (e.g. a
-/// friend that reverted to `Pending`) never surfaces a nickname even if one is
-/// stored. A friend with no nickname entry is unchanged.
-pub fn apply_nicknames(
+/// after `list_friends_inner`. Petnames apply to EVERY row (the old
+/// active-friend-only gate is gone — any identity can be annotated now); a
+/// friend with no contact entry is unchanged.
+pub fn apply_petnames(
     mut friends: Vec<FriendDto>,
-    nicknames: &crate::friend_nicknames::FriendNicknames,
+    contacts: &crate::contacts_crdt::ContactsDoc,
 ) -> Vec<FriendDto> {
     for f in &mut friends {
-        if f.status == crate::friend_graph::FriendStatus::Active {
-            f.nickname = nicknames.get(&f.owner_id_hex).map(str::to_owned);
-        }
+        f.nickname = contacts
+            .get(&f.owner_id_hex)
+            .and_then(|c| c.petname.clone());
     }
     friends
 }
@@ -68530,7 +68668,7 @@ async fn list_friends(state: tauri::State<'_, Mutex<NodeState>>) -> Result<Vec<F
 pub(crate) async fn list_friends_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<Vec<FriendDto>, String> {
-    let (crdt_state, connectivity_settings_path) = {
+    let (crdt_state, contacts_doc) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -68538,22 +68676,23 @@ pub(crate) async fn list_friends_impl(
             g.crdt_state
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.connectivity_settings_path.clone(),
+            g.contacts_doc.clone(),
         )
     };
     let dtos = {
         let s = crdt_state.lock().await;
         list_friends_inner(&s)
     };
-    // ZEB-419: join purely-local nicknames from their own file (outside the
-    // published CRDT). A missing/unset path → no nicknames.
-    let nicknames = match &connectivity_settings_path {
-        Some(p) => crate::friend_nicknames::FriendNicknames::load_or_default(
-            &p.with_file_name("friend_nicknames.json"),
-        ),
-        None => crate::friend_nicknames::FriendNicknames::default(),
+    // ZEB-977: join purely-local petnames from the contacts dataset (outside
+    // the published CRDT — successor of the ZEB-419 nickname file). Dataset
+    // not loaded yet → no petnames.
+    let dtos = match contacts_doc {
+        Some(doc) => {
+            let d = doc.lock().await;
+            apply_petnames(dtos, &d)
+        }
+        None => dtos,
     };
-    let dtos = apply_nicknames(dtos, &nicknames);
     Ok(dtos)
 }
 
@@ -70692,107 +70831,11 @@ async fn get_peer_intro_policy(
     get_peer_intro_policy_impl(path).await
 }
 
-/// ZEB-419: serializes the nickname-file read-modify-write so two concurrent
-/// `set_friend_nickname` calls can't lose an update (load A, load B, save A, save
-/// B → A's change is lost). Reads in `list_friends` don't need it —
-/// `save_atomically` renames atomically, so a reader always sees a complete
-/// old-or-new file.
-static NICKNAME_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
-
 /// Serializes the emoji-names file read-modify-write so two concurrent
-/// `set_emoji_name` calls can't lose an update (parity with `NICKNAME_WRITE_LOCK`).
+/// `set_emoji_name` calls can't lose an update (the pattern the retired
+/// ZEB-419 nickname lock also used).
 static EMOJI_NAMES_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
-
-/// Max nickname length, in chars. Generous for a personal label; bounds local
-/// storage and rejects pathological input.
-const MAX_NICKNAME_LEN: usize = 64;
-
-/// ZEB-419: set or clear the local-only nickname for a friend (by owner_id hex).
-/// `nickname = None`/blank clears it. Persists to `friend_nicknames.json` beside
-/// the connectivity settings, then emits `friend-list-changed` so the panel
-/// re-fetches with the new label. Local-only: never published or synced.
-#[tauri::command]
-async fn set_friend_nickname(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Mutex<NodeState>>,
-    owner_id_hex: String,
-    nickname: Option<String>,
-) -> Result<(), String> {
-    // Validate the owner_id (reject malformed before any write). decode_owner_id_16
-    // is the 16-byte master owner_id decoder used by the other friend IPCs.
-    let addr = decode_owner_id_16(&owner_id_hex)?;
-
-    // Normalize: trim, treat blank as "clear". Cap the length of a real nickname
-    // before any state work (bounds storage + rejects abuse).
-    let trimmed = nickname.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    if let Some(nick) = trimmed {
-        if nick.chars().count() > MAX_NICKNAME_LEN {
-            return Err(format!(
-                "nickname too long (max {MAX_NICKNAME_LEN} characters)"
-            ));
-        }
-    }
-    let is_setting = trimmed.is_some();
-
-    let not_loaded_msg;
-    let (crdt_state, path) = {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        // ZEB-801: classify from the SAME locked snapshot as the handle read.
-        not_loaded_msg = g.owner_not_loaded_msg();
-        (g.crdt_state.clone(), g.connectivity_settings_path.clone())
-    };
-    // ZEB-801 (CodeRabbit): keep the owner-state and settings-path failures
-    // distinct — a missing connectivity_settings_path is a config/startup
-    // dependency, not an owner-identity problem, so it must not surface as the
-    // owner-not-loaded message.
-    let Some(crdt_state) = crdt_state else {
-        return Err(not_loaded_msg.into());
-    };
-    let Some(path) = path else {
-        return Err("connectivity_settings_path missing".into());
-    };
-
-    // Scope: nicknames are an ACTIVE-friend-only feature (the UI only offers the
-    // editor on active rows). Enforce it server-side too so a direct IPC call
-    // can't persist a nickname for a pending/unknown owner. Clearing is always
-    // allowed so a stale nickname can be removed regardless of status.
-    if is_setting {
-        let s = crdt_state.lock().await;
-        let is_active = matches!(
-            s.friend_graph.friends.get(&addr),
-            Some(e) if e.status == crate::friend_graph::FriendStatus::Active
-        );
-        if !is_active {
-            return Err("nickname can only be set for an active friend".into());
-        }
-    }
-
-    let nick_path = path.with_file_name("friend_nicknames.json");
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    // Serialize the read-modify-write so concurrent calls can't lose an update.
-    {
-        let _guard = NICKNAME_WRITE_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
-        let mut store = crate::friend_nicknames::FriendNicknames::load_or_default(&nick_path);
-        store.set(&owner_id_hex, nickname.as_deref(), now_ms);
-        store
-            .save(&nick_path)
-            .map_err(|e| format!("save friend_nicknames: {e}"))?;
-    }
-
-    let _ = app.emit("friend-list-changed", ());
-    Ok(())
-}
 
 /// Outcome of a Path-A `add_friend_by_key` initiate.
 ///
@@ -72383,7 +72426,7 @@ mod friend_ipc_tests {
     }
 
     #[test]
-    fn apply_nicknames_overlays_active_friends_only() {
+    fn apply_petnames_overlays_all_rows() {
         let friends = vec![
             FriendDto {
                 owner_id_hex: "aa".into(),
@@ -72410,16 +72453,25 @@ mod friend_ipc_tests {
                 referrable: false,
             },
         ];
-        let mut nicks = crate::friend_nicknames::FriendNicknames::default();
-        nicks.set("AA", Some("Koya"), 1); // casing differs from owner_id_hex
-        nicks.set("cc", Some("ShouldNotShow"), 1); // stored against a PENDING friend
-        let out = apply_nicknames(friends, &nicks);
-        assert_eq!(out[0].nickname.as_deref(), Some("Koya")); // active → overlaid
-        assert_eq!(out[1].nickname, None); // active, no stored nickname
+        let mut contacts = crate::contacts_crdt::ContactsDoc::default();
+        let at = |w| Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        // Casing differs from owner_id_hex — the store lowercases.
+        contacts.apply_annotation("AA", Some(Some("Koya".into())), None, at(1), 1);
+        // ZEB-977: petnames are NOT active-only — a pending friend's petname
+        // surfaces too (any identity can be annotated now).
+        contacts.apply_annotation("cc", Some(Some("PendingPal".into())), None, at(2), 2);
+        let out = apply_petnames(friends, &contacts);
+        assert_eq!(out[0].nickname.as_deref(), Some("Koya"));
+        assert_eq!(out[1].nickname, None); // no contact entry
         assert_eq!(out[1].display.as_deref(), Some("Hint")); // display hint untouched
         assert_eq!(
-            out[2].nickname, None,
-            "a pending friend never surfaces a nickname (active-only scope)"
+            out[2].nickname.as_deref(),
+            Some("PendingPal"),
+            "petnames overlay every row, not only Active"
         );
     }
 
@@ -72456,6 +72508,15 @@ mod friend_ipc_tests {
             !bytes.windows("nickname".len()).any(|w| w == b"nickname"),
             "published owner-state must not contain a serializable `nickname` field",
         );
+        // ZEB-977: same invariant for the contacts store's fields — petnames
+        // and private notes live in the contacts dataset (own files + own
+        // fleet topic), never inside published owner-state.
+        for key in ["petname", "first_seen_ms"] {
+            assert!(
+                !bytes.windows(key.len()).any(|w| w == key.as_bytes()),
+                "published owner-state must not contain a serializable `{key}` field",
+            );
+        }
     }
 
     #[tokio::test]
@@ -75883,7 +75944,6 @@ pub fn run() {
             // ZEB-376 Phase 2b Task 5: per-user introduction policy IPCs.
             set_peer_intro_policy,
             get_peer_intro_policy,
-            set_friend_nickname,
             // ZEB-329: Network Health IPCs.
             network_health_snapshot,
             network_health_run_self_test,
@@ -75904,6 +75964,10 @@ pub fn run() {
             notes_commands::notes_list,
             notes_commands::notes_upsert,
             notes_commands::notes_delete,
+            // ZEB-977: owner-private Contacts IPCs (petname + notes, any identity).
+            contacts_commands::contacts_list,
+            contacts_commands::set_contact_petname,
+            contacts_commands::set_contact_notes,
             // ZEB-418 P2 D17: pin-a-butler IPC.
             set_butler_pin,
             // ZEB-668 S4: fleet-synced device petname IPC.

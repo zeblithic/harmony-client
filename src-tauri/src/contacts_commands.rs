@@ -27,6 +27,16 @@ pub const MAX_NOTES_LEN: usize = 4096;
 
 const CONTACTS_NOT_LOADED_MSG: &str = "contacts dataset not loaded";
 
+/// Fleet-sync dataset name — forms the Zenoh topic
+/// `harmony/owner/{addr_hex}/ds/contacts-v1` and doubles as the engine's
+/// lookup key tag.
+pub const CONTACTS_DATASET: &str = "contacts-v1";
+
+/// Inbound Zenoh sample size gate for the contacts dataset (root-publish
+/// frames are pointer-sized; 256 KiB matches the sibling small owner
+/// datasets — owner-trust, quorum, fleet-keys).
+pub const CONTACTS_DATASET_MAX_BYTES: usize = 256 * 1024;
+
 /// Flattened, frontend-facing view of a live contact entry.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +223,56 @@ pub(crate) async fn set_contact_notes_impl(
 ) -> Result<Option<ContactView>, String> {
     let notes = validate_field(notes, MAX_NOTES_LEN, "notes")?;
     set_contact_field_shared(state, sink, owner_id_hex, None, Some(notes)).await
+}
+
+// ---- One-time ZEB-419 migration ----
+
+/// Import the legacy `friend_nicknames.json` (ZEB-419) into a fresh
+/// `contacts.cbor`, then rename the legacy file to `*.json.migrated` so it
+/// can never re-import. Runs only while `contacts.cbor` does not exist yet.
+/// Failures are logged, never fatal: a failed import leaves the legacy file
+/// in place for the next boot to retry.
+pub(crate) fn migrate_friend_nicknames_to_contacts(
+    contacts_path: &std::path::Path,
+    legacy_nicknames_path: &std::path::Path,
+    device_id: &str,
+) {
+    if contacts_path.exists() || !legacy_nicknames_path.exists() {
+        return;
+    }
+    let legacy =
+        crate::friend_nicknames::FriendNicknames::load_or_default(legacy_nicknames_path);
+    let mut doc = ContactsDoc::default();
+    for (hex, e) in &legacy.entries {
+        // Synthesize the HLC from the legacy LWW key: preserves the relative
+        // ordering among imported entries and loses (correctly) to any real
+        // post-migration edit, whose minted HLC is current wall-clock.
+        let at = Hlc {
+            wall_ms: e.updated_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
+        doc.apply_annotation(hex, Some(Some(e.nickname.clone())), None, at, e.updated_ms);
+    }
+    if let Err(err) = crate::contacts_persist::save(contacts_path, &doc) {
+        tracing::error!(
+            error = %err,
+            "contacts migration: save failed; legacy nicknames left in place"
+        );
+        return;
+    }
+    let migrated = legacy_nicknames_path.with_extension("json.migrated");
+    if let Err(err) = std::fs::rename(legacy_nicknames_path, &migrated) {
+        tracing::warn!(
+            error = %err,
+            "contacts migration: legacy rename failed (import itself succeeded)"
+        );
+    } else {
+        tracing::info!(
+            count = legacy.entries.len(),
+            "migrated ZEB-419 friend nicknames into the contacts store"
+        );
+    }
 }
 
 // ---- Tauri wrappers ----
@@ -466,6 +526,62 @@ mod tests {
         let view = view.unwrap();
         assert_eq!(view.owner_id_hex, arbitrary);
         assert_eq!(view.notes.as_deref(), Some("from the town hall"));
+    }
+
+    #[test]
+    fn migration_imports_legacy_nicknames_and_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let contacts_path = dir.path().join("contacts.cbor");
+        let legacy_path = dir.path().join("friend_nicknames.json");
+        let mut legacy = crate::friend_nicknames::FriendNicknames::default();
+        legacy.set("AABB", Some("Koya"), 111);
+        legacy.set("ccdd", Some("Priya"), 222);
+        legacy.save(&legacy_path).unwrap();
+
+        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+
+        let doc = crate::contacts_persist::load(&contacts_path).unwrap();
+        assert_eq!(
+            doc.get("aabb").unwrap().petname.as_deref(),
+            Some("Koya"),
+            "legacy key lowercased + nickname imported as petname"
+        );
+        assert_eq!(doc.get("ccdd").unwrap().petname.as_deref(), Some("Priya"));
+        assert_eq!(doc.get("aabb").unwrap().first_seen_ms, 111);
+        assert!(!legacy_path.exists(), "legacy file renamed away");
+        assert!(
+            dir.path().join("friend_nicknames.json.migrated").exists(),
+            "legacy preserved under .migrated"
+        );
+    }
+
+    #[test]
+    fn migration_skips_when_contacts_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let contacts_path = dir.path().join("contacts.cbor");
+        crate::contacts_persist::save(&contacts_path, &ContactsDoc::default()).unwrap();
+        let legacy_path = dir.path().join("friend_nicknames.json");
+        let mut legacy = crate::friend_nicknames::FriendNicknames::default();
+        legacy.set("aabb", Some("Koya"), 111);
+        legacy.save(&legacy_path).unwrap();
+
+        super::migrate_friend_nicknames_to_contacts(&contacts_path, &legacy_path, "dev-A");
+
+        assert!(legacy_path.exists(), "legacy untouched when contacts exist");
+        let doc = crate::contacts_persist::load(&contacts_path).unwrap();
+        assert!(doc.get("aabb").is_none(), "no import into an existing store");
+    }
+
+    #[test]
+    fn migration_noop_without_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let contacts_path = dir.path().join("contacts.cbor");
+        super::migrate_friend_nicknames_to_contacts(
+            &contacts_path,
+            &dir.path().join("friend_nicknames.json"),
+            "dev-A",
+        );
+        assert!(!contacts_path.exists(), "no store materialized from nothing");
     }
 
     /// Two-engine cross-DEVICE convergence proofs for the Contacts dataset —
