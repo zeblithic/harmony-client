@@ -59,6 +59,24 @@ fn norm(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// What an annotation write would do, computed WITHOUT a minted HLC so the
+/// command layer can skip minting entirely on a no-op (the peek-and-commit
+/// discipline from `notes_commands.rs`: never advance the tracker for a write
+/// that doesn't apply — a phantom mint skews the durability indicator).
+enum AnnotationPlan {
+    /// Nothing would change: pure clear on an absent/tombstoned entry, or a
+    /// write whose normalized fields equal the live entry's current fields.
+    NoOp,
+    /// Both fields end up empty on a live entry → tombstone it.
+    Tombstone,
+    /// Set the entry to these fields (creating it when `creates`).
+    Write {
+        petname: Option<String>,
+        notes: Option<String>,
+        creates: bool,
+    },
+}
+
 impl ContactsDoc {
     /// Live (non-tombstoned) entry by owner_id hex.
     pub fn get(&self, owner_id_hex: &str) -> Option<&ContactEntry> {
@@ -75,28 +93,10 @@ impl ContactsDoc {
             .collect()
     }
 
-    /// Apply a local annotation write stamped `at`. Creates the entry
-    /// (`first_seen_ms = now_ms`) when absent, un-tombstones on a real write
-    /// (preserving `created_at`/`first_seen_ms`), and tombstones when both
-    /// fields end up empty — an annotation record with nothing in it should
-    /// not linger. LWW-safe like `NotesDoc::upsert`: a stale `at` against an
-    /// existing entry is ignored. Returns whether the doc visibly changed
-    /// (callers skip `notify_dirty` — and must skip HLC minting via the
-    /// peek-and-commit discipline in `contacts_commands.rs` — on `false`).
-    pub fn apply_annotation(
-        &mut self,
-        owner_id_hex: &str,
-        petname: FieldWrite,
-        notes: FieldWrite,
-        at: Hlc,
-        now_ms: u64,
-    ) -> bool {
-        let key = owner_id_hex.to_lowercase();
-        match self.contacts.get_mut(&key) {
+    /// Compute what a write would do against the current doc (no mutation).
+    fn plan(&self, key: &str, petname: &FieldWrite, notes: &FieldWrite) -> AnnotationPlan {
+        match self.contacts.get(key) {
             Some(e) => {
-                if !at.is_strictly_newer_than(&e.updated_at) {
-                    return false; // stale write, ignore (LWW)
-                }
                 let was_tombstoned = e.deleted_at.is_some();
                 // A tombstoned entry's fields are semantically empty: a new
                 // write starts from a blank record, not the pre-delete values.
@@ -111,45 +111,113 @@ impl ContactsDoc {
                     e.notes.clone()
                 };
                 if let Some(w) = petname {
-                    new_petname = norm(w);
+                    new_petname = norm(w.clone());
                 }
                 if let Some(w) = notes {
-                    new_notes = norm(w);
+                    new_notes = norm(w.clone());
                 }
                 if new_petname.is_none() && new_notes.is_none() {
                     if was_tombstoned {
-                        return false; // clearing an already-dead entry: no-op
+                        return AnnotationPlan::NoOp; // clearing an already-dead entry
                     }
-                    e.updated_at = at.clone();
-                    e.deleted_at = Some(at);
-                    return true;
+                    return AnnotationPlan::Tombstone;
                 }
-                let visibly_changed =
-                    was_tombstoned || e.petname != new_petname || e.notes != new_notes;
-                e.petname = new_petname;
-                e.notes = new_notes;
-                e.updated_at = at;
-                e.deleted_at = None;
-                visibly_changed
+                if !was_tombstoned && new_petname == e.petname && new_notes == e.notes {
+                    return AnnotationPlan::NoOp; // identical content — no LWW bump
+                }
+                AnnotationPlan::Write {
+                    petname: new_petname,
+                    notes: new_notes,
+                    creates: false,
+                }
             }
             None => {
-                let new_petname = petname.and_then(norm);
-                let new_notes = notes.and_then(norm);
+                let new_petname = petname.clone().and_then(norm);
+                let new_notes = notes.clone().and_then(norm);
                 if new_petname.is_none() && new_notes.is_none() {
-                    return false; // nothing to create
+                    return AnnotationPlan::NoOp; // nothing to create
                 }
-                self.contacts.insert(
-                    key.clone(),
-                    ContactEntry {
-                        owner_id_hex: key,
-                        petname: new_petname,
-                        notes: new_notes,
-                        first_seen_ms: now_ms,
-                        created_at: at.clone(),
-                        updated_at: at,
-                        deleted_at: None,
-                    },
-                );
+                AnnotationPlan::Write {
+                    petname: new_petname,
+                    notes: new_notes,
+                    creates: true,
+                }
+            }
+        }
+    }
+
+    /// Whether an annotation write would visibly change the doc. The command
+    /// layer calls this under the doc lock BEFORE minting an HLC, so no-op
+    /// writes never advance the tracker.
+    pub fn would_change(&self, owner_id_hex: &str, petname: &FieldWrite, notes: &FieldWrite) -> bool {
+        !matches!(
+            self.plan(&owner_id_hex.to_lowercase(), petname, notes),
+            AnnotationPlan::NoOp
+        )
+    }
+
+    /// Apply a local annotation write stamped `at`. Creates the entry
+    /// (`first_seen_ms = now_ms`) when absent, un-tombstones on a real write
+    /// (preserving `created_at`/`first_seen_ms`), and tombstones when both
+    /// fields end up empty — an annotation record with nothing in it should
+    /// not linger. LWW-safe like `NotesDoc::upsert`: a stale `at` against an
+    /// existing entry is ignored, and an identical-content write is a no-op
+    /// (no LWW bump). Returns whether the doc visibly changed (callers skip
+    /// `notify_dirty` — and skip minting via [`Self::would_change`] — on
+    /// `false`).
+    pub fn apply_annotation(
+        &mut self,
+        owner_id_hex: &str,
+        petname: FieldWrite,
+        notes: FieldWrite,
+        at: Hlc,
+        now_ms: u64,
+    ) -> bool {
+        let key = owner_id_hex.to_lowercase();
+        if let Some(e) = self.contacts.get(&key) {
+            if !at.is_strictly_newer_than(&e.updated_at) {
+                return false; // stale write, ignore (LWW)
+            }
+        }
+        match self.plan(&key, &petname, &notes) {
+            AnnotationPlan::NoOp => false,
+            AnnotationPlan::Tombstone => {
+                let e = self
+                    .contacts
+                    .get_mut(&key)
+                    .expect("Tombstone plan implies an existing entry");
+                e.updated_at = at.clone();
+                e.deleted_at = Some(at);
+                true
+            }
+            AnnotationPlan::Write {
+                petname: new_petname,
+                notes: new_notes,
+                creates,
+            } => {
+                if creates {
+                    self.contacts.insert(
+                        key.clone(),
+                        ContactEntry {
+                            owner_id_hex: key,
+                            petname: new_petname,
+                            notes: new_notes,
+                            first_seen_ms: now_ms,
+                            created_at: at.clone(),
+                            updated_at: at,
+                            deleted_at: None,
+                        },
+                    );
+                } else {
+                    let e = self
+                        .contacts
+                        .get_mut(&key)
+                        .expect("non-creating Write plan implies an existing entry");
+                    e.petname = new_petname;
+                    e.notes = new_notes;
+                    e.updated_at = at;
+                    e.deleted_at = None;
+                }
                 true
             }
         }
@@ -281,6 +349,25 @@ mod tests {
         assert_eq!(e.first_seen_ms, 100, "first_seen preserved across un-tombstone");
         assert_eq!(e.created_at, created, "created_at preserved");
         assert_eq!(e.notes, None, "fields start blank after resurrection");
+    }
+
+    #[test]
+    fn identical_content_write_is_noop_no_lww_bump() {
+        let mut d = ContactsDoc::default();
+        set_pet(&mut d, "aa", "Koya", hlc(1, "A"), 5);
+        let before = d.contacts.get("aa").unwrap().updated_at.clone();
+        assert!(
+            !set_pet(&mut d, "aa", " Koya ", hlc(2, "A"), 6),
+            "re-writing the same (trimmed) content is a no-op"
+        );
+        assert_eq!(
+            d.contacts.get("aa").unwrap().updated_at,
+            before,
+            "no LWW bump on identical content"
+        );
+        assert!(!d.would_change("aa", &Some(Some("Koya".into())), &None));
+        assert!(d.would_change("aa", &Some(Some("Other".into())), &None));
+        assert!(!d.would_change("zz", &Some(None), &Some(None)), "pure clear on absent");
     }
 
     #[test]

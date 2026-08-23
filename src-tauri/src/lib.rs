@@ -174,6 +174,7 @@ pub mod community_voting_tier3;
 pub mod community_voting_tier3_crypto;
 pub mod community_voting_tier3_nizk;
 pub mod connectivity_settings;
+pub mod contacts_commands;
 pub mod contacts_crdt;
 pub mod contacts_persist;
 pub mod content_index;
@@ -1360,6 +1361,25 @@ pub struct NodeState {
         Option<std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>>,
     pub notes_device_id: Option<String>,
 
+    /// ZEB-977: owner-private Contacts dataset (petname + private notes per
+    /// identity). `Some` while the node is running and an owner identity is
+    /// loaded; `None` before the FleetSyncEngine is wired at startup or after
+    /// stop_node. The contacts IPC commands reject with "contacts dataset not
+    /// loaded" while any of these are `None`. Mirrors the notes handles above
+    /// field-for-field.
+    pub contacts_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::contacts_crdt::ContactsDoc>>>,
+    pub contacts_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
+        >,
+    >,
+    pub contacts_sync: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::contacts_crdt::ContactsDoc>>,
+    >,
+    pub contacts_device_id: Option<String>,
+
     /// ZEB-418 SP2 P1: butler dm-inbox dataset (deposited-but-not-yet-
     /// ingested DM deliveries, spec §5). `Some` while the node is running
     /// and an owner identity is loaded; `None` before the FleetSyncEngine
@@ -2253,6 +2273,10 @@ impl Default for NodeState {
             notes_tracker: None,
             notes_sync: None,
             notes_device_id: None,
+            contacts_doc: None,
+            contacts_tracker: None,
+            contacts_sync: None,
+            contacts_device_id: None,
             // ZEB-418 SP2 P1: dm-inbox dataset handles stay None until
             // start_node wires the FleetSyncEngine (mirrors notes).
             dm_inbox_doc: None,
@@ -2678,6 +2702,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let notes_sync_for_shutdown: Option<
         std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::notes_crdt::NotesDoc>>,
     >;
+    // ZEB-977: contacts fleet-sync engine, taken outside the lock for the
+    // same ephemeral-runtime shutdown pattern as notes.
+    let contacts_sync_for_shutdown: Option<
+        std::sync::Arc<crate::fleet_sync::FleetSyncEngine<crate::contacts_crdt::ContactsDoc>>,
+    >;
     // ZEB-418 SP2 P1: dm-inbox fleet-sync engine, taken outside the lock
     // for the same ephemeral-runtime shutdown pattern as notes.
     let dm_inbox_sync_for_shutdown: Option<
@@ -2971,6 +3000,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.notes_doc = None;
         guard.notes_tracker = None;
         guard.notes_device_id = None;
+        // ZEB-977: take the Contacts engine for shutdown and clear the
+        // remaining contacts handles (mirrors notes): a concurrent contacts
+        // IPC fast-rejects with "contacts dataset not loaded" instead of
+        // racing the shutting-down engine. A restart re-loads from disk.
+        contacts_sync_for_shutdown = guard.contacts_sync.take();
+        guard.contacts_doc = None;
+        guard.contacts_tracker = None;
+        guard.contacts_device_id = None;
         // ZEB-418 SP2 P1: take the dm-inbox engine for shutdown and clear
         // the remaining handles (mirrors notes). The engine shutdown below
         // ALSO stops the ingest sweeper: the engine task's `on_applied`
@@ -3438,6 +3475,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // thread is joined. Same ephemeral-runtime pattern as mint/owner.
     if let Some(notes_engine) = notes_sync_for_shutdown {
         shutdown_fleet_sync_blocking(notes_engine, "Notes");
+    }
+    // ZEB-977: shut down the Contacts fleet-sync engine alongside notes so
+    // its final debounced publish + persist pass runs before the event-loop
+    // thread is joined. Same ephemeral-runtime pattern.
+    if let Some(contacts_engine) = contacts_sync_for_shutdown {
+        shutdown_fleet_sync_blocking(contacts_engine, "Contacts");
     }
     // ZEB-418 SP2 P1: shut down the dm-inbox fleet-sync engine alongside
     // notes so its final debounced publish + persist pass runs before the
@@ -83227,6 +83270,10 @@ mod start_node_race_tests {
             notes_tracker: None,
             notes_sync: None,
             notes_device_id: None,
+            contacts_doc: None,
+            contacts_tracker: None,
+            contacts_sync: None,
+            contacts_device_id: None,
             // ZEB-418 SP2 P1: dm-inbox dataset handles unused in race tests.
             dm_inbox_doc: None,
             dm_inbox_tracker: None,
