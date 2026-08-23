@@ -53,7 +53,10 @@ pub fn save(cipher: &DatasetCipher, path: &Path, doc: &RelayHoldDoc) -> Result<(
 
 /// Load the replay tracker from `path` (strict). Returns `Ok(BTreeMap::new())`
 /// if the file does not exist yet.
-pub fn load_replay(cipher: &DatasetCipher, path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
+pub fn load_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
     fleet_dataset_file::load(
         cipher,
         path,
@@ -389,7 +392,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold.cbor");
         let c = test_cipher();
-        assert_eq!(load_doc_or_recover(&c, &path).unwrap(), RelayHoldDoc::default());
+        assert_eq!(
+            load_doc_or_recover(&c, &path).unwrap(),
+            RelayHoldDoc::default()
+        );
         let any: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -528,7 +534,9 @@ mod tests {
             SyncError::CborDecode(_)
         ));
         // recover quarantines and returns empty
-        assert!(load_first_observed_or_recover(&c, &path).unwrap().is_empty());
+        assert!(load_first_observed_or_recover(&c, &path)
+            .unwrap()
+            .is_empty());
         assert!(!path.exists(), "corrupt sidecar was quarantined");
     }
 

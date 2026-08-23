@@ -6346,7 +6346,7 @@ pub async fn start_node_inner(
                                     &dataset_cipher,
                                     &notes_replay_path,
                                 )
-                                    .map_err(|e| format!("load notes replay: {e}"))?,
+                                .map_err(|e| format!("load notes replay: {e}"))?,
                             ),
                         ));
                         let (notes_out_tx, notes_out_rx) =
@@ -6422,7 +6422,7 @@ pub async fn start_node_inner(
                                 &dataset_cipher,
                                 &contacts_path,
                             )
-                                .map_err(|e| format!("load contacts doc: {e}"))?,
+                            .map_err(|e| format!("load contacts doc: {e}"))?,
                         ));
                         let contacts_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
@@ -6512,12 +6512,11 @@ pub async fn start_node_inner(
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
                         let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
-                            let mut doc =
-                                crate::dm_inbox_persist::load_doc_or_recover(
-                                    &dataset_cipher,
-                                    &dm_inbox_path,
-                                )
-                                    .map_err(|e| format!("load dm-inbox doc: {e}"))?;
+                            let mut doc = crate::dm_inbox_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &dm_inbox_path,
+                            )
+                            .map_err(|e| format!("load dm-inbox doc: {e}"))?;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -6850,12 +6849,11 @@ pub async fn start_node_inner(
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
                         let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
-                            let mut doc =
-                                crate::relay_hold_persist::load_doc_or_recover(
-                                    &dataset_cipher,
-                                    &relay_hold_path,
-                                )
-                                    .map_err(|e| format!("load relay-hold doc: {e}"))?;
+                            let mut doc = crate::relay_hold_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &relay_hold_path,
+                            )
+                            .map_err(|e| format!("load relay-hold doc: {e}"))?;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -6939,7 +6937,7 @@ pub async fn start_node_inner(
                                 &dataset_cipher,
                                 &relay_optin_path,
                             )
-                                .map_err(|e| format!("load relay-optin doc: {e}"))?,
+                            .map_err(|e| format!("load relay-optin doc: {e}"))?,
                         ));
                         let relay_optin_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
@@ -7030,8 +7028,11 @@ pub async fn start_node_inner(
                         let dm_outhold_replay_path = identity_dir
                             .join(crate::dm_outhold_persist::DM_OUTHOLD_REPLAY_FILENAME);
                         let dm_outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::dm_outhold_persist::load_doc_or_recover(&dataset_cipher, &dm_outhold_path)
-                                .map_err(|e| format!("load dm-outhold doc: {e}"))?,
+                            crate::dm_outhold_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &dm_outhold_path,
+                            )
+                            .map_err(|e| format!("load dm-outhold doc: {e}"))?,
                         ));
                         let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
@@ -7124,9 +7125,11 @@ pub async fn start_node_inner(
                             identity_dir.join(crate::fleet_net_persist::FLEET_NET_FILENAME);
                         let fleet_net_replay_path =
                             identity_dir.join(crate::fleet_net_persist::FLEET_NET_REPLAY_FILENAME);
-                        let initial_fleet_net_doc =
-                            crate::fleet_net_persist::load_doc_or_recover(&dataset_cipher, &fleet_net_path)
-                                .map_err(|e| format!("load fleet-net doc: {e}"))?;
+                        let initial_fleet_net_doc = crate::fleet_net_persist::load_doc_or_recover(
+                            &dataset_cipher,
+                            &fleet_net_path,
+                        )
+                        .map_err(|e| format!("load fleet-net doc: {e}"))?;
                         // ZEB-418 P2 Task 7 (D15): SYNCHRONOUS snapshot of the
                         // fleet-net doc, seeded from the loaded doc. The pkarr
                         // routing-blob builder is a sync `Fn() -> Vec<u8>` and

@@ -582,7 +582,11 @@ mod tests {
             "dev-A",
         );
 
-        let doc = crate::contacts_persist::load(&crate::fleet_dataset_file::test_cipher(), &contacts_path).unwrap();
+        let doc = crate::contacts_persist::load(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+        )
+        .unwrap();
         assert_eq!(
             doc.get("aabb").unwrap().petname.as_deref(),
             Some("Koya"),
@@ -605,7 +609,8 @@ mod tests {
             &crate::fleet_dataset_file::test_cipher(),
             &contacts_path,
             &ContactsDoc::default(),
-        ).unwrap();
+        )
+        .unwrap();
         let legacy_path = dir.path().join("friend_nicknames.json");
         let mut legacy = crate::friend_nicknames::FriendNicknames::default();
         legacy.set("aabb", Some("Koya"), 111);
@@ -619,7 +624,11 @@ mod tests {
         );
 
         assert!(legacy_path.exists(), "legacy untouched when contacts exist");
-        let doc = crate::contacts_persist::load(&crate::fleet_dataset_file::test_cipher(), &contacts_path).unwrap();
+        let doc = crate::contacts_persist::load(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+        )
+        .unwrap();
         assert!(
             doc.get("aabb").is_none(),
             "no import into an existing store"
@@ -664,7 +673,11 @@ mod tests {
             "dev-A",
         );
 
-        let imported = crate::contacts_persist::load(&crate::fleet_dataset_file::test_cipher(), &contacts_path).unwrap();
+        let imported = crate::contacts_persist::load(
+            &crate::fleet_dataset_file::test_cipher(),
+            &contacts_path,
+        )
+        .unwrap();
         let entry = imported.contacts.get("aabb").expect("imported");
         assert!(
             entry.updated_at.wall_ms <= super::now_ms(),

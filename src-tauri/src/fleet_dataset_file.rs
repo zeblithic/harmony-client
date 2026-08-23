@@ -283,7 +283,10 @@ mod tests {
         let last = raw.len() - 1;
         raw[last] ^= 0x01;
         std::fs::write(&p, &raw).unwrap();
-        assert_eq!(load_or_recover::<Doc>(&c, &p, LABEL, 1).unwrap(), Doc::default());
+        assert_eq!(
+            load_or_recover::<Doc>(&c, &p, LABEL, 1).unwrap(),
+            Doc::default()
+        );
         assert!(!p.exists(), "quarantined");
         let q: Vec<_> = std::fs::read_dir(d.path())
             .unwrap()

@@ -57,7 +57,10 @@ pub fn save(
 
 /// Load the replay tracker from `path` (strict). Returns `Ok(BTreeMap::new())`
 /// if the file does not exist yet.
-pub fn load_replay(cipher: &DatasetCipher, path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
+pub fn load_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
     fleet_dataset_file::load(cipher, path, REPLAY_FILENAME, REPLAY_SCHEMA_V1)
 }
 

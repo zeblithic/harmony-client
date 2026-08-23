@@ -51,7 +51,10 @@ pub fn save(cipher: &DatasetCipher, path: &Path, doc: &FleetNetDoc) -> Result<()
 
 /// Load the replay tracker from `path` (strict). Returns `Ok(BTreeMap::new())`
 /// if the file does not exist yet.
-pub fn load_replay(cipher: &DatasetCipher, path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
+pub fn load_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
     fleet_dataset_file::load(
         cipher,
         path,
@@ -264,7 +267,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fleet_net.cbor");
         let c = test_cipher();
-        assert_eq!(load_doc_or_recover(&c, &path).unwrap(), FleetNetDoc::default());
+        assert_eq!(
+            load_doc_or_recover(&c, &path).unwrap(),
+            FleetNetDoc::default()
+        );
         let any: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())

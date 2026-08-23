@@ -38,20 +38,32 @@ pub fn load(cipher: &DatasetCipher, path: &Path) -> Result<RelayOptInDoc, SyncEr
 /// Load the relay-optin doc with the ZEB-460 recovery contract (quarantine +
 /// self-heal on corruption/tag failure; transient I/O propagated untouched;
 /// legacy plaintext eagerly re-sealed) — see `fleet_dataset_file::load_or_recover`.
-pub fn load_doc_or_recover(cipher: &DatasetCipher, path: &Path) -> Result<RelayOptInDoc, SyncError> {
+pub fn load_doc_or_recover(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<RelayOptInDoc, SyncError> {
     fleet_dataset_file::load_or_recover(cipher, path, RELAY_OPTIN_FILENAME, RELAY_OPTIN_SCHEMA_V1)
 }
 
 /// Save `RelayOptInDoc` to `path` sealed + atomically.
 pub fn save(cipher: &DatasetCipher, path: &Path, doc: &RelayOptInDoc) -> Result<(), SyncError> {
-    fleet_dataset_file::save(cipher, path, RELAY_OPTIN_FILENAME, RELAY_OPTIN_SCHEMA_V1, doc)
+    fleet_dataset_file::save(
+        cipher,
+        path,
+        RELAY_OPTIN_FILENAME,
+        RELAY_OPTIN_SCHEMA_V1,
+        doc,
+    )
 }
 
 // ── Replay tracker ────────────────────────────────────────────────────────────
 
 /// Load the replay tracker from `path` (strict). Returns `Ok(BTreeMap::new())`
 /// if the file does not exist yet.
-pub fn load_replay(cipher: &DatasetCipher, path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
+pub fn load_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
     fleet_dataset_file::load(
         cipher,
         path,
