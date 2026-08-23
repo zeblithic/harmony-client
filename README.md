@@ -6,6 +6,9 @@ Federated, polycentric social fabric. Desktop client built on Tauri 2 + Svelte 5
 
 Harmony is in public alpha; you can download the released client and create your own communities today! Install via the docs below and use a `harmony://invite/...` URL to join an existing server.
 
+**New here? [See Harmony in action](docs/tutorial/README.md)** — a screenshot walkthrough
+from first launch to a living community, using the real released client.
+
 ## Install
 
 - **macOS** (Apple Silicon or Intel): see [docs/install-macos.md](docs/install-macos.md)
