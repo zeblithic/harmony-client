@@ -63,7 +63,8 @@
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
   import { createInitialSyncTracker } from './lib/community-initial-sync';
-  import { FriendService, contactsFromFriends, nicknameMapFromFriends } from './lib/friend-service';
+  import { FriendService, contactsFromFriends } from './lib/friend-service';
+  import { ContactsService, petnameMapFromContacts } from './lib/contacts-service';
   import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
@@ -316,7 +317,7 @@
   // drain-tick refreshRoster already self-heals within a tick.)
   $effect(() => {
     cardVersion; // reactive dep: a member card landed or changed
-    friendNicknames; // reactive dep: a friend nickname landed or changed
+    contactPetnames; // reactive dep: a contact petname landed or changed
     callSession?.refreshPeerName();
     groupCall?.refreshNames();
   });
@@ -725,14 +726,14 @@
     return memberCardService.resolve(ownerIdHex);
   }
 
-  // ZEB-432: local friend nickname for an owner_id, preferred over the broadcast
-  // profile-card name in community surfaces (members roster + message authors),
-  // matching the Friends panel ladder. Reads the reactive `friendNicknames`
-  // $state so a nickname edit (friend-list-changed → refreshDmContacts) repaints
-  // the open community view. Case-normalized: community member addresses and
-  // friend ownerIdHex are both lowercase owner_id, but normalize defensively.
+  // ZEB-977 (was ZEB-432's friend-nickname map): local petname for an
+  // owner_id — assignable to ANY identity, not just friends — preferred over
+  // the broadcast profile-card name on every ladder surface. Reads the
+  // reactive `contactPetnames` $state so a petname edit (contacts-changed →
+  // refreshContactPetnames) repaints the open view. Case-normalized:
+  // addresses are lowercase owner_id everywhere, but normalize defensively.
   function resolveNickname(ownerIdHex: string): string | undefined {
-    return friendNicknames.get(ownerIdHex.toLowerCase()) || undefined;
+    return contactPetnames.get(ownerIdHex.toLowerCase()) || undefined;
   }
 
   // ZEB-537/ZEB-972: presence resolver threaded into the members roster,
@@ -1755,12 +1756,28 @@
   // Browser/mock demo mode keeps the legacy navService.profiles map.
   let dmContacts: Map<string, Profile> | null = $state(null);
   const EMPTY_DM_CONTACTS: Map<string, Profile> = new Map();
-  // ZEB-432: owner_id(hex) → local friend nickname (ZEB-419), rebuilt from the
-  // same friends list that feeds the DM picker. Consulted by community surfaces
-  // (members roster + message authors) so a nicknamed friend renders by name
-  // instead of raw hex. friend-list-changed (which fires on nickname edits too,
-  // see the listener below) keeps this fresh.
-  let friendNicknames: Map<string, string> = $state(new Map());
+  // ── ZEB-977: contacts service (petname + private notes, any identity) ─
+  // Same eager-construct / adapter-wired-in-IIFE / destroy-on-unmount
+  // pattern as FriendService above.
+  const contactsService = new ContactsService();
+  $effect(() => () => contactsService.destroy());
+  // owner_id(hex) → local petname, rebuilt from the contacts dataset.
+  // Consulted by resolveNickname on every ladder surface so an annotated
+  // identity renders by YOUR name for them instead of card name / hex.
+  // contacts-changed (local writes and fleet-sync merges from the owner's
+  // other devices) keeps this fresh.
+  let contactPetnames: Map<string, string> = $state(new Map());
+  async function refreshContactPetnames(): Promise<void> {
+    try {
+      contactPetnames = petnameMapFromContacts(await contactsService.list());
+    } catch (e) {
+      // Expected pre-owner-load ("contacts dataset not loaded") and in mock
+      // mode (no adapter). Keep the last known-good map rather than wiping.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] refreshContactPetnames skipped:', msg);
+    }
+  }
+  contactsService.onContactsChanged(() => void refreshContactPetnames());
   let pickerContacts = $derived(
     isTauri() ? (dmContacts ?? EMPTY_DM_CONTACTS) : navService.profiles
   );
@@ -1779,12 +1796,6 @@
       if (seq <= dmContactsCommittedSeq) return; // a newer success already committed
       dmContactsCommittedSeq = seq;
       dmContacts = contactsFromFriends(friends);
-      // ZEB-432: rebuild the nickname map under the same commit guard so it
-      // stays consistent with the DM-contact map (and never regresses to an
-      // older friends snapshot). ZEB-962: `nicknameMapFromFriends` filters with
-      // `nonEmpty`, so a whitespace-only nickname never enters state (a plain
-      // truthiness filter kept `"   "`, which `resolveNickname` would return).
-      friendNicknames = nicknameMapFromFriends(friends);
     } catch (e) {
       // Expected pre-owner-load ("owner not loaded") and in mock mode
       // (no adapter). Keep the last known-good map rather than wiping —
@@ -2525,6 +2536,10 @@
       // Fire-and-forget: pre-owner-load failure is recovered by the
       // friend-list-changed listener and the dialog-open refresh.
       void refreshDmContacts();
+      await tryConnect('contacts', contactsService.connectAdapter(adapter));
+      // ZEB-977: hydrate the petname map. Fire-and-forget: pre-owner-load
+      // failure is recovered by the contacts-changed listener.
+      void refreshContactPetnames();
       await tryConnect('dmInvite', dmInviteService.connectAdapter(adapter));
       // ZEB-236: hydrate the pending DM-invite queue. Fire-and-forget:
       // pre-owner-load failure is recovered by the onPendingChanged
@@ -2809,6 +2824,14 @@
           // is $state, so an open dialog converges live via pickerContacts.
           if (dmContacts === null) {
             void refreshDmContacts();
+          }
+          // ZEB-977: same owner-loads-after-start_node window for the
+          // contacts dataset ("contacts dataset not loaded" at connect
+          // time). Retry once the session is confirmed up, gated on the
+          // never-hydrated state; after first hydration contacts-changed
+          // keeps the map fresh.
+          if (contactPetnames.size === 0) {
+            void refreshContactPetnames();
           }
           // ZEB-351: (re)attempt the voice-session build on reconnect — the
           // get_self_voice_identity IPC may not have been ready at boot. The

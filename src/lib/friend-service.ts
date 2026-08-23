@@ -173,21 +173,6 @@ export function contactsFromFriends(friends: FriendDto[]): Map<string, Profile> 
   return contacts;
 }
 
-/**
- * ZEB-962 (CodeRabbit #709): the personal-nickname map behind `resolveNickname`,
- * keyed by lowercased owner hex. Only non-blank nicknames are kept — a plain
- * truthiness filter (`f.nickname`) drops `""` but lets a whitespace-only
- * nickname into state, which `resolveNickname` would then return verbatim.
- */
-export function nicknameMapFromFriends(friends: FriendDto[]): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const f of friends) {
-    const nick = nonEmpty(f.nickname);
-    if (nick !== undefined) map.set(f.ownerIdHex.toLowerCase(), nick);
-  }
-  return map;
-}
-
 export class FriendService {
   /** Listeners notified when the backend emits `friend-list-changed` (a friend
    *  was added or removed, possibly on another device). A registry (not a
@@ -380,14 +365,17 @@ export class FriendService {
   }
 
   /**
-   * ZEB-419: set (or clear, with `null`) the LOCAL-ONLY nickname for a friend
-   * (by 16-byte master owner_id hex). Purely a personal label on this device —
-   * never shared with the peer or synced to the owner's other devices in this
-   * phase. The backend emits `friend-list-changed`, so a subscribed panel
-   * re-fetches `listFriends()` and re-renders with the new label.
+   * ZEB-977 (was ZEB-419's `set_friend_nickname`): set (or clear, with
+   * `null`) the LOCAL petname for this friend — now backed by the contacts
+   * dataset (`set_contact_petname`), so it works for any identity and syncs
+   * across the owner's own devices (never to the peer). The backend emits
+   * `friend-list-changed`, so a subscribed panel re-fetches `listFriends()`
+   * and re-renders with the new label. Kept on FriendService so FriendsPanel's
+   * existing editor keeps its one-service dependency; ContactsService is the
+   * general-purpose surface.
    */
   async setNickname(ownerIdHex: string, nickname: string | null): Promise<void> {
-    await this.invoke<void>('set_friend_nickname', { ownerIdHex, nickname });
+    await this.invoke<void>('set_contact_petname', { ownerIdHex, petname: nickname });
   }
 
   /**

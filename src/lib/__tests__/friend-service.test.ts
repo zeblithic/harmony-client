@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { contactsFromFriends, nicknameMapFromFriends } from '../friend-service';
+import { contactsFromFriends } from '../friend-service';
 import type { FriendDto } from '../friend-service';
 
 // ZEB-962: `contactsFromFriends` bakes the DM contact-cache display name. Its
@@ -33,26 +33,5 @@ describe('contactsFromFriends display-name ladder (ZEB-962)', () => {
   it('falls through null nickname/display to short hex', () => {
     const c = contactsFromFriends([friend({ nickname: null, display: null })]);
     expect(c.get(OWNER)?.displayName).toBe(SHORT);
-  });
-});
-
-// ZEB-962 (CodeRabbit #709): `resolveNickname` reads a nickname map App.svelte
-// built with a plain truthiness filter, so a whitespace-only nickname stayed in
-// state. This shared builder keeps only non-blank nicknames (nonEmpty), keyed by
-// lowercased owner hex — so `resolveNickname` can never return a blank.
-describe('nicknameMapFromFriends (ZEB-962)', () => {
-  it('keeps a non-blank nickname under the lowercased owner key', () => {
-    const m = nicknameMapFromFriends([friend({ nickname: 'Al' })]);
-    expect(m.get(OWNER.toLowerCase())).toBe('Al');
-  });
-
-  it('omits a whitespace-only nickname', () => {
-    const m = nicknameMapFromFriends([friend({ nickname: '   ' })]);
-    expect(m.has(OWNER.toLowerCase())).toBe(false);
-  });
-
-  it('omits a null nickname', () => {
-    const m = nicknameMapFromFriends([friend({ nickname: null })]);
-    expect(m.has(OWNER.toLowerCase())).toBe(false);
   });
 });
