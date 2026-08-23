@@ -272,6 +272,7 @@ If you skip this step, every cold cargo build will appear to hang. There is no w
 
 ## References
 
+- Architecture map (how the pieces fit together): [`docs/architecture/README.md`](docs/architecture/README.md)
 - Active CI workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
 - `cargo-nextest` documentation: <https://nexte.st/>
 - `cargo-watch`: <https://github.com/watchexec/cargo-watch>

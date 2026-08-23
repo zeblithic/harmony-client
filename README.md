@@ -34,6 +34,10 @@ For Jake (running the alpha):
 
 ## Development
 
+**New to the codebase? Start with the [architecture map](docs/architecture/README.md)** —
+one at-a-glance diagram of how the pieces fit together, plus per-layer zoom-ins
+(frontend, IPC boundary, core runtime, state, transport, subsystems).
+
 Run tests:
 - Rust: `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures`
 - Frontend: `npx vitest run`
