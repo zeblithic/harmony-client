@@ -2006,6 +2006,7 @@ mod tests {
             persist: Arc::new(FleetNetPersist {
                 doc_path: dir.path().join("fleet_net.cbor"),
                 replay_path: dir.path().join("fleet_net_replay.cbor"),
+                cipher: crate::fleet_dataset_file::test_cipher(),
             }),
             lookup_key_tag: b"fleet-net-v1",
             debounce_ms: DEFAULT_DEBOUNCE_MS,

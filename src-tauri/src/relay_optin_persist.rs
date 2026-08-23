@@ -1,20 +1,19 @@
 //! On-disk persistence for RelayOptInDoc and its replay tracker (ZEB-458 P4 B).
-//! Mirrors `dm_inbox_persist` exactly: atomic-rename + file fsync + parent-dir
-//! fsync via `owner_state_persist::save_atomically`, a 1-byte schema-version
-//! prefix (plaintext CBOR), strict trailing-byte rejection, and a quarantine-
-//! on-corruption recovery path so a bad load never silently overwrites the
-//! per-community opt-in flags on the next persist.
+//! Thin wrappers over `fleet_dataset_file` (ZEB-981), mirroring
+//! `dm_inbox_persist`: sealed-at-rest v2 envelope under the pinned epoch-0
+//! fleet KeyTree, atomic-rename + fsync durability, strict trailing-byte
+//! rejection, corrupt-file quarantine, and the ZEB-460 transient-vs-corrupt
+//! recovery contract. (The doc carries only booleans + HLC stamps keyed by
+//! community id — sealed uniformly with the rest of the dataset family.)
 //!
-//! `RelayOptInDoc` is plaintext CBOR on disk (it carries only booleans + HLC
-//! stamps keyed by community id — no sealed payloads).
+//! Legacy (pre-ZEB-981) plaintext v1 files are still read and are eagerly
+//! re-sealed on first load.
 
 use crate::community_relay_optin::RelayOptInDoc;
+use crate::fleet_dataset_file::{self, DatasetCipher};
 use crate::fleet_sync::SyncError;
 use crate::owner_state_types::Hlc;
-use ciborium::{from_reader, into_writer};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Cursor;
 use std::path::Path;
 
 /// File name for the persisted RelayOptInDoc. Lives at
@@ -28,191 +27,89 @@ pub const RELAY_OPTIN_REPLAY_FILENAME: &str = "relay_optin_replay.cbor";
 const RELAY_OPTIN_SCHEMA_V1: u8 = 1;
 const RELAY_OPTIN_REPLAY_SCHEMA_V1: u8 = 1;
 
-#[derive(Serialize, Deserialize)]
-struct RelayOptInFileV1(RelayOptInDoc);
-
-#[derive(Serialize, Deserialize)]
-struct RelayOptInReplayFileV1(BTreeMap<String, Hlc>);
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-/// Atomic write with parent-directory fsync (crash-durable rename). Routes
-/// through `owner_state_persist::save_atomically`, which fsyncs both the
-/// tempfile and (on Unix) the parent directory entry.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SyncError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| SyncError::Persist(format!("create_dir_all {}: {e}", path.display())))?;
-    }
-    crate::owner_state_persist::save_atomically(path, bytes)
-        .map_err(|e| SyncError::Persist(e.to_string()))
-}
-
 // ── RelayOptInDoc ──────────────────────────────────────────────────────────────
 
-/// Load `RelayOptInDoc` from `path`. Returns `Ok(RelayOptInDoc::default())` if
-/// the file does not exist yet.
-pub fn load(path: &Path) -> Result<RelayOptInDoc, SyncError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RelayOptInDoc::default()),
-        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
-    };
-    if bytes.is_empty() {
-        return Err(SyncError::CborDecode(format!(
-            "relay-optin file is empty: {}",
-            path.display()
-        )));
-    }
-    let version = bytes[0];
-    let payload = &bytes[1..];
-    match version {
-        RELAY_OPTIN_SCHEMA_V1 => {
-            let mut cursor = Cursor::new(payload);
-            let file: RelayOptInFileV1 = from_reader(&mut cursor)
-                .map_err(|e| SyncError::CborDecode(format!("load {}: {e}", path.display())))?;
-            // Reject trailing bytes after the CBOR value (mirrors
-            // owner_state_crypto::canonical_cbor_decode): a corrupt file that is
-            // valid-prefix + garbage must NOT decode as "valid".
-            let pos = cursor.position() as usize;
-            if pos != payload.len() {
-                return Err(SyncError::CborDecode(format!(
-                    "trailing bytes after relay-optin value: consumed {} of {}",
-                    pos,
-                    payload.len()
-                )));
-            }
-            Ok(file.0)
-        }
-        v => Err(SyncError::CborDecode(format!(
-            "unknown relay-optin schema version {v:#x} in {}",
-            path.display()
-        ))),
-    }
+/// Load `RelayOptInDoc` from `path` (strict). Returns
+/// `Ok(RelayOptInDoc::default())` if the file does not exist yet.
+pub fn load(cipher: &DatasetCipher, path: &Path) -> Result<RelayOptInDoc, SyncError> {
+    fleet_dataset_file::load(cipher, path, RELAY_OPTIN_FILENAME, RELAY_OPTIN_SCHEMA_V1)
 }
 
-/// Load the relay-optin doc, recovering from genuine on-disk corruption.
-///
-/// - `Ok(doc)` on success (or `Ok(default)` when the file is missing).
-/// - `Err(SyncError::CborDecode)` (permanent corruption) → quarantine the bad
-///   file aside (`.corrupt-<ms>`, bytes preserved) and self-heal to
-///   `Ok(default())` so the app still boots and never bricks on corruption.
-/// - any other error — a transient I/O failure (`SyncError::Persist`) → the file
-///   is left untouched and the error is propagated (ZEB-460); quarantining it
-///   would orphan the opt-in flags and let the next persist overwrite them with
-///   an empty doc, so the caller fails the boot loudly and retries next launch
-///   with the file intact.
-pub fn load_doc_or_recover(path: &Path) -> Result<RelayOptInDoc, SyncError> {
-    match load(path) {
-        Ok(doc) => Ok(doc),
-        Err(e @ SyncError::CborDecode(_)) => {
-            quarantine(path, &e);
-            Ok(RelayOptInDoc::default())
-        }
-        Err(e) => Err(e),
-    }
+/// Load the relay-optin doc with the ZEB-460 recovery contract (quarantine +
+/// self-heal on corruption/tag failure; transient I/O propagated untouched;
+/// legacy plaintext eagerly re-sealed) — see `fleet_dataset_file::load_or_recover`.
+pub fn load_doc_or_recover(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<RelayOptInDoc, SyncError> {
+    fleet_dataset_file::load_or_recover(cipher, path, RELAY_OPTIN_FILENAME, RELAY_OPTIN_SCHEMA_V1)
 }
 
-/// Same recovery contract as [`load_doc_or_recover`], but for the replay
-/// tracker: `CborDecode` corruption is quarantined and an empty tracker
-/// returned; a transient `Persist` error is left untouched and propagated
-/// (ZEB-460).
-pub fn load_replay_or_recover(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
-    match load_replay(path) {
-        Ok(t) => Ok(t),
-        Err(e @ SyncError::CborDecode(_)) => {
-            quarantine(path, &e);
-            Ok(BTreeMap::new())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn quarantine(path: &Path, err: &SyncError) {
-    // Append a timestamped `.corrupt-<ms>` suffix so we never clobber a prior
-    // quarantine or the live file; preserves the bytes for manual recovery.
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let mut corrupt = path.as_os_str().to_os_string();
-    corrupt.push(format!(".corrupt-{ms}"));
-    tracing::error!(path = %path.display(), error = %err,
-        "relay-optin persistence load failed; quarantining corrupt file and starting fresh (bytes preserved)");
-    if let Err(re) = std::fs::rename(path, &corrupt) {
-        tracing::warn!(path = %path.display(), error = %re, "failed to quarantine corrupt relay-optin file");
-    }
-}
-
-/// Save `RelayOptInDoc` to `path` atomically (tempfile + fsync + parent-dir
-/// fsync + rename). Creates parent directories if needed.
-pub fn save(path: &Path, doc: &RelayOptInDoc) -> Result<(), SyncError> {
-    let mut bytes = vec![RELAY_OPTIN_SCHEMA_V1];
-    into_writer(&RelayOptInFileV1(doc.clone()), &mut bytes)
-        .map_err(|e| SyncError::CborEncode(format!("encode {}: {e}", path.display())))?;
-    atomic_write(path, &bytes)
+/// Save `RelayOptInDoc` to `path` sealed + atomically.
+pub fn save(cipher: &DatasetCipher, path: &Path, doc: &RelayOptInDoc) -> Result<(), SyncError> {
+    fleet_dataset_file::save(
+        cipher,
+        path,
+        RELAY_OPTIN_FILENAME,
+        RELAY_OPTIN_SCHEMA_V1,
+        doc,
+    )
 }
 
 // ── Replay tracker ────────────────────────────────────────────────────────────
 
-/// Load the replay tracker from `path`. Returns `Ok(BTreeMap::new())` if the
-/// file does not exist yet.
-pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
-    };
-    if bytes.is_empty() {
-        return Err(SyncError::CborDecode(format!(
-            "relay-optin replay file is empty: {}",
-            path.display()
-        )));
-    }
-    let version = bytes[0];
-    let payload = &bytes[1..];
-    match version {
-        RELAY_OPTIN_REPLAY_SCHEMA_V1 => {
-            let mut cursor = Cursor::new(payload);
-            let file: RelayOptInReplayFileV1 = from_reader(&mut cursor).map_err(|e| {
-                SyncError::CborDecode(format!("load_replay {}: {e}", path.display()))
-            })?;
-            // Reject trailing bytes after the CBOR value (mirrors
-            // owner_state_crypto::canonical_cbor_decode).
-            let pos = cursor.position() as usize;
-            if pos != payload.len() {
-                return Err(SyncError::CborDecode(format!(
-                    "trailing bytes after relay-optin replay value: consumed {} of {}",
-                    pos,
-                    payload.len()
-                )));
-            }
-            Ok(file.0)
-        }
-        v => Err(SyncError::CborDecode(format!(
-            "unknown relay-optin replay schema version {v:#x} in {}",
-            path.display()
-        ))),
-    }
+/// Load the replay tracker from `path` (strict). Returns `Ok(BTreeMap::new())`
+/// if the file does not exist yet.
+pub fn load_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
+    fleet_dataset_file::load(
+        cipher,
+        path,
+        RELAY_OPTIN_REPLAY_FILENAME,
+        RELAY_OPTIN_REPLAY_SCHEMA_V1,
+    )
 }
 
-/// Save the replay tracker to `path` atomically.
-pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), SyncError> {
-    let mut bytes = vec![RELAY_OPTIN_REPLAY_SCHEMA_V1];
-    into_writer(&RelayOptInReplayFileV1(tracker.clone()), &mut bytes)
-        .map_err(|e| SyncError::CborEncode(format!("encode replay {}: {e}", path.display())))?;
-    atomic_write(path, &bytes)
+/// Same recovery contract as [`load_doc_or_recover`], for the replay tracker.
+pub fn load_replay_or_recover(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
+    fleet_dataset_file::load_or_recover(
+        cipher,
+        path,
+        RELAY_OPTIN_REPLAY_FILENAME,
+        RELAY_OPTIN_REPLAY_SCHEMA_V1,
+    )
+}
+
+/// Save the replay tracker to `path` sealed + atomically.
+pub fn save_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+    tracker: &BTreeMap<String, Hlc>,
+) -> Result<(), SyncError> {
+    fleet_dataset_file::save(
+        cipher,
+        path,
+        RELAY_OPTIN_REPLAY_FILENAME,
+        RELAY_OPTIN_REPLAY_SCHEMA_V1,
+        tracker,
+    )
 }
 
 // ── FleetPersist impl ─────────────────────────────────────────────────────────
 
 /// Durability sink for the relay-optin fleet-sync engine. Holds the absolute
-/// paths for both the doc and replay-tracker files. The engine calls
-/// `persist` inside a `spawn_blocking` (fleet_sync.rs), so this impl stays
-/// synchronous like `DmInboxPersist`.
+/// paths for both the doc and replay-tracker files plus the sealing context.
+/// The engine calls `persist` inside a `spawn_blocking` (fleet_sync.rs), so
+/// this impl stays synchronous like `DmInboxPersist`.
 pub struct RelayOptInPersist {
     pub doc_path: std::path::PathBuf,
     pub replay_path: std::path::PathBuf,
+    pub cipher: DatasetCipher,
 }
 
 impl crate::fleet_sync::FleetPersist<RelayOptInDoc> for RelayOptInPersist {
@@ -221,8 +118,8 @@ impl crate::fleet_sync::FleetPersist<RelayOptInDoc> for RelayOptInPersist {
         state: &RelayOptInDoc,
         tracker: &BTreeMap<String, Hlc>,
     ) -> Result<(), SyncError> {
-        save(&self.doc_path, state)?;
-        save_replay(&self.replay_path, tracker)?;
+        save(&self.cipher, &self.doc_path, state)?;
+        save_replay(&self.cipher, &self.replay_path, tracker)?;
         Ok(())
     }
 }
@@ -233,6 +130,7 @@ impl crate::fleet_sync::FleetPersist<RelayOptInDoc> for RelayOptInPersist {
 mod tests {
     use super::*;
     use crate::community_relay_optin::RelayOptInDoc;
+    use crate::fleet_dataset_file::test_cipher;
     use crate::fleet_sync::SyncError;
     use crate::owner_state_types::{Hlc, SpaceId};
 
@@ -254,28 +152,51 @@ mod tests {
     fn doc_round_trips_and_missing_file_is_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_optin.cbor");
-        assert_eq!(load(&path).unwrap(), RelayOptInDoc::default());
+        let c = test_cipher();
+        assert_eq!(load(&c, &path).unwrap(), RelayOptInDoc::default());
         let doc = sample_doc();
-        save(&path, &doc).unwrap();
-        assert_eq!(load(&path).unwrap(), doc);
+        save(&c, &path, &doc).unwrap();
+        assert_eq!(load(&c, &path).unwrap(), doc);
+        // ZEB-981: what hits the disk is the sealed envelope, not plaintext.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw[0], crate::fleet_dataset_file::SEALED_SCHEMA_V2);
+    }
+
+    #[test]
+    fn legacy_plaintext_relay_optin_migrates_to_sealed_on_load() {
+        // A pre-ZEB-981 build persisted `[0x01] ‖ plaintext CBOR`; first load
+        // must return the doc AND rewrite the file sealed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_optin.cbor");
+        let c = test_cipher();
+        let mut v1 = vec![1u8];
+        ciborium::into_writer(&sample_doc(), &mut v1).unwrap();
+        std::fs::write(&path, &v1).unwrap();
+        assert_eq!(load_doc_or_recover(&c, &path).unwrap(), sample_doc());
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(
+            raw[0],
+            crate::fleet_dataset_file::SEALED_SCHEMA_V2,
+            "migrated on load"
+        );
+        assert_eq!(load_doc_or_recover(&c, &path).unwrap(), sample_doc());
     }
 
     #[test]
     fn load_rejects_trailing_bytes_after_valid_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_optin.cbor");
-        let doc = sample_doc();
-        save(&path, &doc).unwrap();
-        assert_eq!(load(&path).unwrap(), doc);
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.push(0xFF);
-        std::fs::write(&path, &bytes).unwrap();
-        let err = load(&path).unwrap_err();
+        let c = test_cipher();
+        let mut v1 = vec![1u8];
+        ciborium::into_writer(&sample_doc(), &mut v1).unwrap();
+        v1.push(0xFF);
+        std::fs::write(&path, &v1).unwrap();
+        let err = load(&c, &path).unwrap_err();
         assert!(
             matches!(err, SyncError::CborDecode(_)),
             "trailing bytes must surface CborDecode, got {err:?}"
         );
-        let recovered = load_doc_or_recover(&path).unwrap();
+        let recovered = load_doc_or_recover(&c, &path).unwrap();
         assert_eq!(recovered, RelayOptInDoc::default());
         assert!(!path.exists(), "corrupt file was quarantined");
     }
@@ -284,7 +205,8 @@ mod tests {
     fn replay_round_trips_and_missing_is_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_optin_replay.cbor");
-        assert!(load_replay(&path).unwrap().is_empty());
+        let c = test_cipher();
+        assert!(load_replay(&c, &path).unwrap().is_empty());
         let mut t = std::collections::BTreeMap::new();
         t.insert(
             "A".to_string(),
@@ -294,16 +216,17 @@ mod tests {
                 device_id: "A".into(),
             },
         );
-        save_replay(&path, &t).unwrap();
-        assert_eq!(load_replay(&path).unwrap(), t);
+        save_replay(&c, &path, &t).unwrap();
+        assert_eq!(load_replay(&c, &path).unwrap(), t);
     }
 
     #[test]
     fn load_doc_or_recover_quarantines_corrupt_and_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_optin.cbor");
+        let c = test_cipher();
         std::fs::write(&path, [0xFF_u8, 0x01, 0x02]).unwrap();
-        let doc = load_doc_or_recover(&path).unwrap();
+        let doc = load_doc_or_recover(&c, &path).unwrap();
         assert_eq!(
             doc,
             RelayOptInDoc::default(),
@@ -334,8 +257,9 @@ mod tests {
     fn load_doc_or_recover_missing_is_default_no_quarantine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_optin.cbor");
+        let c = test_cipher();
         assert_eq!(
-            load_doc_or_recover(&path).unwrap(),
+            load_doc_or_recover(&c, &path).unwrap(),
             RelayOptInDoc::default()
         );
         let any: Vec<_> = std::fs::read_dir(dir.path())
@@ -347,15 +271,13 @@ mod tests {
 
     #[test]
     fn load_doc_or_recover_propagates_transient_io_without_quarantine() {
-        // A transient I/O error (NOT corruption) must surface as Err and must
-        // NOT be quarantined: quarantining would orphan real data and let the
-        // next persist overwrite it with an empty doc (ZEB-460). Force a
-        // SyncError::Persist by pointing load() at a directory — std::fs::read
-        // on a dir returns a non-NotFound error.
+        // ZEB-460: transient I/O must surface Err untouched — quarantining
+        // would orphan real data and let the next persist overwrite it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.cbor");
+        let c = test_cipher();
         std::fs::create_dir(&path).unwrap();
-        let err = load_doc_or_recover(&path).unwrap_err();
+        let err = load_doc_or_recover(&c, &path).unwrap_err();
         assert!(
             matches!(err, SyncError::Persist(_)),
             "transient I/O must surface Persist, got {err:?}"
@@ -376,8 +298,9 @@ mod tests {
     fn load_replay_or_recover_propagates_transient_io_without_quarantine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay.cbor");
+        let c = test_cipher();
         std::fs::create_dir(&path).unwrap();
-        let err = load_replay_or_recover(&path).unwrap_err();
+        let err = load_replay_or_recover(&c, &path).unwrap_err();
         assert!(
             matches!(err, SyncError::Persist(_)),
             "transient I/O must surface Persist, got {err:?}"
@@ -392,8 +315,9 @@ mod tests {
     fn load_replay_or_recover_quarantines_corrupt_and_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_optin_replay.cbor");
+        let c = test_cipher();
         std::fs::write(&path, [0xFF_u8]).unwrap();
-        let tracker = load_replay_or_recover(&path).unwrap();
+        let tracker = load_replay_or_recover(&c, &path).unwrap();
         assert!(tracker.is_empty(), "recovers to an empty tracker");
         assert!(!path.exists(), "corrupt replay file moved aside");
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())
@@ -414,6 +338,7 @@ mod tests {
         let p = RelayOptInPersist {
             doc_path: dir.path().join("relay_optin.cbor"),
             replay_path: dir.path().join("relay_optin_replay.cbor"),
+            cipher: test_cipher(),
         };
         use crate::fleet_sync::FleetPersist;
         let doc = sample_doc();
@@ -427,7 +352,7 @@ mod tests {
             },
         );
         p.persist(&doc, &t).unwrap();
-        assert_eq!(load(&p.doc_path).unwrap(), doc);
-        assert_eq!(load_replay(&p.replay_path).unwrap(), t);
+        assert_eq!(load(&p.cipher, &p.doc_path).unwrap(), doc);
+        assert_eq!(load_replay(&p.cipher, &p.replay_path).unwrap(), t);
     }
 }

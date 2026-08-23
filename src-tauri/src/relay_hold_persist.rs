@@ -1,20 +1,21 @@
-//! On-disk persistence for RelayHoldDoc and its replay tracker (ZEB-458 P4 B).
-//! Mirrors `dm_inbox_persist` exactly: atomic-rename + file fsync + parent-dir
-//! fsync via `owner_state_persist::save_atomically`, a 1-byte schema-version
-//! prefix (plaintext CBOR), strict trailing-byte rejection, and a quarantine-
-//! on-corruption recovery path so a bad load never silently overwrites the
-//! relay's held blobs on the next persist.
+//! On-disk persistence for RelayHoldDoc and its replay tracker (ZEB-458 P4 B),
+//! plus the two LOCAL sidecars (first-observed clock ZEB-862, expiry
+//! tombstones ZEB-924). Thin wrappers over `fleet_dataset_file` (ZEB-981),
+//! mirroring `dm_inbox_persist`: sealed-at-rest v2 envelope under the pinned
+//! epoch-0 fleet KeyTree, atomic-rename + fsync durability, strict
+//! trailing-byte rejection, corrupt-file quarantine, and the ZEB-460
+//! transient-vs-corrupt recovery contract. (The held `sealed_blob`s inside are
+//! already sealed to the recipient device — the envelope additionally hides
+//! sender/recipient/community metadata from filesystem readers.)
 //!
-//! `RelayHoldDoc` is not encrypted at rest (the held `sealed_blob`s inside are
-//! already sealed to the recipient device — the relay holds them opaque).
+//! Legacy (pre-ZEB-981) plaintext v1 files are still read and are eagerly
+//! re-sealed on first load.
 
 use crate::community_relay_hold_crdt::RelayHoldDoc;
+use crate::fleet_dataset_file::{self, DatasetCipher};
 use crate::fleet_sync::SyncError;
 use crate::owner_state_types::Hlc;
-use ciborium::{from_reader, into_writer};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Cursor;
 use std::path::Path;
 
 /// File name for the persisted RelayHoldDoc. Lives at
@@ -28,180 +29,68 @@ pub const RELAY_HOLD_REPLAY_FILENAME: &str = "relay_hold_replay.cbor";
 const RELAY_HOLD_SCHEMA_V1: u8 = 1;
 const RELAY_HOLD_REPLAY_SCHEMA_V1: u8 = 1;
 
-#[derive(Serialize, Deserialize)]
-struct RelayHoldFileV1(RelayHoldDoc);
-
-#[derive(Serialize, Deserialize)]
-struct RelayHoldReplayFileV1(BTreeMap<String, Hlc>);
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-/// Atomic write with parent-directory fsync (crash-durable rename). Routes
-/// through `owner_state_persist::save_atomically`, which fsyncs both the
-/// tempfile and (on Unix) the parent directory entry.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SyncError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| SyncError::Persist(format!("create_dir_all {}: {e}", path.display())))?;
-    }
-    crate::owner_state_persist::save_atomically(path, bytes)
-        .map_err(|e| SyncError::Persist(e.to_string()))
-}
-
 // ── RelayHoldDoc ───────────────────────────────────────────────────────────────
 
-/// Load `RelayHoldDoc` from `path`. Returns `Ok(RelayHoldDoc::default())` if
-/// the file does not exist yet.
-pub fn load(path: &Path) -> Result<RelayHoldDoc, SyncError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RelayHoldDoc::default()),
-        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
-    };
-    if bytes.is_empty() {
-        return Err(SyncError::CborDecode(format!(
-            "relay-hold file is empty: {}",
-            path.display()
-        )));
-    }
-    let version = bytes[0];
-    let payload = &bytes[1..];
-    match version {
-        RELAY_HOLD_SCHEMA_V1 => {
-            let mut cursor = Cursor::new(payload);
-            let file: RelayHoldFileV1 = from_reader(&mut cursor)
-                .map_err(|e| SyncError::CborDecode(format!("load {}: {e}", path.display())))?;
-            // Reject trailing bytes after the CBOR value (mirrors
-            // owner_state_crypto::canonical_cbor_decode): a corrupt file that is
-            // valid-prefix + garbage must NOT decode as "valid".
-            let pos = cursor.position() as usize;
-            if pos != payload.len() {
-                return Err(SyncError::CborDecode(format!(
-                    "trailing bytes after relay-hold value: consumed {} of {}",
-                    pos,
-                    payload.len()
-                )));
-            }
-            Ok(file.0)
-        }
-        v => Err(SyncError::CborDecode(format!(
-            "unknown relay-hold schema version {v:#x} in {}",
-            path.display()
-        ))),
-    }
+/// Load `RelayHoldDoc` from `path` (strict). Returns
+/// `Ok(RelayHoldDoc::default())` if the file does not exist yet.
+pub fn load(cipher: &DatasetCipher, path: &Path) -> Result<RelayHoldDoc, SyncError> {
+    fleet_dataset_file::load(cipher, path, RELAY_HOLD_FILENAME, RELAY_HOLD_SCHEMA_V1)
 }
 
-/// Load the relay-hold doc, recovering from genuine on-disk corruption.
-///
-/// - `Ok(doc)` on success (or `Ok(default)` when the file is missing).
-/// - `Err(SyncError::CborDecode)` (permanent corruption) → quarantine the bad
-///   file aside (`.corrupt-<ms>`, bytes preserved) and self-heal to
-///   `Ok(default())` so the app still boots and never bricks on corruption.
-/// - any other error — a transient I/O failure (`SyncError::Persist`) → the file
-///   is left untouched and the error is propagated (ZEB-460); quarantining it
-///   would orphan held blobs and let the next persist overwrite them with an
-///   empty doc, so the caller fails the boot loudly and retries next launch with
-///   the file intact.
-pub fn load_doc_or_recover(path: &Path) -> Result<RelayHoldDoc, SyncError> {
-    match load(path) {
-        Ok(doc) => Ok(doc),
-        Err(e @ SyncError::CborDecode(_)) => {
-            quarantine(path, &e);
-            Ok(RelayHoldDoc::default())
-        }
-        Err(e) => Err(e),
-    }
+/// Load the relay-hold doc with the ZEB-460 recovery contract (quarantine +
+/// self-heal on corruption/tag failure; transient I/O propagated untouched;
+/// legacy plaintext eagerly re-sealed) — see `fleet_dataset_file::load_or_recover`.
+pub fn load_doc_or_recover(cipher: &DatasetCipher, path: &Path) -> Result<RelayHoldDoc, SyncError> {
+    fleet_dataset_file::load_or_recover(cipher, path, RELAY_HOLD_FILENAME, RELAY_HOLD_SCHEMA_V1)
 }
 
-/// Same recovery contract as [`load_doc_or_recover`], but for the replay
-/// tracker: `CborDecode` corruption is quarantined and an empty tracker
-/// returned; a transient `Persist` error is left untouched and propagated
-/// (ZEB-460).
-pub fn load_replay_or_recover(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
-    match load_replay(path) {
-        Ok(t) => Ok(t),
-        Err(e @ SyncError::CborDecode(_)) => {
-            quarantine(path, &e);
-            Ok(BTreeMap::new())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn quarantine(path: &Path, err: &SyncError) {
-    // Append a timestamped `.corrupt-<ms>` suffix so we never clobber a prior
-    // quarantine or the live file; preserves the bytes for manual recovery.
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let mut corrupt = path.as_os_str().to_os_string();
-    corrupt.push(format!(".corrupt-{ms}"));
-    tracing::error!(path = %path.display(), error = %err,
-        "relay-hold persistence load failed; quarantining corrupt file and starting fresh (bytes preserved)");
-    if let Err(re) = std::fs::rename(path, &corrupt) {
-        tracing::warn!(path = %path.display(), error = %re, "failed to quarantine corrupt relay-hold file");
-    }
-}
-
-/// Save `RelayHoldDoc` to `path` atomically (tempfile + fsync + parent-dir
-/// fsync + rename). Creates parent directories if needed.
-pub fn save(path: &Path, doc: &RelayHoldDoc) -> Result<(), SyncError> {
-    let mut bytes = vec![RELAY_HOLD_SCHEMA_V1];
-    into_writer(&RelayHoldFileV1(doc.clone()), &mut bytes)
-        .map_err(|e| SyncError::CborEncode(format!("encode {}: {e}", path.display())))?;
-    atomic_write(path, &bytes)
+/// Save `RelayHoldDoc` to `path` sealed + atomically.
+pub fn save(cipher: &DatasetCipher, path: &Path, doc: &RelayHoldDoc) -> Result<(), SyncError> {
+    fleet_dataset_file::save(cipher, path, RELAY_HOLD_FILENAME, RELAY_HOLD_SCHEMA_V1, doc)
 }
 
 // ── Replay tracker ────────────────────────────────────────────────────────────
 
-/// Load the replay tracker from `path`. Returns `Ok(BTreeMap::new())` if the
-/// file does not exist yet.
-pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, SyncError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
-    };
-    if bytes.is_empty() {
-        return Err(SyncError::CborDecode(format!(
-            "relay-hold replay file is empty: {}",
-            path.display()
-        )));
-    }
-    let version = bytes[0];
-    let payload = &bytes[1..];
-    match version {
-        RELAY_HOLD_REPLAY_SCHEMA_V1 => {
-            let mut cursor = Cursor::new(payload);
-            let file: RelayHoldReplayFileV1 = from_reader(&mut cursor).map_err(|e| {
-                SyncError::CborDecode(format!("load_replay {}: {e}", path.display()))
-            })?;
-            // Reject trailing bytes after the CBOR value (mirrors
-            // owner_state_crypto::canonical_cbor_decode).
-            let pos = cursor.position() as usize;
-            if pos != payload.len() {
-                return Err(SyncError::CborDecode(format!(
-                    "trailing bytes after relay-hold replay value: consumed {} of {}",
-                    pos,
-                    payload.len()
-                )));
-            }
-            Ok(file.0)
-        }
-        v => Err(SyncError::CborDecode(format!(
-            "unknown relay-hold replay schema version {v:#x} in {}",
-            path.display()
-        ))),
-    }
+/// Load the replay tracker from `path` (strict). Returns `Ok(BTreeMap::new())`
+/// if the file does not exist yet.
+pub fn load_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
+    fleet_dataset_file::load(
+        cipher,
+        path,
+        RELAY_HOLD_REPLAY_FILENAME,
+        RELAY_HOLD_REPLAY_SCHEMA_V1,
+    )
 }
 
-/// Save the replay tracker to `path` atomically.
-pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), SyncError> {
-    let mut bytes = vec![RELAY_HOLD_REPLAY_SCHEMA_V1];
-    into_writer(&RelayHoldReplayFileV1(tracker.clone()), &mut bytes)
-        .map_err(|e| SyncError::CborEncode(format!("encode replay {}: {e}", path.display())))?;
-    atomic_write(path, &bytes)
+/// Same recovery contract as [`load_doc_or_recover`], for the replay tracker.
+pub fn load_replay_or_recover(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, SyncError> {
+    fleet_dataset_file::load_or_recover(
+        cipher,
+        path,
+        RELAY_HOLD_REPLAY_FILENAME,
+        RELAY_HOLD_REPLAY_SCHEMA_V1,
+    )
+}
+
+/// Save the replay tracker to `path` sealed + atomically.
+pub fn save_replay(
+    cipher: &DatasetCipher,
+    path: &Path,
+    tracker: &BTreeMap<String, Hlc>,
+) -> Result<(), SyncError> {
+    fleet_dataset_file::save(
+        cipher,
+        path,
+        RELAY_HOLD_REPLAY_FILENAME,
+        RELAY_HOLD_REPLAY_SCHEMA_V1,
+        tracker,
+    )
 }
 
 // ── first-observed sidecar (ZEB-862) ───────────────────────────────────────────
@@ -214,73 +103,49 @@ pub const RELAY_HOLD_FIRST_OBSERVED_FILENAME: &str = "relay_hold_first_observed.
 
 const RELAY_HOLD_FIRST_OBSERVED_SCHEMA_V1: u8 = 1;
 
-#[derive(Serialize, Deserialize)]
-struct RelayHoldFirstObservedFileV1(BTreeMap<String, u64>);
-
-/// Load the LOCAL first-observation clock from `path`. Returns
+/// Load the LOCAL first-observation clock from `path` (strict). Returns
 /// `Ok(BTreeMap::new())` if the file does not exist yet (→ today's re-stamp
 /// behavior; no doc-file migration needed).
-pub fn load_first_observed(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
-    };
-    if bytes.is_empty() {
-        return Err(SyncError::CborDecode(format!(
-            "relay-hold first-observed file is empty: {}",
-            path.display()
-        )));
-    }
-    let version = bytes[0];
-    let payload = &bytes[1..];
-    match version {
-        RELAY_HOLD_FIRST_OBSERVED_SCHEMA_V1 => {
-            let mut cursor = Cursor::new(payload);
-            let file: RelayHoldFirstObservedFileV1 = from_reader(&mut cursor).map_err(|e| {
-                SyncError::CborDecode(format!("load_first_observed {}: {e}", path.display()))
-            })?;
-            // Reject trailing bytes after the CBOR value (mirrors `load`).
-            let pos = cursor.position() as usize;
-            if pos != payload.len() {
-                return Err(SyncError::CborDecode(format!(
-                    "trailing bytes after relay-hold first-observed value: consumed {} of {}",
-                    pos,
-                    payload.len()
-                )));
-            }
-            Ok(file.0)
-        }
-        v => Err(SyncError::CborDecode(format!(
-            "unknown relay-hold first-observed schema version {v:#x} in {}",
-            path.display()
-        ))),
-    }
+pub fn load_first_observed(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, u64>, SyncError> {
+    fleet_dataset_file::load(
+        cipher,
+        path,
+        RELAY_HOLD_FIRST_OBSERVED_FILENAME,
+        RELAY_HOLD_FIRST_OBSERVED_SCHEMA_V1,
+    )
 }
 
-/// Same recovery contract as [`load_doc_or_recover`]: `CborDecode` corruption is
-/// quarantined (`.corrupt-<ms>`, bytes preserved) and an empty map returned; a
-/// transient `Persist` error is left untouched and propagated (ZEB-460). A
-/// missing/empty clock is safe — the next sweep re-stamps `now`, exactly today's
-/// behavior — so quarantine-to-empty never loses correctness, only punctuality.
-pub fn load_first_observed_or_recover(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
-    match load_first_observed(path) {
-        Ok(m) => Ok(m),
-        Err(e @ SyncError::CborDecode(_)) => {
-            quarantine(path, &e);
-            Ok(BTreeMap::new())
-        }
-        Err(e) => Err(e),
-    }
+/// Same recovery contract as [`load_doc_or_recover`]. A missing/empty clock is
+/// safe — the next sweep re-stamps `now`, exactly today's behavior — so
+/// quarantine-to-empty never loses correctness, only punctuality.
+pub fn load_first_observed_or_recover(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, u64>, SyncError> {
+    fleet_dataset_file::load_or_recover(
+        cipher,
+        path,
+        RELAY_HOLD_FIRST_OBSERVED_FILENAME,
+        RELAY_HOLD_FIRST_OBSERVED_SCHEMA_V1,
+    )
 }
 
-/// Save the LOCAL first-observation clock to `path` atomically.
-pub fn save_first_observed(path: &Path, map: &BTreeMap<String, u64>) -> Result<(), SyncError> {
-    let mut bytes = vec![RELAY_HOLD_FIRST_OBSERVED_SCHEMA_V1];
-    into_writer(&RelayHoldFirstObservedFileV1(map.clone()), &mut bytes).map_err(|e| {
-        SyncError::CborEncode(format!("encode first-observed {}: {e}", path.display()))
-    })?;
-    atomic_write(path, &bytes)
+/// Save the LOCAL first-observation clock to `path` sealed + atomically.
+pub fn save_first_observed(
+    cipher: &DatasetCipher,
+    path: &Path,
+    map: &BTreeMap<String, u64>,
+) -> Result<(), SyncError> {
+    fleet_dataset_file::save(
+        cipher,
+        path,
+        RELAY_HOLD_FIRST_OBSERVED_FILENAME,
+        RELAY_HOLD_FIRST_OBSERVED_SCHEMA_V1,
+        map,
+    )
 }
 
 // ── expiry-tombstone sidecar (ZEB-924) ─────────────────────────────────────────
@@ -294,81 +159,58 @@ pub const RELAY_HOLD_EXPIRED_FILENAME: &str = "relay_hold_expired.cbor";
 
 const RELAY_HOLD_EXPIRED_SCHEMA_V1: u8 = 1;
 
-#[derive(Serialize, Deserialize)]
-struct RelayHoldExpiredFileV1(BTreeMap<String, u64>);
-
-/// Load the LOCAL expiry tombstones from `path`. Returns
+/// Load the LOCAL expiry tombstones from `path` (strict). Returns
 /// `Ok(BTreeMap::new())` if the file does not exist yet (→ no suppression;
 /// the next TTL expiry starts recording).
-pub fn load_expired(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
-    };
-    if bytes.is_empty() {
-        return Err(SyncError::CborDecode(format!(
-            "relay-hold expired file is empty: {}",
-            path.display()
-        )));
-    }
-    let version = bytes[0];
-    let payload = &bytes[1..];
-    match version {
-        RELAY_HOLD_EXPIRED_SCHEMA_V1 => {
-            let mut cursor = Cursor::new(payload);
-            let file: RelayHoldExpiredFileV1 = from_reader(&mut cursor).map_err(|e| {
-                SyncError::CborDecode(format!("load_expired {}: {e}", path.display()))
-            })?;
-            // Reject trailing bytes after the CBOR value (mirrors `load`).
-            let pos = cursor.position() as usize;
-            if pos != payload.len() {
-                return Err(SyncError::CborDecode(format!(
-                    "trailing bytes after relay-hold expired value: consumed {} of {}",
-                    pos,
-                    payload.len()
-                )));
-            }
-            Ok(file.0)
-        }
-        v => Err(SyncError::CborDecode(format!(
-            "unknown relay-hold expired schema version {v:#x} in {}",
-            path.display()
-        ))),
-    }
+pub fn load_expired(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, u64>, SyncError> {
+    fleet_dataset_file::load(
+        cipher,
+        path,
+        RELAY_HOLD_EXPIRED_FILENAME,
+        RELAY_HOLD_EXPIRED_SCHEMA_V1,
+    )
 }
 
-/// Same recovery contract as [`load_doc_or_recover`]: `CborDecode` corruption
-/// is quarantined (`.corrupt-<ms>`, bytes preserved) and an empty map
-/// returned; a transient `Persist` error is left untouched and propagated
-/// (ZEB-460). A missing/empty tombstone set is safe-but-slower — the next
-/// resurrection re-arms one TTL window, then re-tombstones — so
-/// quarantine-to-empty never loses correctness, only punctuality.
-pub fn load_expired_or_recover(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
-    match load_expired(path) {
-        Ok(m) => Ok(m),
-        Err(e @ SyncError::CborDecode(_)) => {
-            quarantine(path, &e);
-            Ok(BTreeMap::new())
-        }
-        Err(e) => Err(e),
-    }
+/// Same recovery contract as [`load_doc_or_recover`]. A missing/empty
+/// tombstone set is safe-but-slower — the next resurrection re-arms one TTL
+/// window, then re-tombstones — so quarantine-to-empty never loses
+/// correctness, only punctuality.
+pub fn load_expired_or_recover(
+    cipher: &DatasetCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, u64>, SyncError> {
+    fleet_dataset_file::load_or_recover(
+        cipher,
+        path,
+        RELAY_HOLD_EXPIRED_FILENAME,
+        RELAY_HOLD_EXPIRED_SCHEMA_V1,
+    )
 }
 
-/// Save the LOCAL expiry tombstones to `path` atomically.
-pub fn save_expired(path: &Path, map: &BTreeMap<String, u64>) -> Result<(), SyncError> {
-    let mut bytes = vec![RELAY_HOLD_EXPIRED_SCHEMA_V1];
-    into_writer(&RelayHoldExpiredFileV1(map.clone()), &mut bytes)
-        .map_err(|e| SyncError::CborEncode(format!("encode expired {}: {e}", path.display())))?;
-    atomic_write(path, &bytes)
+/// Save the LOCAL expiry tombstones to `path` sealed + atomically.
+pub fn save_expired(
+    cipher: &DatasetCipher,
+    path: &Path,
+    map: &BTreeMap<String, u64>,
+) -> Result<(), SyncError> {
+    fleet_dataset_file::save(
+        cipher,
+        path,
+        RELAY_HOLD_EXPIRED_FILENAME,
+        RELAY_HOLD_EXPIRED_SCHEMA_V1,
+        map,
+    )
 }
 
 // ── FleetPersist impl ─────────────────────────────────────────────────────────
 
 /// Durability sink for the relay-hold fleet-sync engine. Holds the absolute
-/// paths for both the doc and replay-tracker files. The engine calls
-/// `persist` inside a `spawn_blocking` (fleet_sync.rs), so this impl stays
-/// synchronous like `DmInboxPersist`.
+/// paths for both the doc and replay-tracker files plus the sealing context.
+/// The engine calls `persist` inside a `spawn_blocking` (fleet_sync.rs), so
+/// this impl stays synchronous like `DmInboxPersist`.
 pub struct RelayHoldPersist {
     pub doc_path: std::path::PathBuf,
     pub replay_path: std::path::PathBuf,
@@ -378,6 +220,7 @@ pub struct RelayHoldPersist {
     /// ZEB-924: local-only expiry-tombstone sidecar (see
     /// `RELAY_HOLD_EXPIRED_FILENAME`).
     pub expired_path: std::path::PathBuf,
+    pub cipher: DatasetCipher,
 }
 
 impl crate::fleet_sync::FleetPersist<RelayHoldDoc> for RelayHoldPersist {
@@ -394,10 +237,14 @@ impl crate::fleet_sync::FleetPersist<RelayHoldDoc> for RelayHoldPersist {
         // fresh TTL). Tombstone-first inverts the window: a crash leaves the
         // tombstone durable with a stale doc still holding the entry, which
         // boot restoration removes (the tombstone wins).
-        save_expired(&self.expired_path, state.expired_at_ms())?;
-        save(&self.doc_path, state)?;
-        save_replay(&self.replay_path, tracker)?;
-        save_first_observed(&self.first_observed_path, state.first_observed_ms())?;
+        save_expired(&self.cipher, &self.expired_path, state.expired_at_ms())?;
+        save(&self.cipher, &self.doc_path, state)?;
+        save_replay(&self.cipher, &self.replay_path, tracker)?;
+        save_first_observed(
+            &self.cipher,
+            &self.first_observed_path,
+            state.first_observed_ms(),
+        )?;
         Ok(())
     }
 }
@@ -408,6 +255,7 @@ impl crate::fleet_sync::FleetPersist<RelayHoldDoc> for RelayHoldPersist {
 mod tests {
     use super::*;
     use crate::community_relay_hold_crdt::{RelayHoldDoc, RelayHoldEntry};
+    use crate::fleet_dataset_file::test_cipher;
     use crate::fleet_sync::SyncError;
     use crate::owner_state_types::{Hlc, SpaceId};
 
@@ -438,28 +286,51 @@ mod tests {
     fn doc_round_trips_and_missing_file_is_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold.cbor");
-        assert_eq!(load(&path).unwrap(), RelayHoldDoc::default());
+        let c = test_cipher();
+        assert_eq!(load(&c, &path).unwrap(), RelayHoldDoc::default());
         let doc = sample_doc();
-        save(&path, &doc).unwrap();
-        assert_eq!(load(&path).unwrap(), doc);
+        save(&c, &path, &doc).unwrap();
+        assert_eq!(load(&c, &path).unwrap(), doc);
+        // ZEB-981: what hits the disk is the sealed envelope, not plaintext.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw[0], crate::fleet_dataset_file::SEALED_SCHEMA_V2);
+    }
+
+    #[test]
+    fn legacy_plaintext_relay_hold_migrates_to_sealed_on_load() {
+        // A pre-ZEB-981 build persisted `[0x01] ‖ plaintext CBOR`; first load
+        // must return the doc AND rewrite the file sealed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_hold.cbor");
+        let c = test_cipher();
+        let mut v1 = vec![1u8];
+        ciborium::into_writer(&sample_doc(), &mut v1).unwrap();
+        std::fs::write(&path, &v1).unwrap();
+        assert_eq!(load_doc_or_recover(&c, &path).unwrap(), sample_doc());
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(
+            raw[0],
+            crate::fleet_dataset_file::SEALED_SCHEMA_V2,
+            "migrated on load"
+        );
+        assert_eq!(load_doc_or_recover(&c, &path).unwrap(), sample_doc());
     }
 
     #[test]
     fn load_rejects_trailing_bytes_after_valid_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold.cbor");
-        let doc = sample_doc();
-        save(&path, &doc).unwrap();
-        assert_eq!(load(&path).unwrap(), doc);
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.push(0xFF);
-        std::fs::write(&path, &bytes).unwrap();
-        let err = load(&path).unwrap_err();
+        let c = test_cipher();
+        let mut v1 = vec![1u8];
+        ciborium::into_writer(&sample_doc(), &mut v1).unwrap();
+        v1.push(0xFF);
+        std::fs::write(&path, &v1).unwrap();
+        let err = load(&c, &path).unwrap_err();
         assert!(
             matches!(err, SyncError::CborDecode(_)),
             "trailing bytes must surface CborDecode, got {err:?}"
         );
-        let recovered = load_doc_or_recover(&path).unwrap();
+        let recovered = load_doc_or_recover(&c, &path).unwrap();
         assert_eq!(recovered, RelayHoldDoc::default());
         assert!(!path.exists(), "corrupt file was quarantined");
     }
@@ -468,7 +339,8 @@ mod tests {
     fn replay_round_trips_and_missing_is_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold_replay.cbor");
-        assert!(load_replay(&path).unwrap().is_empty());
+        let c = test_cipher();
+        assert!(load_replay(&c, &path).unwrap().is_empty());
         let mut t = std::collections::BTreeMap::new();
         t.insert(
             "A".to_string(),
@@ -478,16 +350,17 @@ mod tests {
                 device_id: "A".into(),
             },
         );
-        save_replay(&path, &t).unwrap();
-        assert_eq!(load_replay(&path).unwrap(), t);
+        save_replay(&c, &path, &t).unwrap();
+        assert_eq!(load_replay(&c, &path).unwrap(), t);
     }
 
     #[test]
     fn load_doc_or_recover_quarantines_corrupt_and_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold.cbor");
+        let c = test_cipher();
         std::fs::write(&path, [0xFF_u8, 0x01, 0x02]).unwrap();
-        let doc = load_doc_or_recover(&path).unwrap();
+        let doc = load_doc_or_recover(&c, &path).unwrap();
         assert_eq!(
             doc,
             RelayHoldDoc::default(),
@@ -518,7 +391,11 @@ mod tests {
     fn load_doc_or_recover_missing_is_default_no_quarantine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold.cbor");
-        assert_eq!(load_doc_or_recover(&path).unwrap(), RelayHoldDoc::default());
+        let c = test_cipher();
+        assert_eq!(
+            load_doc_or_recover(&c, &path).unwrap(),
+            RelayHoldDoc::default()
+        );
         let any: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -528,15 +405,13 @@ mod tests {
 
     #[test]
     fn load_doc_or_recover_propagates_transient_io_without_quarantine() {
-        // A transient I/O error (NOT corruption) must surface as Err and must
-        // NOT be quarantined: quarantining would orphan real data and let the
-        // next persist overwrite it with an empty doc (ZEB-460). Force a
-        // SyncError::Persist by pointing load() at a directory — std::fs::read
-        // on a dir returns a non-NotFound error.
+        // ZEB-460: transient I/O must surface Err untouched — quarantining
+        // would orphan real data and let the next persist overwrite it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.cbor");
+        let c = test_cipher();
         std::fs::create_dir(&path).unwrap();
-        let err = load_doc_or_recover(&path).unwrap_err();
+        let err = load_doc_or_recover(&c, &path).unwrap_err();
         assert!(
             matches!(err, SyncError::Persist(_)),
             "transient I/O must surface Persist, got {err:?}"
@@ -557,8 +432,9 @@ mod tests {
     fn load_replay_or_recover_propagates_transient_io_without_quarantine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay.cbor");
+        let c = test_cipher();
         std::fs::create_dir(&path).unwrap();
-        let err = load_replay_or_recover(&path).unwrap_err();
+        let err = load_replay_or_recover(&c, &path).unwrap_err();
         assert!(
             matches!(err, SyncError::Persist(_)),
             "transient I/O must surface Persist, got {err:?}"
@@ -573,8 +449,9 @@ mod tests {
     fn load_replay_or_recover_quarantines_corrupt_and_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold_replay.cbor");
+        let c = test_cipher();
         std::fs::write(&path, [0xFF_u8]).unwrap();
-        let tracker = load_replay_or_recover(&path).unwrap();
+        let tracker = load_replay_or_recover(&c, &path).unwrap();
         assert!(tracker.is_empty(), "recovers to an empty tracker");
         assert!(!path.exists(), "corrupt replay file moved aside");
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())
@@ -597,6 +474,7 @@ mod tests {
             replay_path: dir.path().join("relay_hold_replay.cbor"),
             first_observed_path: dir.path().join("relay_hold_first_observed.cbor"),
             expired_path: dir.path().join(RELAY_HOLD_EXPIRED_FILENAME),
+            cipher: test_cipher(),
         };
         use crate::fleet_sync::FleetPersist;
         let mut doc = sample_doc();
@@ -617,9 +495,12 @@ mod tests {
             },
         );
         p.persist(&doc, &t).unwrap();
-        assert_eq!(load(&p.doc_path).unwrap(), doc);
-        assert_eq!(load_replay(&p.replay_path).unwrap(), t);
-        assert_eq!(load_first_observed(&p.first_observed_path).unwrap(), fo);
+        assert_eq!(load(&p.cipher, &p.doc_path).unwrap(), doc);
+        assert_eq!(load_replay(&p.cipher, &p.replay_path).unwrap(), t);
+        assert_eq!(
+            load_first_observed(&p.cipher, &p.first_observed_path).unwrap(),
+            fo
+        );
     }
 
     // ── first-observed sidecar (ZEB-862) ──────────────────────────────────────
@@ -628,30 +509,34 @@ mod tests {
     fn first_observed_round_trips_and_missing_is_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold_first_observed.cbor");
-        assert!(load_first_observed(&path).unwrap().is_empty());
+        let c = test_cipher();
+        assert!(load_first_observed(&c, &path).unwrap().is_empty());
         let mut m = std::collections::BTreeMap::new();
         m.insert("k1".to_string(), 111u64);
         m.insert("k2".to_string(), 222u64);
-        save_first_observed(&path, &m).unwrap();
-        assert_eq!(load_first_observed(&path).unwrap(), m);
+        save_first_observed(&c, &path, &m).unwrap();
+        assert_eq!(load_first_observed(&c, &path).unwrap(), m);
     }
 
     #[test]
     fn load_first_observed_rejects_trailing_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay_hold_first_observed.cbor");
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("k".to_string(), 5u64);
-        save_first_observed(&path, &m).unwrap();
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.push(0xFF);
-        std::fs::write(&path, &bytes).unwrap();
+        let c = test_cipher();
+        // Legacy v1 sidecar with a stray byte appended.
+        let m: BTreeMap<String, u64> = [("k".to_string(), 5u64)].into_iter().collect();
+        let mut v1 = vec![1u8];
+        ciborium::into_writer(&m, &mut v1).unwrap();
+        v1.push(0xFF);
+        std::fs::write(&path, &v1).unwrap();
         assert!(matches!(
-            load_first_observed(&path).unwrap_err(),
+            load_first_observed(&c, &path).unwrap_err(),
             SyncError::CborDecode(_)
         ));
         // recover quarantines and returns empty
-        assert!(load_first_observed_or_recover(&path).unwrap().is_empty());
+        assert!(load_first_observed_or_recover(&c, &path)
+            .unwrap()
+            .is_empty());
         assert!(!path.exists(), "corrupt sidecar was quarantined");
     }
 
@@ -659,9 +544,10 @@ mod tests {
     fn load_first_observed_or_recover_propagates_transient_io_without_quarantine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fo.cbor");
+        let c = test_cipher();
         std::fs::create_dir(&path).unwrap();
         assert!(matches!(
-            load_first_observed_or_recover(&path).unwrap_err(),
+            load_first_observed_or_recover(&c, &path).unwrap_err(),
             SyncError::Persist(_)
         ));
         assert!(path.is_dir(), "transient error leaves the path untouched");
@@ -674,16 +560,17 @@ mod tests {
         // never-covered entry out on gc(now).
         let dir = tempfile::tempdir().unwrap();
         let fo_path = dir.path().join("relay_hold_first_observed.cbor");
+        let c = test_cipher();
         let key = RelayHoldDoc::key(&[1u8; 16], &[2u8; 32]);
         let seed: BTreeMap<String, u64> = [(key.clone(), 1u64)].into_iter().collect();
-        save_first_observed(&fo_path, &seed).unwrap();
+        save_first_observed(&c, &fo_path, &seed).unwrap();
 
         let mut doc = RelayHoldDoc::default();
         let mut e = sample_entry();
         e.pulled_by.clear(); // never covered → only TTL removes it
         doc.entries.insert(key.clone(), e);
         let now = crate::community_relay::RELAY_HOLD_TTL_MS + 10_000;
-        doc.restore_first_observed(load_first_observed_or_recover(&fo_path).unwrap(), now);
+        doc.restore_first_observed(load_first_observed_or_recover(&c, &fo_path).unwrap(), now);
         doc.gc(now);
         assert!(
             !doc.entries.contains_key(&key),
@@ -697,31 +584,33 @@ mod tests {
     fn expired_round_trips_and_missing_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(RELAY_HOLD_EXPIRED_FILENAME);
+        let c = test_cipher();
         assert!(
-            load_expired(&path).unwrap().is_empty(),
+            load_expired(&c, &path).unwrap().is_empty(),
             "missing file → empty"
         );
         let mut m: BTreeMap<String, u64> = BTreeMap::new();
         m.insert("k1".into(), 42);
-        save_expired(&path, &m).unwrap();
-        assert_eq!(load_expired(&path).unwrap(), m);
+        save_expired(&c, &path, &m).unwrap();
+        assert_eq!(load_expired(&c, &path).unwrap(), m);
     }
 
     #[test]
     fn load_expired_rejects_trailing_bytes_and_recover_quarantines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(RELAY_HOLD_EXPIRED_FILENAME);
-        let mut m: BTreeMap<String, u64> = BTreeMap::new();
-        m.insert("k1".into(), 42);
-        save_expired(&path, &m).unwrap();
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.push(0x00);
-        std::fs::write(&path, &bytes).unwrap();
+        let c = test_cipher();
+        // Legacy v1 sidecar with a stray byte appended.
+        let m: BTreeMap<String, u64> = [("k1".to_string(), 42u64)].into_iter().collect();
+        let mut v1 = vec![1u8];
+        ciborium::into_writer(&m, &mut v1).unwrap();
+        v1.push(0x00);
+        std::fs::write(&path, &v1).unwrap();
         assert!(matches!(
-            load_expired(&path).unwrap_err(),
+            load_expired(&c, &path).unwrap_err(),
             SyncError::CborDecode(_)
         ));
-        assert!(load_expired_or_recover(&path).unwrap().is_empty());
+        assert!(load_expired_or_recover(&c, &path).unwrap().is_empty());
         assert!(!path.exists(), "corrupt file quarantined away");
     }
 
@@ -733,6 +622,7 @@ mod tests {
             replay_path: dir.path().join("relay_hold_replay.cbor"),
             first_observed_path: dir.path().join("relay_hold_first_observed.cbor"),
             expired_path: dir.path().join(RELAY_HOLD_EXPIRED_FILENAME),
+            cipher: test_cipher(),
         };
         let mut doc = RelayHoldDoc::default();
         let m: BTreeMap<String, u64> = [("gone-key".to_string(), 7u64)].into_iter().collect();
@@ -740,6 +630,6 @@ mod tests {
         doc.restore_expired(m.clone(), 7);
         use crate::fleet_sync::FleetPersist;
         p.persist(&doc, &BTreeMap::new()).unwrap();
-        assert_eq!(load_expired(&p.expired_path).unwrap(), m);
+        assert_eq!(load_expired(&p.cipher, &p.expired_path).unwrap(), m);
     }
 }

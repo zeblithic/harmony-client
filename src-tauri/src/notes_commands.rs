@@ -467,6 +467,7 @@ mod tests {
             persist: Arc::new(NotesPersist {
                 doc_path: dir.path().join("notes.cbor"),
                 replay_path: dir.path().join("notes_replay.cbor"),
+                cipher: crate::fleet_dataset_file::test_cipher(),
             }),
             lookup_key_tag: b"notes-v1",
             debounce_ms: DEFAULT_DEBOUNCE_MS,

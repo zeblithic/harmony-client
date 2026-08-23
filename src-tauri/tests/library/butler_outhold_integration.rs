@@ -276,6 +276,7 @@ fn build_outhold_engine(
         persist: Arc::new(DmOutholdPersist {
             doc_path: dir.join("dm_outhold.cbor"),
             replay_path: dir.join("dm_outhold_replay.cbor"),
+            cipher: harmony_app::fleet_dataset_file::test_cipher(),
         }),
         lookup_key_tag: b"dm-outhold-v1",
         debounce_ms: 50,
@@ -322,6 +323,7 @@ fn build_inbox_engine(
             replay_path: dir.join("dm_inbox_replay.cbor"),
             first_observed_path: dir.join("dm_inbox_first_observed.cbor"),
             expired_path: dir.join("dm_inbox_expired.cbor"),
+            cipher: harmony_app::fleet_dataset_file::test_cipher(),
         }),
         lookup_key_tag: b"dm-inbox-v1",
         debounce_ms: 50,

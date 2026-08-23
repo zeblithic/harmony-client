@@ -657,6 +657,76 @@ pub fn decrypt_file_dek(keys: &KeyTree, blob: &[u8]) -> Result<Zeroizing<[u8; 32
     Ok(out)
 }
 
+/// Domain-separated AAD prefix for sealed dataset files at rest (ZEB-981).
+/// DISTINCT from `AAD_FILE_DEK` and `AAD_FRIEND_SECRET` so a sealed dataset
+/// file can never be opened as either (and vice versa) even though all three
+/// seal under `friend_aead`. The file's canonical filename (label) is
+/// appended so ciphertext moved between dataset files fails the Poly1305 tag.
+const AAD_DATASET_AT_REST: &[u8] = b"zeb-981-dataset-at-rest:v2:";
+
+fn dataset_aad(label: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(AAD_DATASET_AT_REST.len() + label.len());
+    aad.extend_from_slice(AAD_DATASET_AT_REST);
+    aad.extend_from_slice(label.as_bytes());
+    aad
+}
+
+/// Seal a dataset file image for at-rest storage (ZEB-981). Mirrors
+/// [`encrypt_file_dek`] (random nonce; layout `nonce(12) ‖ ct+tag`) with the
+/// dataset AAD domain. `label` is the file's canonical filename constant.
+pub fn seal_dataset_file(
+    keys: &KeyTree,
+    label: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut nonce_bytes = [0u8; 12];
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|e| CryptoError::Rng(e.to_string()))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.friend_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad: &dataset_aad(label),
+            },
+        )
+        .map_err(|_| CryptoError::AeadEncrypt)?;
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Open a blob produced by [`seal_dataset_file`]. Returns the inner file
+/// image zeroized-on-drop, or `CryptoError::AeadDecrypt` on wrong
+/// key/label/corruption — callers map that to quarantine-and-self-heal
+/// (fleet sync re-populates content from peer devices).
+pub fn open_dataset_file(
+    keys: &KeyTree,
+    label: &str,
+    sealed: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    if sealed.len() < 12 + 16 {
+        return Err(CryptoError::AeadDecrypt);
+    }
+    let (nonce_bytes, ciphertext) = sealed.split_at(12);
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.friend_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: &dataset_aad(label),
+            },
+        )
+        .map_err(|_| CryptoError::AeadDecrypt)?;
+    Ok(Zeroizing::new(plaintext))
+}
+
 /// Per-publisher HLC tracker for state-root replay protection.
 ///
 /// Per ZEB-211 round-5: "last accepted" is keyed by `at.device_id`,
@@ -1505,5 +1575,42 @@ mod tests {
         assert_eq!(back.epoch, 3);
         assert_eq!(back.entry_aead.as_ref(), kt.entry_aead.as_ref());
         assert_eq!(back.friend_aead.as_ref(), kt.friend_aead.as_ref());
+    }
+
+    // ── ZEB-981: dataset-file at-rest envelope ───────────────────────────────
+
+    #[test]
+    fn dataset_file_seal_open_round_trip() {
+        let keys = KeyTree::derive(&[7u8; 32]).unwrap();
+        let sealed = seal_dataset_file(&keys, "notes.cbor", b"hello dataset").unwrap();
+        assert_eq!(sealed.len(), 12 + 13 + 16, "nonce + ct + tag");
+        let opened = open_dataset_file(&keys, "notes.cbor", &sealed).unwrap();
+        assert_eq!(&opened[..], b"hello dataset");
+    }
+
+    #[test]
+    fn dataset_file_label_swap_fails_tag() {
+        let keys = KeyTree::derive(&[7u8; 32]).unwrap();
+        let sealed = seal_dataset_file(&keys, "contacts.cbor", b"x").unwrap();
+        assert!(open_dataset_file(&keys, "notes.cbor", &sealed).is_err());
+    }
+
+    #[test]
+    fn dataset_file_tamper_and_foreign_key_fail() {
+        let keys = KeyTree::derive(&[7u8; 32]).unwrap();
+        let mut sealed = seal_dataset_file(&keys, "notes.cbor", b"x").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        assert!(open_dataset_file(&keys, "notes.cbor", &sealed).is_err());
+        let sealed_ok = seal_dataset_file(&keys, "notes.cbor", b"x").unwrap();
+        let other = KeyTree::derive(&[8u8; 32]).unwrap();
+        assert!(open_dataset_file(&other, "notes.cbor", &sealed_ok).is_err());
+    }
+
+    #[test]
+    fn dataset_file_truncated_blob_fails_cleanly() {
+        let keys = KeyTree::derive(&[7u8; 32]).unwrap();
+        assert!(open_dataset_file(&keys, "notes.cbor", &[]).is_err());
+        assert!(open_dataset_file(&keys, "notes.cbor", &[0u8; 11]).is_err());
     }
 }

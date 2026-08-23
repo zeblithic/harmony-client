@@ -197,6 +197,7 @@ pub mod event_loop;
 pub mod feed_authority;
 pub mod file_sharing;
 pub mod file_stream_crypto;
+pub mod fleet_dataset_file;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
 pub mod fleet_net_persist;
@@ -6159,6 +6160,11 @@ pub async fn start_node_inner(
                     // keyless (local-only) boot skips it as one unit.
                     if let Some((kt, keys)) = fleet_crypto.clone() {
                         tracing::info!("BOOT-PROBE 02: iroh/pkarr/profile sections done, entering mint sync engine");
+                        // ZEB-981: sealing context for dataset files at rest —
+                        // pinned epoch-0 tree, shared by every fleet dataset
+                        // persist constructed in this band.
+                        let dataset_cipher =
+                            crate::fleet_dataset_file::DatasetCipher::new(kt.clone());
                         // ── Mint Phase 2 sync engine ─────────────────────────────
                         //
                         // Construct MintSyncEngine now that kt, device_id, and
@@ -6330,14 +6336,17 @@ pub async fn start_node_inner(
                         let notes_replay_path =
                             identity_dir.join(crate::notes_persist::NOTES_REPLAY_FILENAME);
                         let notes_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::notes_persist::load_doc_or_recover(&notes_path)
+                            crate::notes_persist::load_doc_or_recover(&dataset_cipher, &notes_path)
                                 .map_err(|e| format!("load notes doc: {e}"))?,
                         ));
                         let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
-                                crate::notes_persist::load_replay_or_recover(&notes_replay_path)
-                                    .map_err(|e| format!("load notes replay: {e}"))?,
+                                crate::notes_persist::load_replay_or_recover(
+                                    &dataset_cipher,
+                                    &notes_replay_path,
+                                )
+                                .map_err(|e| format!("load notes replay: {e}"))?,
                             ),
                         ));
                         let (notes_out_tx, notes_out_rx) =
@@ -6362,6 +6371,7 @@ pub async fn start_node_inner(
                                         crate::notes_persist::NotesPersist {
                                             doc_path: notes_path,
                                             replay_path: notes_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"notes-v1",
@@ -6402,18 +6412,23 @@ pub async fn start_node_inner(
                         // runs only while contacts.cbor does not exist yet, then
                         // renames the legacy file so it can never re-import.
                         crate::contacts_commands::migrate_friend_nicknames_to_contacts(
+                            &dataset_cipher,
                             &contacts_path,
                             &app_data_dir.join("friend_nicknames.json"),
                             &device_id,
                         );
                         let contacts_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::contacts_persist::load_doc_or_recover(&contacts_path)
-                                .map_err(|e| format!("load contacts doc: {e}"))?,
+                            crate::contacts_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &contacts_path,
+                            )
+                            .map_err(|e| format!("load contacts doc: {e}"))?,
                         ));
                         let contacts_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::contacts_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &contacts_replay_path,
                                 )
                                 .map_err(|e| format!("load contacts replay: {e}"))?,
@@ -6443,6 +6458,7 @@ pub async fn start_node_inner(
                                         crate::contacts_persist::ContactsPersist {
                                             doc_path: contacts_path,
                                             replay_path: contacts_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: crate::contacts_commands::CONTACTS_DATASET
@@ -6496,9 +6512,11 @@ pub async fn start_node_inner(
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
                         let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
-                            let mut doc =
-                                crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
-                                    .map_err(|e| format!("load dm-inbox doc: {e}"))?;
+                            let mut doc = crate::dm_inbox_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &dm_inbox_path,
+                            )
+                            .map_err(|e| format!("load dm-inbox doc: {e}"))?;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -6509,6 +6527,7 @@ pub async fn start_node_inner(
                             // the removed entries' stamps.
                             doc.restore_expired(
                                 crate::dm_inbox_persist::load_expired_or_recover(
+                                    &dataset_cipher,
                                     &dm_inbox_expired_path,
                                 )
                                 .map_err(|e| format!("load dm-inbox expired: {e}"))?,
@@ -6516,6 +6535,7 @@ pub async fn start_node_inner(
                             );
                             doc.restore_first_observed(
                                 crate::dm_inbox_persist::load_first_observed_or_recover(
+                                    &dataset_cipher,
                                     &dm_inbox_first_observed_path,
                                 )
                                 .map_err(|e| format!("load dm-inbox first-observed: {e}"))?,
@@ -6527,6 +6547,7 @@ pub async fn start_node_inner(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::dm_inbox_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &dm_inbox_replay_path,
                                 )
                                 .map_err(|e| format!("load dm-inbox replay: {e}"))?,
@@ -6582,6 +6603,7 @@ pub async fn start_node_inner(
                                             replay_path: dm_inbox_replay_path,
                                             first_observed_path: dm_inbox_first_observed_path,
                                             expired_path: dm_inbox_expired_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"dm-inbox-v1",
@@ -6709,6 +6731,7 @@ pub async fn start_node_inner(
                         let community_device_intro_doc =
                             std::sync::Arc::new(tokio::sync::Mutex::new(
                                 crate::community_device_intro_persist::load_doc_or_recover(
+                                    &dataset_cipher,
                                     &community_device_intro_path,
                                 )
                                 .map_err(|e| format!("load community-device-intro doc: {e}"))?,
@@ -6718,6 +6741,7 @@ pub async fn start_node_inner(
                                 harmony_crdt_sync::ReplayTracker::from_accepted(
                                     device_id.clone(),
                                     crate::community_device_intro_persist::load_replay_or_recover(
+                                        &dataset_cipher,
                                         &community_device_intro_replay_path,
                                     )
                                     .map_err(|e| {
@@ -6756,6 +6780,7 @@ pub async fn start_node_inner(
                                     crate::community_device_intro_persist::CommunityDeviceIntroPersist {
                                         doc_path: community_device_intro_path,
                                         replay_path: community_device_intro_replay_path,
+                                        cipher: dataset_cipher.clone(),
                                     },
                                 ),
                                 lookup_key_tag: b"community-device-intro-v1",
@@ -6824,9 +6849,11 @@ pub async fn start_node_inner(
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
                         let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
-                            let mut doc =
-                                crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
-                                    .map_err(|e| format!("load relay-hold doc: {e}"))?;
+                            let mut doc = crate::relay_hold_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &relay_hold_path,
+                            )
+                            .map_err(|e| format!("load relay-hold doc: {e}"))?;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -6838,6 +6865,7 @@ pub async fn start_node_inner(
                             // their stamps.
                             doc.restore_expired(
                                 crate::relay_hold_persist::load_expired_or_recover(
+                                    &dataset_cipher,
                                     &relay_hold_expired_path,
                                 )
                                 .map_err(|e| format!("load relay-hold expired: {e}"))?,
@@ -6845,6 +6873,7 @@ pub async fn start_node_inner(
                             );
                             doc.restore_first_observed(
                                 crate::relay_hold_persist::load_first_observed_or_recover(
+                                    &dataset_cipher,
                                     &relay_hold_first_observed_path,
                                 )
                                 .map_err(|e| format!("load relay-hold first-observed: {e}"))?,
@@ -6856,6 +6885,7 @@ pub async fn start_node_inner(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::relay_hold_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &relay_hold_replay_path,
                                 )
                                 .map_err(|e| format!("load relay-hold replay: {e}"))?,
@@ -6886,6 +6916,7 @@ pub async fn start_node_inner(
                                             replay_path: relay_hold_replay_path,
                                             first_observed_path: relay_hold_first_observed_path,
                                             expired_path: relay_hold_expired_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"relay-hold-v1",
@@ -6902,13 +6933,17 @@ pub async fn start_node_inner(
                         let relay_optin_replay_path = identity_dir
                             .join(crate::relay_optin_persist::RELAY_OPTIN_REPLAY_FILENAME);
                         let relay_optin_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::relay_optin_persist::load_doc_or_recover(&relay_optin_path)
-                                .map_err(|e| format!("load relay-optin doc: {e}"))?,
+                            crate::relay_optin_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &relay_optin_path,
+                            )
+                            .map_err(|e| format!("load relay-optin doc: {e}"))?,
                         ));
                         let relay_optin_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::relay_optin_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &relay_optin_replay_path,
                                 )
                                 .map_err(|e| format!("load relay-optin replay: {e}"))?,
@@ -6937,6 +6972,7 @@ pub async fn start_node_inner(
                                         crate::relay_optin_persist::RelayOptInPersist {
                                             doc_path: relay_optin_path,
                                             replay_path: relay_optin_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"relay-optin-v1",
@@ -6992,13 +7028,17 @@ pub async fn start_node_inner(
                         let dm_outhold_replay_path = identity_dir
                             .join(crate::dm_outhold_persist::DM_OUTHOLD_REPLAY_FILENAME);
                         let dm_outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::dm_outhold_persist::load_doc_or_recover(&dm_outhold_path)
-                                .map_err(|e| format!("load dm-outhold doc: {e}"))?,
+                            crate::dm_outhold_persist::load_doc_or_recover(
+                                &dataset_cipher,
+                                &dm_outhold_path,
+                            )
+                            .map_err(|e| format!("load dm-outhold doc: {e}"))?,
                         ));
                         let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::dm_outhold_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &dm_outhold_replay_path,
                                 )
                                 .map_err(|e| format!("load dm-outhold replay: {e}"))?,
@@ -7029,6 +7069,7 @@ pub async fn start_node_inner(
                                         crate::dm_outhold_persist::DmOutholdPersist {
                                             doc_path: dm_outhold_path,
                                             replay_path: dm_outhold_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"dm-outhold-v1",
@@ -7084,9 +7125,11 @@ pub async fn start_node_inner(
                             identity_dir.join(crate::fleet_net_persist::FLEET_NET_FILENAME);
                         let fleet_net_replay_path =
                             identity_dir.join(crate::fleet_net_persist::FLEET_NET_REPLAY_FILENAME);
-                        let initial_fleet_net_doc =
-                            crate::fleet_net_persist::load_doc_or_recover(&fleet_net_path)
-                                .map_err(|e| format!("load fleet-net doc: {e}"))?;
+                        let initial_fleet_net_doc = crate::fleet_net_persist::load_doc_or_recover(
+                            &dataset_cipher,
+                            &fleet_net_path,
+                        )
+                        .map_err(|e| format!("load fleet-net doc: {e}"))?;
                         // ZEB-418 P2 Task 7 (D15): SYNCHRONOUS snapshot of the
                         // fleet-net doc, seeded from the loaded doc. The pkarr
                         // routing-blob builder is a sync `Fn() -> Vec<u8>` and
@@ -7105,6 +7148,7 @@ pub async fn start_node_inner(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::fleet_net_persist::load_replay_or_recover(
+                                    &dataset_cipher,
                                     &fleet_net_replay_path,
                                 )
                                 .map_err(|e| format!("load fleet-net replay: {e}"))?,
@@ -7145,6 +7189,7 @@ pub async fn start_node_inner(
                                         crate::fleet_net_persist::FleetNetPersist {
                                             doc_path: fleet_net_path,
                                             replay_path: fleet_net_replay_path,
+                                            cipher: dataset_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: b"fleet-net-v1",

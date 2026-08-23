@@ -935,6 +935,7 @@ mod tests {
             persist: Arc::new(DmOutholdPersist {
                 doc_path: dir.path().join("dm_outhold.cbor"),
                 replay_path: dir.path().join("dm_outhold_replay.cbor"),
+                cipher: crate::fleet_dataset_file::test_cipher(),
             }),
             lookup_key_tag: b"dm-outhold-v1",
             debounce_ms: DEFAULT_DEBOUNCE_MS,
