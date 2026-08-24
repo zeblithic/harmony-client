@@ -44498,6 +44498,9 @@ mod redeem_invite_inner_tests {
     async fn redeem_invite_writes_snapshot_to_data_dir() {
         let fixture = build_redeem_invite_test_fixture().await;
         let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+        // ZEB-983: seed the per-dir device-cipher memo so the sealed
+        // pre_fork_snapshot.bin write derives a key without a real identity.
+        crate::device_dataset_file::install_test_cipher(tmp.path());
 
         let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
@@ -44586,11 +44589,23 @@ mod redeem_invite_inner_tests {
             snapshot_path.display()
         );
 
-        // Assert 2: decoded bytes match the input snapshot.
-        let bytes = std::fs::read(&snapshot_path).expect("read snapshot file");
+        // Assert 2: the sealed file opens under the device cipher and its
+        // inner image decodes to the input snapshot (ZEB-983).
+        assert_eq!(
+            std::fs::read(&snapshot_path).unwrap().first(),
+            Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3),
+            "snapshot must be sealed at rest"
+        );
+        let image = crate::device_dataset_file::read_image(
+            &crate::device_dataset_file::test_cipher(),
+            &snapshot_path,
+            &crate::community_state_persist::seal_label(&community_id, "pre_fork_snapshot.bin"),
+        )
+        .expect("open sealed snapshot")
+        .expect("snapshot present");
         let decoded: crate::community_invite::PreForkSnapshot =
-            crate::owner_state_crypto::canonical_cbor_decode(&bytes)
-                .expect("decode pre_fork_snapshot.bin");
+            crate::owner_state_crypto::canonical_cbor_decode(&image.bytes)
+                .expect("decode pre_fork_snapshot inner image");
         assert_eq!(decoded, snapshot, "decoded snapshot must match input");
 
         // Assert 3: CommunityState.forked_from is set on the engine.
@@ -44615,6 +44630,7 @@ mod redeem_invite_inner_tests {
     async fn redeem_fork_invite_wires_parent_lineage_into_community_state() {
         let fixture = build_redeem_invite_test_fixture().await;
         let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+        crate::device_dataset_file::install_test_cipher(tmp.path());
 
         let admin_identity = PrivateIdentity::from_seed(&[0xab; 32]);
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
@@ -44748,6 +44764,7 @@ mod redeem_invite_inner_tests {
     async fn redeem_phase1_fork_invite_yields_empty_lineage_with_forked_at_set() {
         let fixture = build_redeem_invite_test_fixture().await;
         let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+        crate::device_dataset_file::install_test_cipher(tmp.path());
 
         let admin_identity = PrivateIdentity::from_seed(&[0xae; 32]);
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
