@@ -605,7 +605,10 @@ mod tests {
                 parse_json,
             );
             assert!(r.value.is_empty());
-            assert!(!r.disk_write_frozen, "absent file, no cipher: first-run empty");
+            assert!(
+                !r.disk_write_frozen,
+                "absent file, no cipher: first-run empty"
+            );
         }
 
         #[test]
@@ -616,8 +619,15 @@ mod tests {
             let before = std::fs::read(&p).unwrap();
             let r = load_sealed_or_recover::<Vec<u32>>(None, &p, "v.json", 1_000, parse_json);
             assert!(r.value.is_empty());
-            assert!(r.disk_write_frozen, "existing file, no cipher: freeze, never wipe");
-            assert_eq!(std::fs::read(&p).unwrap(), before, "file left byte-identical");
+            assert!(
+                r.disk_write_frozen,
+                "existing file, no cipher: freeze, never wipe"
+            );
+            assert_eq!(
+                std::fs::read(&p).unwrap(),
+                before,
+                "file left byte-identical"
+            );
         }
 
         #[test]
@@ -626,7 +636,8 @@ mod tests {
             let p = dir.path().join("v.json");
             write_image(&test_cipher(), &p, "v.json", b"[1,2,3]").unwrap();
             let foreign = DeviceCipher::derive(&[9u8; 32]).unwrap();
-            let r = load_sealed_or_recover::<Vec<u32>>(Some(&foreign), &p, "v.json", 4_242, parse_json);
+            let r =
+                load_sealed_or_recover::<Vec<u32>>(Some(&foreign), &p, "v.json", 4_242, parse_json);
             assert!(r.value.is_empty());
             assert!(r.disk_write_frozen, "undecryptable sealed file freezes");
             assert!(p.exists(), "sealed file preserved (not quarantined)");
@@ -649,13 +660,8 @@ mod tests {
             let sub = dir.path().join("asdir");
             std::fs::create_dir(&sub).unwrap();
             let cipher = test_cipher();
-            let r = load_sealed_or_recover::<Vec<u32>>(
-                Some(&cipher),
-                &sub,
-                "asdir",
-                1_000,
-                parse_json,
-            );
+            let r =
+                load_sealed_or_recover::<Vec<u32>>(Some(&cipher), &sub, "asdir", 1_000, parse_json);
             assert!(r.disk_write_frozen);
         }
 

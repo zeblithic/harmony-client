@@ -4326,12 +4326,11 @@ pub async fn start_node_inner(
         records.apply_boot_grace(wall_clock_ms());
         records
     }));
-    let storage_ledger_arc = std::sync::Arc::new(std::sync::Mutex::new(
-        storage_ledger::StorageLedger::new(
+    let storage_ledger_arc =
+        std::sync::Arc::new(std::sync::Mutex::new(storage_ledger::StorageLedger::new(
             device_cipher.clone(),
             Some(app_data_dir.join("storage_ledger.json")),
-        ),
-    ));
+        )));
     let storage_settings_arc =
         std::sync::Arc::new(std::sync::Mutex::new(storage_settings_loaded.clone()));
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
@@ -25792,7 +25791,10 @@ mod path_ingest_tests {
 
     fn fresh_content_index() -> Arc<std::sync::Mutex<content_index::ContentIndex>> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let idx = content_index::ContentIndex::load(Some(&crate::device_dataset_file::test_cipher()), dir.path());
+        let idx = content_index::ContentIndex::load(
+            Some(&crate::device_dataset_file::test_cipher()),
+            dir.path(),
+        );
         // Leak the TempDir so the persist directory survives the test body
         // — we don't validate on-disk persistence here, only in-memory rows.
         std::mem::forget(dir);

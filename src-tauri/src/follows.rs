@@ -450,6 +450,10 @@ mod tests {
         let mut mgr = FollowManager::load(None, &dir, 2);
         assert!(mgr.list().is_empty());
         mgr.follow("newguy".to_string(), None); // frozen no-op
-        assert_eq!(std::fs::read(&p).unwrap(), sealed, "file preserved when no cipher");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            sealed,
+            "file preserved when no cipher"
+        );
     }
 }

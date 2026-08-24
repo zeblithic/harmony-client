@@ -803,7 +803,10 @@ mod tests {
         .unwrap();
         std::fs::write(&p, &legacy).unwrap();
         let idx = ContentIndex::load(Some(&tc()), dir.path());
-        assert!(idx.get(&entry.sidecar_id).is_some(), "legacy data recovered");
+        assert!(
+            idx.get(&entry.sidecar_id).is_some(),
+            "legacy data recovered"
+        );
         assert_eq!(
             std::fs::read(&p).unwrap()[0],
             crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
@@ -834,7 +837,10 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("content-index.json.corrupt-")
         });
-        assert!(!quarantined, "sealed decrypt failure freezes, never quarantines");
+        assert!(
+            !quarantined,
+            "sealed decrypt failure freezes, never quarantines"
+        );
     }
 
     #[test]

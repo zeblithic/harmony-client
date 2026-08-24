@@ -1699,11 +1699,17 @@ mod tests {
 
         // A truncated/garbage file must load as an empty default, not error.
         std::fs::write(&path, [0xFFu8, 0x00]).expect("write garbage");
-        assert_eq!(load_vine_pull(Some(&tc()), &path), VinePullSidecar::default());
+        assert_eq!(
+            load_vine_pull(Some(&tc()), &path),
+            VinePullSidecar::default()
+        );
 
         // A missing file must also load as an empty default.
         let missing = dir.path().join("does_not_exist.cbor");
-        assert_eq!(load_vine_pull(Some(&tc()), &missing), VinePullSidecar::default());
+        assert_eq!(
+            load_vine_pull(Some(&tc()), &missing),
+            VinePullSidecar::default()
+        );
     }
 
     #[test]

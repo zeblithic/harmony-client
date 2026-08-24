@@ -1576,12 +1576,18 @@ mod tests {
                 .changed());
         }
         let sealed = std::fs::read(&path).unwrap();
-        assert_eq!(sealed[0], crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3);
+        assert_eq!(
+            sealed[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3
+        );
 
         // Reload under a foreign device key: cannot decrypt → fail closed.
         let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
         let mut store = StorageRecordStore::new(Some(foreign), Some(path.clone()));
-        assert!(store.pledge_lists.is_empty(), "undecryptable → empty in memory");
+        assert!(
+            store.pledge_lists.is_empty(),
+            "undecryptable → empty in memory"
+        );
         let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 6);
         assert!(
             matches!(
@@ -1590,7 +1596,10 @@ mod tests {
             ),
             "sealed-fault refuses all ingest (anti-rebind ratchet not reset)"
         );
-        assert!(store.pledge_list(&addr_of(&id)).is_none(), "no ingest landed");
+        assert!(
+            store.pledge_list(&addr_of(&id)).is_none(),
+            "no ingest landed"
+        );
         store.save(); // no-op while faulted
         assert_eq!(
             std::fs::read(&path).unwrap(),

@@ -3030,7 +3030,10 @@ mod tests {
         let sealed = std::fs::read(&path).unwrap();
         let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
         let mut cache = VineFeedCache::load(Some(&foreign), dir.path());
-        assert!(!cache.is_viewed("keepme"), "undecryptable → empty in memory");
+        assert!(
+            !cache.is_viewed("keepme"),
+            "undecryptable → empty in memory"
+        );
         cache.mark_viewed("newone".to_string());
         cache.save_for_test(); // frozen: no-op
         assert_eq!(
@@ -3043,7 +3046,10 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("vine_feed.json.corrupt-")
         });
-        assert!(!quarantined, "sealed decrypt failure freezes, never quarantines");
+        assert!(
+            !quarantined,
+            "sealed decrypt failure freezes, never quarantines"
+        );
     }
 
     #[test]

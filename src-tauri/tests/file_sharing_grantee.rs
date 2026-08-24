@@ -191,7 +191,10 @@ fn grantee_ingest_no_matching_device_is_none() {
 
 fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     let dir = tempfile::tempdir().expect("tempdir");
-    let idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), dir.path());
+    let idx = ContentIndex::load(
+        Some(&harmony_app::device_dataset_file::test_cipher()),
+        dir.path(),
+    );
     std::mem::forget(dir);
     Arc::new(Mutex::new(idx))
 }
