@@ -138,13 +138,21 @@ pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
         let cipher = DeviceCipher::derive(&seed).map_err(|e| e.to_string())?;
         // Insert only if no invalidation happened since the snapshot — the
         // seed this cipher was derived from may have been replaced mid-read.
+        // The re-check MUST happen UNDER the memo lock (Greptile, PR #728):
+        // checked outside it, `invalidate` could bump-and-remove entirely
+        // between the check and the insert, re-poisoning the memo with the
+        // old-seed cipher. Under the lock the interleavings are exhaustive
+        // and both safe: if this critical section runs after `invalidate`'s
+        // remove, the mutex unlock→lock edge guarantees the bumped
+        // generation is visible here and we retry; if it runs before, our
+        // insert (stale or not) is removed by that pending `invalidate`.
         // On a lost race, loop: the retry re-reads the post-replacement seed.
-        if MEMO_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
-            memo()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(memo_key, cipher.clone());
-            return Ok(cipher);
+        {
+            let mut memo = memo().lock().unwrap_or_else(|p| p.into_inner());
+            if MEMO_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+                memo.insert(memo_key.clone(), cipher.clone());
+                return Ok(cipher);
+            }
         }
     }
 }
@@ -160,8 +168,12 @@ pub fn invalidate(identity_dir: &Path) {
     let memo_key = identity_dir
         .canonicalize()
         .unwrap_or_else(|_| identity_dir.to_path_buf());
-    // Bump BEFORE removing so an in-flight derive that read the old seed
-    // observes the new generation at its insert check and discards.
+    // Bump BEFORE taking the memo lock to remove: the bump is then
+    // sequenced before this function's critical section, so any
+    // `get_or_derive` insert that locks the memo AFTER this remove is
+    // guaranteed (mutex unlock→lock happens-before) to see the bumped
+    // generation and discard its possibly-stale cipher. An insert that
+    // locked BEFORE this remove is cleaned up by the remove itself.
     MEMO_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     memo()
         .lock()

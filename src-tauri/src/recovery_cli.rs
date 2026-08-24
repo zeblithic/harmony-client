@@ -731,6 +731,156 @@ pub struct ExportResult {
     pub snapshot_bytes_written: usize,
 }
 
+/// Device-sealed files that live under the identity dir, as
+/// `(relative path, AAD filename label)`. The label MUST match the one the
+/// owning family passes to `write_image` — a correct-key probe with the
+/// wrong label fails the AEAD tag and would falsely classify a healthy file
+/// as foreign. Per-owner profile-card stores are matched by prefix in
+/// [`sweep_foreign_sealed_files`] instead (their filename IS their label).
+const DEVICE_SEALED_SWEEP_FILES: &[(&str, &str)] = &[
+    (
+        crate::owner_state::OWNER_STATE_FILENAME,
+        crate::owner_state::OWNER_STATE_FILENAME,
+    ),
+    (
+        crate::owner_state_persist::CRDT_FILENAME,
+        crate::owner_state_persist::CRDT_FILENAME,
+    ),
+    (
+        crate::owner_state_persist::REPLAY_FILENAME,
+        crate::owner_state_persist::REPLAY_FILENAME,
+    ),
+    (
+        crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME,
+        crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME,
+    ),
+    (
+        crate::owner_quorum_sync::OWNER_QUORUM_DOC_FILENAME,
+        crate::owner_quorum_sync::OWNER_QUORUM_DOC_FILENAME,
+    ),
+    (
+        crate::owner_quorum_sync::OWNER_QUORUM_REPLAY_FILENAME,
+        crate::owner_quorum_sync::OWNER_QUORUM_REPLAY_FILENAME,
+    ),
+    (
+        crate::friend_requests::OUTBOUND_LINKS_FILENAME,
+        crate::friend_requests::OUTBOUND_LINKS_FILENAME,
+    ),
+    (
+        "mint/mint_sync_state.cbor",
+        crate::mint_sync_persist::MINT_SYNC_STATE_FILENAME,
+    ),
+];
+
+/// ZEB-982 (PR #728 review, Greptile): a `--force` restore may REPLACE a
+/// different node identity — after which every device-sealed dataset from
+/// the previous identity is unreadable under the new device cipher, and the
+/// owner-state family treats an unreadable sealed file as boot-fatal. A
+/// supported restore must not brick the next boot, so after the seed write
+/// each known device-sealed file is probed under the NEW cipher and the
+/// ones that fail to open are moved into a `_restore-backup-<ts>` dir
+/// (mirroring the "Reset this device" move-aside pattern — never deleted).
+///
+/// Probing — instead of comparing old and new seed — is what makes this
+/// safe and self-healing:
+/// - a same-identity restore (the "lost passphrase, same mnemonic" flow)
+///   opens every file fine and sweeps NOTHING;
+/// - the old seed may be unreadable (that is often WHY the operator is
+///   restoring) yet the decision needs nothing from it;
+/// - a crash between the seed write and the sweep is repaired by simply
+///   re-running the restore: the probe re-runs under the (now on-disk)
+///   new seed and sweeps whatever is still foreign.
+///
+/// Legacy plaintext files are left in place (readable under any key; their
+/// families' own parsers keep handling them). A transient read error skips
+/// the file with a warning — relocating state on an I/O hiccup is worse
+/// than deferring to the family's own boot-time Io handling. A file that is
+/// sealed-but-corrupt also sweeps aside: during an explicit restore that
+/// converts a future boot-fatal into "fresh default + recoverable backup".
+pub(crate) fn sweep_foreign_sealed_files(
+    identity_dir: &Path,
+    cipher: &crate::device_dataset_file::DeviceCipher,
+) -> Result<(), String> {
+    use crate::device_dataset_file::{read_image, ImageError};
+
+    // Collect (absolute path, AAD label) candidates: the fixed list plus
+    // any per-owner profile-card stores sitting in the identity dir.
+    let mut candidates: Vec<(PathBuf, String)> = DEVICE_SEALED_SWEEP_FILES
+        .iter()
+        .map(|(rel, label)| (identity_dir.join(rel), (*label).to_string()))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(identity_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with("profile_cards.") && name.ends_with(".cbor") {
+                candidates.push((entry.path(), name.to_string()));
+            }
+        }
+    }
+
+    let mut backup_dir: Option<PathBuf> = None;
+    for (path, label) in candidates {
+        match read_image(cipher, &path, &label) {
+            // Absent, or readable (legacy plaintext / sealed under THIS
+            // key): nothing to do.
+            Ok(_) => {}
+            Err(ImageError::Io(e)) => {
+                eprintln!(
+                    "warning: could not probe {} during restore sweep ({e}); leaving in place",
+                    path.display()
+                );
+            }
+            Err(ImageError::Crypto(_)) => {
+                let dst_dir = match &backup_dir {
+                    Some(d) => d.clone(),
+                    None => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let base = format!("_restore-backup-{ts}");
+                        let mut candidate = identity_dir.join(&base);
+                        let mut n = 0u32;
+                        while candidate.exists() && n < 1000 {
+                            n += 1;
+                            candidate = identity_dir.join(format!("{base}-{n}"));
+                        }
+                        std::fs::create_dir_all(&candidate).map_err(|e| {
+                            format!(
+                                "identity restored, but could not create {} to move aside \
+                                 stale sealed state (re-run the restore to retry): {e}",
+                                candidate.display()
+                            )
+                        })?;
+                        backup_dir = Some(candidate.clone());
+                        candidate
+                    }
+                };
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| label.clone());
+                let dst = dst_dir.join(&file_name);
+                std::fs::rename(&path, &dst).map_err(|e| {
+                    format!(
+                        "identity restored, but {} is sealed under the previous identity's \
+                         key and could not be moved aside (it would fail the next boot; \
+                         re-run the restore to retry): {e}",
+                        path.display()
+                    )
+                })?;
+                eprintln!(
+                    "moved aside {} (sealed under the previous identity) -> {}",
+                    path.display(),
+                    dst.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Restore identity + (optionally) owner-state sidecar.
 ///
 /// `ignore_state == true` skips sidecar lookup. Otherwise auto-detects
@@ -813,6 +963,16 @@ pub fn restore_recovery_file_pair_with_keychain(
     // Now safe to write identity.
     identity::write_seed_to_disk_with_keychain(identity_path, &seed_bytes, force, keychain)?;
 
+    // ZEB-982: seal under the cipher derived from the seed written just
+    // above — NOT get_or_derive, whose memo the seed write invalidated;
+    // deriving directly from the in-hand seed is race-free and lock-free.
+    let cipher = crate::device_dataset_file::DeviceCipher::derive(&seed_bytes)
+        .map_err(|e| format!("identity restored but device-cipher derivation failed: {e}"))?;
+    // A --force restore may have replaced a DIFFERENT identity: move aside
+    // any device-sealed files the new cipher cannot open, or the boot-fatal
+    // owner family would brick the next boot (PR #728 review, Greptile).
+    sweep_foreign_sealed_files(harmony_dir, &cipher)?;
+
     // Then write owner-state if present.
     let spaces_restored = if let Some(snap) = snapshot {
         // Reconstruct OwnerState from the tree bytes and persist.
@@ -825,11 +985,6 @@ pub fn restore_recovery_file_pair_with_keychain(
         // genuine error, but the message must make the partial-success
         // state explicit so the operator can recover (their identity is
         // restored; only the state sidecar didn't land).
-        // ZEB-982: seal under the cipher derived from the seed written just
-        // above — NOT get_or_derive, whose memo the seed write invalidated;
-        // deriving directly from the in-hand seed is race-free and lock-free.
-        let cipher = crate::device_dataset_file::DeviceCipher::derive(&seed_bytes)
-            .map_err(|e| format!("identity restored but owner-state write failed: {e}"))?;
         if let Err(e) = crate::device_dataset_file::write_image(
             &cipher,
             &state_path,
@@ -970,8 +1125,18 @@ pub fn restore_mnemonic_from_words_with_keychain(
     let phrase = words.join(" ");
     let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
-    identity::write_seed_to_disk_with_keychain(identity_path, &seed_bytes, force, keychain)
-        .map_err(|e| e.to_string())
+    identity::write_seed_to_disk_with_keychain(identity_path, &seed_bytes, force, keychain)?;
+    // A --force restore may have replaced a DIFFERENT identity — sweep any
+    // device-sealed files the new device cipher cannot open (PR #728
+    // review, Greptile); leftovers in the boot-fatal owner family would
+    // brick the next boot. A same-mnemonic restore derives the same cipher
+    // and sweeps nothing.
+    if let Some(dir) = identity_path.parent() {
+        let cipher = crate::device_dataset_file::DeviceCipher::derive(&seed_bytes)
+            .map_err(|e| format!("identity restored but device-cipher derivation failed: {e}"))?;
+        sweep_foreign_sealed_files(dir, &cipher)?;
+    }
+    Ok(())
 }
 
 /// Inner entry point — accepts an injected keychain so tests can stay
@@ -1250,6 +1415,15 @@ pub fn restore_recovery_file_with_keychain(
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
     identity::write_seed_to_disk_with_keychain(identity_path, &seed_bytes, force, keychain)?;
+    // A --force restore may have replaced a DIFFERENT identity — sweep any
+    // device-sealed files the new device cipher cannot open (PR #728
+    // review, Greptile); leftovers in the boot-fatal owner family would
+    // brick the next boot.
+    if let Some(dir) = identity_path.parent() {
+        let cipher = crate::device_dataset_file::DeviceCipher::derive(&seed_bytes)
+            .map_err(|e| format!("identity restored but device-cipher derivation failed: {e}"))?;
+        sweep_foreign_sealed_files(dir, &cipher)?;
+    }
     eprintln!("restored identity-hash: {}", hex::encode(id_hash));
     Ok(())
 }
@@ -2496,6 +2670,217 @@ mod tests {
             None,
         )
         .expect("force restore succeeds");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    /// PR #728 review (Greptile): a forced restore that REPLACES a different
+    /// identity must move aside device-sealed files from the old identity —
+    /// the boot-fatal owner family would otherwise brick the next boot.
+    #[test]
+    #[serial]
+    fn forced_restore_different_identity_sweeps_foreign_sealed_files() {
+        use crate::device_dataset_file::{read_image, write_image, DeviceCipher};
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let mnemonic_path = dir.path().join("mnemonic.txt");
+        std::env::set_var("HARMONY_PASSPHRASE", "sweep-test");
+
+        // Plant the OLD identity and seal the owner family under ITS cipher.
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0x99u8; 32], true, None)
+            .unwrap();
+        let old_cipher = DeviceCipher::derive(&[0x99u8; 32]).unwrap();
+        let doc_path = dir.path().join(crate::owner_state::OWNER_STATE_FILENAME);
+        let crdt_path = super::owner_state_path(dir.path());
+        let replay_path = dir.path().join(crate::owner_state_persist::REPLAY_FILENAME);
+        write_image(
+            &old_cipher,
+            &doc_path,
+            crate::owner_state::OWNER_STATE_FILENAME,
+            b"old-owner-doc",
+        )
+        .unwrap();
+        crate::owner_state_persist::save_crdt(&old_cipher, &crdt_path, &OwnerState::default())
+            .unwrap();
+        write_image(
+            &old_cipher,
+            &replay_path,
+            crate::owner_state_persist::REPLAY_FILENAME,
+            b"old-replay",
+        )
+        .unwrap();
+        // A legacy PLAINTEXT file must be left in place: it is readable
+        // under any key, and its family's own parser keeps handling it.
+        let legacy_path = dir
+            .path()
+            .join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
+        std::fs::write(&legacy_path, b"legacy-plaintext").unwrap();
+
+        // Forced restore of a DIFFERENT identity.
+        let restored = RecoveryArtifact::from_seed([0xABu8; 32]);
+        std::fs::write(&mnemonic_path, restored.to_mnemonic().as_str()).unwrap();
+        restore_mnemonic_with_keychain(&identity_path, &mnemonic_path, /*force=*/ true, None)
+            .expect("forced restore succeeds");
+
+        // The foreign-sealed owner family is gone from the identity dir...
+        assert!(!doc_path.exists(), "foreign owner_state.cbor swept");
+        assert!(!crdt_path.exists(), "foreign owner_state_crdt.cbor swept");
+        assert!(
+            !replay_path.exists(),
+            "foreign state_root_replay.cbor swept"
+        );
+        // ...moved (not deleted) into a _restore-backup-* dir...
+        let backup_dir = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("_restore-backup-"))
+            })
+            .expect("restore backup dir created");
+        assert_eq!(
+            std::fs::read_dir(&backup_dir).unwrap().count(),
+            3,
+            "all three foreign files preserved in the backup dir"
+        );
+        // ...while the legacy plaintext file stayed put.
+        assert!(legacy_path.exists(), "legacy plaintext left in place");
+
+        // The new identity's boot-path read sees ABSENT (fresh default),
+        // never "corrupt": get_or_derive re-derives from the restored seed
+        // (the seed write invalidated the memo).
+        let new_cipher = crate::device_dataset_file::get_or_derive(dir.path()).unwrap();
+        assert!(matches!(
+            read_image(
+                &new_cipher,
+                &crdt_path,
+                crate::owner_state_persist::CRDT_FILENAME
+            ),
+            Ok(None)
+        ));
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// The "lost passphrase, same mnemonic" flow: a forced restore of the
+    /// SAME identity derives the same device cipher — every sealed file
+    /// still opens, and the sweep must touch nothing.
+    #[test]
+    #[serial]
+    fn forced_restore_same_identity_leaves_sealed_files() {
+        use crate::device_dataset_file::{read_image, write_image, DeviceCipher};
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let mnemonic_path = dir.path().join("mnemonic.txt");
+        std::env::set_var("HARMONY_PASSPHRASE", "same-seed-test");
+
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xEEu8; 32], true, None)
+            .unwrap();
+        let cipher = DeviceCipher::derive(&[0xEEu8; 32]).unwrap();
+        let doc_path = dir.path().join(crate::owner_state::OWNER_STATE_FILENAME);
+        let crdt_path = super::owner_state_path(dir.path());
+        write_image(
+            &cipher,
+            &doc_path,
+            crate::owner_state::OWNER_STATE_FILENAME,
+            b"same-owner-doc",
+        )
+        .unwrap();
+        crate::owner_state_persist::save_crdt(&cipher, &crdt_path, &OwnerState::default()).unwrap();
+
+        let same = RecoveryArtifact::from_seed([0xEEu8; 32]);
+        std::fs::write(&mnemonic_path, same.to_mnemonic().as_str()).unwrap();
+        restore_mnemonic_with_keychain(&identity_path, &mnemonic_path, /*force=*/ true, None)
+            .expect("same-identity forced restore succeeds");
+
+        assert!(doc_path.exists() && crdt_path.exists(), "nothing swept");
+        assert!(
+            read_image(&cipher, &doc_path, crate::owner_state::OWNER_STATE_FILENAME)
+                .unwrap()
+                .is_some(),
+            "still readable under the (unchanged) device cipher"
+        );
+        assert!(
+            !std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| e
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("_restore-backup-"))),
+            "no backup dir created on a same-identity restore"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// The pair-restore call site: a forced restore over a dir whose sealed
+    /// state belongs to ANOTHER identity sweeps the foreign files and then
+    /// writes the restored snapshot sealed under the NEW cipher.
+    #[test]
+    #[serial]
+    fn forced_pair_restore_over_foreign_identity_sweeps_then_writes_state() {
+        use crate::device_dataset_file::{write_image, DeviceCipher};
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+        std::env::set_var("HARMONY_PASSPHRASE", "pair-sweep");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+
+        // Export a pair from identity A.
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xAAu8; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &identity_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // The dir now belongs to identity B, with owner files sealed under
+        // B's cipher.
+        identity::write_seed_to_disk_with_keychain(&identity_path, &[0xBBu8; 32], true, None)
+            .unwrap();
+        let b_cipher = DeviceCipher::derive(&[0xBBu8; 32]).unwrap();
+        let doc_path = dir.path().join(crate::owner_state::OWNER_STATE_FILENAME);
+        let crdt_path = super::owner_state_path(dir.path());
+        write_image(
+            &b_cipher,
+            &doc_path,
+            crate::owner_state::OWNER_STATE_FILENAME,
+            b"identity-b-doc",
+        )
+        .unwrap();
+        crate::owner_state_persist::save_crdt(&b_cipher, &crdt_path, &OwnerState::default())
+            .unwrap();
+
+        // Forced pair restore back to identity A.
+        super::restore_recovery_file_pair_with_keychain(
+            &identity_path,
+            dir.path(),
+            &out,
+            None,
+            /*force=*/ true,
+            /*ignore_state=*/ false,
+            None,
+        )
+        .expect("forced pair restore succeeds");
+
+        // B's owner doc was swept; the restored CRDT is readable under A.
+        assert!(!doc_path.exists(), "foreign owner_state.cbor swept");
+        let a_cipher = DeviceCipher::derive(&[0xAAu8; 32]).unwrap();
+        load_crdt(&a_cipher, &crdt_path)
+            .expect("restored snapshot sealed under the restored identity's cipher");
 
         std::env::remove_var("HARMONY_PASSPHRASE");
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");

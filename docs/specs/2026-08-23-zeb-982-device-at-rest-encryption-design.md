@@ -318,6 +318,22 @@ schema-byte/CBOR handling runs against `image.bytes`:
   in-place format change) — the fold-in *adds* `owner_trust_replay.cbor`
   to it. Reset-backup dirs will contain sealed copies going forward,
   which strictly improves on today's plaintext copies.
+- **Forced restore of a different identity (PR #728 review, Greptile):**
+  the three CLI flows that rewrite the node seed (`restore mnemonic`,
+  `restore recovery-file`, pair restore) sweep the identity dir after the
+  seed write: each known device-sealed file is probed under the NEW
+  cipher and the ones that fail the AEAD (sealed under the replaced
+  identity's key) move into `_restore-backup-<ts>` — mirroring the
+  "Reset this device" move-aside pattern. Without the sweep, a supported
+  `--force` restore would leave the boot-fatal owner family unreadable
+  and brick the next boot. Probing (not old-vs-new seed comparison) is
+  what keeps this safe: a same-identity restore opens everything and
+  sweeps nothing; the old seed (often unreadable — that is why the
+  operator is restoring) is never needed; and a crash between seed write
+  and sweep self-heals on re-run. Legacy plaintext files stay in place;
+  the in-app owner-mnemonic re-adoption (ZEB-439) never touches the node
+  seed, so it needs no sweep. Cross-process (CLI restore racing a
+  running app) remains out of scope as everywhere in this module.
 - **`friend_nicknames.json.migrated` cleanup:** after a successful load of
   sealed `contacts.cbor` **with at least one contact entry**, delete the
   leftover file; absence is not an error. The non-empty guard matters:

@@ -510,16 +510,34 @@ pub fn restore_recovery_from_preview_token_helper(
     )
     .map_err(|e| e.to_string())?;
 
+    // ZEB-982 (PR #728 review, Greptile): this commit may have REPLACED a
+    // different identity — device-sealed files from the old identity are
+    // unreadable under the new device cipher, and the owner family is
+    // boot-fatal on an unreadable sealed file. Sweep them aside before
+    // writing the restored state, mirroring the CLI restore flows.
+    // Deriving directly from the in-hand seed — NOT get_or_derive, whose
+    // memo the seed write just invalidated.
+    let cipher = crate::device_dataset_file::DeviceCipher::derive(&seed)
+        .map_err(|e| format!("identity restored but device-cipher derivation failed: {e}"))?;
+    recovery_cli::sweep_foreign_sealed_files(&harmony_dir, &cipher)?;
+
     // Identity is now on disk. The owner-state write below is the only
     // operation that can leave a partial-success state; its error must
     // be prefixed accordingly so the operator knows identity DID land.
     if let Some(snap) = snapshot {
         let state_path = recovery_cli::owner_state_path(&harmony_dir);
         // force=true: same gate as the identity write above (user
-        // already passed TypeToConfirmDialog). save_atomically writes
-        // the canonical bytes verbatim — load_crdt parses that same
-        // shape, mirroring the pair-helper's tempfile composition.
-        if let Err(e) = crate::owner_state_persist::save_atomically(&state_path, &snap.tree) {
+        // already passed TypeToConfirmDialog). The snapshot tree is the
+        // inner image — sealed on write (ZEB-982; this path previously
+        // wrote it plaintext via save_atomically, leaving the restored
+        // tree in the clear until the next boot's legacy reseal) —
+        // load_crdt opens that same shape, mirroring the pair helper.
+        if let Err(e) = crate::device_dataset_file::write_image(
+            &cipher,
+            &state_path,
+            crate::owner_state_persist::CRDT_FILENAME,
+            &snap.tree,
+        ) {
             return Err(format!(
                 "identity restored but owner-state write failed: {e}"
             ));
@@ -1572,6 +1590,94 @@ mod tests {
             after, identity_b_bytes,
             "identity must NOT be overwritten when sidecar addr-binding fails"
         );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// ZEB-982 (PR #728 review, Greptile): the GUI commit path replaces the
+    /// on-disk identity with force=true — device-sealed files from the OLD
+    /// identity must be swept aside (boot-fatal under the new cipher), and
+    /// the restored snapshot must land SEALED (this path previously wrote
+    /// it plaintext via save_atomically).
+    #[test]
+    #[serial]
+    fn token_commit_over_foreign_identity_sweeps_and_writes_sealed() {
+        use crate::device_dataset_file::{write_image, DeviceCipher};
+        use crate::owner_state_crdt::OwnerState;
+        use crate::state_snapshot::encode_snapshot;
+        use harmony_owner::lifecycle::RecoveryArtifact;
+        use harmony_owner::recovery::RecoveryMetadata;
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let recovery_path = dir.path().join("rec.bin");
+        let sidecar_path = recovery_cli::sidecar_path(&recovery_path);
+        let harmony_dir = identity_path.parent().unwrap();
+        let state_path = recovery_cli::owner_state_path(harmony_dir);
+
+        std::env::set_var("HARMONY_PASSPHRASE", "gui-sweep-test");
+
+        // Plant identity B with an owner doc sealed under B's cipher.
+        let seed_b = [0xB7u8; 32];
+        plant_seed(&identity_path, &seed_b);
+        let b_cipher = DeviceCipher::derive(&seed_b).unwrap();
+        let doc_path = harmony_dir.join(crate::owner_state::OWNER_STATE_FILENAME);
+        write_image(
+            &b_cipher,
+            &doc_path,
+            crate::owner_state::OWNER_STATE_FILENAME,
+            b"identity-b-doc",
+        )
+        .unwrap();
+
+        clear_preview_cache();
+
+        // Recovery file + addr-bound sidecar, both for identity A.
+        let seed_a = [0xA7u8; 32];
+        let artifact_a = RecoveryArtifact::from_seed(seed_a);
+        let pass = SecretString::from("pass".to_string());
+        let bytes_a = artifact_a
+            .to_encrypted_file(&pass, &RecoveryMetadata::default())
+            .unwrap();
+        std::fs::write(&recovery_path, &bytes_a).unwrap();
+        let addr_a = recovery_cli::derive_owner_addr_from_seed(&seed_a);
+        let hrss = encode_snapshot(
+            b"pass",
+            addr_a,
+            crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            &OwnerState::default(),
+        )
+        .expect("encode HRSS for A");
+        std::fs::write(&sidecar_path, &hrss).unwrap();
+
+        let preview = preview_recovery_file_helper(&recovery_path, "pass").expect("preview");
+        restore_recovery_from_preview_token_helper(
+            &identity_path,
+            &preview.preview_token,
+            /*ignore_state=*/ false,
+            None,
+        )
+        .expect("commit succeeds");
+
+        // B's foreign-sealed doc was swept aside, not left to brick boot.
+        assert!(!doc_path.exists(), "foreign owner_state.cbor swept");
+
+        // The restored CRDT is on disk SEALED (sentinel 3, not plaintext)
+        // and opens under A's device cipher.
+        let raw = std::fs::read(&state_path).expect("restored crdt exists");
+        assert_eq!(
+            raw.first(),
+            Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3),
+            "restored snapshot must be written sealed, not plaintext"
+        );
+        let a_cipher = DeviceCipher::derive(&seed_a).unwrap();
+        crate::owner_state_persist::load_crdt(&a_cipher, &state_path)
+            .expect("restored snapshot opens under the restored identity's cipher");
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
