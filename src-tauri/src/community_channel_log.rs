@@ -2430,7 +2430,7 @@ impl ChannelLog {
             Ok(Some(image)) => image,
             Err(ImageError::Io(e)) => return Err(ChannelLogPersistError::Io(e.to_string())),
             Err(ImageError::Crypto(msg)) => {
-                Self::quarantine_channel_dir(&root, &msg);
+                Self::quarantine_channel_dir(&root, &msg)?;
                 return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
             }
         };
@@ -2438,7 +2438,7 @@ impl ChannelLog {
             Some((&CHANNEL_LOG_MANIFEST_V1, rest)) => match ciborium::from_reader(rest) {
                 Ok(m) => m,
                 Err(e) => {
-                    Self::quarantine_channel_dir(&root, &format!("manifest decode: {e}"));
+                    Self::quarantine_channel_dir(&root, &format!("manifest decode: {e}"))?;
                     return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
                 }
             },
@@ -2446,11 +2446,11 @@ impl ChannelLog {
                 Self::quarantine_channel_dir(
                     &root,
                     &format!("manifest schema version {v} unsupported"),
-                );
+                )?;
                 return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
             }
             None => {
-                Self::quarantine_channel_dir(&root, "manifest image is empty");
+                Self::quarantine_channel_dir(&root, "manifest image is empty")?;
                 return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
             }
         };
@@ -2497,16 +2497,25 @@ impl ChannelLog {
             // Missing tail.cbor is a legitimate fresh-log state.
             Ok(None) => Vec::new(),
             Ok(Some(image)) => match image.bytes.split_first() {
-                Some((&CHANNEL_LOG_TAIL_V1, rest)) => match ciborium::from_reader(rest) {
-                    Ok(t) => {
-                        reseal_if_legacy(&cipher, &tail_path, &tail_label, &image);
-                        t
+                Some((&CHANNEL_LOG_TAIL_V1, rest)) => {
+                    match ciborium::from_reader::<Vec<SignedChannelEvent>, _>(rest) {
+                        Ok(t) if !events_all_bind(&t, &community_id, &channel_id) => {
+                            // Tampered/foreign tail (see `events_all_bind`): do
+                            // NOT reseal it into an authenticated envelope —
+                            // quarantine and continue with an empty tail.
+                            quarantine_aside(&tail_path, "tail contains foreign-channel events");
+                            Vec::new()
+                        }
+                        Ok(t) => {
+                            reseal_if_legacy(&cipher, &tail_path, &tail_label, &image);
+                            t
+                        }
+                        Err(e) => {
+                            quarantine_aside(&tail_path, &format!("tail decode: {e}"));
+                            Vec::new()
+                        }
                     }
-                    Err(e) => {
-                        quarantine_aside(&tail_path, &format!("tail decode: {e}"));
-                        Vec::new()
-                    }
-                },
+                }
                 // Unknown version OR an empty image (zero-byte tail.cbor):
                 // quarantine the tail alone and continue with the intact
                 // manifest + segments.
@@ -2543,16 +2552,34 @@ impl ChannelLog {
     /// aside under `root.corrupt.<ms>` (taking its segments with it, so a
     /// fresh log can't overwrite `segments/00000000.cbor`) and recreate an
     /// empty `root` so downstream writers and the adapter find it present.
-    fn quarantine_channel_dir(root: &std::path::Path, reason: &str) {
-        if quarantine_aside(root, reason) {
-            if let Err(e) = std::fs::create_dir_all(root) {
-                tracing::error!(
-                    ?root,
-                    error = %e,
-                    "channel-log: failed to recreate dir after manifest quarantine"
-                );
-            }
+    ///
+    /// ZEB-983 (Greptile): if the rename FAILS the corrupt dir and its
+    /// orphaned segments stay in place — returning a fresh empty log then
+    /// would let the next seal overwrite `segments/00000000.cbor` (the very
+    /// data quarantine exists to preserve). So a failed move is a HARD error
+    /// (transient — a retry next boot may succeed); the channel does not
+    /// spawn and nothing is clobbered. A failed *recreate* after a
+    /// successful move is non-fatal: the next sealed write `create_dir_all`s
+    /// the dir.
+    fn quarantine_channel_dir(
+        root: &std::path::Path,
+        reason: &str,
+    ) -> Result<(), ChannelLogPersistError> {
+        if !quarantine_aside(root, reason) {
+            return Err(ChannelLogPersistError::Io(format!(
+                "failed to quarantine corrupt channel dir {} ({reason}); refusing to \
+                 spawn a fresh log that would overwrite the orphaned segments",
+                root.display()
+            )));
         }
+        if let Err(e) = std::fs::create_dir_all(root) {
+            tracing::error!(
+                ?root,
+                error = %e,
+                "channel-log: failed to recreate dir after manifest quarantine (next write will)"
+            );
+        }
+        Ok(())
     }
 
     /// Return the highest locally-persisted event HLC for this channel.
@@ -2649,6 +2676,19 @@ impl ChannelLog {
             descriptor,
         )?;
         let events = decode_segment(&image.bytes, rel_path)?;
+        // ZEB-983 (Greptile): reject a segment holding foreign-channel events
+        // BEFORE resealing it — otherwise a downgraded plaintext segment
+        // would launder them into an authenticated envelope. The boot walk
+        // maps this error to a quarantine (CborDecode class = corruption).
+        if !events_all_bind(
+            &events,
+            &self.manifest.community_id,
+            &self.manifest.channel_id,
+        ) {
+            return Err(ChannelLogPersistError::CborDecode(format!(
+                "segment {rel_path} contains foreign-channel events"
+            )));
+        }
         reseal_if_legacy(&self.cipher, &abs_path, &label, &image);
         Ok(events)
     }
@@ -2989,6 +3029,28 @@ fn open_segment_image(
         Err(ImageError::Io(e)) => Err(ChannelLogPersistError::Io(e.to_string())),
         Err(ImageError::Crypto(msg)) => Err(ChannelLogPersistError::CborDecode(msg)),
     }
+}
+
+/// ZEB-983 (Greptile): every event loaded from disk into a channel log MUST
+/// bind to that log's `(community_id, channel_id)`. `append` enforces this
+/// for live/backfill ingest, but `reload` and the boot segment walk populate
+/// the log directly, bypassing it. A sealed file's AAD already authenticates
+/// the binding, but an offline attacker can DOWNGRADE a sealed file to a
+/// schema-v1 plaintext image holding validly-signed events copied from
+/// ANOTHER channel; without this check the legacy path would reseal those
+/// foreign events as authenticated target-channel state. Checked on BOTH
+/// paths (a correctly-written sealed file always passes, so this only ever
+/// rejects tampered/foreign content). The signature covers these fields, so
+/// an attacker cannot forge a matching binding — only copy a mismatched one,
+/// which this rejects.
+fn events_all_bind(
+    events: &[SignedChannelEvent],
+    community_id: &SpaceId,
+    channel_id: &ChannelId,
+) -> bool {
+    events
+        .iter()
+        .all(|e| e.community_id() == community_id && e.channel_id() == channel_id)
 }
 
 /// Parse the numeric index from a segment descriptor's `rel_path`
@@ -3387,6 +3449,143 @@ mod tests {
                 .read_segment(&seg)
                 .expect("segment intact after re-seal");
         }
+    }
+
+    /// Build a signed event bound to an arbitrary `(community, channel)` —
+    /// used to forge a "foreign-channel" event for the binding tests.
+    fn signed_event_for(community: SpaceId, channel: ChannelId, wall: u64) -> SignedChannelEvent {
+        let key = fixture_signing_key(0xa1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: community,
+            channel_id: channel,
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(wall, "a-dev"),
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+            mentions: None,
+            attachments: None,
+        };
+        sign_channel_event(&payload, &key).expect("sign")
+    }
+
+    /// ZEB-983 (Greptile P1, security): an offline attacker downgrades a
+    /// sealed tail to a LEGACY plaintext image holding a validly-signed
+    /// event copied from ANOTHER channel. The legacy path must NOT reseal
+    /// those foreign events into the target channel — it quarantines the
+    /// tail and continues empty, so nothing foreign enters the log.
+    #[test]
+    fn zeb983_legacy_tail_with_foreign_channel_events_is_quarantined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Seal a legit 1-segment log for (0xc0, 0x01).
+        drop(sealed_log_with_segments(root, 1));
+        // Overwrite tail.cbor with a LEGACY plaintext image whose event is
+        // bound to a DIFFERENT channel (0xc0, 0x99).
+        let foreign = vec![signed_event_for(
+            fixture_community(0xc0),
+            fixture_channel(0x99),
+            500_000,
+        )];
+        let mut legacy = vec![CHANNEL_LOG_TAIL_V1];
+        ciborium::into_writer(&foreign, &mut legacy).unwrap();
+        std::fs::write(root.join(TAIL_FILENAME), &legacy).unwrap();
+
+        let (log, _total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .unwrap();
+        assert!(log.tail.is_empty(), "foreign tail rejected, not laundered");
+        assert_eq!(log.manifest.segments.len(), 1, "manifest intact");
+        assert!(
+            has_quarantine_sibling(root),
+            "foreign tail quarantined aside"
+        );
+        // The tail was NOT resealed: the quarantined file is still the
+        // attacker's plaintext (first byte is the schema byte, not sentinel 3).
+        let quarantined = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("tail.cbor.corrupt.")
+            })
+            .expect("quarantined tail exists");
+        assert_eq!(
+            std::fs::read(quarantined.path()).unwrap().first(),
+            Some(&CHANNEL_LOG_TAIL_V1),
+            "foreign bytes were NOT resealed into an authenticated envelope"
+        );
+    }
+
+    /// The segment twin: `read_segment_migrating` rejects a legacy segment
+    /// holding foreign-channel events (the boot walk then quarantines it).
+    #[test]
+    fn zeb983_segment_with_foreign_channel_events_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = sealed_log_with_segments(root, 1);
+        // Overwrite segment 0 with a legacy plaintext image of a foreign event.
+        let foreign = vec![signed_event_for(
+            fixture_community(0xc0),
+            fixture_channel(0x99),
+            500_000,
+        )];
+        let mut legacy = vec![CHANNEL_LOG_SEGMENT_V1];
+        ciborium::into_writer(&foreign, &mut legacy).unwrap();
+        std::fs::write(root.join("segments/00000000.cbor"), &legacy).unwrap();
+
+        let err = log
+            .read_segment_migrating(&log.manifest.segments[0])
+            .expect_err("foreign-channel segment must be rejected");
+        assert!(matches!(err, ChannelLogPersistError::CborDecode(_)));
+    }
+
+    /// ZEB-983 (Greptile P1): when the whole-dir quarantine RENAME fails, a
+    /// fresh log must NOT be returned (it would overwrite the orphaned
+    /// segments) — reload hard-errors instead. Forced by making the channel
+    /// dir's parent read-only so the rename fails.
+    #[cfg(unix)]
+    #[test]
+    fn zeb983_failed_dir_quarantine_hard_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let root = parent.join("chan");
+        std::fs::create_dir_all(&root).unwrap();
+        drop(sealed_log_with_segments(&root, 1));
+        // Corrupt the manifest (Crypto) so reload takes the dir-quarantine arm.
+        let man_path = root.join(MANIFEST_FILENAME);
+        let mut raw = std::fs::read(&man_path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        std::fs::write(&man_path, &raw).unwrap();
+        // Make the parent read-only → the rename of `chan` → `chan.corrupt.*`
+        // fails (no write permission on the directory entry's parent).
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.clone(),
+            ChannelLogConfig::default(),
+        );
+        // Restore perms before asserting so the tempdir cleans up.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(result, Err(ChannelLogPersistError::Io(_))),
+            "a failed dir quarantine must hard-error, not return a clobbering fresh log"
+        );
+        // The original segment is still present (not overwritten).
+        assert!(root.join("segments/00000000.cbor").exists());
     }
 
     /// A LEGACY plaintext segment with invalid inner CBOR fails to decode
