@@ -460,7 +460,8 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     /// while `None`, `persist_now` is a no-op (tests / lightweight
     /// harnesses that don't persist). `std::sync::Mutex` because the read
     /// is a quick clone with no `.await` held across the guard.
-    persist_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+    persist_dir:
+        std::sync::Mutex<Option<(std::path::PathBuf, crate::device_dataset_file::DeviceCipher)>>,
     /// ZEB-307 PhantomData<fn() -> R>: makes VotingLogEngine<R> unconditionally
     /// Send + Sync even when R = tauri::Wry (which is !Send because its
     /// EventLoop holds Rc<>). The engine only owns R through this marker,
@@ -476,9 +477,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// ZEB-718: install the `identity_dir` that `persist_now` writes
     /// under. Install-once from the production `ensure_voting_engine_for`;
     /// tests that don't persist simply never call it.
-    pub fn install_persist_dir(&self, identity_dir: std::path::PathBuf) {
+    pub fn install_persist_dir(
+        &self,
+        identity_dir: std::path::PathBuf,
+        device_cipher: crate::device_dataset_file::DeviceCipher,
+    ) {
         if let Ok(mut g) = self.persist_dir.lock() {
-            *g = Some(identity_dir);
+            *g = Some((identity_dir, device_cipher));
         }
     }
 
@@ -490,11 +495,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// archive sweep, policy change).
     pub(crate) async fn persist_now(&self) {
         // Clone the path out from under the std mutex before any await.
-        let dir = match self.persist_dir.lock() {
+        let slot = match self.persist_dir.lock() {
             Ok(g) => g.clone(),
             Err(_) => return,
         };
-        let Some(dir) = dir else {
+        let Some((dir, cipher)) = slot else {
             return;
         };
         let path = crate::community_voting_persist::voting_path_for(&dir, &self.community_id);
@@ -508,14 +513,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // three tasks (IPC publish / inbound receive loop / backfill apply)
         // and the 24h tick archive sweep writes the same `voting.cbor` — all
         // serialize on this one per-community mutex. Releasing before the
-        // write would let two writers race on the fixed `.tmp` name and land
-        // out of order (a stale snapshot renaming last → lost update). The
+        // write would let two writers' renames land out of order (a stale
+        // snapshot renaming last → lost update; ZEB-983's randomized temp
+        // names removed the temp-file collision, not the ordering race). The
         // hold is a sub-ms clone+write on a sparse path, and the blocking I/O
         // is off-worker, so contention is negligible.
         let log = self.voting_log.lock().await;
         let snapshot = crate::community_voting_persist::snapshot_for_persist(&log, &community_id);
         let write_result = tokio::task::spawn_blocking(move || {
-            crate::community_voting_persist::write_snapshot(&path, &snapshot)
+            crate::community_voting_persist::write_snapshot(&cipher, &path, &snapshot)
         })
         .await;
         drop(log);
@@ -4354,7 +4360,10 @@ mod tests {
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         )
         .await;
-        engine.install_persist_dir(dir.path().to_path_buf());
+        engine.install_persist_dir(
+            dir.path().to_path_buf(),
+            crate::device_dataset_file::test_cipher(),
+        );
 
         let ev = signed_poll_create(&key, owner, "dev", 1_000);
         engine
@@ -4369,7 +4378,7 @@ mod tests {
             "voting.cbor must exist after a persisted mutation"
         );
         let (events, _policy, poll_restore) =
-            crate::community_voting_persist::load_voting_log(&path, &community_id).unwrap();
+            crate::community_voting_persist::load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &community_id).unwrap();
         assert_eq!(events, vec![ev], "persisted log reloads the applied event");
         // The applied PollCreate materialized one poll, so its restore persists.
         assert_eq!(

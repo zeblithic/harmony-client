@@ -16046,13 +16046,20 @@ pub async fn start_node_inner(
                     // no-handle context falls to the `SkippedNotAdmin` stub.
                     let auto_exec_fn = build_auto_exec_fn(wry_handle.clone(), owned_state.clone());
 
+                    // ZEB-718/983: resolve once; the sweep persists sealed,
+                    // so it needs the (memoized) device cipher beside the dir.
+                    let sweep_identity_dir = crate::owner_commands::resolve_identity_dir().ok();
+                    let sweep_cipher = sweep_identity_dir
+                        .as_ref()
+                        .and_then(|d| crate::device_dataset_file::get_or_derive(d).ok());
                     let tick_ctx = crate::community_voting_tick::VotingTickContext {
                         voting_logs: voting_logs_clone,
                         last_archive_sweep_ms: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
                         emit: emit_fn,
                         auto_exec_set_power: auto_exec_fn,
+                        device_cipher: sweep_cipher,
                         // ZEB-718: persist a log pruned by the archive sweep.
-                        identity_dir: crate::owner_commands::resolve_identity_dir().ok(),
+                        identity_dir: sweep_identity_dir,
                         // ZEB-720: default 24h; short (strictly positive)
                         // override only when the operator sets the env (never
                         // in production). Non-positive/garbage → default.
@@ -56076,10 +56083,22 @@ async fn voting_set_notify_on_delegate_signal(
     // under `log_g` so it serializes with the engine's `persist_now`.
     if let Some(dir) = identity_dir {
         let path = crate::community_voting_persist::voting_path_for(&dir, &space_id);
-        if let Err(e) =
-            crate::community_voting_persist::save_policy_only(&path, &space_id, log_g.policy())
-        {
-            tracing::warn!(community_id = %community_id, err = %e, "voting policy persist skipped/failed");
+        // ZEB-983: memoized derive (boot warmed it); a derive failure skips
+        // the persist with a warn — same degrade stance as a write failure.
+        match crate::device_dataset_file::get_or_derive(&dir) {
+            Ok(cipher) => {
+                if let Err(e) = crate::community_voting_persist::save_policy_only(
+                    &cipher,
+                    &path,
+                    &space_id,
+                    log_g.policy(),
+                ) {
+                    tracing::warn!(community_id = %community_id, err = %e, "voting policy persist skipped/failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(community_id = %community_id, err = %e, "voting policy persist skipped: device cipher unavailable");
+            }
         }
     }
     Ok(())
@@ -57563,8 +57582,13 @@ async fn reconcile_voting_from_state(
     // the boot sweep calls this once per joined community). `community_id` is
     // `Copy`, so the outer binding is still usable for the error log below.
     let load_community_id = community_id;
+    // ZEB-983: derive failure is the same "present but unreadable" signal an
+    // I/O error is — propagate Err so the caller disarms persistence for the
+    // session instead of clobbering a recoverable sealed file.
+    let load_cipher = crate::device_dataset_file::get_or_derive(identity_dir)
+        .map_err(|e| format!("voting reconcile: device cipher unavailable: {e}"))?;
     let loaded = tokio::task::spawn_blocking(move || {
-        crate::community_voting_persist::load_voting_log(&path, &load_community_id)
+        crate::community_voting_persist::load_voting_log(&load_cipher, &path, &load_community_id)
     })
     .await
     .map_err(|e| format!("voting reconcile load task join error: {e}"))?;
@@ -58088,7 +58112,7 @@ mod zeb718_voting_reconcile_tests {
         let mut log = VotingLog::new();
         log.events.push(tier1_poll_create(actor, 1_000));
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
 
         // Resolver reports `actor` as a member at any HLC.
         let mut members = HashMap::new();
@@ -58172,7 +58196,7 @@ mod zeb718_voting_reconcile_tests {
             state.meta.finalized_at_ms = Some(1_234);
         }
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
 
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
         let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -58232,7 +58256,7 @@ mod zeb718_voting_reconcile_tests {
         // Engine patches the real epoch (non-event mutation).
         assert!(log.set_tier3_poll_epoch(&pid, 42));
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
 
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
         let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -58396,7 +58420,7 @@ mod zeb718_voting_reconcile_tests {
         );
 
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
 
         // Cold boot: reconcile replays [create, ss, dv, ds] through
         // apply_with_snapshot; the out-of-order ds triggers the same canonical
@@ -58484,7 +58508,7 @@ mod zeb718_voting_reconcile_tests {
             t2.last_unsignal_after_threshold_ms = Some(LAST_UNSIGNAL_MS);
         }
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
 
         // Fresh empty registry — reconcile must load + replay + overlay.
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
@@ -58569,7 +58593,7 @@ mod zeb718_voting_reconcile_tests {
                     .threshold_reached_at_ms = Some(1_700_000_000_000);
             }
             let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier2);
-            crate::community_voting_persist::save_voting_log(&path, &log, &cid_ok_tier2).unwrap();
+            crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid_ok_tier2).unwrap();
         }
         // Community B: a plain Tier-1 poll.
         {
@@ -58581,7 +58605,7 @@ mod zeb718_voting_reconcile_tests {
             )
             .expect("apply tier1");
             let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier1);
-            crate::community_voting_persist::save_voting_log(&path, &log, &cid_ok_tier1).unwrap();
+            crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid_ok_tier1).unwrap();
         }
         // Community C: a present-but-unreadable voting.cbor. A directory at the
         // file path makes std::fs::read return EISDIR (a non-NotFound io error),
@@ -58650,7 +58674,7 @@ mod zeb718_voting_reconcile_tests {
         log.set_policy(policy.clone());
         assert!(log.events.is_empty(), "fixture has no events");
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
 
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
             snapshot: MembershipSnapshot {
@@ -58863,7 +58887,14 @@ async fn ensure_voting_engine_for(
     // restart that reads successfully re-arms persistence.
     if let Some(dir) = identity_dir {
         if reconcile_ok {
-            engine.install_persist_dir(dir);
+            match crate::device_dataset_file::get_or_derive(&dir) {
+                Ok(cipher) => engine.install_persist_dir(dir, cipher),
+                Err(e) => tracing::warn!(
+                    ?community_id,
+                    err = %e,
+                    "voting: persistence disarmed this session (device cipher unavailable)"
+                ),
+            }
         } else {
             tracing::warn!(
                 ?community_id,

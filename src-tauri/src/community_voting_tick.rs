@@ -123,6 +123,9 @@ pub struct VotingTickContext {
     pub last_archive_sweep_ms: Arc<Mutex<i128>>,
     pub emit: EmitFn,
     pub auto_exec_set_power: AutoExecSetPowerFn,
+    /// ZEB-983: device cipher for the sealed archive-sweep persist.
+    /// `None` alongside `identity_dir: None` in tests that never persist.
+    pub device_cipher: Option<crate::device_dataset_file::DeviceCipher>,
     /// ZEB-718: identity_dir for persisting a pruned log after the archive
     /// sweep. `None` ⇒ no persistence (test/headless contexts).
     pub identity_dir: Option<std::path::PathBuf>,
@@ -572,7 +575,9 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                 // ZEB-718: persist the pruned log so archived events don't
                 // resurrect on reload and the on-disk file stays bounded.
                 if !archived.is_empty() {
-                    if let Some(dir) = ctx.identity_dir.as_ref() {
+                    if let (Some(dir), Some(cipher)) =
+                        (ctx.identity_dir.as_ref(), ctx.device_cipher.clone())
+                    {
                         let path = crate::community_voting_persist::voting_path_for(dir, &space_id);
                         let snapshot =
                             crate::community_voting_persist::snapshot_for_persist(&log, &space_id);
@@ -584,7 +589,7 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                         // worker; the sweep is 24h-cadence so the hold is a
                         // non-issue.
                         let write_result = tokio::task::spawn_blocking(move || {
-                            crate::community_voting_persist::write_snapshot(&path, &snapshot)
+                            crate::community_voting_persist::write_snapshot(&cipher, &path, &snapshot)
                         })
                         .await;
                         match write_result {
@@ -786,6 +791,7 @@ mod tests {
             last_archive_sweep_ms: Arc::new(Mutex::new(last_sweep_ms)),
             emit,
             auto_exec_set_power,
+            device_cipher: None,
             identity_dir: None,
             contestability_window_ms: CONTESTABILITY_WINDOW_MS,
         };
