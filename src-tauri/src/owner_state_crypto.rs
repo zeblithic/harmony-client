@@ -727,6 +727,96 @@ pub fn open_dataset_file(
     Ok(Zeroizing::new(plaintext))
 }
 
+/// Domain-separated AAD prefix for device-sealed files at rest (ZEB-982).
+/// DISTINCT from `AAD_DATASET_AT_REST`: those seal under the fleet KeyTree's
+/// `friend_aead`, these under the seed-derived device key, and neither
+/// domain's ciphertext may ever open in the other. The file's canonical
+/// filename (label) is appended so ciphertext moved between files fails the
+/// Poly1305 tag.
+const AAD_DEVICE_AT_REST: &[u8] = b"zeb-982-device-at-rest:v3:";
+
+fn device_aad(label: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(AAD_DEVICE_AT_REST.len() + label.len());
+    aad.extend_from_slice(AAD_DEVICE_AT_REST);
+    aad.extend_from_slice(label.as_bytes());
+    aad
+}
+
+/// HKDF salt/info for the device dataset key (ZEB-982). Golden-pinned in
+/// tests — changing either constant strands every sealed file on disk.
+const DEVICE_DATASET_SALT: &[u8] = b"zeb-982-device-dataset-salt";
+const INFO_DEVICE_DATASET_AEAD: &[u8] = b"device-dataset-aead";
+
+/// Derive the device dataset at-rest key from the node identity master seed
+/// (ZEB-982). The seed is available on every boot mode — keyless local-only
+/// (ZEB-905), pre-mint, recovery CLI — which is exactly why this key, and
+/// not the fleet KeyTree, seals the owner-state family. Same seed → same
+/// key, so files survive re-pairing as long as the node identity does.
+pub fn derive_device_dataset_key(seed: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    let hk = Hkdf::<Sha256>::new(Some(DEVICE_DATASET_SALT), seed);
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(INFO_DEVICE_DATASET_AEAD, key.as_mut())
+        .map_err(|e| CryptoError::Hkdf(format!("device-dataset-aead: {e}")))?;
+    Ok(key)
+}
+
+/// Seal a file image under the device dataset key (ZEB-982). Same layout as
+/// [`seal_dataset_file`] (random nonce; `nonce(12) ‖ ct+tag`) in the device
+/// AAD domain. `label` is the file's canonical filename constant.
+pub fn seal_device_file(
+    key: &[u8; 32],
+    label: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut nonce_bytes = [0u8; 12];
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|e| CryptoError::Rng(e.to_string()))?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key).expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad: &device_aad(label),
+            },
+        )
+        .map_err(|_| CryptoError::AeadEncrypt)?;
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Open a blob produced by [`seal_device_file`]. Returns the inner file
+/// image zeroized-on-drop, or `CryptoError::AeadDecrypt` on wrong
+/// key/label/corruption. Callers do NOT uniformly quarantine on failure —
+/// each persist family maps this to its own recovery contract (boot-fatal
+/// for the owner family, quarantine for the sidecars; see the ZEB-982 spec).
+pub fn open_device_file(
+    key: &[u8; 32],
+    label: &str,
+    sealed: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    if sealed.len() < 12 + 16 {
+        return Err(CryptoError::AeadDecrypt);
+    }
+    let (nonce_bytes, ciphertext) = sealed.split_at(12);
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key).expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: &device_aad(label),
+            },
+        )
+        .map_err(|_| CryptoError::AeadDecrypt)?;
+    Ok(Zeroizing::new(plaintext))
+}
+
 /// Per-publisher HLC tracker for state-root replay protection.
 ///
 /// Per ZEB-211 round-5: "last accepted" is keyed by `at.device_id`,
@@ -1612,5 +1702,66 @@ mod tests {
         let keys = KeyTree::derive(&[7u8; 32]).unwrap();
         assert!(open_dataset_file(&keys, "notes.cbor", &[]).is_err());
         assert!(open_dataset_file(&keys, "notes.cbor", &[0u8; 11]).is_err());
+    }
+
+    // ── ZEB-982: device-sealed at-rest envelope ──────────────────────────────
+
+    #[test]
+    fn device_dataset_key_derivation_golden_pin() {
+        // Changing DEVICE_DATASET_SALT or INFO_DEVICE_DATASET_AEAD strands
+        // every sealed file on disk — this pin makes any drift loud.
+        let key = derive_device_dataset_key(&[7u8; 32]).unwrap();
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "7f58aa4a60e8c386d2098a08589a17ee171745f2bb8f53f3d1ebd3c0360dd11a",
+            "device dataset key derivation drifted"
+        );
+    }
+
+    #[test]
+    fn device_file_seal_open_round_trip() {
+        let key = derive_device_dataset_key(&[7u8; 32]).unwrap();
+        let sealed = seal_device_file(&key, "owner_state.cbor", b"hello device").unwrap();
+        assert_eq!(sealed.len(), 12 + 12 + 16, "nonce + ct + tag");
+        let opened = open_device_file(&key, "owner_state.cbor", &sealed).unwrap();
+        assert_eq!(&opened[..], b"hello device");
+    }
+
+    #[test]
+    fn device_file_label_swap_fails_tag() {
+        let key = derive_device_dataset_key(&[7u8; 32]).unwrap();
+        let sealed = seal_device_file(&key, "owner_state_crdt.cbor", b"x").unwrap();
+        assert!(open_device_file(&key, "state_root_replay.cbor", &sealed).is_err());
+    }
+
+    #[test]
+    fn device_file_tamper_and_foreign_key_fail() {
+        let key = derive_device_dataset_key(&[7u8; 32]).unwrap();
+        let mut sealed = seal_device_file(&key, "owner_state.cbor", b"x").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        assert!(open_device_file(&key, "owner_state.cbor", &sealed).is_err());
+        let sealed_ok = seal_device_file(&key, "owner_state.cbor", b"x").unwrap();
+        let other = derive_device_dataset_key(&[8u8; 32]).unwrap();
+        assert!(open_device_file(&other, "owner_state.cbor", &sealed_ok).is_err());
+    }
+
+    #[test]
+    fn device_file_truncated_blob_fails_cleanly() {
+        let key = derive_device_dataset_key(&[7u8; 32]).unwrap();
+        assert!(open_device_file(&key, "owner_state.cbor", &[]).is_err());
+        assert!(open_device_file(&key, "owner_state.cbor", &[0u8; 11]).is_err());
+    }
+
+    #[test]
+    fn device_and_dataset_domains_never_cross_open() {
+        // Even with byte-identical key material, the AAD domains keep the
+        // ZEB-981 fleet envelope and the ZEB-982 device envelope disjoint.
+        let kt = KeyTree::derive(&[7u8; 32]).unwrap();
+        let raw: [u8; 32] = *kt.friend_aead;
+        let fleet_sealed = seal_dataset_file(&kt, "notes.cbor", b"x").unwrap();
+        assert!(open_device_file(&raw, "notes.cbor", &fleet_sealed).is_err());
+        let dev_sealed = seal_device_file(&raw, "notes.cbor", b"x").unwrap();
+        assert!(open_dataset_file(&kt, "notes.cbor", &dev_sealed).is_err());
     }
 }

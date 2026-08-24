@@ -6,22 +6,32 @@
 //! because `RootReplayTracker` itself is not (de)serializable.
 
 use crate::mint_sync_types::{MintSyncError, MintSyncState};
-use std::io::Write;
 use std::path::Path;
 
 /// File name for the persisted state. Lives at `<app_data_dir>/mint/mint_sync_state.cbor`.
 pub const MINT_SYNC_STATE_FILENAME: &str = "mint_sync_state.cbor";
 
 /// Load state from disk. Returns `Ok(default)` if the file doesn't exist yet.
-pub fn load(path: &Path) -> Result<MintSyncState, MintSyncError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(MintSyncState::default());
+///
+/// ZEB-982: the file is device-sealed (v3 envelope); a legacy bare-CBOR file
+/// (first byte is a map header, never the sentinel) still parses and is
+/// eagerly re-sealed after a successful load. Envelope failures map onto the
+/// existing hard-error contract: read I/O → `Io`, AEAD/content → `Cbor` —
+/// both take the caller's disarm path (`break 'mint_init`), unchanged.
+pub fn load(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> Result<MintSyncState, MintSyncError> {
+    let image = match crate::device_dataset_file::read_image(cipher, path, MINT_SYNC_STATE_FILENAME)
+    {
+        Ok(None) => return Ok(MintSyncState::default()),
+        Ok(Some(img)) => img,
+        Err(crate::device_dataset_file::ImageError::Io(e)) => return Err(e.into()),
+        Err(crate::device_dataset_file::ImageError::Crypto(e)) => {
+            return Err(MintSyncError::Cbor(format!("load {}: {e}", path.display())))
         }
-        Err(e) => return Err(e.into()),
     };
-    let state: MintSyncState = ciborium::from_reader(&bytes[..])
+    let state: MintSyncState = ciborium::from_reader(&image.bytes[..])
         .map_err(|e| MintSyncError::Cbor(format!("load {}: {e}", path.display())))?;
     if state.schema_version > crate::mint_sync_types::MINT_SCHEMA_VERSION {
         return Err(MintSyncError::SchemaTooNew {
@@ -29,6 +39,7 @@ pub fn load(path: &Path) -> Result<MintSyncState, MintSyncError> {
             local_max: crate::mint_sync_types::MINT_SCHEMA_VERSION,
         });
     }
+    crate::device_dataset_file::reseal_if_legacy(cipher, path, MINT_SYNC_STATE_FILENAME, &image);
     Ok(state)
 }
 
@@ -40,20 +51,16 @@ pub fn load(path: &Path) -> Result<MintSyncState, MintSyncError> {
 /// (e.g. via the engine's `TokioMutex` around `MintSyncState`).
 /// Concurrent unprotected calls will race and the later `persist()` to
 /// complete will silently clobber the earlier.
-pub fn save(path: &Path, state: &MintSyncState) -> Result<(), MintSyncError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+pub fn save(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    state: &MintSyncState,
+) -> Result<(), MintSyncError> {
     let mut bytes = Vec::new();
     ciborium::into_writer(state, &mut bytes)
         .map_err(|e| MintSyncError::Cbor(format!("save {}: {e}", path.display())))?;
-    let dir = path.parent().expect("save: path has no parent");
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(&bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)
-        .map_err(|e| MintSyncError::Io(std::io::Error::other(e)))?;
-    Ok(())
+    crate::device_dataset_file::write_image(cipher, path, MINT_SYNC_STATE_FILENAME, &bytes)
+        .map_err(MintSyncError::Io)
 }
 
 #[cfg(test)]
@@ -64,7 +71,7 @@ mod tests {
     fn load_returns_default_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MINT_SYNC_STATE_FILENAME);
-        let state = load(&path).unwrap();
+        let state = load(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(state, MintSyncState::default());
     }
 
@@ -76,8 +83,8 @@ mod tests {
         state
             .account_deletion_floor
             .insert("a1".into(), "2026-05-02T00:00:00Z".into());
-        save(&path, &state).unwrap();
-        let loaded = load(&path).unwrap();
+        save(&crate::device_dataset_file::test_cipher(), &path, &state).unwrap();
+        let loaded = load(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         assert_eq!(state, loaded);
     }
 
@@ -89,8 +96,8 @@ mod tests {
             schema_version: 999,
             ..MintSyncState::default()
         };
-        save(&path, &future).unwrap();
-        let result = load(&path);
+        save(&crate::device_dataset_file::test_cipher(), &path, &future).unwrap();
+        let result = load(&crate::device_dataset_file::test_cipher(), &path);
         assert!(
             matches!(
                 result,
@@ -107,7 +114,12 @@ mod tests {
     fn save_does_not_leave_tmp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MINT_SYNC_STATE_FILENAME);
-        save(&path, &MintSyncState::default()).unwrap();
+        save(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &MintSyncState::default(),
+        )
+        .unwrap();
         // tempfile uses random names in the same dir, not a fixed .tmp suffix.
         // Verify no files remain other than the target file.
         let entries: Vec<_> = std::fs::read_dir(dir.path())
@@ -120,5 +132,33 @@ mod tests {
             "only the final file should exist; found: {entries:?}"
         );
         assert_eq!(entries[0].to_str().unwrap(), MINT_SYNC_STATE_FILENAME);
+    }
+
+    #[test]
+    fn legacy_bare_cbor_loads_and_reseals() {
+        // PR #728 review: pin the legacy-compatibility path — a pre-982
+        // plaintext file (bare CBOR, no sentinel) loads, is rewritten
+        // sealed, and reloads identically through the sealed path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MINT_SYNC_STATE_FILENAME);
+        let cipher = crate::device_dataset_file::test_cipher();
+        let mut state = MintSyncState::default();
+        state
+            .account_deletion_floor
+            .insert("legacy".into(), "2026-08-23T00:00:00Z".into());
+        let mut plain = Vec::new();
+        ciborium::into_writer(&state, &mut plain).unwrap();
+        std::fs::write(&path, &plain).unwrap();
+
+        let loaded = load(&cipher, &path).unwrap();
+        assert_eq!(loaded, state, "legacy content preserved");
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(
+            on_disk[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "file rewritten sealed"
+        );
+        let reloaded = load(&cipher, &path).unwrap();
+        assert_eq!(reloaded, state, "sealed path round-trips");
     }
 }

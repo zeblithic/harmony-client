@@ -400,8 +400,14 @@ fn file_deks_persist_reload() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("crdt-v2.bin");
-    save_crdt(&path, &state).expect("save_crdt");
-    let reloaded = load_crdt(&path).expect("load_crdt");
+    save_crdt(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &state,
+    )
+    .expect("save_crdt");
+    let reloaded =
+        load_crdt(&harmony_app::device_dataset_file::test_cipher(), &path).expect("load_crdt");
 
     let reloaded_sealed = reloaded
         .file_deks

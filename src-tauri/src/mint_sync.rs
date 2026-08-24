@@ -362,6 +362,9 @@ struct EngineShared {
     /// (CRITICAL 2) to flush the deletion floor to disk after an in-memory
     /// update. `None` in test constructors — tests don't persist to disk.
     sync_state_path: Option<std::path::PathBuf>,
+    /// ZEB-982: seals `mint_sync_state.cbor` at rest. Set together with
+    /// `sync_state_path` (production ctor); `None` in test constructors.
+    cipher: Option<crate::device_dataset_file::DeviceCipher>,
     /// Production passes `Some(sink)` so successful subscriber merges
     /// can fire a `"mint-changed"` event (ZEB-445: via the mode-agnostic
     /// sink). Test constructors pass `None` — the emit is a best-effort UI
@@ -476,6 +479,7 @@ impl MintSyncEngine {
             content_store: content_store.clone(),
             sync_state: sync_state.clone(),
             sync_state_path: None,
+            cipher: None,
             app_handle: None,
             // ZEB-845: test constructors default to a fresh (empty/identity)
             // floor. Production wires the real node-wide handle via `new`.
@@ -521,6 +525,7 @@ impl MintSyncEngine {
         content_store: Arc<dyn crate::content_store::ContentStore>,
         sync_state: Arc<TokioMutex<MintSyncState>>,
         sync_state_path: std::path::PathBuf,
+        cipher: crate::device_dataset_file::DeviceCipher,
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
         debounce_ms: u64,
@@ -535,6 +540,7 @@ impl MintSyncEngine {
             content_store: content_store.clone(),
             sync_state: sync_state.clone(),
             sync_state_path: Some(sync_state_path.clone()),
+            cipher: Some(cipher),
             app_handle: Some(app_handle),
             // ZEB-845: node-wide bounded-adoption floor.
             adopt_floor,
@@ -618,6 +624,11 @@ impl MintSyncEngine {
     /// test engines (which don't persist to disk).
     pub fn sync_state_path(&self) -> Option<&std::path::Path> {
         self.shared.sync_state_path.as_deref()
+    }
+
+    /// ZEB-982: the at-rest cipher paired with [`Self::sync_state_path`].
+    pub fn dataset_cipher(&self) -> Option<crate::device_dataset_file::DeviceCipher> {
+        self.shared.cipher.clone()
     }
 }
 
@@ -932,6 +943,12 @@ async fn internal_task_zenoh(
     publisher_tx: mpsc::Sender<Vec<u8>>,
     mut subscriber_rx: mpsc::Receiver<Vec<u8>>,
 ) {
+    // ZEB-982: this task only runs for the path-ful production engine, whose
+    // ctor always pairs the path with a cipher.
+    let cipher = shared
+        .cipher
+        .clone()
+        .expect("ZEB-982: a path-ful mint engine always carries a cipher");
     let mint_db = shared.mint_db.clone();
     let content_store = shared.content_store.clone();
     let sync_state = shared.sync_state.clone();
@@ -977,6 +994,7 @@ async fn internal_task_zenoh(
                     &content_store,
                     &sync_state,
                     &sync_state_path,
+                    &cipher,
                     &keys,
                     &device_id,
                     &publisher_tx,
@@ -994,6 +1012,7 @@ async fn internal_task_zenoh(
                     &content_store,
                     &sync_state,
                     &sync_state_path,
+                    &cipher,
                     &keys,
                     &device_id,
                     &publisher_tx,
@@ -1049,6 +1068,7 @@ async fn internal_task_zenoh(
                     &content_store,
                     &sync_state,
                     &sync_state_path,
+                    &cipher,
                     &keys,
                     &device_id,
                     &publisher_tx,
@@ -1106,6 +1126,7 @@ async fn publish_root_now_zenoh(
     content_store: &Arc<dyn crate::content_store::ContentStore>,
     sync_state: &Arc<TokioMutex<MintSyncState>>,
     sync_state_path: &std::path::Path,
+    cipher: &crate::device_dataset_file::DeviceCipher,
     keys: &FleetKeySet,
     device_id: &str,
     publisher_tx: &mpsc::Sender<Vec<u8>>,
@@ -1184,8 +1205,11 @@ async fn publish_root_now_zenoh(
     {
         let st_snap = sync_state.lock().await.clone();
         let path = sync_state_path.to_path_buf();
-        match tokio::task::spawn_blocking(move || crate::mint_sync_persist::save(&path, &st_snap))
-            .await
+        let cipher = cipher.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::mint_sync_persist::save(&cipher, &path, &st_snap)
+        })
+        .await
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -1352,8 +1376,14 @@ async fn handle_incoming_publish_zenoh(
         shared.adopt_floor.observe(payload.at.wall_ms);
         let st_snap = st.clone();
         let path = sync_state_path.to_path_buf();
-        match tokio::task::spawn_blocking(move || crate::mint_sync_persist::save(&path, &st_snap))
-            .await
+        let cipher = shared
+            .cipher
+            .clone()
+            .expect("ZEB-982: a path-ful mint engine always carries a cipher");
+        match tokio::task::spawn_blocking(move || {
+            crate::mint_sync_persist::save(&cipher, &path, &st_snap)
+        })
+        .await
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -2363,6 +2393,7 @@ mod tests {
             content_store,
             sync_state: Arc::new(TokioMutex::new(MintSyncState::default())),
             sync_state_path: None,
+            cipher: Some(crate::device_dataset_file::test_cipher()),
             app_handle: None,
             adopt_floor,
         };
@@ -2662,6 +2693,7 @@ mod tests {
             content_store: cs.clone(),
             sync_state: Arc::new(TokioMutex::new(MintSyncState::default())),
             sync_state_path: None,
+            cipher: Some(crate::device_dataset_file::test_cipher()),
             app_handle: None,
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         };

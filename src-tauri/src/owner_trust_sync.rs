@@ -161,12 +161,18 @@ pub fn trust_merger() -> Merger<OwnerState> {
 #[derive(Serialize, Deserialize)]
 struct TrustReplayFileV1(BTreeMap<String, Hlc>);
 
-/// Save the replay tracker atomically (schema byte + canonical CBOR).
-pub fn save_trust_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), String> {
+/// Save the replay tracker atomically, sealed (ZEB-982 v3 envelope around
+/// the schema byte + canonical CBOR image).
+pub fn save_trust_replay(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    tracker: &BTreeMap<String, Hlc>,
+) -> Result<(), String> {
     let mut bytes = vec![OWNER_TRUST_REPLAY_SCHEMA_V1];
     into_writer(&TrustReplayFileV1(tracker.clone()), &mut bytes)
         .map_err(|e| format!("encode trust replay {}: {e}", path.display()))?;
-    crate::owner_state_persist::save_atomically(path, &bytes).map_err(|e| e.to_string())
+    crate::device_dataset_file::write_image(cipher, path, OWNER_TRUST_REPLAY_FILENAME, &bytes)
+        .map_err(|e| e.to_string())
 }
 
 /// Load the replay tracker, recovering to empty on ANY failure. A lost
@@ -175,17 +181,27 @@ pub fn save_trust_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result
 /// idempotent through the validating merge. Corrupt files are quarantined
 /// (renamed aside) so the bytes survive for manual inspection — the
 /// `fleet_net_persist::quarantine` contract.
-pub fn load_trust_replay_or_recover(path: &Path) -> BTreeMap<String, Hlc> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e,
+pub fn load_trust_replay_or_recover(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> BTreeMap<String, Hlc> {
+    let image =
+        match crate::device_dataset_file::read_image(cipher, path, OWNER_TRUST_REPLAY_FILENAME) {
+            Ok(None) => return BTreeMap::new(),
+            Ok(Some(img)) => img,
+            Err(crate::device_dataset_file::ImageError::Io(e)) => {
+                tracing::warn!(path = %path.display(), error = %e,
                 "trust replay read failed; starting with empty tracker");
-            return BTreeMap::new();
-        }
-    };
-    let decoded = match bytes.split_first() {
+                return BTreeMap::new();
+            }
+            // AEAD/envelope failure is content-corrupt: same quarantine path as
+            // corrupt CBOR (ZEB-982 — the aside file now holds ciphertext).
+            Err(crate::device_dataset_file::ImageError::Crypto(e)) => {
+                quarantine(path, &e);
+                return BTreeMap::new();
+            }
+        };
+    let decoded = match image.bytes.split_first() {
         Some((&OWNER_TRUST_REPLAY_SCHEMA_V1, rest)) => {
             from_reader::<TrustReplayFileV1, _>(rest).map(|f| f.0)
         }
@@ -195,7 +211,15 @@ pub fn load_trust_replay_or_recover(path: &Path) -> BTreeMap<String, Hlc> {
         )),
     };
     match decoded {
-        Ok(t) => t,
+        Ok(t) => {
+            crate::device_dataset_file::reseal_if_legacy(
+                cipher,
+                path,
+                OWNER_TRUST_REPLAY_FILENAME,
+                &image,
+            );
+            t
+        }
         Err(e) => {
             quarantine(path, &e.to_string());
             BTreeMap::new()
@@ -226,6 +250,9 @@ fn quarantine(path: &Path, err: &str) {
 pub struct TrustPersist {
     pub identity_dir: PathBuf,
     pub replay_path: PathBuf,
+    /// ZEB-982: seals the replay tracker at rest (the doc itself seals via
+    /// `save_owner_state_cbor_only`'s internal per-dir derive).
+    pub cipher: crate::device_dataset_file::DeviceCipher,
 }
 
 impl FleetPersist<OwnerState> for TrustPersist {
@@ -263,7 +290,7 @@ impl FleetPersist<OwnerState> for TrustPersist {
             }
         };
         save_owner_state_cbor_only(&self.identity_dir, &merged).map_err(SyncError::Persist)?;
-        save_trust_replay(&self.replay_path, tracker).map_err(SyncError::Persist)?;
+        save_trust_replay(&self.cipher, &self.replay_path, tracker).map_err(SyncError::Persist)?;
         Ok(())
     }
 }
@@ -611,12 +638,15 @@ mod tests {
     #[test]
     fn trust_persist_round_trips_doc_and_replay() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let now = 1_700_000_000u64;
         let (state, _a, _s) = test_mint(now);
         let replay_path = dir.path().join(OWNER_TRUST_REPLAY_FILENAME);
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let persist = TrustPersist {
             identity_dir: dir.path().to_path_buf(),
             replay_path: replay_path.clone(),
+            cipher: crate::device_dataset_file::test_cipher(),
         };
         let mut tracker = BTreeMap::new();
         tracker.insert(
@@ -631,7 +661,8 @@ mod tests {
         let reloaded = load_owner_state_cbor(dir.path()).unwrap();
         assert_eq!(reloaded.enrollments.len(), state.enrollments.len());
         assert_eq!(reloaded.owner_id, state.owner_id);
-        let replay = load_trust_replay_or_recover(&replay_path);
+        let replay =
+            load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &replay_path);
         assert_eq!(replay.get("device-a"), tracker.get("device-a"));
     }
 
@@ -642,6 +673,7 @@ mod tests {
         // must not clobber it. The persist load-merge-saves, so the disk
         // file ends up as the union.
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let now = 1_700_000_000u64;
         let (old_snapshot, artifact, _sk) = test_mint(now);
         // Disk gains a second enrollment the snapshot doesn't know.
@@ -652,9 +684,11 @@ mod tests {
             .unwrap();
         save_owner_state_cbor_only(dir.path(), &disk_state).unwrap();
 
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let persist = TrustPersist {
             identity_dir: dir.path().to_path_buf(),
             replay_path: dir.path().join(OWNER_TRUST_REPLAY_FILENAME),
+            cipher: crate::device_dataset_file::test_cipher(),
         };
         FleetPersist::persist(&persist, &old_snapshot, &BTreeMap::new()).unwrap();
 
@@ -669,11 +703,18 @@ mod tests {
     #[test]
     fn replay_recover_returns_empty_on_missing_or_corrupt() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let missing = dir.path().join("nope.cbor");
-        assert!(load_trust_replay_or_recover(&missing).is_empty());
+        assert!(
+            load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &missing)
+                .is_empty()
+        );
         let corrupt = dir.path().join("bad.cbor");
         std::fs::write(&corrupt, b"not cbor at all").unwrap();
-        assert!(load_trust_replay_or_recover(&corrupt).is_empty());
+        assert!(
+            load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &corrupt)
+                .is_empty()
+        );
         // Quarantined aside, original gone.
         assert!(!corrupt.exists());
     }
@@ -696,6 +737,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let kt = Arc::new(KeyTree::derive(&[0x66u8; 32]).expect("kt"));
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let a_doc = Arc::new(tokio::sync::Mutex::new(seeded.clone()));
@@ -734,6 +776,7 @@ mod tests {
                 persist: Arc::new(TrustPersist {
                     identity_dir: dir.path().join(name),
                     replay_path: dir.path().join(format!("{name}-replay.cbor")),
+                    cipher: crate::device_dataset_file::test_cipher(),
                 }),
                 lookup_key_tag: OWNER_TRUST_LOOKUP_TAG,
                 debounce_ms: 50,
@@ -930,6 +973,7 @@ mod tests {
         // Simulate a pairing install: disk gains an enrollment the
         // resident doc doesn't know.
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let (_sk2, cert2) = test_enroll_second_device(&artifact, &state, now + 10);
         let mut disk_state = state;
         disk_state
@@ -954,6 +998,7 @@ mod tests {
     #[tokio::test]
     async fn mutate_file_only_loads_applies_saves() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let now = 1_700_000_000u64;
         let (state, _a, _s) = test_mint(now);
         save_owner_state_cbor_only(dir.path(), &state).unwrap();

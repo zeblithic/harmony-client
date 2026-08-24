@@ -194,9 +194,19 @@ pub fn staleness_from_dir(
     now_wall_ms: u64,
     dismiss_until_wall_ms: Option<u64>,
 ) -> StalenessResult {
-    let state =
-        crate::owner_state_persist::load_crdt(&crate::recovery_cli::owner_state_path(harmony_dir))
-            .unwrap_or_else(|_| OwnerState::default());
+    // PR #728 review (CA-5): a read-only staleness query must not create a
+    // node identity as a side effect — get_or_derive fresh-generates when
+    // none exists. Absent file → the same default-state answer the loader
+    // gives for a missing file, with zero derives.
+    let state_path = crate::recovery_cli::owner_state_path(harmony_dir);
+    let state = if state_path.exists() {
+        crate::device_dataset_file::get_or_derive(harmony_dir)
+            .ok()
+            .and_then(|cipher| crate::owner_state_persist::load_crdt(&cipher, &state_path).ok())
+            .unwrap_or_default()
+    } else {
+        OwnerState::default()
+    };
     let last =
         load_last_backup(&crate::recovery_cli::last_backup_path(harmony_dir)).unwrap_or(None);
     should_warn_about_stale_backup(now_wall_ms, last.as_ref(), &state, dismiss_until_wall_ms)

@@ -49,7 +49,12 @@ fn plant_state(harmony_dir: &std::path::Path) -> OwnerState {
         pending_join_at: None,
     };
     state.spaces.insert(sp.id, sp);
-    owner_state_persist::save_crdt(&recovery_cli::owner_state_path(harmony_dir), &state).unwrap();
+    owner_state_persist::save_crdt(
+        &harmony_app::device_dataset_file::get_or_derive(harmony_dir).unwrap(),
+        &recovery_cli::owner_state_path(harmony_dir),
+        &state,
+    )
+    .unwrap();
     state
 }
 
@@ -134,10 +139,22 @@ fn recovery_file_round_trip_with_state() {
         /*keychain=*/ None,
     )
     .unwrap();
-    let restored_bytes = std::fs::read(recovery_cli::owner_state_path(dir.path())).unwrap();
+    // ZEB-982: the on-disk file is a sealed v3 envelope; the byte-pin now
+    // targets the INNER image (unseal via the same per-dir cipher restore
+    // derived from the just-written seed).
+    let cipher = harmony_app::device_dataset_file::get_or_derive(dir.path()).unwrap();
+    let restored_image = harmony_app::device_dataset_file::read_image(
+        &cipher,
+        &recovery_cli::owner_state_path(dir.path()),
+        harmony_app::owner_state_persist::CRDT_FILENAME,
+    )
+    .unwrap()
+    .expect("restored owner-state file present");
+    assert!(!restored_image.was_legacy, "restore must write sealed");
     assert_eq!(
-        restored_bytes, original_bytes,
-        "owner-state must round-trip byte-equal"
+        &restored_image.bytes[..],
+        &original_bytes[..],
+        "owner-state inner image must round-trip byte-equal"
     );
 }
 
@@ -325,8 +342,18 @@ fn cross_machine_state_restore() {
     )
     .unwrap();
 
-    let restored = std::fs::read(recovery_cli::owner_state_path(machine_b.path())).unwrap();
-    assert_eq!(restored, original_bytes);
+    // ZEB-982: unseal machine B's envelope (cipher derives from the seed the
+    // restore just installed on B) and byte-pin the INNER image.
+    let cipher_b = harmony_app::device_dataset_file::get_or_derive(machine_b.path()).unwrap();
+    let restored = harmony_app::device_dataset_file::read_image(
+        &cipher_b,
+        &recovery_cli::owner_state_path(machine_b.path()),
+        harmony_app::owner_state_persist::CRDT_FILENAME,
+    )
+    .unwrap()
+    .expect("restored owner-state file present");
+    assert!(!restored.was_legacy, "restore must write sealed");
+    assert_eq!(&restored.bytes[..], &original_bytes[..]);
 }
 
 #[test]
@@ -356,8 +383,11 @@ fn last_backup_record_drives_staleness() {
     let last = backup_state::load_last_backup(&recovery_cli::last_backup_path(dir.path()))
         .unwrap()
         .expect("file present");
-    let state =
-        owner_state_persist::load_crdt(&recovery_cli::owner_state_path(dir.path())).unwrap();
+    let state = owner_state_persist::load_crdt(
+        &harmony_app::device_dataset_file::get_or_derive(dir.path()).unwrap(),
+        &recovery_cli::owner_state_path(dir.path()),
+    )
+    .unwrap();
 
     // 1 minute later — no mutation, not stale.
     let r = backup_state::should_warn_about_stale_backup(

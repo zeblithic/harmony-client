@@ -179,6 +179,7 @@ pub mod contacts_crdt;
 pub mod contacts_persist;
 pub mod content_index;
 pub mod content_store;
+pub mod device_dataset_file;
 pub mod dm_crypto;
 pub mod dm_envelope;
 pub mod dm_inbox_crdt;
@@ -5964,10 +5965,20 @@ pub async fn start_node_inner(
 
                     let crdt_path = identity_dir.join("owner_state_crdt.cbor");
                     let replay_path = identity_dir.join("state_root_replay.cbor");
-                    let initial_crdt = crate::owner_state_persist::load_crdt(&crdt_path)
-                        .map_err(|e| format!("load owner_state_crdt.cbor: {e}"))?;
-                    let initial_replay = crate::owner_state_persist::load_replay(&replay_path)
-                        .map_err(|e| format!("load state_root_replay.cbor: {e}"))?;
+                    // ZEB-982: the device at-rest cipher. Key-free w.r.t.
+                    // fleet crypto (derived from the node identity seed), so
+                    // it exists on ZEB-905 local-only boots too. This derive
+                    // also warms the process-wide memo for every later
+                    // free-function reader (owner_state.rs hot paths).
+                    let device_cipher = crate::device_dataset_file::get_or_derive(&identity_dir)?;
+                    let initial_crdt =
+                        crate::owner_state_persist::load_crdt_migrating(&device_cipher, &crdt_path)
+                            .map_err(|e| format!("load owner_state_crdt.cbor: {e}"))?;
+                    let initial_replay = crate::owner_state_persist::load_replay_migrating(
+                        &device_cipher,
+                        &replay_path,
+                    )
+                    .map_err(|e| format!("load state_root_replay.cbor: {e}"))?;
 
                     // ZEB-685 (S3): boot-replay seed the revoked-device
                     // projection from the persisted DM-only revocation store
@@ -6116,6 +6127,7 @@ pub async fn start_node_inner(
                             crdt: crdt_path,
                             replay: replay_path,
                         },
+                        device_cipher.clone(),
                         crate::owner_state_sync::DEFAULT_DEBOUNCE_MS,
                         adopt_floor.clone(),
                     ));
@@ -6185,6 +6197,7 @@ pub async fn start_node_inner(
                             // node start normally. The user will see mint sync disabled
                             // but all other features keep working.
                             let initial_sync_state = match crate::mint_sync_persist::load(
+                                &device_cipher,
                                 &mint_sync_state_path,
                             ) {
                                 Ok(state) => state,
@@ -6287,6 +6300,7 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&content_store),
                                     mint_sync_state,
                                     mint_sync_state_path,
+                                    device_cipher.clone(),
                                     mint_out_tx,
                                     mint_in_rx,
                                     crate::mint_sync::DEFAULT_DEBOUNCE_MS,
@@ -6417,13 +6431,34 @@ pub async fn start_node_inner(
                             &app_data_dir.join("friend_nicknames.json"),
                             &device_id,
                         );
-                        let contacts_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::contacts_persist::load_doc_or_recover(
-                                &dataset_cipher,
-                                &contacts_path,
-                            )
-                            .map_err(|e| format!("load contacts doc: {e}"))?,
-                        ));
+                        let loaded_contacts = crate::contacts_persist::load_doc_or_recover(
+                            &dataset_cipher,
+                            &contacts_path,
+                        )
+                        .map_err(|e| format!("load contacts doc: {e}"))?;
+                        // ZEB-982 fold-in: the ZEB-981 nickname migration left
+                        // the plaintext legacy file behind as `.migrated`. Once
+                        // the (sealed) contacts store loads with actual content
+                        // the plaintext copy has served its safety-net purpose —
+                        // delete it. Guarded on non-empty: load_doc_or_recover
+                        // quarantine-DEFAULTS on corruption, and deleting the
+                        // backup after a quarantine reset would destroy the last
+                        // copy of the nicknames. (An empty legacy import leaves
+                        // an empty leftover — nothing to protect, nothing leaked.)
+                        if !loaded_contacts.contacts.is_empty() {
+                            let migrated_leftover =
+                                app_data_dir.join("friend_nicknames.json.migrated");
+                            match std::fs::remove_file(&migrated_leftover) {
+                                Ok(()) => tracing::info!(
+                                    "ZEB-982: removed plaintext friend_nicknames.json.migrated                                      (sealed contacts store verified non-empty)"
+                                ),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => tracing::warn!(error = %e,
+                                    "ZEB-982: could not remove friend_nicknames.json.migrated"),
+                            }
+                        }
+                        let contacts_doc =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(loaded_contacts));
                         let contacts_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
@@ -7409,6 +7444,7 @@ pub async fn start_node_inner(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::owner_trust_sync::load_trust_replay_or_recover(
+                                    &device_cipher,
                                     &trust_replay_path,
                                 ),
                             ),
@@ -7444,6 +7480,7 @@ pub async fn start_node_inner(
                                         crate::owner_trust_sync::TrustPersist {
                                             identity_dir: identity_dir.clone(),
                                             replay_path: trust_replay_path,
+                                            cipher: device_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
@@ -7497,12 +7534,16 @@ pub async fn start_node_inner(
                         let quorum_replay_path = identity_dir
                             .join(crate::owner_quorum_sync::OWNER_QUORUM_REPLAY_FILENAME);
                         let owner_quorum_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::owner_quorum_sync::load_quorum_doc_or_recover(&quorum_doc_path),
+                            crate::owner_quorum_sync::load_quorum_doc_or_recover(
+                                &device_cipher,
+                                &quorum_doc_path,
+                            ),
                         ));
                         let owner_quorum_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
                                 crate::owner_quorum_sync::load_quorum_replay_or_recover(
+                                    &device_cipher,
                                     &quorum_replay_path,
                                 ),
                             ),
@@ -7529,6 +7570,7 @@ pub async fn start_node_inner(
                                         crate::owner_quorum_sync::QuorumPersist {
                                             doc_path: quorum_doc_path,
                                             replay_path: quorum_replay_path,
+                                            cipher: device_cipher.clone(),
                                         },
                                     ),
                                     lookup_key_tag:
@@ -13459,12 +13501,22 @@ pub async fn start_node_inner(
         // Best-effort: a corrupt/missing file starts empty and refills from
         // live broadcasts — never blocks node start.
         if !node_addr.is_empty() {
-            profile_card_cache_arc.set_store(std::sync::Arc::new(
-                crate::persistent_card_store::PersistentCardStore::load_for_owner(
-                    &app_data_dir,
-                    &node_addr,
-                ),
-            ));
+            // ZEB-982: the store seals under the device cipher (memo warm from
+            // boot). If the cipher is unavailable the cache runs memory-only
+            // this session (pre-ZEB-839 behavior) rather than risking the file.
+            match crate::device_dataset_file::get_or_derive(
+                &crate::owner_commands::resolve_identity_dir()?,
+            ) {
+                Ok(cipher) => profile_card_cache_arc.set_store(std::sync::Arc::new(
+                    crate::persistent_card_store::PersistentCardStore::load_for_owner(
+                        cipher,
+                        &app_data_dir,
+                        &node_addr,
+                    ),
+                )),
+                Err(e) => tracing::error!(error = %e,
+                    "ZEB-982: no device cipher for the profile-card store;                      running memory-only this session"),
+            }
         }
         // ZEB-679: storage-record v2 admission consults the same revoked-
         // device projection the DM/friend/PEX cutoffs use.
@@ -14630,10 +14682,24 @@ pub async fn start_node_inner(
                         // would silently abandon a request the user is still
                         // waiting on and restore the ZEB-784 dead end.
                         guard.pending_outbound_links = std::sync::Arc::new(
-                            crate::friend_requests::PendingOutboundLinks::load_or_recover(
-                                identity_dir.join(crate::friend_requests::OUTBOUND_LINKS_FILENAME),
-                                crate::iroh_friend_acceptor::wall_now_ms(),
-                            ),
+                            // ZEB-982: memo warm from boot; a derive failure
+                            // degrades to the ephemeral store (same stance as
+                            // the quarantine-rename-failure path inside).
+                            match crate::device_dataset_file::get_or_derive(&identity_dir) {
+                                Ok(cipher) => {
+                                    crate::friend_requests::PendingOutboundLinks::load_or_recover(
+                                        cipher,
+                                        identity_dir
+                                            .join(crate::friend_requests::OUTBOUND_LINKS_FILENAME),
+                                        crate::iroh_friend_acceptor::wall_now_ms(),
+                                    )
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e,
+                                        "ZEB-982: no device cipher for outbound-link store;                                          running WITHOUT persistence this session");
+                                    crate::friend_requests::PendingOutboundLinks::new()
+                                }
+                            },
                         );
                         // ZEB-236: stash the staged DM-invite store so the
                         // accept/decline/list IPCs (later tasks) reach the SAME
@@ -48831,6 +48897,7 @@ mod zeb427_leave_left_at_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             600_000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
@@ -48849,8 +48916,11 @@ mod zeb427_leave_left_at_tests {
         .await;
 
         assert!(crdt_path.exists(), "fence must have written the crdt file");
-        let loaded =
-            crate::owner_state_persist::load_crdt(&crdt_path).expect("crdt file must decode");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("crdt file must decode");
         let row = loaded
             .spaces
             .get(&SpaceId([7; 16]))
@@ -55027,10 +55097,21 @@ async fn preview_recovery_state_sidecar(
         // load_crdt parses the same canonicalize() output that
         // save_atomically writes — matches the pattern in
         // recovery_cli::restore_recovery_file_pair_with_keychain.
+        // PR #728 review: derive first and write the snapshot SEALED — the
+        // decrypted HRSS tree must not touch the temp dir as plaintext.
+        let preview_cipher = crate::device_dataset_file::get_or_derive(
+            &crate::owner_commands::resolve_identity_dir()?,
+        )?;
         let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        crate::owner_state_persist::save_atomically(tmp.path(), &snap.tree)
+        crate::device_dataset_file::write_image(
+            &preview_cipher,
+            tmp.path(),
+            crate::owner_state_persist::CRDT_FILENAME,
+            &snap.tree,
+        )
+        .map_err(|e| e.to_string())?;
+        let state = crate::owner_state_persist::load_crdt(&preview_cipher, tmp.path())
             .map_err(|e| e.to_string())?;
-        let state = crate::owner_state_persist::load_crdt(tmp.path()).map_err(|e| e.to_string())?;
         Ok(SidecarPreview {
             present: true,
             space_count: Some(state.spaces.len() as u32),
@@ -64244,6 +64325,7 @@ mod zeb427_fence_tests {
             pub_tx,
             sub_rx,
             paths.clone(),
+            crate::device_dataset_file::test_cipher(),
             // Large debounce: only the explicit flush_now calls drive
             // publishes; the wedge below is established deterministically, not
             // via the debounce-wakeup arm.
@@ -64299,8 +64381,11 @@ mod zeb427_fence_tests {
         // wedged reached disk. Pre-ZEB-710 the fence could only return via
         // its timeout here, persisting nothing — this load would miss the
         // tombstone.
-        let persisted = crate::owner_state_persist::load_crdt(&paths.crdt)
-            .expect("crdt file must load after the fence");
+        let persisted = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &paths.crdt,
+        )
+        .expect("crdt file must load after the fence");
         assert!(
             persisted.tombstones.contains(&tombstoned),
             "the fence on a wedged engine must persist the mutation directly \
@@ -81742,6 +81827,7 @@ mod zeb703_outbox_runtime_durability_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             250,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
@@ -81786,7 +81872,10 @@ mod zeb703_outbox_runtime_durability_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if crdt_path.exists() {
-                if let Ok(loaded) = crate::owner_state_persist::load_crdt(&crdt_path) {
+                if let Ok(loaded) = crate::owner_state_persist::load_crdt(
+                    &crate::device_dataset_file::test_cipher(),
+                    &crdt_path,
+                ) {
                     if loaded.outbox.contains_key(&entry_id) {
                         break; // durable at runtime — ZEB-703 fixed
                     }
@@ -81811,7 +81900,10 @@ mod zeb703_outbox_runtime_durability_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if path.exists() {
-                if let Ok(loaded) = crate::owner_state_persist::load_crdt(path) {
+                if let Ok(loaded) = crate::owner_state_persist::load_crdt(
+                    &crate::device_dataset_file::test_cipher(),
+                    path,
+                ) {
                     if pred(&loaded) {
                         return;
                     }
@@ -81861,6 +81953,7 @@ mod zeb703_outbox_runtime_durability_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             250,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
@@ -81937,6 +82030,7 @@ mod zeb703_outbox_runtime_durability_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             250,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
@@ -82022,6 +82116,7 @@ mod zeb703_outbox_runtime_durability_tests {
                 pub_tx,
                 sub_rx,
                 paths,
+                crate::device_dataset_file::test_cipher(),
                 250,
                 crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             ));
@@ -82185,6 +82280,7 @@ mod zeb703_outbox_runtime_durability_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             250,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
@@ -82272,6 +82368,7 @@ mod zeb703_outbox_runtime_durability_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             600_000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
@@ -82367,8 +82464,11 @@ mod zeb703_outbox_runtime_durability_tests {
         // trailing flush (the pre-fix behavior: ack first, stop_inner
         // later) fails here because this harness never runs stop_inner at
         // all — exactly the supervisor's view after kill-on-200.
-        let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
-            .expect("owner_state_crdt.cbor must exist by ack time (pre-ack flush)");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("owner_state_crdt.cbor must exist by ack time (pre-ack flush)");
         assert!(
             loaded.outbox.contains_key(&entry_id),
             "ZEB-703: /v1/shutdown acked 200 before persisting owner-state — \
@@ -82590,6 +82690,7 @@ mod zeb703_outbox_runtime_durability_tests {
             pub_tx,
             sub_rx,
             paths,
+            crate::device_dataset_file::test_cipher(),
             600_000,
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
@@ -82690,8 +82791,11 @@ mod zeb703_outbox_runtime_durability_tests {
             .expect("request task must not panic");
         assert!(resp.contains("200"), "shutdown must ack 200, got: {resp}");
 
-        let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
-            .expect("owner_state_crdt.cbor must exist by ack time");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("owner_state_crdt.cbor must exist by ack time");
         assert!(
             loaded.outbox.contains_key(&entry_id),
             "ZEB-703: a mutation landed while the barrier awaited Phase C \
@@ -82811,6 +82915,7 @@ mod zeb708_gui_exit_flush_tests {
                 pub_tx,
                 sub_rx,
                 paths,
+                crate::device_dataset_file::test_cipher(),
                 // Debounce far beyond the test horizon: the runtime flush can
                 // never fire here, so ONLY the quit-path flush can save the
                 // mutation — the exposure window this test pins.
@@ -82864,9 +82969,12 @@ mod zeb708_gui_exit_flush_tests {
         // 600s debounce is still pending). Otherwise the final assert would
         // pass without the quit flush doing anything.
         let already_persisted = crdt_path.exists()
-            && crate::owner_state_persist::load_crdt(&crdt_path)
-                .map(|s| s.outbox.contains_key(&entry_id))
-                .unwrap_or(false);
+            && crate::owner_state_persist::load_crdt(
+                &crate::device_dataset_file::test_cipher(),
+                &crdt_path,
+            )
+            .map(|s| s.outbox.contains_key(&entry_id))
+            .unwrap_or(false);
         assert!(
             !already_persisted,
             "fixture: entry must NOT be persisted before the quit flush"
@@ -82879,8 +82987,11 @@ mod zeb708_gui_exit_flush_tests {
             "quit flush must complete within the bound AND report a real flush"
         );
 
-        let loaded = crate::owner_state_persist::load_crdt(&crdt_path)
-            .expect("crdt file must exist after the quit flush");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("crdt file must exist after the quit flush");
         assert!(
             loaded.outbox.contains_key(&entry_id),
             "ZEB-708: the un-debounced outbox entry must be persisted by the \
