@@ -114,7 +114,8 @@ pub fn load_or_recover<T: Default>(
 /// already exists, so two corrupt loads of the same `path` at the same `now_ms` — e.g.
 /// under a stuck clock — would otherwise clobber the first sidecar's bytes. Probe for a
 /// free `<stamp>` (incrementing keeps the name parseable by [`sweep_corrupt_sidecars`])
-/// so both payloads stay recoverable.
+/// so both payloads stay recoverable. If the whole window is occupied, returns `false`
+/// (freeze) rather than overwriting an existing sidecar.
 fn quarantine(path: &Path, now_ms: u64) -> bool {
     let mut stamp = now_ms;
     let aside = loop {
@@ -125,9 +126,15 @@ fn quarantine(path: &Path, now_ms: u64) -> bool {
         }
         stamp = stamp.saturating_add(1);
         if stamp.saturating_sub(now_ms) > 1_000 {
-            // Pathological (1000 sidecars at this timestamp): stop probing and replace
-            // the last candidate rather than spin. Recovery robustness, not a guarantee.
-            break candidate;
+            // Pathological (1001 sidecars already occupy this timestamp window): refuse
+            // to overwrite an existing sidecar — that would discard retained recovery
+            // evidence. Leave the file in place and signal a freeze, same posture as a
+            // failed rename (ZEB-784).
+            tracing::warn!(
+                path = ?path,
+                "recoverable_load: no free quarantine name; freezing instead of clobbering a sidecar"
+            );
+            return false;
         }
     };
     match std::fs::rename(path, &aside) {
@@ -334,6 +341,31 @@ mod tests {
             std::fs::read(dir.path().join("v.json.corrupt-101")).unwrap(),
             b"second-corrupt",
             "second sidecar got a collision-free name"
+        );
+    }
+
+    #[test]
+    fn quarantine_all_names_occupied_freezes_without_clobbering() {
+        // Pathological: every candidate sidecar name in the probe window is occupied by
+        // prior recovery evidence. Rather than overwrite one, the load freezes and leaves
+        // the current corrupt file in place (ZEB-784: never discard recovery evidence).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.json");
+        std::fs::write(&p, b"corrupt-current").unwrap();
+        for s in 0..=1000u64 {
+            std::fs::write(dir.path().join(format!("v.json.corrupt-{s}")), b"evidence").unwrap();
+        }
+        let r = load_or_recover::<Vec<u32>>(&p, 0, parse_json);
+        assert!(r.disk_write_frozen, "exhausted probe window freezes");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"corrupt-current",
+            "current corrupt file left in place, not renamed over a sidecar"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("v.json.corrupt-1000")).unwrap(),
+            b"evidence",
+            "prior evidence sidecar intact"
         );
     }
 
