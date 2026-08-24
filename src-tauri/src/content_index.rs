@@ -230,22 +230,43 @@ impl ContentIndex {
         let (entries, disk_write_frozen) = if path_is_bare {
             (HashMap::new(), false)
         } else {
-            // QuarantineAndHeal (ZEB-986): a corrupt index is renamed aside — preserving
-            // its bytes for recovery — and healed on the next write, so NEW ingests
-            // persist durably (a FreezeInPlace no-op would report ingest success while
-            // silently dropping the entry, orphaning the just-stored blob after restart —
-            // CodeAnt Critical). A corrupt index can't be read into memory under either
-            // policy, so old blobs are unreferenced regardless; quarantine keeps their
-            // metadata in the `.corrupt-<ms>` sidecar. A transient READ error still
-            // freezes (never overwrite maybe-good bytes). `load()` stays clock-free (the
-            // sidecar name uses the wall clock internally), so its call sites are
-            // untouched.
-            let recovered = crate::recoverable_load::load_or_recover(
+            // ZEB-986 recovery contract:
+            //  * Malformed/undecodable bytes → QuarantineAndHeal: rename aside (bytes
+            //    preserved for recovery) + heal on next write, so NEW ingests persist
+            //    durably. A FreezeInPlace no-op would report ingest success while
+            //    silently dropping the entry, orphaning the just-stored blob after
+            //    restart (CodeAnt Critical). A corrupt index can't be read into memory
+            //    anyway, so old blobs are unreferenced regardless; the `.corrupt-<ms>`
+            //    sidecar keeps their metadata.
+            //  * Parseable-but-unsupported version → freeze in place (left intact, not
+            //    quarantined) so the next `save()` cannot overwrite a forward/foreign
+            //    build's index with an empty current-version one.
+            //  * Transient READ error → freeze (never overwrite maybe-good bytes).
+            // `load()` stays clock-free (the sidecar name uses the wall clock
+            // internally), so its many call sites are untouched.
+            let recovered = crate::recoverable_load::load_or_recover::<Option<IndexFile>>(
                 &path,
                 crate::recoverable_load::now_ms(),
-                Self::parse_index,
+                |bytes| {
+                    serde_json::from_slice::<IndexFile>(bytes)
+                        .map(Some)
+                        .map_err(|e| e.to_string())
+                },
             );
-            (recovered.value, recovered.disk_write_frozen)
+            match recovered.value {
+                Some(file) if file.version == FILE_VERSION => {
+                    (Self::build_map(file.entries), recovered.disk_write_frozen)
+                }
+                Some(file) => {
+                    tracing::warn!(
+                        version = file.version,
+                        expected = FILE_VERSION,
+                        "content-index: unexpected version; freezing in place to preserve the foreign-version file"
+                    );
+                    (HashMap::new(), true)
+                }
+                None => (HashMap::new(), recovered.disk_write_frozen),
+            }
         };
         ContentIndex {
             path,
@@ -258,18 +279,14 @@ impl ContentIndex {
         }
     }
 
-    fn parse_index(data: &[u8]) -> Result<HashMap<SidecarId, ContentIndexEntry>, String> {
-        let file: IndexFile = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-        if file.version != FILE_VERSION {
-            return Err(format!("unexpected version {}", file.version));
-        }
-        let mut map = HashMap::with_capacity(file.entries.len());
-        for entry in file.entries {
+    fn build_map(entries: Vec<ContentIndexEntry>) -> HashMap<SidecarId, ContentIndexEntry> {
+        let mut map = HashMap::with_capacity(entries.len());
+        for entry in entries {
             if map.insert(entry.sidecar_id, entry).is_some() {
                 tracing::warn!("duplicate sidecar_id in content-index.json; last-write-wins");
             }
         }
-        Ok(map)
+        map
     }
 
     fn save(&self) {
@@ -691,6 +708,39 @@ mod tests {
         assert!(
             reloaded.get(&id).is_some(),
             "healed write persisted — new blob is durably indexed, not orphaned"
+        );
+    }
+
+    #[test]
+    fn wrong_version_freezes_in_place_and_preserves_index() {
+        // ZEB-986: a parseable-but-unsupported version is frozen in place (not
+        // quarantined-and-healed), so a downgrade cannot overwrite the forward-version
+        // index and make its blobs inaccessible.
+        let dir = tempdir().unwrap();
+        let p = dir.path().join(INDEX_FILE);
+        let forward = br#"{"version":999,"entries":[]}"#;
+        std::fs::write(&p, forward).unwrap();
+
+        let mut idx = ContentIndex::load(dir.path());
+        assert!(
+            idx.entries.is_empty(),
+            "unsupported version starts empty in-memory"
+        );
+        // Frozen: the next insert's save is a no-op, so the file stays byte-identical.
+        idx.insert(sample_entry([0xCD; 32]));
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            forward,
+            "foreign-version file preserved byte-identical"
+        );
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("content-index.json.corrupt-")
+        });
+        assert!(
+            !quarantined,
+            "unsupported version frozen in place, not quarantined"
         );
     }
 

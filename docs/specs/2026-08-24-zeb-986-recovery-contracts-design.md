@@ -237,12 +237,40 @@ issues that revised this:
    `<stamp>` (incrementing keeps the name sweep-parseable) so both payloads stay
    recoverable.
 
-**Accepted degradation (not fixed):** while frozen (transient Io or failed quarantine),
-`follows`/`vine_feed`/`vine_pull` mutations still return success and, for follows, publish
-to the wire, even though the write did not persist and reverts next boot. This is a rare,
-self-healing transient-error state (the freeze exists precisely to protect the existing
-on-disk data, which is the PR's goal); surfacing a persistence error through every
-mutator's return type and caller is disproportionate. content-index is exempt because its
-`QuarantineAndHeal` path is never frozen on corruption, and the Io-freeze case is equally
-rare — the CodeAnt Critical there was specifically the *silent-drop-then-orphan* under the
-old `FreezeInPlace`, which the policy switch resolves.
+### Round 2 (Greptile)
+
+5. **Quarantine exhaustion freezes instead of clobbering** (Greptile P2). The round-1
+   collision-safe `quarantine` fell back to *replacing* the last candidate when the whole
+   `<stamp>` probe window was occupied — discarding retained recovery evidence. It now
+   returns `false` (freeze) on exhaustion, same posture as a failed rename.
+
+### Round 3 (Qodo `/agentic_review`)
+
+6. **Version-mismatch freeze extended to `follows` + `content_index`** (Qodo 🔴 High). The
+   round-1 fix froze on unsupported version only in `vine_feed`; `follows` and
+   `content_index` still returned `Err` on version mismatch, routing it through the
+   corruption path (quarantine + unfrozen) so the next mutation overwrote the
+   foreign-version file with an empty current-version one. All three loaders now share the
+   contract: **decode failure → quarantine + heal; parseable-but-unsupported version →
+   freeze in place.** For `content_index` this means the *malformed* path keeps
+   `QuarantineAndHeal` (revision #1) while an unsupported *version* freezes — the two are
+   distinct cases (version-mismatch is speculative: `FILE_VERSION` has only ever been 1).
+7. **Boot sweep moved off the critical path** (Qodo ➹ Performance). `sweep_corrupt_sidecars`
+   ran synchronously in `start_node` before node init, walking the whole app-data tree with
+   no budget. It now runs in a detached `std::thread` — best-effort cleanup that never
+   stalls startup; it only touches `.corrupt` sidecars, so it is safe against live data.
+8. **Quarantine TOCTOU** (Qodo, not reachable): the `exists()`-probe-then-`rename` is not
+   atomic, but each store loads exactly once at boot and there is a single process per data
+   dir, so no two recoveries race the same `path`. Documented the single-writer invariant on
+   `quarantine`; no code change.
+
+**Accepted degradation (not fixed):** while frozen — transient Io, failed quarantine, or an
+unsupported on-disk version — `follows` / `content_index` / `vine_feed` / `vine_pull`
+mutations still return success (and, for follows, publish to the wire) even though the write
+did not persist and reverts / is discarded next boot. These are rare states (transient disk
+error, or a speculative downgrade past an unshipped schema bump); the freeze exists
+precisely to protect the existing on-disk data, which is the PR's goal, and surfacing a
+persistence error through every mutator's return type and caller is disproportionate. The
+CodeAnt Critical was specifically the *common* corruption path silently dropping new
+ingests under the old `FreezeInPlace`; the `QuarantineAndHeal` switch resolves that, and the
+residual freeze cases here are the rare tail.

@@ -116,6 +116,10 @@ pub fn load_or_recover<T: Default>(
 /// free `<stamp>` (incrementing keeps the name parseable by [`sweep_corrupt_sidecars`])
 /// so both payloads stay recoverable. If the whole window is occupied, returns `false`
 /// (freeze) rather than overwriting an existing sidecar.
+///
+/// The `exists()` probe then `rename` is not atomic, but each store is loaded exactly
+/// once at boot and there is a single process per data dir, so no two recoveries race the
+/// same `path` concurrently; the sequential same-`now_ms` case is what the probe covers.
 fn quarantine(path: &Path, now_ms: u64) -> bool {
     let mut stamp = now_ms;
     let aside = loop {

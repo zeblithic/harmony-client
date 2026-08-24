@@ -46,21 +46,43 @@ impl FollowManager {
     /// Load the follow list from `data_dir/follows.json`.
     ///
     /// A missing file starts empty (first run). A transient read error starts empty but
-    /// FREEZES writes (the on-disk graph may still be good). Content corruption is
-    /// quarantined aside (`follows.json.corrupt-<now_ms>`) and heals on the next write.
+    /// FREEZES writes (the on-disk graph may still be good). Malformed/undecodable bytes
+    /// are quarantined aside (`follows.json.corrupt-<now_ms>`) and heal on the next write.
+    /// A parseable-but-unsupported `version` (forward/foreign build) FREEZES in place —
+    /// left intact, not quarantined — so the next `save()` cannot overwrite it with an
+    /// empty current-version file (a downgrade or later support can still use it).
     pub fn load(data_dir: &Path, now_ms: u64) -> Self {
         let path = data_dir.join(FOLLOWS_FILE);
-        let recovered = crate::recoverable_load::load_or_recover(&path, now_ms, |bytes| {
-            let file: FollowsFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-            if file.version != FILE_VERSION {
-                return Err(format!("unexpected version {}", file.version));
+        // Parse only — the version check happens after so an unsupported-but-parseable
+        // version freezes in place rather than being quarantined-and-healed (which would
+        // drop the foreign-version follows on the next mutation).
+        let recovered = crate::recoverable_load::load_or_recover::<Option<FollowsFile>>(
+            &path,
+            now_ms,
+            |bytes| {
+                serde_json::from_slice::<FollowsFile>(bytes)
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            },
+        );
+        let (follows, disk_write_frozen) = match recovered.value {
+            Some(file) if file.version == FILE_VERSION => {
+                (file.follows, recovered.disk_write_frozen)
             }
-            Ok(file.follows)
-        });
+            Some(file) => {
+                tracing::warn!(
+                    version = file.version,
+                    expected = FILE_VERSION,
+                    "follows: unexpected version; freezing writes to preserve the foreign-version file in place"
+                );
+                (Vec::new(), true)
+            }
+            None => (Vec::new(), recovered.disk_write_frozen),
+        };
         FollowManager {
             path,
-            follows: recovered.value,
-            disk_write_frozen: recovered.disk_write_frozen,
+            follows,
+            disk_write_frozen,
         }
     }
 
@@ -288,6 +310,34 @@ mod tests {
         assert!(
             !reloaded.is_followed("newguy"),
             "frozen: new follow not persisted"
+        );
+    }
+
+    #[test]
+    fn wrong_version_freezes_and_preserves_follows() {
+        // ZEB-986: a parseable-but-unsupported version is frozen in place (not
+        // quarantined), so a downgrade cannot silently drop the foreign build's follows.
+        let dir = temp_dir();
+        let forward =
+            br#"{"version":999,"follows":[{"address":"keepme","name":null,"followed_at":1}]}"#;
+        let p = dir.join(FOLLOWS_FILE);
+        std::fs::write(&p, forward).unwrap();
+
+        let mut mgr = FollowManager::load(&dir, 5);
+        assert!(
+            mgr.list().is_empty(),
+            "unsupported version starts empty in-memory"
+        );
+        // Frozen: the next follow()'s save is a no-op, so the file stays byte-identical.
+        mgr.follow("newguy".to_string(), None);
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            forward,
+            "foreign-version file left byte-identical"
+        );
+        assert!(
+            !dir.join(format!("{FOLLOWS_FILE}.corrupt-5")).exists(),
+            "unsupported version frozen in place, not quarantined"
         );
     }
 }
