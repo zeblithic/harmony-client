@@ -274,6 +274,7 @@ pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
 pub mod protocol_versioning;
+pub mod recoverable_load;
 pub mod referral_catalog;
 pub mod relay_acceptor_watchdog;
 pub mod relay_hold_persist;
