@@ -18,6 +18,16 @@
 
 use std::path::Path;
 
+/// Current wall-clock time in milliseconds since the Unix epoch. Convenience for
+/// production callers threading `now_ms` into [`load_or_recover`] / [`sweep_corrupt_sidecars`];
+/// tests pass a fixed value instead so quarantine names and age gates stay deterministic.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Outcome of a recoverable load.
 pub struct Recovered<T> {
     /// The loaded value, or `T::default()` when the file was missing, unreadable, or

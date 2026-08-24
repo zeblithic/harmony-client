@@ -36,28 +36,48 @@ struct FollowsFile {
 pub struct FollowManager {
     path: PathBuf,
     follows: Vec<FollowEntry>,
+    /// When the file was unreadable at load (transient Io), or corrupt bytes could not
+    /// be quarantined aside, writes are frozen so the still-good on-disk follow graph is
+    /// never overwritten with the empty in-memory default (ZEB-986).
+    disk_write_frozen: bool,
 }
 
 impl FollowManager {
     /// Load the follow list from `data_dir/follows.json`.
-    /// Returns an empty manager if the file is missing or corrupt.
-    pub fn load(data_dir: &Path) -> Self {
+    ///
+    /// A missing file starts empty (first run). A transient read error starts empty but
+    /// FREEZES writes (the on-disk graph may still be good). Content corruption is
+    /// quarantined aside (`follows.json.corrupt-<now_ms>`) and heals on the next write.
+    pub fn load(data_dir: &Path, now_ms: u64) -> Self {
         let path = data_dir.join(FOLLOWS_FILE);
-        let follows = Self::read_file(&path).unwrap_or_default();
-        FollowManager { path, follows }
-    }
-
-    fn read_file(path: &Path) -> Option<Vec<FollowEntry>> {
-        let data = std::fs::read(path).ok()?;
-        let file: FollowsFile = serde_json::from_slice(&data).ok()?;
-        if file.version != FILE_VERSION {
-            return None;
+        let recovered = crate::recoverable_load::load_or_recover(
+            &path,
+            now_ms,
+            crate::recoverable_load::CorruptPolicy::QuarantineAndHeal,
+            |bytes| {
+                let file: FollowsFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+                if file.version != FILE_VERSION {
+                    return Err(format!("unexpected version {}", file.version));
+                }
+                Ok(file.follows)
+            },
+        );
+        FollowManager {
+            path,
+            follows: recovered.value,
+            disk_write_frozen: recovered.disk_write_frozen,
         }
-        Some(file.follows)
     }
 
     /// Atomically write the follow list to disk (temp file + rename).
     fn save(&self) {
+        if self.disk_write_frozen {
+            tracing::warn!(
+                path = ?self.path,
+                "follows save skipped — file unreadable at load; preserving existing graph"
+            );
+            return;
+        }
         let file = FollowsFile {
             version: FILE_VERSION,
             follows: self.follows.clone(),
@@ -149,14 +169,14 @@ mod tests {
     #[test]
     fn load_empty_dir_returns_empty_manager() {
         let dir = temp_dir();
-        let mgr = FollowManager::load(&dir);
+        let mgr = FollowManager::load(&dir, 1);
         assert!(mgr.list().is_empty());
     }
 
     #[test]
     fn follow_and_list() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir);
+        let mut mgr = FollowManager::load(&dir, 1);
         mgr.follow("addr1".to_string(), Some("Alice".to_string()));
         mgr.follow("addr2".to_string(), None);
         let list = mgr.list();
@@ -172,7 +192,7 @@ mod tests {
     #[test]
     fn follow_is_idempotent() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir);
+        let mut mgr = FollowManager::load(&dir, 1);
         let first = mgr.follow("addr1".to_string(), Some("Alice".to_string()));
         let second = mgr.follow("addr1".to_string(), Some("Alice Again".to_string()));
         assert!(first, "first follow should return true");
@@ -186,7 +206,7 @@ mod tests {
     #[test]
     fn unfollow_returns_true_when_present() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir);
+        let mut mgr = FollowManager::load(&dir, 1);
         mgr.follow("addr1".to_string(), None);
         let result = mgr.unfollow("addr1");
         assert!(result);
@@ -196,7 +216,7 @@ mod tests {
     #[test]
     fn unfollow_returns_false_when_absent() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir);
+        let mut mgr = FollowManager::load(&dir, 1);
         let result = mgr.unfollow("nonexistent");
         assert!(!result);
     }
@@ -205,13 +225,13 @@ mod tests {
     fn persistence_round_trip() {
         let dir = temp_dir();
         {
-            let mut mgr = FollowManager::load(&dir);
+            let mut mgr = FollowManager::load(&dir, 1);
             mgr.follow("addr1".to_string(), Some("Alice".to_string()));
             mgr.follow("addr2".to_string(), None);
             // mgr drops here, file is already saved after each follow()
         }
         // Reload from disk
-        let mgr2 = FollowManager::load(&dir);
+        let mgr2 = FollowManager::load(&dir, 1);
         let list = mgr2.list();
         assert_eq!(list.len(), 2);
         assert!(mgr2.is_followed("addr1"));
@@ -223,7 +243,7 @@ mod tests {
     #[test]
     fn addresses_returns_all_followed() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir);
+        let mut mgr = FollowManager::load(&dir, 1);
         mgr.follow("addr1".to_string(), None);
         mgr.follow("addr2".to_string(), None);
         mgr.follow("addr3".to_string(), None);
@@ -232,5 +252,47 @@ mod tests {
         assert!(addrs.contains(&"addr1".to_string()));
         assert!(addrs.contains(&"addr2".to_string()));
         assert!(addrs.contains(&"addr3".to_string()));
+    }
+
+    #[test]
+    fn corrupt_follows_quarantined_and_heals() {
+        let dir = temp_dir();
+        std::fs::write(dir.join(FOLLOWS_FILE), b"{ not json").unwrap();
+        let mut mgr = FollowManager::load(&dir, 4_242);
+        assert!(mgr.list().is_empty(), "corrupt file starts empty");
+        assert!(
+            dir.join(format!("{FOLLOWS_FILE}.corrupt-4242")).exists(),
+            "corrupt bytes quarantined aside"
+        );
+        // Not frozen: the next follow() heals by writing a fresh file.
+        mgr.follow("addr1".to_string(), Some("Alice".to_string()));
+        let reloaded = FollowManager::load(&dir, 5_000);
+        assert!(reloaded.is_followed("addr1"), "healed write persisted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn io_error_freezes_follows_no_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        {
+            let mut mgr = FollowManager::load(&dir, 1);
+            mgr.follow("keepme".to_string(), None);
+        }
+        let p = dir.join(FOLLOWS_FILE);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut mgr = FollowManager::load(&dir, 3);
+        // restore perms so the frozen no-op and reload can read the untouched file
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        mgr.follow("newguy".to_string(), None); // frozen: save is a no-op
+        let reloaded = FollowManager::load(&dir, 5);
+        assert!(
+            reloaded.is_followed("keepme"),
+            "frozen save preserved original graph"
+        );
+        assert!(
+            !reloaded.is_followed("newguy"),
+            "frozen: new follow not persisted"
+        );
     }
 }

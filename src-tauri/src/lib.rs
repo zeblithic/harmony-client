@@ -4275,7 +4275,7 @@ pub async fn start_node_inner(
     // ZEB-445: resolved Tauri-free (identical path to `app.path().app_data_dir()`).
     let app_data_dir = crate::resolve_app_data_dir()?;
     std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
-    let follow_mgr = follows::FollowManager::load(&app_data_dir);
+    let follow_mgr = follows::FollowManager::load(&app_data_dir, crate::recoverable_load::now_ms());
     // ZEB-671: share_follows gate for follow-list wire publication.
     let vine_settings_path = vine_settings::settings_path(&app_data_dir);
     let vine_settings_loaded = vine_settings::load_or_default(&vine_settings_path);
@@ -20331,7 +20331,10 @@ mod follow_list_publish_tests {
         let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(8);
         let state = Mutex::new(NodeState {
             follow_tx: Some(follow_tx),
-            follow_mgr: Some(follows::FollowManager::load(&temp_data_dir())),
+            follow_mgr: Some(follows::FollowManager::load(
+                &temp_data_dir(),
+                crate::recoverable_load::now_ms(),
+            )),
             followed_set: Some(std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             ))),
