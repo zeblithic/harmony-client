@@ -36898,20 +36898,38 @@ pub(crate) async fn generate_invite_impl(
                     .join("communities")
                     .join(hex::encode(space_id.0))
                     .join("pre_fork_snapshot.bin");
-                let bytes = match std::fs::read(&snapshot_path) {
-                    Ok(b) => b,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                // ZEB-983: open the sealed envelope; a missing file / device
+                // cipher / undecryptable snapshot all degrade to None (the
+                // fork invite is sent without the snapshot), never an error.
+                let cipher = match crate::device_dataset_file::get_or_derive(&identity_dir) {
+                    Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(
-                            error = ?e,
-                            path = %snapshot_path.display(),
+                            error = %e,
                             community_id = %hex::encode(space_id.0),
-                            "generate_invite: failed to read pre_fork_snapshot.bin; \
+                            "generate_invite: device cipher unavailable; \
                              fork invite will be sent without snapshot (degraded experience)"
                         );
                         return None;
                     }
                 };
+                let label =
+                    crate::community_state_persist::seal_label(&space_id, "pre_fork_snapshot.bin");
+                let bytes =
+                    match crate::device_dataset_file::read_image(&cipher, &snapshot_path, &label) {
+                        Ok(Some(image)) => image.bytes,
+                        Ok(None) => return None,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %snapshot_path.display(),
+                                community_id = %hex::encode(space_id.0),
+                                "generate_invite: failed to open pre_fork_snapshot.bin; \
+                                 fork invite will be sent without snapshot (degraded experience)"
+                            );
+                            return None;
+                        }
+                    };
                 match crate::owner_state_crypto::canonical_cbor_decode::<
                     crate::community_invite::PreForkSnapshot,
                 >(&bytes)
@@ -43203,31 +43221,43 @@ where
                     );
                 } else {
                     let snapshot_path = fork_dir.join("pre_fork_snapshot.bin");
-                    let tmp_path = fork_dir.join("pre_fork_snapshot.bin.tmp");
-                    match crate::owner_state_crypto::canonical_cbor_encode(snapshot) {
-                        Ok(bytes) => {
-                            if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                    // ZEB-983: seal at rest (message bodies + fork_reason).
+                    match (
+                        crate::owner_state_crypto::canonical_cbor_encode(snapshot),
+                        crate::device_dataset_file::get_or_derive(id_dir),
+                    ) {
+                        (Ok(bytes), Ok(cipher)) => {
+                            if let Err(e) = crate::device_dataset_file::write_image(
+                                &cipher,
+                                &snapshot_path,
+                                &crate::community_state_persist::seal_label(
+                                    &minted.community_id,
+                                    "pre_fork_snapshot.bin",
+                                ),
+                                &bytes,
+                            ) {
                                 tracing::warn!(
-                                    path = %tmp_path.display(),
+                                    path = %snapshot_path.display(),
                                     error = %e,
-                                    "redeem_invite_inner: write pre_fork_snapshot.bin.tmp failed"
-                                );
-                            } else if let Err(e) = std::fs::rename(&tmp_path, &snapshot_path) {
-                                tracing::warn!(
-                                    from = %tmp_path.display(),
-                                    to = %snapshot_path.display(),
-                                    error = %e,
-                                    "redeem_invite_inner: rename pre_fork_snapshot.bin.tmp failed"
+                                    "redeem_invite_inner: write pre_fork_snapshot.bin failed"
                                 );
                             }
                         }
-                        Err(e) => {
+                        (Err(e), _) => {
                             tracing::warn!(
                                 community_id = %hex::encode(minted.community_id.0),
                                 path = %snapshot_path.display(),
                                 error = %e,
                                 "redeem_invite_inner: encode pre_fork_snapshot failed; \
                                  snapshot not written"
+                            );
+                        }
+                        (_, Err(e)) => {
+                            tracing::warn!(
+                                community_id = %hex::encode(minted.community_id.0),
+                                error = %e,
+                                "redeem_invite_inner: device cipher unavailable; \
+                                 pre_fork_snapshot not written"
                             );
                         }
                     }
@@ -47960,12 +47990,21 @@ async fn get_fork_snapshot_metadata(
         .join(&safe_community_id)
         .join("pre_fork_snapshot.bin");
 
-    let bytes = match std::fs::read(&snapshot_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    // ZEB-983: open the sealed envelope. Missing → Ok(None); Io →
+    // Err (transient hard); Crypto/undecryptable → Err (same hard stance
+    // this getter gave a decode failure).
+    let cipher = crate::device_dataset_file::get_or_derive(&identity_dir)
+        .map_err(|e| format!("get_fork_snapshot_metadata: device cipher unavailable: {e}"))?;
+    let label = crate::community_state_persist::seal_label(
+        &crate::owner_state_types::SpaceId(id_bytes),
+        "pre_fork_snapshot.bin",
+    );
+    let bytes = match crate::device_dataset_file::read_image(&cipher, &snapshot_path, &label) {
+        Ok(Some(image)) => image.bytes,
+        Ok(None) => return Ok(None),
         Err(e) => {
             return Err(format!(
-                "get_fork_snapshot_metadata: read pre_fork_snapshot.bin: {e}"
+                "get_fork_snapshot_metadata: open pre_fork_snapshot.bin: {e}"
             ))
         }
     };
@@ -48036,12 +48075,19 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
         .join(&safe_community_id)
         .join("pre_fork_snapshot.bin");
 
-    let bytes = match std::fs::read(&snapshot_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    // ZEB-983: sealed envelope — missing → Ok(None); Io/Crypto → Err.
+    let cipher = crate::device_dataset_file::get_or_derive(&identity_dir)
+        .map_err(|e| format!("get_pre_fork_snapshot: device cipher unavailable: {e}"))?;
+    let label = crate::community_state_persist::seal_label(
+        &crate::owner_state_types::SpaceId(id_bytes),
+        "pre_fork_snapshot.bin",
+    );
+    let bytes = match crate::device_dataset_file::read_image(&cipher, &snapshot_path, &label) {
+        Ok(Some(image)) => image.bytes,
+        Ok(None) => return Ok(None),
         Err(e) => {
             return Err(format!(
-                "get_pre_fork_snapshot: read pre_fork_snapshot.bin: {e}"
+                "get_pre_fork_snapshot: open pre_fork_snapshot.bin: {e}"
             ))
         }
     };

@@ -593,13 +593,19 @@ pub async fn fork_community(
         let snapshot_bytes = crate::owner_state_crypto::canonical_cbor_encode(&pre_fork_snapshot)
             .map_err(|e| format!("fork_community: encode snapshot: {e}"))?;
 
-        // Atomic write via tempfile + rename.
+        // ZEB-983: seal at rest (the snapshot carries message bodies +
+        // fork_reason). AAD binds the fork community id; write_image
+        // supplies the atomic tempfile + fsync + rename.
+        let cipher = crate::device_dataset_file::get_or_derive(&identity_dir)
+            .map_err(|e| format!("fork_community: device cipher unavailable: {e}"))?;
         let snapshot_path = fork_dir.join("pre_fork_snapshot.bin");
-        let tmp_path = fork_dir.join("pre_fork_snapshot.bin.tmp");
-        std::fs::write(&tmp_path, &snapshot_bytes)
-            .map_err(|e| format!("fork_community: write snapshot tmp: {e}"))?;
-        std::fs::rename(&tmp_path, &snapshot_path)
-            .map_err(|e| format!("fork_community: rename snapshot: {e}"))?;
+        crate::device_dataset_file::write_image(
+            &cipher,
+            &snapshot_path,
+            &crate::community_state_persist::seal_label(&fork_space_id, "pre_fork_snapshot.bin"),
+            &snapshot_bytes,
+        )
+        .map_err(|e| format!("fork_community: write snapshot: {e}"))?;
     }
 
     // Now spawn the fork community engine + persist owner-state space.
