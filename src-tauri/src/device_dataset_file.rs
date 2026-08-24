@@ -49,7 +49,7 @@ pub const SEALED_DEVICE_SCHEMA_V3: u8 = 3;
 /// Coarse plausibility cap checked against file METADATA before the bytes
 /// are read — same rationale and value as
 /// `fleet_dataset_file::MAX_DATASET_FILE_BYTES` (PR #727 review).
-const MAX_DEVICE_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_DEVICE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Sealing context for device-sealed files: the seed-derived at-rest key.
 /// Cheap to clone; the key bytes are shared and zeroized on final drop.

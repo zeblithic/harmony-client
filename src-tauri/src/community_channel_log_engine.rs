@@ -784,6 +784,27 @@ impl ChannelLogEngine {
     /// events toward `limit`. Paging by retained events means a filtered-out
     /// run (e.g. a long reaction streak) cannot exhaust the budget before
     /// later kept events (CodeRabbit PR #314).
+    /// ZEB-983 (CodeRabbit): the off-lock segment readers all need the same
+    /// under-lock snapshot — the sealed segment descriptors, the in-memory
+    /// tail, the root dir, and the device cipher. Take the lock once here so
+    /// the three call sites stay in sync (and drop their tuple annotation).
+    async fn snapshot_for_offlock_read(
+        &self,
+    ) -> (
+        Vec<SegmentDescriptor>,
+        Vec<SignedChannelEvent>,
+        PathBuf,
+        DeviceCipher,
+    ) {
+        let log = self.log.lock().await;
+        (
+            log.manifest.segments.clone(),
+            log.tail.clone(),
+            log.root().to_path_buf(),
+            log.cipher().clone(),
+        )
+    }
+
     async fn collect_events(
         &self,
         since: Option<Hlc>,
@@ -805,20 +826,7 @@ impl ChannelLogEngine {
         // `seal_threshold_events`, so the under-lock clone is cheap.
         let community_id = self.community_id;
         let channel_id = self.channel_id;
-        let (segments, tail, root, cipher): (
-            Vec<SegmentDescriptor>,
-            Vec<SignedChannelEvent>,
-            _,
-            crate::device_dataset_file::DeviceCipher,
-        ) = {
-            let log = self.log.lock().await;
-            (
-                log.manifest.segments.clone(),
-                log.tail.clone(),
-                log.root().to_path_buf(),
-                log.cipher().clone(),
-            )
-        };
+        let (segments, tail, root, cipher) = self.snapshot_for_offlock_read().await;
 
         // Phase 2 stores events in the tail (newest, in-memory) + sealed
         // segments (older, on-disk; sorted ascending by `range.0`). For correct
@@ -927,20 +935,7 @@ impl ChannelLogEngine {
         // blocking task.
         let community_id = self.community_id;
         let channel_id = self.channel_id;
-        let (segments, tail, root, cipher): (
-            Vec<SegmentDescriptor>,
-            Vec<SignedChannelEvent>,
-            _,
-            crate::device_dataset_file::DeviceCipher,
-        ) = {
-            let log = self.log.lock().await;
-            (
-                log.manifest.segments.clone(),
-                log.tail.clone(),
-                log.root().to_path_buf(),
-                log.cipher().clone(),
-            )
-        };
+        let (segments, tail, root, cipher) = self.snapshot_for_offlock_read().await;
         let vector = vector.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1028,20 +1023,7 @@ impl ChannelLogEngine {
         // `ChannelAttachment` (within `scope`), else `None`.
         let community_id = self.community_id;
         let channel_id = self.channel_id;
-        let (segments, tail, root, cipher): (
-            Vec<SegmentDescriptor>,
-            Vec<SignedChannelEvent>,
-            _,
-            crate::device_dataset_file::DeviceCipher,
-        ) = {
-            let log = self.log.lock().await;
-            (
-                log.manifest.segments.clone(),
-                log.tail.clone(),
-                log.root().to_path_buf(),
-                log.cipher().clone(),
-            )
-        };
+        let (segments, tail, root, cipher) = self.snapshot_for_offlock_read().await;
 
         // Read + scan the persisted segments off the async executor — the
         // reads use blocking `std::fs::read`. Early-exit on the first match.

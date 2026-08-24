@@ -531,14 +531,28 @@ mod tests {
 
     #[test]
     fn replay_roundtrip_sealed() {
+        use crate::owner_state_types::{Hlc, OwnerAddr};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay.cbor");
         let cipher = test_cipher();
-        let tracker = CommunityRootHlcTracker::default();
+        // ZEB-983 (CodeRabbit): seed a NON-default entry so the round-trip
+        // actually exercises decrypt + decode, not just the empty default
+        // load_replay returns on missing/quarantine/decode-error paths.
+        let mut tracker = CommunityRootHlcTracker::default();
+        tracker.per_device.insert(
+            (OwnerAddr([0xA1; 16]), "dev-1".to_string()),
+            Hlc {
+                wall_ms: 4242,
+                logical: 7,
+                device_id: "dev-1".into(),
+            },
+        );
         save_replay(&cipher, &path, &cid(3), &tracker).unwrap();
-        // No PartialEq on the tracker DTO — a default round-trip plus the
-        // sealed-sentinel pin is the contract here.
-        let _loaded = load_replay(&cipher, &path, &cid(3)).unwrap();
+        let loaded = load_replay(&cipher, &path, &cid(3)).unwrap();
+        assert_eq!(
+            loaded.per_device, tracker.per_device,
+            "sealed replay tracker round-trips its content"
+        );
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(
             raw.first(),

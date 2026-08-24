@@ -94,7 +94,7 @@ pub fn voting_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf {
     identity_dir
         .join("communities")
         .join(id_hex)
-        .join("voting.cbor")
+        .join(VOTING_FILENAME)
 }
 
 /// An owned, `Send + 'static` snapshot of the serde-clean subset of a

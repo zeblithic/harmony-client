@@ -1916,7 +1916,16 @@ impl ChannelBackfillState {
         root: &std::path::Path,
         label: &str,
     ) -> Option<ChannelBackfillState> {
-        let raw = tokio::fs::read(Self::path(root)).await.ok()?;
+        let path = Self::path(root);
+        // ZEB-983 (CodeRabbit): enforce the same size cap the sync `load`
+        // gets from `read_image::check_size_cap`, so both paths refuse an
+        // implausibly-large sidecar before slurping it into memory.
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.len() > crate::device_dataset_file::MAX_DEVICE_FILE_BYTES {
+                return None;
+            }
+        }
+        let raw = tokio::fs::read(&path).await.ok()?;
         let image = crate::device_dataset_file::open_raw_image(cipher, label, raw).ok()?;
         Self::parse(&image.bytes)
     }
@@ -2245,7 +2254,20 @@ impl ChannelLog {
             // Nothing to seal. No-op.
             return Ok(());
         }
-        let next_index = self.manifest.segments.len() as u32;
+        // ZEB-983: allocate the next segment index as (max surviving index
+        // + 1), NOT `segments.len()`. `quarantine_segment` can remove a
+        // non-last descriptor, after which `len()` would collide with a
+        // surviving descriptor's `rel_path` and OVERWRITE live segment data
+        // (CodeRabbit #729). Reusing the index of a quarantined-then-removed
+        // segment is safe — that file was renamed to `.corrupt.<ms>`, so a
+        // fresh write at its old name clobbers nothing referenced.
+        let next_index = self
+            .manifest
+            .segments
+            .iter()
+            .filter_map(segment_index_of)
+            .max()
+            .map_or(0, |m| m + 1);
         let rel_path = format!("segments/{:08x}.cbor", next_index);
         let abs_path = self.root.join(&rel_path);
 
@@ -2969,6 +2991,17 @@ fn open_segment_image(
     }
 }
 
+/// Parse the numeric index from a segment descriptor's `rel_path`
+/// (`segments/{N:08x}.cbor`). Returns `None` for a malformed/foreign
+/// handle — such a descriptor simply doesn't constrain the next index.
+fn segment_index_of(descriptor: &SegmentDescriptor) -> Option<u32> {
+    let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
+    let hex = rel_path
+        .strip_prefix("segments/")
+        .and_then(|s| s.strip_suffix(".cbor"))?;
+    u32::from_str_radix(hex, 16).ok()
+}
+
 /// Decode a segment's inner image (`[schema]‖CBOR(Vec<SignedChannelEvent>)`).
 fn decode_segment(
     bytes: &[u8],
@@ -3315,7 +3348,7 @@ mod tests {
             "segment file moved aside"
         );
         // A reload sees the rewritten (1-segment) sealed manifest.
-        let (reloaded, _total) = ChannelLog::reload(
+        let (mut reloaded, _total) = ChannelLog::reload(
             crate::device_dataset_file::test_cipher(),
             fixture_community(0xc0),
             fixture_channel(0x01),
@@ -3324,6 +3357,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reloaded.manifest.segments.len(), 1);
+
+        // ZEB-983 (CodeRabbit #729 critical): the surviving descriptor is the
+        // ORIGINAL segment 1 (`segments/00000001.cbor`). Appending + sealing
+        // must NOT reuse index 1 (which `segments.len()==1` naively would),
+        // or it would overwrite the surviving segment's live data.
+        let survivor_rel = match &reloaded.manifest.segments[0].handle {
+            SegmentHandle::LocalFile { rel_path } => rel_path.clone(),
+        };
+        assert_eq!(survivor_rel, "segments/00000001.cbor");
+        reloaded
+            .append(fixture_signed_event(200_000, 0, "b-dev"))
+            .unwrap();
+        reloaded.seal_and_persist().unwrap();
+        let new_rel = match &reloaded.manifest.segments.last().unwrap().handle {
+            SegmentHandle::LocalFile { rel_path } => rel_path.clone(),
+        };
+        assert_ne!(
+            new_rel, survivor_rel,
+            "a fresh seal must not reuse the surviving segment's index (no overwrite)"
+        );
+        assert_eq!(
+            new_rel, "segments/00000002.cbor",
+            "next index = max survivor + 1"
+        );
+        // Both segments still readable → the survivor's data was not clobbered.
+        for seg in reloaded.manifest.segments.clone() {
+            reloaded
+                .read_segment(&seg)
+                .expect("segment intact after re-seal");
+        }
+    }
+
+    /// A LEGACY plaintext segment with invalid inner CBOR fails to decode
+    /// (`CborDecode`, not `Io`), so the boot walk quarantines it — proving
+    /// the dead-channel cliff is retired for corrupt PLAINTEXT segments too
+    /// (not only sealed-Crypto ones). Io stays hard (pinned elsewhere).
+    #[test]
+    fn zeb983_legacy_invalid_segment_decode_is_quarantinable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = sealed_log_with_segments(root, 1);
+        // Overwrite segment 0 with a legacy plaintext file (first byte != 3)
+        // whose inner CBOR is garbage → open_segment_image treats it as a
+        // legacy image, decode fails → CborDecode (quarantine-eligible).
+        std::fs::write(
+            root.join("segments/00000000.cbor"),
+            [CHANNEL_LOG_SEGMENT_V1, 0xFF, 0xFF, 0xFF],
+        )
+        .unwrap();
+        let err = log
+            .read_segment(&log.manifest.segments[0])
+            .expect_err("garbage legacy segment must fail to decode");
+        assert!(
+            matches!(err, ChannelLogPersistError::CborDecode(_)),
+            "corrupt legacy segment is CborDecode (quarantine-eligible), not Io"
+        );
     }
 
     /// A sealed segment's ciphertext copied to a DIFFERENT index fails the

@@ -338,7 +338,20 @@ pub fn load_addrbook(
     let label = crate::community_state_persist::seal_label(community, ADDRBOOK_FILENAME);
     let image = match crate::device_dataset_file::read_image(cipher, path, &label) {
         Ok(Some(image)) => image,
-        Ok(None) | Err(_) => return Vec::new(),
+        // Missing file (first boot / left community) is silent by design.
+        Ok(None) => return Vec::new(),
+        // ZEB-983 (CodeRabbit): an Io / AEAD failure still degrades to empty
+        // (loss-safe — rows re-verify on ingest), but log the reason so a
+        // wrong-key or unreadable addrbook is distinguishable from first boot.
+        Err(e) => {
+            tracing::warn!(
+                community = %hex::encode(&community.0[..4]),
+                path = %path.display(),
+                error = %e,
+                "addrbook: unreadable sealed sidecar; loading empty (peer-recoverable)"
+            );
+            return Vec::new();
+        }
     };
     let rows: Vec<AddressBookRow> = match from_reader(image.bytes.as_slice()) {
         Ok(r) => r,

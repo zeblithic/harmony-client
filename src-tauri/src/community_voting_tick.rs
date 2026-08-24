@@ -571,37 +571,42 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
             };
             for (space_id, log_mtx) in entries {
                 let mut log = log_mtx.lock().await;
+                // ZEB-983 (CodeAnt): the archive prune MUTATES the in-memory
+                // log, so it must not run unless the removal can be persisted
+                // — otherwise a restart reloads the old file and resurrects
+                // the finalized polls. Resolve persistence availability FIRST;
+                // when unavailable (no dir / no device cipher), skip this
+                // community's prune entirely and retry on the next sweep.
+                let persist = ctx.identity_dir.as_ref().zip(ctx.device_cipher.clone());
+                let Some((dir, cipher)) = persist else {
+                    drop(log);
+                    continue;
+                };
                 let archived = log.archive_finalized_polls(now_wall_ms_u64);
                 // ZEB-718: persist the pruned log so archived events don't
                 // resurrect on reload and the on-disk file stays bounded.
                 if !archived.is_empty() {
-                    if let (Some(dir), Some(cipher)) =
-                        (ctx.identity_dir.as_ref(), ctx.device_cipher.clone())
-                    {
-                        let path = crate::community_voting_persist::voting_path_for(dir, &space_id);
-                        let snapshot =
-                            crate::community_voting_persist::snapshot_for_persist(&log, &space_id);
-                        // Hold this per-community log lock across the write so
-                        // the sweep serializes with the engine's `persist_now`
-                        // (which shares this same mutex) — preventing a
-                        // temp-file race on `voting.cbor`. `spawn_blocking`
-                        // keeps the blocking `std::fs` write off the async
-                        // worker; the sweep is 24h-cadence so the hold is a
-                        // non-issue.
-                        let write_result = tokio::task::spawn_blocking(move || {
-                            crate::community_voting_persist::write_snapshot(
-                                &cipher, &path, &snapshot,
-                            )
-                        })
-                        .await;
-                        match write_result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(community_id = ?space_id, err = %e, "voting archive persist failed")
-                            }
-                            Err(join_err) => {
-                                tracing::warn!(community_id = ?space_id, err = %join_err, "voting archive persist task panicked")
-                            }
+                    let path = crate::community_voting_persist::voting_path_for(dir, &space_id);
+                    let snapshot =
+                        crate::community_voting_persist::snapshot_for_persist(&log, &space_id);
+                    // Hold this per-community log lock across the write so
+                    // the sweep serializes with the engine's `persist_now`
+                    // (which shares this same mutex) — preventing a
+                    // temp-file race on `voting.cbor`. `spawn_blocking`
+                    // keeps the blocking `std::fs` write off the async
+                    // worker; the sweep is 24h-cadence so the hold is a
+                    // non-issue.
+                    let write_result = tokio::task::spawn_blocking(move || {
+                        crate::community_voting_persist::write_snapshot(&cipher, &path, &snapshot)
+                    })
+                    .await;
+                    match write_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(community_id = ?space_id, err = %e, "voting archive persist failed")
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(community_id = ?space_id, err = %join_err, "voting archive persist task panicked")
                         }
                     }
                 }

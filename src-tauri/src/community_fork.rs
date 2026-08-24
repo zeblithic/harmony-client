@@ -14,6 +14,11 @@
 pub const SNAPSHOT_PER_CHANNEL_CAP: usize = 500;
 pub const SNAPSHOT_TOTAL_CAP: usize = 5000;
 
+/// Filename of the pre-fork snapshot under a fork community's dir. Used as
+/// BOTH the on-disk path component and the ZEB-983 AAD seal label — one
+/// constant so the two can never drift (a mismatch silently breaks the tag).
+pub(crate) const PRE_FORK_SNAPSHOT_FILENAME: &str = "pre_fork_snapshot.bin";
+
 /// §4.2 snapshot policy: per-channel cap + proportional total trim.
 ///
 /// 1. Per-channel cap: for each channel, sort descending by HLC, take
@@ -598,11 +603,11 @@ pub async fn fork_community(
         // supplies the atomic tempfile + fsync + rename.
         let cipher = crate::device_dataset_file::get_or_derive(&identity_dir)
             .map_err(|e| format!("fork_community: device cipher unavailable: {e}"))?;
-        let snapshot_path = fork_dir.join("pre_fork_snapshot.bin");
+        let snapshot_path = fork_dir.join(PRE_FORK_SNAPSHOT_FILENAME);
         crate::device_dataset_file::write_image(
             &cipher,
             &snapshot_path,
-            &crate::community_state_persist::seal_label(&fork_space_id, "pre_fork_snapshot.bin"),
+            &crate::community_state_persist::seal_label(&fork_space_id, PRE_FORK_SNAPSHOT_FILENAME),
             &snapshot_bytes,
         )
         .map_err(|e| format!("fork_community: write snapshot: {e}"))?;
@@ -659,7 +664,7 @@ pub async fn fork_community(
         .map(|d| {
             d.join("communities")
                 .join(&fork_space_id_hex)
-                .join("pre_fork_snapshot.bin")
+                .join(PRE_FORK_SNAPSHOT_FILENAME)
         })
         .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
     let cleanup_disk_artifacts = || {

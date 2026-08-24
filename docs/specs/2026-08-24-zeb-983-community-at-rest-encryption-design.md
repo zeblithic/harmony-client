@@ -216,18 +216,43 @@ granularity that machinery already proven in production can heal:
   independently legacy-detectable (first-byte sniff: anything ≠ 3 is a
   legacy image), so a crash mid-migration is safe and resumes next boot;
   no inter-file ordering constraint.
+- **Reseal write-failure behavior** (all families): `reseal_if_legacy` is
+  best-effort — a write failure warns, leaves the legacy plaintext file
+  in place, does NOT block channel/community startup, and retries on the
+  next load. A boot can therefore run indefinitely on legacy files if the
+  disk keeps rejecting the reseal write; migration is convergent, not
+  transactional.
+- **Legacy quarantine leaves plaintext aside — accepted.** When an
+  *unreadable legacy* file is quarantined (rename to `.corrupt.<ms>`),
+  the aside bytes are plaintext. This does not worsen the at-rest
+  exposure: the file was already plaintext on disk before migration, and
+  the offline-disk attacker could already read it. A *sealed*-then-corrupt
+  file quarantines as ciphertext. This matches the pre-existing ZEB-460
+  quarantine convention used by every community family; changing it for
+  channel logs alone would be inconsistent, and securely shredding corrupt
+  bytes would forfeit the forensic evidence the `.corrupt.<ms>` aside
+  exists to preserve.
 - **`backfill_state.cbor` (both levels): lazy** — sealed on next save
   (rewritten roughly hourly by the resync floor), legacy accepted on
   read indefinitely. It carries a single timestamp; an eager pass buys
   nothing.
-- **Rollback (pre-983 binary + sealed files):** every community family
-  degrades exactly as its corruption contract dictates — quarantine +
-  default + peer-recovery for crdt/replay/segments/voting, empty
-  addrbook, `None` hints, degraded fork reads, and for channel logs the
-  OLD binary's hard-error (dead channel until re-upgrade — accepted; the
-  old binary predates the recovery contract by definition). No silent
-  misreads anywhere: sentinel 3 parses as neither valid CBOR nor schema
-  byte 1.
+- **Rollback (pre-983 binary + sealed files) is DESTRUCTIVE — restore a
+  pre-upgrade backup after re-upgrading.** A pre-983 binary reads sealed
+  files as corrupt and, per each family's old contract, will *quarantine
+  or overwrite* them: `crdt`/`replay`/`segments`/`voting` quarantine +
+  default (peer-recoverable only for OPEN communities — invite-only
+  bootstrap admission refuses a Joined publisher's root, so those need a
+  re-invite); `addrbook` overwrites the sealed file with a fresh plaintext
+  sidecar on the next persist (its old contract never quarantined); fork
+  reads degrade to None; channel logs hit the OLD binary's hard-error
+  (dead channel until re-upgrade). None of these is lossless. Operators
+  who must downgrade should keep a pre-upgrade backup and restore it after
+  re-upgrading; the sealed-file format has no forward-compatible
+  downgrade path by design (no plaintext fallback mode). No silent
+  misreads: sentinel `0x03` is itself valid CBOR, but it fails every
+  family's legacy schema-byte / type check, so a sealed file is never
+  mistaken for legacy content — it is always classified as corrupt (then
+  quarantined) rather than parsed.
 - The whole-dir detach on community delete
   (`{cid_hex}.deleting.<nanos>.<seq>`) and the ZEB-436 dir-level
   freshness probe are unaffected (both operate on names/dirs, not

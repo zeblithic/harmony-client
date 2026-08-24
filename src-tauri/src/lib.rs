@@ -36897,10 +36897,16 @@ pub(crate) async fn generate_invite_impl(
                 let snapshot_path = identity_dir
                     .join("communities")
                     .join(hex::encode(space_id.0))
-                    .join("pre_fork_snapshot.bin");
-                // ZEB-983: open the sealed envelope; a missing file / device
-                // cipher / undecryptable snapshot all degrade to None (the
-                // fork invite is sent without the snapshot), never an error.
+                    .join(crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME);
+                // ZEB-983: skip the cipher derive entirely when no snapshot
+                // exists — the common non-fork case — so a read-only lookup
+                // never fresh-generates an identity via get_or_derive.
+                if !snapshot_path.exists() {
+                    return None;
+                }
+                // Open the sealed envelope; a missing file / device cipher /
+                // undecryptable snapshot all degrade to None (the fork invite
+                // is sent without the snapshot), never an error.
                 let cipher = match crate::device_dataset_file::get_or_derive(&identity_dir) {
                     Ok(c) => c,
                     Err(e) => {
@@ -36913,8 +36919,10 @@ pub(crate) async fn generate_invite_impl(
                         return None;
                     }
                 };
-                let label =
-                    crate::community_state_persist::seal_label(&space_id, "pre_fork_snapshot.bin");
+                let label = crate::community_state_persist::seal_label(
+                    &space_id,
+                    crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME,
+                );
                 let bytes =
                     match crate::device_dataset_file::read_image(&cipher, &snapshot_path, &label) {
                         Ok(Some(image)) => image.bytes,
@@ -43220,7 +43228,8 @@ where
                         "redeem_invite_inner: create fork dir failed; pre_fork_snapshot not written"
                     );
                 } else {
-                    let snapshot_path = fork_dir.join("pre_fork_snapshot.bin");
+                    let snapshot_path =
+                        fork_dir.join(crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME);
                     // ZEB-983: seal at rest (message bodies + fork_reason).
                     match (
                         crate::owner_state_crypto::canonical_cbor_encode(snapshot),
@@ -43232,7 +43241,7 @@ where
                                 &snapshot_path,
                                 &crate::community_state_persist::seal_label(
                                     &minted.community_id,
-                                    "pre_fork_snapshot.bin",
+                                    crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME,
                                 ),
                                 &bytes,
                             ) {
@@ -44582,7 +44591,7 @@ mod redeem_invite_inner_tests {
             .path()
             .join("communities")
             .join(hex::encode(community_id.0))
-            .join("pre_fork_snapshot.bin");
+            .join(crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME);
         assert!(
             snapshot_path.exists(),
             "pre_fork_snapshot.bin must be written to data dir: {}",
@@ -44599,7 +44608,10 @@ mod redeem_invite_inner_tests {
         let image = crate::device_dataset_file::read_image(
             &crate::device_dataset_file::test_cipher(),
             &snapshot_path,
-            &crate::community_state_persist::seal_label(&community_id, "pre_fork_snapshot.bin"),
+            &crate::community_state_persist::seal_label(
+                &community_id,
+                crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME,
+            ),
         )
         .expect("open sealed snapshot")
         .expect("snapshot present");
@@ -48010,16 +48022,27 @@ async fn get_fork_snapshot_metadata(
     let snapshot_path = identity_dir
         .join("communities")
         .join(&safe_community_id)
-        .join("pre_fork_snapshot.bin");
+        .join(crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME);
 
-    // ZEB-983: open the sealed envelope. Missing → Ok(None); Io →
-    // Err (transient hard); Crypto/undecryptable → Err (same hard stance
-    // this getter gave a decode failure).
+    // ZEB-983: check existence BEFORE deriving the cipher — a read-only
+    // lookup must not fresh-generate a node identity (get_or_derive would,
+    // on a fresh dir). Missing → Ok(None); other stat Io → Err. Then open
+    // the sealed envelope (Io/Crypto → Err, the hard stance this getter
+    // already gave a decode failure).
+    match std::fs::metadata(&snapshot_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "get_fork_snapshot_metadata: stat pre_fork_snapshot.bin: {e}"
+            ))
+        }
+    }
     let cipher = crate::device_dataset_file::get_or_derive(&identity_dir)
         .map_err(|e| format!("get_fork_snapshot_metadata: device cipher unavailable: {e}"))?;
     let label = crate::community_state_persist::seal_label(
         &crate::owner_state_types::SpaceId(id_bytes),
-        "pre_fork_snapshot.bin",
+        crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME,
     );
     let bytes = match crate::device_dataset_file::read_image(&cipher, &snapshot_path, &label) {
         Ok(Some(image)) => image.bytes,
@@ -48095,14 +48118,25 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
     let snapshot_path = identity_dir
         .join("communities")
         .join(&safe_community_id)
-        .join("pre_fork_snapshot.bin");
+        .join(crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME);
 
-    // ZEB-983: sealed envelope — missing → Ok(None); Io/Crypto → Err.
+    // ZEB-983: existence check BEFORE the cipher derive (read-only lookup
+    // must not fresh-generate an identity). Missing → Ok(None); stat Io →
+    // Err; then sealed envelope Io/Crypto → Err.
+    match std::fs::metadata(&snapshot_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "get_pre_fork_snapshot: stat pre_fork_snapshot.bin: {e}"
+            ))
+        }
+    }
     let cipher = crate::device_dataset_file::get_or_derive(&identity_dir)
         .map_err(|e| format!("get_pre_fork_snapshot: device cipher unavailable: {e}"))?;
     let label = crate::community_state_persist::seal_label(
         &crate::owner_state_types::SpaceId(id_bytes),
-        "pre_fork_snapshot.bin",
+        crate::community_fork::PRE_FORK_SNAPSHOT_FILENAME,
     );
     let bytes = match crate::device_dataset_file::read_image(&cipher, &snapshot_path, &label) {
         Ok(Some(image)) => image.bytes,
