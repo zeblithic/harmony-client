@@ -56,7 +56,7 @@ async fn ingest_list_pin_burn_roundtrip() {
 
     // ── Step 2: write a sidecar entry for the same CID ───────────────────
     // Mimics what the Tauri ingest_content command does post-ack.
-    let index = Arc::new(Mutex::new(ContentIndex::load(&app_data_dir)));
+    let index = Arc::new(Mutex::new(ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), &app_data_dir)));
     let sid = SidecarId::new();
     {
         let mut idx = index.lock().unwrap();
@@ -235,7 +235,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     );
 
     // ── Step 3: Sidecar insert for the root CID ───────────────────────
-    let index = Arc::new(Mutex::new(content_index::ContentIndex::load(&app_data_dir)));
+    let index = Arc::new(Mutex::new(content_index::ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), &app_data_dir)));
     let root_sid = SidecarId::new();
     {
         let mut idx = index.lock().unwrap();
@@ -334,7 +334,7 @@ fn pin_intent_survives_reload() {
     let sid = SidecarId::new();
 
     {
-        let mut idx = ContentIndex::load(tmp.path());
+        let mut idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), tmp.path());
         idx.insert(ContentIndexEntry {
             stored_at_ms: 1_700_000_000_000,
             ..make_entry(sid, cid, "persist-me.bin", 100, ContentKind::Leaf, false)
@@ -347,7 +347,7 @@ fn pin_intent_survives_reload() {
 
     // Reload — simulates app restart. SidecarId is part of the persisted
     // file format, so the same `sid` resolves the entry post-reload.
-    let reloaded = ContentIndex::load(tmp.path());
+    let reloaded = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), tmp.path());
     let entry = reloaded.get(&sid).expect("entry must persist");
     assert!(
         entry.pinned,
@@ -522,7 +522,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
 
     // ── Step 3: write sidecar rows for both as independent pinnable roots
     // (mimics what the Tauri ingest_content / folder upload paths do).
-    let index = Arc::new(Mutex::new(ContentIndex::load(&app_data_dir)));
+    let index = Arc::new(Mutex::new(ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), &app_data_dir)));
     let sid_a = SidecarId::new();
     let sid_c = SidecarId::new();
     {
@@ -672,7 +672,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
     ack_rx.await.unwrap().expect("ingest must succeed");
 
     // ── Step 2: write a sidecar row with pinned=false initially ─────────
-    let index = Arc::new(Mutex::new(ContentIndex::load(&app_data_dir)));
+    let index = Arc::new(Mutex::new(ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), &app_data_dir)));
     let sid = SidecarId::new();
     {
         let mut idx = index.lock().unwrap();

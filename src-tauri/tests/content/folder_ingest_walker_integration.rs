@@ -56,7 +56,7 @@ fn spawn_recording_ingest_handler() -> (tokio::sync::mpsc::Sender<IngestRequest>
 /// `path_ingest_tests::fresh_content_index` patterns.
 fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     let dir = tempfile::tempdir().expect("tempdir");
-    let idx = ContentIndex::load(dir.path());
+    let idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), dir.path());
     // Persist directory is examined only via the in-memory entries() iterator
     // here; leaking keeps the directory alive without obscuring the test body.
     std::mem::forget(dir);

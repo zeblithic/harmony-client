@@ -280,7 +280,7 @@ pub async fn spawn_test_runtime_with_pins(
                     )),
                     // ZEB-612 S3: re-announce not exercised (empty index)
                     std::sync::Arc::new(std::sync::Mutex::new(
-                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                        harmony_app::content_index::ContentIndex::load(None, std::path::Path::new("")),
                     )),
                     // ZEB-669 S2: buddy records/ledger/settings not exercised
                     std::sync::Arc::new(std::sync::Mutex::new(
@@ -408,6 +408,6 @@ pub fn insert_top_level(
 /// slip past tests that only assert in-memory state.
 pub fn fresh_index() -> (Arc<Mutex<ContentIndex>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let idx = ContentIndex::load(dir.path());
+    let idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), dir.path());
     (Arc::new(Mutex::new(idx)), dir)
 }

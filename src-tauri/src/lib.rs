@@ -2141,7 +2141,7 @@ impl Default for NodeState {
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
-                content_index::ContentIndex::load(std::path::Path::new("")),
+                content_index::ContentIndex::load(None, std::path::Path::new("")),
             )),
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),
@@ -13734,7 +13734,7 @@ pub async fn start_node_inner(
                 // (the next NEW-Arc save() overwrites). That end-to-end
                 // serialization is ZEB-160's territory.
                 let content_index = std::sync::Arc::new(std::sync::Mutex::new(
-                    content_index::ContentIndex::load(&app_data_dir),
+                    content_index::ContentIndex::load(device_cipher.as_ref(), &app_data_dir),
                 ));
                 let pin_intent: std::collections::HashSet<[u8; 32]> = {
                     let idx = content_index
@@ -25788,7 +25788,7 @@ mod path_ingest_tests {
 
     fn fresh_content_index() -> Arc<std::sync::Mutex<content_index::ContentIndex>> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let idx = content_index::ContentIndex::load(dir.path());
+        let idx = content_index::ContentIndex::load(Some(&crate::device_dataset_file::test_cipher()), dir.path());
         // Leak the TempDir so the persist directory survives the test body
         // — we don't validate on-disk persistence here, only in-memory rows.
         std::mem::forget(dir);
@@ -77191,7 +77191,7 @@ mod tests {
     #[test]
     fn collect_reannouncements_public_only_deduped() {
         use content_index::Sensitivity;
-        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        let mut index = content_index::ContentIndex::load(None, std::path::Path::new(""));
         index.insert(reannounce_entry(
             [0xAA; 32],
             Sensitivity::Public,
@@ -77243,7 +77243,7 @@ mod tests {
 
     #[test]
     fn collect_reannouncements_saturates_oversized() {
-        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        let mut index = content_index::ContentIndex::load(None, std::path::Path::new(""));
         index.insert(reannounce_entry(
             [0xEE; 32],
             content_index::Sensitivity::Public,
@@ -78093,7 +78093,7 @@ mod pin_persistence_tests {
         .expect("cid")
         .to_bytes();
 
-        let mut idx = content_index::ContentIndex::load(std::path::Path::new(""));
+        let mut idx = content_index::ContentIndex::load(None, std::path::Path::new(""));
         idx.insert(content_index::ContentIndexEntry {
             sidecar_id: content_index::SidecarId::new(),
             cid: enc_cid,
@@ -83669,7 +83669,7 @@ mod start_node_race_tests {
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
-                content_index::ContentIndex::load(std::path::Path::new("")),
+                content_index::ContentIndex::load(None, std::path::Path::new("")),
             )),
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),

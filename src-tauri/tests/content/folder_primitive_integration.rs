@@ -15,7 +15,7 @@ use crate::harness::{make_entry, spawn_test_runtime};
 #[test]
 fn create_folder_at_root_then_list_shows_it() {
     let dir = tempdir().unwrap();
-    let mut idx = ContentIndex::load(dir.path());
+    let mut idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), dir.path());
 
     // Build what create_folder_at_root would build: an empty folder.
     let built = folders::build_folder("Photos", &[]).expect("build");
@@ -49,7 +49,7 @@ fn create_nested_folder_updates_top_level_root_cid() {
     // a fresh SidecarId; its `cid` field holds Photos's bundle CID
     // (call that root_v1).
     let dir = tempdir().unwrap();
-    let mut idx = ContentIndex::load(dir.path());
+    let mut idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), dir.path());
     let photos_v1 = folders::build_folder("Photos", &[]).expect("build v1");
 
     let photos_sid = SidecarId::new();
@@ -201,7 +201,7 @@ fn pin_intent_survives_restart_for_folder() {
     let sid = SidecarId::new();
 
     {
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), dir.path());
         let built = folders::build_folder("Pinned", &[]).expect("build");
         idx.insert(make_entry(
             sid,
@@ -213,7 +213,7 @@ fn pin_intent_survives_restart_for_folder() {
         ));
     }
 
-    let idx = ContentIndex::load(dir.path());
+    let idx = ContentIndex::load(Some(&harmony_app::device_dataset_file::test_cipher()), dir.path());
     let entry = idx
         .get(&sid)
         .expect("folder entry persisted under same sid");

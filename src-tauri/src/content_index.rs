@@ -181,11 +181,16 @@ struct IndexFile {
 pub struct ContentIndex {
     path: PathBuf,
     entries: HashMap<SidecarId, ContentIndexEntry>,
-    /// ZEB-986: set only when the index file was unreadable at load (transient Io) or
-    /// corrupt bytes could not be quarantined aside. Freezes `save()` so the still-good
-    /// on-disk index is never overwritten with the empty in-memory default. Content
-    /// corruption itself does NOT freeze — it quarantines aside and heals (see `load`).
+    /// ZEB-986: set only when the index file was unreadable at load (transient Io), a
+    /// sealed image would not decrypt (wrong/rotated key), or corrupt bytes could not be
+    /// quarantined aside. Freezes `save()` so the still-good on-disk index is never
+    /// overwritten with the empty in-memory default. Legacy-plaintext content corruption
+    /// does NOT freeze — it quarantines aside and heals (see `load`).
     disk_write_frozen: bool,
+    /// ZEB-986 PR-3: device cipher for at-rest sealing. `None` for the bare-path
+    /// placeholder (`NodeState::default`) and on a pre-identity boot; `save()` is a no-op
+    /// when `None` (matching the bare-path guard).
+    cipher: Option<crate::device_dataset_file::DeviceCipher>,
     /// Test-only one-shot hook armed via `arm_next_rekey_conflict`.
     /// When `Some((sid, fake_actual))`, the next `rekey` call targeting
     /// `sid` returns `Err(RekeyError::Conflict { actual: fake_actual })`
@@ -221,7 +226,10 @@ pub enum RekeyError {
 }
 
 impl ContentIndex {
-    pub fn load(data_dir: &Path) -> Self {
+    pub fn load(
+        cipher: Option<&crate::device_dataset_file::DeviceCipher>,
+        data_dir: &Path,
+    ) -> Self {
         let path = data_dir.join(INDEX_FILE);
         // Symmetric with save(): if data_dir is empty, `path` is the bare
         // filename "content-index.json" and would resolve to CWD. Don't read
@@ -244,8 +252,10 @@ impl ContentIndex {
             //  * Transient READ error → freeze (never overwrite maybe-good bytes).
             // `load()` stays clock-free (the sidecar name uses the wall clock
             // internally), so its many call sites are untouched.
-            let recovered = crate::recoverable_load::load_or_recover::<Option<IndexFile>>(
+            let recovered = crate::recoverable_load::load_sealed_or_recover::<Option<IndexFile>>(
+                cipher,
                 &path,
+                INDEX_FILE,
                 crate::recoverable_load::now_ms(),
                 |bytes| {
                     serde_json::from_slice::<IndexFile>(bytes)
@@ -272,6 +282,7 @@ impl ContentIndex {
             path,
             entries,
             disk_write_frozen,
+            cipher: cipher.cloned(),
             #[cfg(any(test, feature = "test-fixtures"))]
             test_rekey_conflict_hook: None,
             #[cfg(any(test, feature = "test-fixtures"))]
@@ -312,6 +323,14 @@ impl ContentIndex {
             );
             return;
         }
+        let Some(cipher) = &self.cipher else {
+            tracing::warn!(
+                path = ?self.path,
+                "content-index save skipped — no device cipher (pre-identity boot); \
+                 will persist once sealed"
+            );
+            return;
+        };
         // Sort by sidecar_id for deterministic on-disk ordering; HashMap
         // iteration order would otherwise churn the file on every save and
         // make diffs (and future snapshotting) noisy.
@@ -329,20 +348,11 @@ impl ContentIndex {
             }
         };
 
-        let tmp_path = {
-            let mut name = self.path.file_name().unwrap_or_default().to_os_string();
-            name.push(".tmp");
-            self.path.with_file_name(name)
-        };
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(&tmp_path, &json) {
-            tracing::warn!(err = %e, "content-index write failed; changes not persisted");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
-            tracing::warn!(err = %e, "content-index rename failed; tmp file may be stale");
+        // ZEB-986 PR-3: seal + atomic write + fsync + 0600 + parent-dir creation.
+        if let Err(e) =
+            crate::device_dataset_file::write_image(cipher, &self.path, INDEX_FILE, &json)
+        {
+            tracing::warn!(err = %e, "content-index sealed write failed; changes not persisted");
         }
     }
 
@@ -608,6 +618,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Deterministic device cipher for the sealing tests (ZEB-986 PR-3).
+    fn tc() -> crate::device_dataset_file::DeviceCipher {
+        crate::device_dataset_file::test_cipher()
+    }
+
     fn sample_entry(cid: [u8; 32]) -> ContentIndexEntry {
         ContentIndexEntry {
             sidecar_id: SidecarId::new(),
@@ -629,7 +644,7 @@ mod tests {
     #[test]
     fn load_missing_file_returns_empty() {
         let dir = tempdir().unwrap();
-        let idx = ContentIndex::load(dir.path());
+        let idx = ContentIndex::load(Some(&tc()), dir.path());
         assert!(idx.entries.is_empty());
     }
 
@@ -638,11 +653,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let entry = sample_entry([0xAA; 32]);
 
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         idx.entries.insert(entry.sidecar_id, entry.clone());
         idx.save();
 
-        let reloaded = ContentIndex::load(dir.path());
+        let reloaded = ContentIndex::load(Some(&tc()), dir.path());
         assert_eq!(reloaded.entries.len(), 1);
         assert_eq!(reloaded.entries.get(&entry.sidecar_id), Some(&entry));
     }
@@ -651,7 +666,7 @@ mod tests {
     fn load_malformed_json_returns_empty() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join(INDEX_FILE), b"{ not valid json").unwrap();
-        let idx = ContentIndex::load(dir.path());
+        let idx = ContentIndex::load(Some(&tc()), dir.path());
         assert!(idx.entries.is_empty());
     }
 
@@ -663,14 +678,14 @@ mod tests {
             br#"{"version": 99, "entries": []}"#,
         )
         .unwrap();
-        let idx = ContentIndex::load(dir.path());
+        let idx = ContentIndex::load(Some(&tc()), dir.path());
         assert!(idx.entries.is_empty());
     }
 
     #[test]
     fn insert_adds_entry_and_returns_true() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let entry = sample_entry([0xBB; 32]);
         let id = entry.sidecar_id;
         assert!(idx.insert(entry.clone()));
@@ -687,7 +702,7 @@ mod tests {
         let p = dir.path().join(INDEX_FILE);
         std::fs::write(&p, b"{ corrupt").unwrap();
 
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         assert!(
             idx.entries.is_empty(),
             "corrupt index starts empty in-memory"
@@ -704,7 +719,7 @@ mod tests {
         let entry = sample_entry([0xAB; 32]);
         let id = entry.sidecar_id;
         assert!(idx.insert(entry));
-        let reloaded = ContentIndex::load(dir.path());
+        let reloaded = ContentIndex::load(Some(&tc()), dir.path());
         assert!(
             reloaded.get(&id).is_some(),
             "healed write persisted — new blob is durably indexed, not orphaned"
@@ -718,10 +733,13 @@ mod tests {
         // index and make its blobs inaccessible.
         let dir = tempdir().unwrap();
         let p = dir.path().join(INDEX_FILE);
+        // Post-PR-3 a forward-version file on disk is SEALED (every build seals), so freeze
+        // leaves the sealed bytes byte-identical with no reseal churn.
         let forward = br#"{"version":999,"entries":[]}"#;
-        std::fs::write(&p, forward).unwrap();
+        crate::device_dataset_file::write_image(&tc(), &p, INDEX_FILE, forward).unwrap();
+        let sealed = std::fs::read(&p).unwrap();
 
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         assert!(
             idx.entries.is_empty(),
             "unsupported version starts empty in-memory"
@@ -730,8 +748,8 @@ mod tests {
         idx.insert(sample_entry([0xCD; 32]));
         assert_eq!(
             std::fs::read(&p).unwrap(),
-            forward,
-            "foreign-version file preserved byte-identical"
+            sealed,
+            "foreign-version sealed file preserved byte-identical"
         );
         let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
             e.file_name()
@@ -745,12 +763,87 @@ mod tests {
     }
 
     #[test]
+    fn save_seals_on_disk() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
+        idx.insert(sample_entry([0x11; 32]));
+        let bytes = std::fs::read(dir.path().join(INDEX_FILE)).unwrap();
+        assert_eq!(
+            bytes[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "content-index.json is sealed on disk"
+        );
+        assert!(serde_json::from_slice::<IndexFile>(&bytes).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
+        idx.insert(sample_entry([0x22; 32]));
+        let mode = std::fs::metadata(dir.path().join(INDEX_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "sealed content-index is owner-only");
+    }
+
+    #[test]
+    fn legacy_plaintext_migrates_to_sealed() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join(INDEX_FILE);
+        let entry = sample_entry([0x33; 32]);
+        let legacy = serde_json::to_vec_pretty(&IndexFile {
+            version: FILE_VERSION,
+            entries: vec![entry.clone()],
+        })
+        .unwrap();
+        std::fs::write(&p, &legacy).unwrap();
+        let idx = ContentIndex::load(Some(&tc()), dir.path());
+        assert!(idx.get(&entry.sidecar_id).is_some(), "legacy data recovered");
+        assert_eq!(
+            std::fs::read(&p).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "migrated to sealed on load"
+        );
+    }
+
+    #[test]
+    fn foreign_cipher_freezes_and_preserves_index() {
+        let dir = tempdir().unwrap();
+        {
+            let mut idx = ContentIndex::load(Some(&tc()), dir.path());
+            idx.insert(sample_entry([0x44; 32]));
+        }
+        let p = dir.path().join(INDEX_FILE);
+        let sealed = std::fs::read(&p).unwrap();
+        let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
+        let mut idx = ContentIndex::load(Some(&foreign), dir.path());
+        assert!(idx.entries.is_empty(), "undecryptable → empty in memory");
+        idx.insert(sample_entry([0x55; 32])); // frozen: no-op
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            sealed,
+            "sealed index preserved byte-identical under a foreign cipher"
+        );
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("content-index.json.corrupt-")
+        });
+        assert!(!quarantined, "sealed decrypt failure freezes, never quarantines");
+    }
+
+    #[test]
     fn insert_two_entries_with_same_cid_coexist() {
         // Pre-ZEB-164 this case was rejected via duplicate-CID guard. Now
         // each entry's identity is its sidecar_id, so two entries pointing
         // at the same CID are legal (symlink-style).
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
 
         let mut alpha = sample_entry([0xCC; 32]);
         alpha.file_name = "Alpha".into();
@@ -772,7 +865,7 @@ mod tests {
         // for UUID v4, but the API still has to behave sensibly if a caller
         // re-uses one (e.g. tests cloning an entry verbatim).
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let entry = sample_entry([0xCD; 32]);
         assert!(idx.insert(entry.clone()));
         assert!(!idx.insert(entry), "duplicate sidecar_id is rejected");
@@ -781,7 +874,7 @@ mod tests {
     #[test]
     fn remove_returns_true_when_present_false_otherwise() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let entry = sample_entry([0xDD; 32]);
         let id = entry.sidecar_id;
         idx.insert(entry);
@@ -792,7 +885,7 @@ mod tests {
     #[test]
     fn set_archived_flips_flag_and_reports_change() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let entry = sample_entry([0xEE; 32]);
         let id = entry.sidecar_id;
         idx.insert(entry);
@@ -805,7 +898,7 @@ mod tests {
     #[test]
     fn set_archived_missing_id_returns_false() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let bogus = SidecarId::new();
         assert!(!idx.set_archived(&bogus, true));
     }
@@ -813,7 +906,7 @@ mod tests {
     #[test]
     fn set_file_name_updates_name_and_reports_change() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let entry = sample_entry([0xF1; 32]);
         let id = entry.sidecar_id;
         idx.insert(entry);
@@ -826,7 +919,7 @@ mod tests {
     #[test]
     fn set_file_name_missing_id_returns_false() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let bogus = SidecarId::new();
         assert!(!idx.set_file_name(&bogus, "new.txt".into()));
     }
@@ -836,13 +929,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let saved_id;
         {
-            let mut idx = ContentIndex::load(dir.path());
+            let mut idx = ContentIndex::load(Some(&tc()), dir.path());
             let entry = sample_entry([0xF2; 32]);
             saved_id = entry.sidecar_id;
             idx.insert(entry);
             assert!(idx.set_file_name(&saved_id, "persisted.txt".into()));
         }
-        let reloaded = ContentIndex::load(dir.path());
+        let reloaded = ContentIndex::load(Some(&tc()), dir.path());
         assert_eq!(
             reloaded.get(&saved_id).expect("entry persisted").file_name,
             "persisted.txt",
@@ -852,7 +945,7 @@ mod tests {
     #[test]
     fn set_replication_tier_counts_updated_entries() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let a = sample_entry([0x01; 32]);
         let b = sample_entry([0x02; 32]);
         let a_id = a.sidecar_id;
@@ -876,7 +969,7 @@ mod tests {
         // NodeState::default() constructs a ContentIndex with an empty
         // path. Ensure mutations on that degenerate state don't
         // accidentally write content-index.json into CWD.
-        let mut idx = ContentIndex::load(Path::new(""));
+        let mut idx = ContentIndex::load(None, Path::new(""));
         assert!(idx.insert(sample_entry([0xFE; 32])));
         // No file should have been created in CWD.
         assert!(!Path::new("content-index.json").exists());
@@ -887,7 +980,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let saved_id;
         {
-            let mut idx = ContentIndex::load(dir.path());
+            let mut idx = ContentIndex::load(Some(&tc()), dir.path());
             let a1 = sample_entry([0xA1; 32]);
             let a2 = sample_entry([0xA2; 32]);
             let a1_id = a1.sidecar_id;
@@ -901,7 +994,7 @@ mod tests {
                 1
             );
         }
-        let reloaded = ContentIndex::load(dir.path());
+        let reloaded = ContentIndex::load(Some(&tc()), dir.path());
         assert_eq!(reloaded.entries.len(), 1);
         let entry = reloaded.get(&saved_id).expect("saved entry persisted");
         assert!(entry.archived);
@@ -911,7 +1004,7 @@ mod tests {
     #[test]
     fn set_pinned_flips_flag_and_reports_change() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let entry = sample_entry([0xB1; 32]);
         let id = entry.sidecar_id;
         idx.insert(entry);
@@ -928,7 +1021,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let id = {
-            let mut idx = ContentIndex::load(&path);
+            let mut idx = ContentIndex::load(Some(&tc()), &path);
             let entry = sample_entry([0xB2; 32]);
             let id = entry.sidecar_id;
             idx.insert(entry);
@@ -936,7 +1029,7 @@ mod tests {
             assert!(!idx.set_backup(&id, true), "same value is a no-op");
             id
         };
-        let mut idx = ContentIndex::load(&path);
+        let mut idx = ContentIndex::load(Some(&tc()), &path);
         assert!(idx.get(&id).unwrap().backup, "flag survives reload");
         assert!(
             !idx.set_backup(&SidecarId::new(), true),
@@ -978,7 +1071,7 @@ mod tests {
     #[test]
     fn origin_round_trips_through_save_and_reload() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let mut entry = sample_entry([0xC4; 32]);
         entry.origin = Some(OriginInfo {
             kind: OriginKind::SelfIngest,
@@ -987,7 +1080,7 @@ mod tests {
         let id = entry.sidecar_id;
         idx.insert(entry);
 
-        let reloaded = ContentIndex::load(dir.path());
+        let reloaded = ContentIndex::load(Some(&tc()), dir.path());
         let got = reloaded.get(&id).expect("round-trips");
         assert_eq!(
             got.origin,
@@ -1005,7 +1098,7 @@ mod tests {
     #[test]
     fn set_pinned_missing_id_returns_false() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let bogus = SidecarId::new();
         assert!(!idx.set_pinned(&bogus, true));
     }
@@ -1015,13 +1108,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let entry_id;
         {
-            let mut idx = ContentIndex::load(dir.path());
+            let mut idx = ContentIndex::load(Some(&tc()), dir.path());
             let entry = sample_entry([0xB3; 32]);
             entry_id = entry.sidecar_id;
             idx.insert(entry);
             assert!(idx.set_pinned(&entry_id, true));
         }
-        let reloaded = ContentIndex::load(dir.path());
+        let reloaded = ContentIndex::load(Some(&tc()), dir.path());
         assert!(
             reloaded.get(&entry_id).expect("persisted").pinned,
             "pinned flag must survive save/load"
@@ -1031,14 +1124,14 @@ mod tests {
     #[test]
     fn save_persists_kind_field() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let mut entry = sample_entry([0xF0; 32]);
         entry.file_name = "Photos".into();
         entry.kind = ContentKind::Folder;
         let id = entry.sidecar_id;
         idx.insert(entry);
 
-        let reloaded = ContentIndex::load(dir.path());
+        let reloaded = ContentIndex::load(Some(&tc()), dir.path());
         let got = reloaded.get(&id).expect("round-trips");
         assert_eq!(got.kind, ContentKind::Folder);
         assert_eq!(got.file_name, "Photos");
@@ -1047,7 +1140,7 @@ mod tests {
     #[test]
     fn rekey_atomically_replaces_cid_and_preserves_user_state() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
 
         let mut entry = sample_entry([0x01; 32]);
         entry.file_name = "Folder".into();
@@ -1082,7 +1175,7 @@ mod tests {
     #[test]
     fn rekey_missing_id_returns_old_missing() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let bogus = SidecarId::new();
         // OldMissing fires before the expected_old_cid check.
         assert_eq!(
@@ -1094,7 +1187,7 @@ mod tests {
     #[test]
     fn rekey_self_update_refreshes_size_and_stored_at() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
         let entry = sample_entry([0xCC; 32]);
         let id = entry.sidecar_id;
         idx.insert(entry);
@@ -1167,7 +1260,7 @@ mod tests {
             }]
         }"#;
         std::fs::write(dir.path().join(INDEX_FILE), pre_zeb164).unwrap();
-        let idx = ContentIndex::load(dir.path());
+        let idx = ContentIndex::load(Some(&tc()), dir.path());
         assert!(
             idx.entries.is_empty(),
             "legacy entry without sidecar_id must not load"
@@ -1180,7 +1273,7 @@ mod tests {
         // multiple entries can share a CID — the rekey target collision
         // case is no longer an error.
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
 
         let keeper = sample_entry([0xAA; 32]);
         let other = sample_entry([0xBB; 32]);
@@ -1203,7 +1296,7 @@ mod tests {
         // current CID won't match what the caller walked from. Surface
         // the actual CID so a future retry path could rebuild from it.
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
 
         let entry = sample_entry([0xAA; 32]);
         let id = entry.sidecar_id;
@@ -1221,7 +1314,7 @@ mod tests {
     #[test]
     fn entries_for_cid_returns_all_matching() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
 
         let a = sample_entry([0x10; 32]);
         let b = sample_entry([0x10; 32]);
@@ -1255,7 +1348,7 @@ mod tests {
     #[test]
     fn is_cid_pinned_by_any_or_joins_entries() {
         let dir = tempdir().unwrap();
-        let mut idx = ContentIndex::load(dir.path());
+        let mut idx = ContentIndex::load(Some(&tc()), dir.path());
 
         let mut a = sample_entry([0x30; 32]);
         let mut b = sample_entry([0x30; 32]);
