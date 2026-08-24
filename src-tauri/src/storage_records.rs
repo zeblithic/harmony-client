@@ -424,6 +424,17 @@ impl StorageRecordStore {
         s
     }
 
+    /// ZEB-986 PR-3: arm the device cipher after a fresh-profile boot (identity.key is
+    /// created partway through `start_node_inner`, after this store first loads). On a
+    /// fresh profile the file is absent, so the store loaded empty and un-faulted; arming
+    /// the cipher lets later saves seal. Deliberately does NOT clear `sealed_fault`: a store
+    /// that failed closed on an existing file stays fail-closed. No-op if already armed.
+    pub fn arm_cipher(&mut self, cipher: crate::device_dataset_file::DeviceCipher) {
+        if self.cipher.is_none() {
+            self.cipher = Some(cipher);
+        }
+    }
+
     fn save(&self) {
         let Some(path) = self.path.as_ref() else {
             return;

@@ -1493,6 +1493,16 @@ impl VineFeedCache {
         newly_added
     }
 
+    /// ZEB-986 PR-3: arm the device cipher after a fresh-profile boot (identity.key is
+    /// created partway through `start_node_inner`, after this cache first loads). The cache
+    /// loaded empty on a fresh profile (the file was absent), so arming the cipher once
+    /// identity exists lets later saves seal; no reload needed. No-op if already armed.
+    pub fn arm_cipher(&mut self, cipher: crate::device_dataset_file::DeviceCipher) {
+        if self.cipher.is_none() {
+            self.cipher = Some(cipher);
+        }
+    }
+
     /// Atomic save: serialize cache state, write to `<path>.tmp`, rename
     /// to `<path>`. No-op when `self.path.is_none()` (test path).
     ///

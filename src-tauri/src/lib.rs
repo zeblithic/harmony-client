@@ -4293,18 +4293,20 @@ pub async fn start_node_inner(
         });
     }
     // ZEB-986 PR-3: device cipher for at-rest sealing of the app-data + storage stores.
-    // Derived once here and threaded into every store's load. Guarded on identity.key
-    // existence so a pre-identity boot never fresh-generates an identity as a side effect
-    // (get_or_derive's seed chain would otherwise create one). `None` on such a boot: the
-    // store files do not exist yet, so loads are first-run empty and saves no-op until a
-    // cipher is available. The node seed backs this key and is established during network
-    // init above, so in practice this resolves to `Some` on every real boot.
-    let device_cipher: Option<crate::device_dataset_file::DeviceCipher> =
+    // Threaded into every store's load. Guarded on identity.key existence so a *fresh*
+    // profile boot never fresh-generates an identity as a side effect here (get_or_derive's
+    // seed chain would otherwise create one). On an existing profile identity.key already
+    // exists → `Some`, and the stores load their data sealed. On a fresh profile identity.key
+    // does not exist yet — it is created by `identity::load_or_generate` further down in this
+    // function — so this resolves to `None`; the store files are absent too, so those early
+    // loads are correctly first-run empty. The cipher is re-derived and armed onto those
+    // stores below (`arm_cipher`) once identity exists, so first-session writes persist.
+    let mut device_cipher: Option<crate::device_dataset_file::DeviceCipher> =
         crate::owner_commands::resolve_identity_dir()
             .ok()
             .filter(|id| id.join("identity.key").exists())
             .and_then(|id| crate::device_dataset_file::get_or_derive(&id).ok());
-    let follow_mgr = follows::FollowManager::load(
+    let mut follow_mgr = follows::FollowManager::load(
         device_cipher.as_ref(),
         &app_data_dir,
         crate::recoverable_load::now_ms(),
@@ -4844,6 +4846,60 @@ pub async fn start_node_inner(
             crate::identity::KeychainStore::new().ok(),
         )?;
         tracing::info!("BOOT-PROBE 01: owner state loaded (keychain reads done)");
+        // ZEB-986 PR-3: on a FRESH profile the device cipher was `None` when the app-data
+        // and storage stores first loaded, because `identity.key` is created by
+        // `identity::load_or_generate` above — AFTER those early loads. Now that identity
+        // exists, (re-)derive the cipher and ARM the early stores so their first-session
+        // mutations seal to disk instead of being silently dropped. Those stores loaded
+        // empty on a fresh profile (their files were absent), so arming the cipher is
+        // enough — no data reload is needed. On an existing profile the cipher was already
+        // `Some`, so this whole block is skipped. This also re-arms `device_cipher` for the
+        // stores that load LATER in this function (content-index, vine-pull), which pick up
+        // the re-derived value directly.
+        if device_cipher.is_none() {
+            // Distinguish the three cases so a genuine derive FAILURE is not silently masked
+            // as a benign pre-identity state (PR-731 review, CodeRabbit): identity.key still
+            // absent → genuinely pre-identity/local-only (stores stay first-run empty, no
+            // warn); identity.key present but derive errors → surface it (stores stay
+            // read-only this session, data preserved, recovers next boot); derive OK → arm.
+            match crate::owner_commands::resolve_identity_dir() {
+                Ok(id) if id.join("identity.key").exists() => {
+                    match crate::device_dataset_file::get_or_derive(&id) {
+                        Ok(cipher) => {
+                            device_cipher = Some(cipher.clone());
+                            follow_mgr.arm_cipher(cipher.clone());
+                            storage_records_arc
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .arm_cipher(cipher.clone());
+                            storage_ledger_arc
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .arm_cipher(cipher.clone());
+                            vine_feed_cache
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .arm_cipher(cipher);
+                            tracing::info!(
+                                "ZEB-986: device cipher armed onto early-loaded stores after fresh-profile identity creation"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "ZEB-986: identity.key exists but device-cipher derive failed; app-data/storage stores stay read-only this session (existing data preserved, recovers next boot)"
+                        ),
+                    }
+                }
+                Ok(_) => {
+                    // identity.key still absent (local-only / pre-mint path that did not
+                    // generate a node seed): stores remain first-run empty. Benign.
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "ZEB-986: identity dir unresolved after identity load; app-data/storage stores stay read-only this session"
+                ),
+            }
+        }
         // ZEB-668 S1 boot refusal: a device whose own enrollment is revoked
         // in the trust CRDT must not rejoin the fleet. Dropping the loaded
         // owner here makes every downstream owner-gated wiring block behave

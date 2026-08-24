@@ -140,6 +140,17 @@ impl StorageLedger {
         ledger
     }
 
+    /// ZEB-986 PR-3: arm the device cipher after a fresh-profile boot (identity.key is
+    /// created partway through `start_node_inner`, after this ledger first loads). On a
+    /// fresh profile the file is absent, so the ledger loaded empty and un-faulted; arming
+    /// the cipher lets later saves seal. Deliberately does NOT clear `sealed_fault`. No-op
+    /// if already armed.
+    pub fn arm_cipher(&mut self, cipher: crate::device_dataset_file::DeviceCipher) {
+        if self.cipher.is_none() {
+            self.cipher = Some(cipher);
+        }
+    }
+
     /// Persist. Public so callers batching several mutations via the
     /// non-saving internals can flush once — the standard mutators below
     /// already save.

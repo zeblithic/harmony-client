@@ -102,6 +102,18 @@ impl FollowManager {
         }
     }
 
+    /// ZEB-986 PR-3: arm the device cipher after a fresh-profile boot. `identity.key` is
+    /// created by `load_or_generate` partway through `start_node_inner`, AFTER this manager
+    /// first loads — so on a fresh profile it loads with `cipher = None` and `save()` is a
+    /// no-op. The follow graph loaded empty (the file was absent on a fresh profile), so
+    /// arming the cipher once identity exists is enough for later saves to seal; no reload
+    /// is needed. A no-op if a cipher is already present (existing profile).
+    pub fn arm_cipher(&mut self, cipher: crate::device_dataset_file::DeviceCipher) {
+        if self.cipher.is_none() {
+            self.cipher = Some(cipher);
+        }
+    }
+
     /// Seal the follow list to disk (`write_image` = seal + atomic temp + fsync + 0600).
     fn save(&self) {
         if self.disk_write_frozen {
@@ -435,6 +447,47 @@ mod tests {
             !dir.join(format!("{FOLLOWS_FILE}.corrupt-5")).exists(),
             "sealed decrypt failure freezes, never quarantines"
         );
+    }
+
+    #[test]
+    fn arm_cipher_after_fresh_profile_boot_persists_first_session() {
+        // Fresh profile: identity.key does not exist yet, so the manager loads with no
+        // cipher. A follow() before arming does not persist (save is a no-op). After
+        // arm_cipher (once identity exists), follow() seals and survives reload.
+        let dir = temp_dir();
+        let mut mgr = FollowManager::load(None, &dir, 1);
+        assert!(mgr.list().is_empty());
+        mgr.follow("early".to_string(), None); // no cipher yet → not persisted
+        assert!(
+            !dir.join(FOLLOWS_FILE).exists(),
+            "no file written without a cipher"
+        );
+        // Identity now exists → arm the cipher.
+        mgr.arm_cipher(tc());
+        mgr.follow("armed".to_string(), None); // now seals
+        assert_eq!(
+            std::fs::read(dir.join(FOLLOWS_FILE)).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "armed follow is sealed on disk"
+        );
+        let reloaded = FollowManager::load(Some(&tc()), &dir, 2);
+        assert!(reloaded.is_followed("armed"), "armed write persisted");
+        assert!(
+            reloaded.is_followed("early"),
+            "the pre-arm follow is in memory and re-saved after arming"
+        );
+    }
+
+    #[test]
+    fn arm_cipher_is_noop_when_already_armed() {
+        // An existing profile loaded with a cipher must not have it replaced by arm_cipher.
+        let dir = temp_dir();
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
+        mgr.arm_cipher(crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap());
+        mgr.follow("a".to_string(), None);
+        // Still readable under the ORIGINAL test cipher (arm did not swap it).
+        let reloaded = FollowManager::load(Some(&tc()), &dir, 2);
+        assert!(reloaded.is_followed("a"));
     }
 
     #[test]

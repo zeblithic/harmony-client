@@ -118,7 +118,8 @@ pub fn load_or_recover<T: Default>(
 /// - **missing file** → `(default, frozen = false)` — first run, silent.
 /// - **read `Io` error** → `(default, frozen = true)` + warn — preserve maybe-good bytes.
 /// - **sealed-image `Crypto` error** (bad AEAD tag, truncated envelope, wrong/rotated key) → `(default, frozen = true)` + warn. FREEZE, never quarantine: a sealed file that will not decrypt must not be wiped — it may be a key rotation not yet reflected, and these stores re-derive from the network. This is the key divergence from [`load_or_recover`], whose content-error path quarantines.
-/// - **`parse` `Err`** (unparseable legacy plaintext, or — rarely — garbage inside a valid seal) → quarantine aside (`<path>.corrupt-<now_ms>`) and heal on next write → `(default, frozen = false)`; rename-fail → freeze. A *sealed* body cannot reach this arm undecrypted: it fails earlier as `Crypto`.
+/// - **`parse` `Err` on a legacy plaintext file** (`was_legacy == true`) → quarantine aside (`<path>.corrupt-<now_ms>`) and heal on next write → `(default, frozen = false)`; rename-fail → freeze.
+/// - **`parse` `Err` on a sealed file** (`was_legacy == false` — it decrypted, but its inner payload does not parse) → FREEZE and preserve in place, never quarantine (quarantining unfreezes and lets the next save replace an authenticated file).
 /// - **`parse` `Ok(v)`** → [`crate::device_dataset_file::reseal_if_legacy`] (lazy plaintext→sealed migration), then `(v, frozen = false)`.
 ///
 /// `filename` is the canonical name bound as the envelope AAD; it must match the file the
@@ -190,12 +191,28 @@ pub fn load_sealed_or_recover<T: Default>(
                 disk_write_frozen: false,
             }
         }
+        // A SEALED file that decrypted cleanly (`was_legacy == false`) but whose inner
+        // content does not parse is NOT legacy-plaintext corruption to heal — it is an
+        // authenticated file whose payload we cannot use. Preserve it (freeze), never
+        // quarantine: quarantining renames it aside and unfreezes, so the next save would
+        // replace it. Only genuine legacy-plaintext parse failures quarantine-and-heal.
+        Err(reason) if !image.was_legacy => {
+            tracing::warn!(
+                path = ?path,
+                reason = %reason,
+                "recoverable_load: sealed content unparseable after decrypt; FREEZING to preserve (not quarantining)"
+            );
+            Recovered {
+                value: T::default(),
+                disk_write_frozen: true,
+            }
+        }
         Err(reason) => {
             if quarantine(path, now_ms) {
                 tracing::warn!(
                     path = ?path,
                     reason = %reason,
-                    "recoverable_load: content unparseable; quarantined aside, healing on next write"
+                    "recoverable_load: legacy-plaintext content unparseable; quarantined aside, healing on next write"
                 );
                 Recovered {
                     value: T::default(),
@@ -205,7 +222,7 @@ pub fn load_sealed_or_recover<T: Default>(
                 tracing::warn!(
                     path = ?path,
                     reason = %reason,
-                    "recoverable_load: content unparseable but quarantine rename FAILED; FREEZING to avoid clobber"
+                    "recoverable_load: legacy-plaintext content unparseable but quarantine rename FAILED; FREEZING to avoid clobber"
                 );
                 Recovered {
                     value: T::default(),
@@ -680,6 +697,31 @@ mod tests {
             assert_eq!(
                 std::fs::read(dir.path().join("v.json.corrupt-4242")).unwrap(),
                 b"not json"
+            );
+        }
+
+        #[test]
+        fn sealed_unparseable_inner_freezes_not_quarantined() {
+            // A valid seal over garbage inner bytes (was_legacy == false): decrypt succeeds
+            // but parse fails. Must FREEZE and preserve in place — never quarantine (which
+            // would let the next save replace an authenticated file).
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("v.json");
+            let cipher = test_cipher();
+            write_image(&cipher, &p, "v.json", b"not json at all").unwrap();
+            let before = std::fs::read(&p).unwrap();
+            let r =
+                load_sealed_or_recover::<Vec<u32>>(Some(&cipher), &p, "v.json", 4_242, parse_json);
+            assert!(r.value.is_empty());
+            assert!(r.disk_write_frozen, "sealed-unparseable freezes");
+            assert!(
+                !dir.path().join("v.json.corrupt-4242").exists(),
+                "sealed-unparseable is NOT quarantined"
+            );
+            assert_eq!(
+                std::fs::read(&p).unwrap(),
+                before,
+                "sealed file left byte-identical"
             );
         }
 

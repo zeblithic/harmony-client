@@ -75,12 +75,25 @@ into boot.
 
 ## Cipher threading
 
-Each store gains a `cipher: DeviceCipher` field (cheap clone; key `Arc`-shared, zeroized on
-final drop). The production boot derives one cipher early via
-`device_dataset_file::get_or_derive(&identity_dir)` (memoized; the seed is in hand right after
-identity load) and threads it into every store's `load`. `save` reads the held field. Test and
-placeholder (`Path::new("")`) call sites pass `test_cipher()` — the bare-path branch
-short-circuits before any read, so its cipher is unused.
+Each store gains an `cipher: Option<DeviceCipher>` field (cheap clone; key `Arc`-shared,
+zeroized on final drop). The production boot derives the cipher via
+`device_dataset_file::get_or_derive(&identity_dir)` (memoized) and threads it into every store's
+`load`. `save` reads the held field. Test and placeholder (`Path::new("")`) call sites pass
+`test_cipher()`/`None` — the bare-path branch short-circuits before any read.
+
+**Boot ordering (PR-731 review).** The device seed `identity.key` is *not* in hand at the start
+of `start_node_inner`: it is created by `identity::load_or_generate` partway through the function,
+AFTER the early app-data/storage stores (`follows`, `vine_feed`, `storage_records`,
+`storage_ledger`) load. So on a **fresh profile** the initial `get_or_derive` finds no
+`identity.key` and resolves to `None` (the guard on `identity.key` existence deliberately avoids
+fresh-generating an identity as a side effect). Those stores therefore load `cipher = None` — but
+their files are absent too, so they load first-run-empty, which is correct. Immediately after
+`load_or_generate` creates the identity, the boot re-derives the cipher and calls
+`arm_cipher(cipher)` on each early store so first-session mutations seal. Stores that load later
+(`content_index`, `vine_pull`) pick up the re-derived cipher directly. On an existing profile
+`identity.key` already exists, so the cipher is `Some` from the first derive and the arm step is a
+no-op. `arm_cipher` never clears a store's freeze/`sealed_fault` — a store that failed closed on
+an existing file stays fail-closed.
 
 ## Two recovery contracts
 
@@ -116,10 +129,14 @@ Classification (via `device_dataset_file::read_image`'s typed error):
   `:5991`) gives no earlier key-correctness gate.
 - `Ok(Some(image))`, `parse(image.bytes)`:
   - `Ok(v)` → `reseal_if_legacy(cipher, path, filename, &image)` then `(v, frozen=false)`.
-  - `Err(reason)` → this is a **legacy-plaintext** content corruption (a sealed body would have
-    failed at `read_image` as `Crypto`, above) → quarantine aside `.corrupt-<now_ms>` + heal on
-    next write → `(default, frozen=false)`; a failed quarantine-rename → `(default, frozen=true)`.
-    Reuses PR-1's collision-safe, exhaustion-freezing `quarantine`.
+  - `Err(reason)` **and `image.was_legacy`** (legacy plaintext corruption) → quarantine aside
+    `.corrupt-<now_ms>` + heal on next write → `(default, frozen=false)`; a failed
+    quarantine-rename → `(default, frozen=true)`. Reuses PR-1's collision-safe, exhaustion-freezing
+    `quarantine`.
+  - `Err(reason)` **and NOT `image.was_legacy`** (a *sealed* file decrypted cleanly but its inner
+    payload does not parse) → **freeze and preserve in place, never quarantine** → `(default,
+    frozen=true)`. Quarantining would rename an authenticated file aside and unfreeze, letting the
+    next save replace it. (PR-731 review, CodeRabbit.)
 
 Version handling stays at the **store layer**, unchanged from PR-1: a parseable-but-unsupported
 `version` freezes in place (the store sets `frozen=true` after the parse). A forward-version
@@ -212,3 +229,28 @@ during iteration, full `--workspace --all-targets` sweep before push; frontend u
   sealing subsumes it.
 - content-index rebuild-from-directory-scan — the PR-1 follow-up idea; the `.corrupt-<ms>`
   sidecar still preserves bytes for it.
+
+## Review-round revisions (PR #731, bot convergence)
+
+1. **Fresh-profile persistence loss** (CodeAnt *Critical* + CodeRabbit *Major*). The original
+   design assumed the device seed was in hand early in `start_node_inner`; in fact `identity.key`
+   is created by `load_or_generate` AFTER the early stores load, so a fresh profile loaded them
+   with `cipher = None` and their first-session mutations were silently dropped (`save()` no-op).
+   Fixed by re-deriving the cipher immediately after identity creation and `arm_cipher`-ing the
+   early stores — see *Cipher threading → Boot ordering* above. (Existing profiles were never
+   affected: `identity.key` exists at the first derive.)
+2. **Sealed-but-unparseable freezes, not quarantines** (CodeRabbit *Major*). `load_sealed_or_recover`'s
+   parse-error arm quarantined regardless of provenance. A *sealed* file that decrypts but whose
+   inner payload does not parse (`was_legacy == false`) is now frozen-and-preserved, never
+   quarantined (which would unfreeze and let the next save replace an authenticated file). Only
+   *legacy-plaintext* parse failures quarantine-and-heal — see the app-data contract above.
+3. **Storage `sealed_fault` has no mid-session retry** (CodeAnt *Major*, **not changed —
+   by design**). A transient boot load failure latches `sealed_fault` for the process lifetime
+   (recovered at the next restart). This is the deliberately-chosen fail-closed contract: the
+   alternative — clearing the latch and accepting ingest — is exactly the re-TOFU downgrade the
+   anchors must avoid, and no store in this codebase reloads mid-session (single-load-at-boot is
+   the architecture; restart is the retry boundary). The rejection reason string is already
+   specific (`sealed-fault: ingest refused …`), distinguishing store-unavailable from a
+   peer-invalid rejection in the logs. A mid-session reload path, if ever wanted, is a separate
+   follow-up. Note the fresh-profile fix (#1) removes the most common benign trigger: a fresh
+   profile now loads un-faulted (absent file) and is armed, rather than faulting.
