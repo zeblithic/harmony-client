@@ -4787,30 +4787,29 @@ pub async fn run(
                         // device cipher is somehow unavailable the persist
                         // task is skipped — the book stays in-memory-only
                         // this session (peer-recoverable), never plaintext.
-                        let persist_handle = match crate::device_dataset_file::get_or_derive(
-                            &identity_dir,
-                        ) {
-                            Ok(addrbook_cipher) => {
-                                Some(crate::address_book_sync::spawn_addrbook_persist_task(
-                                    std::sync::Arc::clone(&book),
-                                    addrbook_cipher,
-                                    crate::community_address_book::addrbook_path(
-                                        &identity_dir,
-                                        &community,
-                                    ),
-                                    community,
-                                    dirty,
-                                ))
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    community = %hex::encode(&community.0[..4]),
-                                    err = %e,
-                                    "addrbook persist disabled: device cipher unavailable"
-                                );
-                                None
-                            }
-                        };
+                        let persist_handle =
+                            match crate::device_dataset_file::get_or_derive(&identity_dir) {
+                                Ok(addrbook_cipher) => {
+                                    Some(crate::address_book_sync::spawn_addrbook_persist_task(
+                                        std::sync::Arc::clone(&book),
+                                        addrbook_cipher,
+                                        crate::community_address_book::addrbook_path(
+                                            &identity_dir,
+                                            &community,
+                                        ),
+                                        community,
+                                        dirty,
+                                    ))
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        community = %hex::encode(&community.0[..4]),
+                                        err = %e,
+                                        "addrbook persist disabled: device cipher unavailable"
+                                    );
+                                    None
+                                }
+                            };
                         let mut community_handles =
                             vec![queryable_handle, subscriber_handle, requester_handle];
                         community_handles.extend(persist_handle);

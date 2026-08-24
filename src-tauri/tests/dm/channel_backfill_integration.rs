@@ -212,6 +212,7 @@ fn build_registry(session: &Arc<zenoh::Session>, seed: u8, device_id: &str) -> R
     // ZEB-445: registry takes a mode-agnostic NodeEventSink; this test
     // asserts convergence via engine state, not emissions — empty fan-out.
     let registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adapter_request_tx: adapter_tx,
         sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir.path().to_path_buf(),

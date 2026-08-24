@@ -7467,29 +7467,44 @@ impl CommunitySyncRegistry {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let last =
-                            crate::community_channel_log::ChannelBackfillState::load_async(&dir)
-                                .await
-                                .map(|s| s.last_full_reconcile_ms);
+                        let root_label = crate::community_state_persist::seal_label(
+                            &community_id,
+                            "backfill_state.cbor",
+                        );
+                        let last = crate::community_channel_log::ChannelBackfillState::load_async(
+                            &self.cfg.device_cipher,
+                            &dir,
+                            &root_label,
+                        )
+                        .await
+                        .map(|s| s.last_full_reconcile_ms);
                         let first_deadline_ms = crate::channel_backfill::first_resync_deadline(
                             last,
                             interval_ms,
                             now_ms,
                         );
                         let persist_dir = dir.clone();
+                        let persist_cipher = self.cfg.device_cipher.clone();
                         (
                             interval_ms,
                             Some(crate::channel_backfill::ResyncPersist {
                                 first_deadline_ms,
                                 on_full_reconcile: std::sync::Arc::new(move |fired_at_ms| {
                                     let dir = persist_dir.clone();
+                                    let cipher = persist_cipher.clone();
+                                    let label = crate::community_state_persist::seal_label(
+                                        &community_id,
+                                        "backfill_state.cbor",
+                                    );
                                     // Tiny sidecar write off the driver task
                                     // (same shape as the mail-root / channel-log
                                     // ZEB-599 callbacks).
                                     tokio::task::spawn_blocking(move || {
                                         if let Err(e) =
                                             crate::community_channel_log::ChannelBackfillState::save(
+                                                &cipher,
                                                 &dir,
+                                                &label,
                                                 fired_at_ms,
                                             )
                                         {
@@ -10154,8 +10169,12 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create community dir");
         let crdt_path = dir.join("crdt.cbor");
         let preexisting = CommunityState::new(community_id);
-        crate::community_state_persist::save_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, &preexisting)
-            .expect("seed pre-existing crdt.cbor");
+        crate::community_state_persist::save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            &preexisting,
+        )
+        .expect("seed pre-existing crdt.cbor");
 
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -10368,8 +10387,12 @@ mod tests {
             .join("communities")
             .join(hex::encode(community_id.0))
             .join("segments.cbor");
-        let index = crate::community_state_persist::load_segment_index(&crate::device_dataset_file::test_cipher(), &segments_path, &community_id)
-            .expect("segment index persisted by the publish");
+        let index = crate::community_state_persist::load_segment_index(
+            &crate::device_dataset_file::test_cipher(),
+            &segments_path,
+            &community_id,
+        )
+        .expect("segment index persisted by the publish");
         assert!(
             !index.sealed.is_empty(),
             "fixture must seal at least one segment or the test is vacuous"
@@ -10584,7 +10607,12 @@ mod tests {
         // has run, yet the CRDT must be on disk after this returns.
         engine.persist_now().await.expect("persist_now");
 
-        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, community_id).expect("load_crdt after persist_now");
+        let loaded = load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load_crdt after persist_now");
         assert!(
             loaded.contains_event(&eid),
             "persist_now must durably write the in-memory membership event"
@@ -10663,8 +10691,12 @@ mod tests {
             "publish must fail with the adapter receiver + CAS dropped"
         );
 
-        let loaded =
-            load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, community_id).expect("load_crdt after failed-publish flush");
+        let loaded = load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load_crdt after failed-publish flush");
         assert!(
             loaded.contains_event(&eid),
             "ZEB-462 B: CRDT must persist even when the publish failed"
@@ -13897,7 +13929,12 @@ mod tests {
 
         engine.shutdown().await.expect("shutdown");
 
-        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, community_id).expect("load persisted crdt");
+        let loaded = load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load persisted crdt");
         assert!(
             loaded.contains_event(&join_id),
             "pre-shutdown insert must reach disk via the shutdown arm's final flush"
@@ -15227,10 +15264,19 @@ mod tests {
         {
             let state = engine1.state();
             let g = state.lock().await;
-            crate::community_state_persist::save_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, &g).expect("save_crdt");
+            crate::community_state_persist::save_crdt(
+                &crate::device_dataset_file::test_cipher(),
+                &crdt_path,
+                &g,
+            )
+            .expect("save_crdt");
         }
-        let reloaded =
-            crate::community_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, community_id).expect("load_crdt");
+        let reloaded = crate::community_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load_crdt");
 
         // Engine #2 stands up around the RELOADED state.
         let dir2 = tempfile::tempdir().expect("tempdir2");

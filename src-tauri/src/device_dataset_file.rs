@@ -58,6 +58,14 @@ pub struct DeviceCipher {
     key: Arc<Zeroizing<[u8; 32]>>,
 }
 
+/// Redacting Debug: the key bytes must never reach logs or a `#[derive(Debug)]`
+/// on a struct that holds a cipher (e.g. `ChannelLog`).
+impl std::fmt::Debug for DeviceCipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceCipher(<redacted>)")
+    }
+}
+
 impl DeviceCipher {
     /// Derive from the node identity master seed (boot has it in hand
     /// right after `identity::load_or_generate`; the recovery CLI reads it

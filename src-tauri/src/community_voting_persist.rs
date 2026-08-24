@@ -362,8 +362,15 @@ mod tests {
         log.events.push(test_event(200, 1, "d2"));
         // policy stays default (fields are private) — round-trip still
         // exercises the serde path and Eq confirms fidelity.
-        save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
-        let (events, policy, _poll_meta) = load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
+        save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
+        let (events, policy, _poll_meta) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert_eq!(events, log.events);
         assert_eq!(&policy, log.policy());
     }
@@ -373,7 +380,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cid = SpaceId([5u8; 16]);
         let path = voting_path_for(dir.path(), &cid);
-        let (events, policy, poll_meta) = load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
+        let (events, policy, poll_meta) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
         assert!(poll_meta.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
@@ -388,8 +396,15 @@ mod tests {
         let path = voting_path_for(dir.path(), &cid_a);
         let mut log = VotingLog::default();
         log.events.push(test_event(1, 0, "d"));
-        save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid_a).unwrap();
-        let (events, _policy, _pm) = load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid_b).unwrap();
+        save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid_a,
+        )
+        .unwrap();
+        let (events, _policy, _pm) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid_b).unwrap();
         assert!(
             events.is_empty(),
             "mismatch must not surface foreign events"
@@ -418,7 +433,8 @@ mod tests {
         ciborium::into_writer(&record, &mut bytes).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        let (events, _, _) = load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
+        let (events, _, _) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
     }
 
@@ -429,7 +445,8 @@ mod tests {
         let path = voting_path_for(dir.path(), &cid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
-        let (events, policy, _pm) = load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
+        let (events, policy, _pm) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
     }
@@ -447,15 +464,28 @@ mod tests {
         let mut log = VotingLog::default();
         log.events.push(test_event(100, 0, "d1"));
         log.events.push(test_event(200, 1, "d2"));
-        save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
+        save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         let new_policy = CommunityVotingPolicy {
             notify_on_delegate_signal: true,
             ..Default::default()
         };
-        save_policy_only(&crate::device_dataset_file::test_cipher(), &path, &cid, &new_policy).unwrap();
+        save_policy_only(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &cid,
+            &new_policy,
+        )
+        .unwrap();
 
-        let (events, policy, _pm) = load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
+        let (events, policy, _pm) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert_eq!(events, log.events, "policy-only write must preserve events");
         assert_eq!(policy, new_policy, "policy must be updated");
     }
@@ -474,7 +504,13 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            save_policy_only(&crate::device_dataset_file::test_cipher(), &path, &cid, &new_policy).is_err(),
+            save_policy_only(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &cid,
+                &new_policy
+            )
+            .is_err(),
             "an unreadable existing file must not be clobbered by a policy write"
         );
         assert!(path.is_dir(), "the file must be left untouched");

@@ -4377,8 +4377,12 @@ mod tests {
             path.exists(),
             "voting.cbor must exist after a persisted mutation"
         );
-        let (events, _policy, poll_restore) =
-            crate::community_voting_persist::load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &community_id).unwrap();
+        let (events, _policy, poll_restore) = crate::community_voting_persist::load_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &community_id,
+        )
+        .unwrap();
         assert_eq!(events, vec![ev], "persisted log reloads the applied event");
         // The applied PollCreate materialized one poll, so its restore persists.
         assert_eq!(

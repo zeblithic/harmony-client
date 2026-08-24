@@ -2079,6 +2079,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
     let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adapter_request_tx: channel_log_adapter_tx,
         sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir.path().to_path_buf(),
@@ -2981,6 +2982,7 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
     let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adapter_request_tx: channel_log_adapter_tx,
         sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir.path().to_path_buf(),
@@ -3520,8 +3522,19 @@ async fn addrbook_replaces_announce_events_end_to_end() {
     let sidecar_path = addrbook_path(sidecar_dir.path(), &community_id);
     let rows_before = book_b.rows_for_community(&community_id, ts);
     assert_eq!(rows_before.len(), 1, "B's book holds exactly admin's row");
-    save_addrbook(&harmony_app::device_dataset_file::test_cipher(), &sidecar_path, &community_id, &rows_before).expect("save addrbook");
-    let rows_after = load_addrbook(&harmony_app::device_dataset_file::test_cipher(), &sidecar_path, &community_id, ts);
+    save_addrbook(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &sidecar_path,
+        &community_id,
+        &rows_before,
+    )
+    .expect("save addrbook");
+    let rows_after = load_addrbook(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &sidecar_path,
+        &community_id,
+        ts,
+    );
     assert_eq!(
         rows_after, rows_before,
         "B's book rows must survive a save_addrbook/load_addrbook round trip"

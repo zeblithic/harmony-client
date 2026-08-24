@@ -292,6 +292,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
 
     // ── Build registries ─────────────────────────────────────────────
     let registry_a = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adapter_request_tx: adapter_tx_a,
         sink: sink_a,
         identity_dir: dir_a.path().to_path_buf(),
@@ -310,6 +311,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         presence_resync_rx: None,
     });
     let registry_b = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adapter_request_tx: adapter_tx_b,
         sink: sink_b,
         identity_dir: dir_b.path().to_path_buf(),

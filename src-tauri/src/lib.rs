@@ -8199,6 +8199,9 @@ pub async fn start_node_inner(
                     > = crate::community_channel_log_engine::ChannelLogRegistry::new(
                         crate::community_channel_log_engine::ChannelLogRegistryConfig {
                             adapter_request_tx: channel_log_adapter_request_tx_outer.clone(),
+                            // ZEB-983: seals every channel log file at rest;
+                            // derived once at boot (line ~5973), keyless-safe.
+                            device_cipher: device_cipher.clone(),
                             sink: app.clone(),
                             identity_dir: identity_dir.clone(),
                             self_owner,
@@ -13739,23 +13742,44 @@ pub async fn start_node_inner(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    let last = crate::community_channel_log::ChannelBackfillState::load(&mail_dir)
-                        .map(|s| s.last_full_reconcile_ms);
+                    // ZEB-983: this timestamp hint is sealed too (it shares
+                    // ChannelBackfillState). The mail *bodies/index* remain
+                    // ZEB-984's scope; sealing a u64 hint here is incidental.
+                    // The boot derive warmed the memo, so get_or_derive is a
+                    // cheap hit; if the identity dir is unresolvable the hint
+                    // just isn't persisted (floor falls back to spawn-interval).
+                    let mail_cipher = crate::owner_commands::resolve_identity_dir()
+                        .ok()
+                        .and_then(|d| crate::device_dataset_file::get_or_derive(&d).ok());
+                    let last = mail_cipher.as_ref().and_then(|cipher| {
+                        crate::community_channel_log::ChannelBackfillState::load(
+                            cipher,
+                            &mail_dir,
+                            "mail/backfill_state.cbor",
+                        )
+                        .map(|s| s.last_full_reconcile_ms)
+                    });
                     let first_deadline_ms =
                         crate::channel_backfill::first_resync_deadline(last, interval_ms, now_ms);
                     let persist_dir = mail_dir.clone();
+                    let persist_cipher = mail_cipher.clone();
                     Some((
                         interval_ms,
                         crate::channel_backfill::ResyncPersist {
                             first_deadline_ms,
                             on_full_reconcile: std::sync::Arc::new(move |fired_at_ms| {
                                 let dir = persist_dir.clone();
+                                let Some(cipher) = persist_cipher.clone() else {
+                                    return;
+                                };
                                 // Tiny sidecar write off the driver task (same
                                 // shape as the channel-log engine's ZEB-599 cb).
                                 tokio::task::spawn_blocking(move || {
                                     if let Err(e) =
                                         crate::community_channel_log::ChannelBackfillState::save(
+                                            &cipher,
                                             &dir,
+                                            "mail/backfill_state.cbor",
                                             fired_at_ms,
                                         )
                                     {
@@ -38038,6 +38062,7 @@ mod create_community_inner_tests {
         let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
             std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adapter_request_tx: channel_log_adapter_tx,
             sink,
             identity_dir: tmp.path().to_path_buf(),
@@ -41059,6 +41084,7 @@ mod list_bootstrap_hint_tests {
         let (adapter_request_tx, _adapter_request_rx) = mpsc::unbounded_channel();
         let channel_log_registry = crate::community_channel_log_engine::ChannelLogRegistry::new(
             crate::community_channel_log_engine::ChannelLogRegistryConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adapter_request_tx,
                 sink: Arc::new(crate::node_event_sink::FanoutSink(vec![])),
                 identity_dir: dir.path().to_path_buf(),
@@ -44114,6 +44140,7 @@ mod redeem_invite_inner_tests {
         let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
             std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adapter_request_tx: channel_log_adapter_tx,
             sink,
             identity_dir: tmp.path().to_path_buf(),
@@ -45354,8 +45381,12 @@ mod zeb436_orphan_adoption_tests {
         let mut on_disk = crate::community_state_crdt::CommunityState::new(community_id);
         let event_count = events.len();
         on_disk.set_event_log_for_test(events);
-        crate::community_state_persist::save_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, &on_disk)
-            .expect("persist orphaned community CRDT");
+        crate::community_state_persist::save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            &on_disk,
+        )
+        .expect("persist orphaned community CRDT");
 
         let rebooted = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
         (rebooted, event_count)
@@ -45498,8 +45529,12 @@ mod zeb436_orphan_adoption_tests {
             "failed redeem must NOT delete the pre-existing community dir \
              (the user's entire local history)"
         );
-        let survived = crate::community_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, community_id)
-            .expect("orphaned CRDT must remain loadable after the failed attempt");
+        let survived = crate::community_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("orphaned CRDT must remain loadable after the failed attempt");
         assert_eq!(
             survived.event_count(),
             events_before,
@@ -45671,6 +45706,7 @@ mod zeb436_orphan_adoption_tests {
         let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
             std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
         let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adapter_request_tx: channel_log_adapter_tx,
             sink,
             identity_dir: tmp.path().to_path_buf(),
@@ -45731,8 +45767,12 @@ mod zeb436_orphan_adoption_tests {
             .join(hex::encode(community_id.0))
             .join("crdt.cbor");
         std::fs::create_dir_all(crdt_path.parent().expect("parent")).expect("create dir");
-        crate::community_state_persist::save_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, &orphaned)
-            .expect("persist orphaned community CRDT");
+        crate::community_state_persist::save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            &orphaned,
+        )
+        .expect("persist orphaned community CRDT");
 
         // ── Fresh invite from the admin (valid token + sealed epoch key,
         // exactly what a willing inviter would mint for the victim).
@@ -58119,7 +58159,13 @@ mod zeb718_voting_reconcile_tests {
         let mut log = VotingLog::new();
         log.events.push(tier1_poll_create(actor, 1_000));
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         // Resolver reports `actor` as a member at any HLC.
         let mut members = HashMap::new();
@@ -58203,7 +58249,13 @@ mod zeb718_voting_reconcile_tests {
             state.meta.finalized_at_ms = Some(1_234);
         }
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
         let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -58263,7 +58315,13 @@ mod zeb718_voting_reconcile_tests {
         // Engine patches the real epoch (non-event mutation).
         assert!(log.set_tier3_poll_epoch(&pid, 42));
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
         let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -58427,7 +58485,13 @@ mod zeb718_voting_reconcile_tests {
         );
 
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         // Cold boot: reconcile replays [create, ss, dv, ds] through
         // apply_with_snapshot; the out-of-order ds triggers the same canonical
@@ -58515,7 +58579,13 @@ mod zeb718_voting_reconcile_tests {
             t2.last_unsignal_after_threshold_ms = Some(LAST_UNSIGNAL_MS);
         }
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         // Fresh empty registry — reconcile must load + replay + overlay.
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
@@ -58600,7 +58670,13 @@ mod zeb718_voting_reconcile_tests {
                     .threshold_reached_at_ms = Some(1_700_000_000_000);
             }
             let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier2);
-            crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid_ok_tier2).unwrap();
+            crate::community_voting_persist::save_voting_log(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &log,
+                &cid_ok_tier2,
+            )
+            .unwrap();
         }
         // Community B: a plain Tier-1 poll.
         {
@@ -58612,7 +58688,13 @@ mod zeb718_voting_reconcile_tests {
             )
             .expect("apply tier1");
             let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier1);
-            crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid_ok_tier1).unwrap();
+            crate::community_voting_persist::save_voting_log(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &log,
+                &cid_ok_tier1,
+            )
+            .unwrap();
         }
         // Community C: a present-but-unreadable voting.cbor. A directory at the
         // file path makes std::fs::read return EISDIR (a non-NotFound io error),
@@ -58681,7 +58763,13 @@ mod zeb718_voting_reconcile_tests {
         log.set_policy(policy.clone());
         assert!(log.events.is_empty(), "fixture has no events");
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
-        crate::community_voting_persist::save_voting_log(&crate::device_dataset_file::test_cipher(), &path, &log, &cid).unwrap();
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
             snapshot: MembershipSnapshot {

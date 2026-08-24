@@ -736,10 +736,21 @@ mod tests {
         let now = 1_700_000_000_000;
         let rows = vec![reach_row(0x01, actor, now), relay_row(0x02, actor, now)];
 
-        save_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), &rows).unwrap();
+        save_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            &rows,
+        )
+        .unwrap();
         assert!(path.exists());
 
-        let loaded = load_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), now);
+        let loaded = load_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            now,
+        );
         assert_eq!(loaded.len(), 2);
         assert!(loaded
             .iter()
@@ -761,10 +772,22 @@ mod tests {
         let now = 1_700_000_000_000;
 
         let rows = vec![reach_row(0x01, actor, now), relay_row(0x02, actor, now)];
-        save_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), &rows).unwrap();
+        save_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            &rows,
+        )
+        .unwrap();
 
         assert_eq!(
-            load_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), now).len(),
+            load_addrbook(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &SpaceId([0xAB; 16]),
+                now
+            )
+            .len(),
             2,
             "both rows are fresh immediately after write"
         );
@@ -772,13 +795,24 @@ mod tests {
         // Past the relay TTL (15 min) but before the reachability TTL
         // (24h): relay row filtered, reachability row survives.
         let after_relay_ttl = now + COMMUNITY_RELAY_AD_FRESHNESS_MS + 1;
-        let loaded = load_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), after_relay_ttl);
+        let loaded = load_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            after_relay_ttl,
+        );
         assert_eq!(loaded.len(), 1);
         assert!(matches!(loaded[0].entry, AddressBookEntry::Reachability(_)));
 
         // Past the reachability TTL too: nothing survives.
         let after_reach_ttl = now + ADDRBOOK_REACHABILITY_TTL_MS + 1;
-        assert!(load_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), after_reach_ttl).is_empty());
+        assert!(load_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            after_reach_ttl
+        )
+        .is_empty());
     }
 
     #[test]
@@ -788,14 +822,26 @@ mod tests {
         let path = addrbook_path(dir.path(), &community);
 
         assert!(
-            load_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), 1_700_000_000_000).is_empty(),
+            load_addrbook(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &SpaceId([0xAB; 16]),
+                1_700_000_000_000
+            )
+            .is_empty(),
             "nonexistent path returns empty, not an error"
         );
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"not cbor garbage").unwrap();
         assert!(
-            load_addrbook(&crate::device_dataset_file::test_cipher(), &path, &SpaceId([0xAB; 16]), 1_700_000_000_000).is_empty(),
+            load_addrbook(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &SpaceId([0xAB; 16]),
+                1_700_000_000_000
+            )
+            .is_empty(),
             "corrupt bytes return empty, not an error"
         );
     }

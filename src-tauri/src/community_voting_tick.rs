@@ -589,7 +589,9 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                         // worker; the sweep is 24h-cadence so the hold is a
                         // non-issue.
                         let write_result = tokio::task::spawn_blocking(move || {
-                            crate::community_voting_persist::write_snapshot(&cipher, &path, &snapshot)
+                            crate::community_voting_persist::write_snapshot(
+                                &cipher, &path, &snapshot,
+                            )
                         })
                         .await;
                         match write_result {

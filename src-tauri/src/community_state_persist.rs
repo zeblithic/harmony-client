@@ -47,7 +47,9 @@ use std::path::Path;
 use crate::community_state_crdt::CommunityState;
 use crate::community_state_segments::SegmentIndex;
 use crate::community_state_sync::CommunityRootHlcTracker;
-use crate::device_dataset_file::{read_image, reseal_if_legacy, write_image, DeviceCipher, Image, ImageError};
+use crate::device_dataset_file::{
+    read_image, reseal_if_legacy, write_image, DeviceCipher, Image, ImageError,
+};
 use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use crate::owner_state_types::SpaceId;
 
@@ -85,11 +87,20 @@ pub enum PersistError {
 /// future "did anything change?" file-hash check would be meaningful)
 /// and writes through `write_image` → `save_atomically` so a crash
 /// mid-save can't corrupt the live file.
-pub fn save_crdt(cipher: &DeviceCipher, path: &Path, state: &CommunityState) -> Result<(), PersistError> {
+pub fn save_crdt(
+    cipher: &DeviceCipher,
+    path: &Path,
+    state: &CommunityState,
+) -> Result<(), PersistError> {
     let bytes =
         canonical_cbor_encode(state).map_err(|e| PersistError::CborEncode(e.to_string()))?;
-    write_image(cipher, path, &seal_label(&state.community_id, CRDT_FILENAME), &bytes)
-        .map_err(PersistError::Io)
+    write_image(
+        cipher,
+        path,
+        &seal_label(&state.community_id, CRDT_FILENAME),
+        &bytes,
+    )
+    .map_err(PersistError::Io)
 }
 
 /// Open the sealed (or legacy plaintext) image at `path`, mapping the
@@ -181,8 +192,13 @@ pub fn save_replay(
 ) -> Result<(), PersistError> {
     let bytes =
         canonical_cbor_encode(tracker).map_err(|e| PersistError::CborEncode(e.to_string()))?;
-    write_image(cipher, path, &seal_label(community_id, REPLAY_FILENAME), &bytes)
-        .map_err(PersistError::Io)
+    write_image(
+        cipher,
+        path,
+        &seal_label(community_id, REPLAY_FILENAME),
+        &bytes,
+    )
+    .map_err(PersistError::Io)
 }
 
 /// Load the per-community replay tracker from `path`.
@@ -437,7 +453,11 @@ mod tests {
         std::fs::write(&path, &raw).unwrap();
 
         let loaded = load_crdt(&cipher, &path, cid(7)).unwrap();
-        assert_eq!(loaded, CommunityState::new(cid(7)), "defaults after quarantine");
+        assert_eq!(
+            loaded,
+            CommunityState::new(cid(7)),
+            "defaults after quarantine"
+        );
         assert!(
             std::fs::read_dir(dir.path())
                 .unwrap()
