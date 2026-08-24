@@ -641,9 +641,11 @@ mod tests {
     #[test]
     fn trust_persist_round_trips_doc_and_replay() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let now = 1_700_000_000u64;
         let (state, _a, _s) = test_mint(now);
         let replay_path = dir.path().join(OWNER_TRUST_REPLAY_FILENAME);
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let persist = TrustPersist {
             identity_dir: dir.path().to_path_buf(),
             replay_path: replay_path.clone(),
@@ -673,6 +675,7 @@ mod tests {
         // must not clobber it. The persist load-merge-saves, so the disk
         // file ends up as the union.
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let now = 1_700_000_000u64;
         let (old_snapshot, artifact, _sk) = test_mint(now);
         // Disk gains a second enrollment the snapshot doesn't know.
@@ -683,6 +686,7 @@ mod tests {
             .unwrap();
         save_owner_state_cbor_only(dir.path(), &disk_state).unwrap();
 
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let persist = TrustPersist {
             identity_dir: dir.path().to_path_buf(),
             replay_path: dir.path().join(OWNER_TRUST_REPLAY_FILENAME),
@@ -701,6 +705,7 @@ mod tests {
     #[test]
     fn replay_recover_returns_empty_on_missing_or_corrupt() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let missing = dir.path().join("nope.cbor");
         assert!(load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &missing).is_empty());
         let corrupt = dir.path().join("bad.cbor");
@@ -728,6 +733,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let kt = Arc::new(KeyTree::derive(&[0x66u8; 32]).expect("kt"));
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let a_doc = Arc::new(tokio::sync::Mutex::new(seeded.clone()));
@@ -963,6 +969,7 @@ mod tests {
         // Simulate a pairing install: disk gains an enrollment the
         // resident doc doesn't know.
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let (_sk2, cert2) = test_enroll_second_device(&artifact, &state, now + 10);
         let mut disk_state = state;
         disk_state
@@ -987,6 +994,7 @@ mod tests {
     #[tokio::test]
     async fn mutate_file_only_loads_applies_saves() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let now = 1_700_000_000u64;
         let (state, _a, _s) = test_mint(now);
         save_owner_state_cbor_only(dir.path(), &state).unwrap();

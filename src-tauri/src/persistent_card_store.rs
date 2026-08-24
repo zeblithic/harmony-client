@@ -22,7 +22,7 @@
 //!   cryptographically verified was cert-bound to its `owner_id` when seen. We
 //!   do not re-verify on load (revocation is a separate concern; see the spec).
 
-use crate::owner_state_persist::{save_atomically, PersistError};
+use crate::owner_state_persist::PersistError;
 use crate::owner_state_types::Hlc;
 use crate::profile_card_broadcast::{DiscoveredCardInfo, ProfileCardBroadcast};
 use ciborium::{from_reader, into_writer};
@@ -130,6 +130,11 @@ pub struct PersistentCardStore {
     /// truncation) deliberately do NOT set this: their bytes are already
     /// unusable, so a self-healing overwrite is correct.
     disk_write_frozen: bool,
+    /// ZEB-982: seals the file at rest under the device cipher. The AAD label
+    /// is the per-owner filename, so a ciphertext copied between two owners'
+    /// stores fails the tag (the ZEB-586 cross-identity lesson, enforced
+    /// cryptographically).
+    cipher: crate::device_dataset_file::DeviceCipher,
 }
 
 impl PersistentCardStore {
@@ -142,9 +147,13 @@ impl PersistentCardStore {
     /// an empty store; a corrupt/unreadable file logs a warning and starts
     /// empty — this is a self-healing cache, not authoritative state (it
     /// refills from live broadcasts), so it must never fail node start.
-    pub fn load_for_owner(app_data_dir: &Path, owner_id_hex: &str) -> Self {
+    pub fn load_for_owner(
+        cipher: crate::device_dataset_file::DeviceCipher,
+        app_data_dir: &Path,
+        owner_id_hex: &str,
+    ) -> Self {
         let path = Self::path_for_owner(app_data_dir, owner_id_hex);
-        let (cards, disk_write_frozen) = match load_cards(&path) {
+        let (cards, disk_write_frozen) = match load_cards(&cipher, &path) {
             Ok(c) => (c, false),
             Err(e) => {
                 // Distinguish a *read* failure from *content* corruption. Within
@@ -167,17 +176,24 @@ impl PersistentCardStore {
                 (Vec::new(), disk_write_frozen)
             }
         };
-        Self::from_cards_with_freeze(path, DEFAULT_MAX_ENTRIES, cards, disk_write_frozen)
+        Self::from_cards_with_freeze(cipher, path, DEFAULT_MAX_ENTRIES, cards, disk_write_frozen)
     }
 
     /// Test-only convenience wrapper: construct an unfrozen store (production
     /// callers go through `load_for_owner`, which decides the freeze flag).
     #[cfg(test)]
     fn from_cards(path: PathBuf, max_entries: usize, cards: Vec<PersistedCard>) -> Self {
-        Self::from_cards_with_freeze(path, max_entries, cards, false)
+        Self::from_cards_with_freeze(
+            crate::device_dataset_file::test_cipher(),
+            path,
+            max_entries,
+            cards,
+            false,
+        )
     }
 
     fn from_cards_with_freeze(
+        cipher: crate::device_dataset_file::DeviceCipher,
         path: PathBuf,
         max_entries: usize,
         cards: Vec<PersistedCard>,
@@ -201,6 +217,7 @@ impl PersistentCardStore {
             inner: Mutex::new(Inner { map, next_seq }),
             flush_lock: Mutex::new(()),
             disk_write_frozen,
+            cipher,
         }
     }
 
@@ -307,7 +324,13 @@ impl PersistentCardStore {
             let inner = self.inner.lock().expect("card store poisoned");
             encode_cards(inner.map.values().map(|e| (&e.card, e.seq)))?
         };
-        save_atomically(&self.path, &bytes)
+        crate::device_dataset_file::write_image(
+            &self.cipher,
+            &self.path,
+            &store_label(&self.path),
+            &bytes,
+        )
+        .map_err(PersistError::Io)
     }
 }
 
@@ -329,20 +352,40 @@ fn encode_cards<'a>(
     Ok(bytes)
 }
 
+/// AAD label for the store at `path`: its per-owner filename.
+fn store_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("profile_cards.cbor")
+        .to_string()
+}
+
 /// Load + decode the cards file. Missing file → empty vec. Version/CBOR errors
 /// surface as `PersistError` (the caller treats them as "start empty").
-fn load_cards(path: &Path) -> Result<Vec<PersistedCard>, PersistError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
+///
+/// ZEB-982 freeze mapping: an envelope READ failure surfaces as
+/// `PersistError::Io` (caller freezes writes — the bytes may still be good);
+/// an AEAD/envelope-content failure surfaces as `Corrupt` (no freeze — the
+/// next flush self-heals, sealed).
+fn load_cards(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> Result<Vec<PersistedCard>, PersistError> {
+    let image = match crate::device_dataset_file::read_image(cipher, path, &store_label(path)) {
+        Ok(None) => return Ok(Vec::new()),
+        Ok(Some(img)) => img,
+        Err(crate::device_dataset_file::ImageError::Io(e)) => return Err(PersistError::Io(e)),
+        Err(crate::device_dataset_file::ImageError::Crypto(e)) => {
+            return Err(PersistError::CborDecode(e))
+        }
     };
+    let bytes = &image.bytes;
     if bytes.is_empty() {
         return Err(PersistError::Corrupt);
     }
     let version = bytes[0];
     let payload = &bytes[1..];
-    match version {
+    let cards = match version {
         CARD_STORE_SCHEMA_V1 => {
             let mut cursor = Cursor::new(payload);
             let cards: Vec<PersistedCard> =
@@ -352,10 +395,14 @@ fn load_cards(path: &Path) -> Result<Vec<PersistedCard>, PersistError> {
             if (cursor.position() as usize) != payload.len() {
                 return Err(PersistError::Corrupt);
             }
-            Ok(cards)
+            cards
         }
-        v => Err(PersistError::UnknownSchemaVersion(v)),
-    }
+        v => return Err(PersistError::UnknownSchemaVersion(v)),
+    };
+    // Eager migration after a successful parse (best-effort; the next
+    // successful `persist` reseals anyway).
+    crate::device_dataset_file::reseal_if_legacy(cipher, path, &store_label(path), &image);
+    Ok(cards)
 }
 
 #[cfg(test)]
@@ -434,7 +481,7 @@ mod tests {
         store.persist().unwrap();
 
         // Reload from disk via the production load path.
-        let loaded = PersistentCardStore::load_for_owner(dir.path(), "owner");
+        let loaded = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "owner");
         assert_eq!(loaded.len(), 2);
         let a = loaded.get(&[7; 16]).unwrap();
         assert_eq!(a.display_name, "Alice");
@@ -446,7 +493,7 @@ mod tests {
     #[test]
     fn load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let loaded = PersistentCardStore::load_for_owner(dir.path(), "never-written");
+        let loaded = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "never-written");
         assert!(loaded.is_empty());
     }
 
@@ -457,18 +504,18 @@ mod tests {
         // Unknown schema byte.
         std::fs::write(&path, [0xFF, 0x00]).unwrap();
         assert!(matches!(
-            load_cards(&path),
+            load_cards(&crate::device_dataset_file::test_cipher(), &path),
             Err(PersistError::UnknownSchemaVersion(0xFF))
         ));
         // Valid schema byte, junk CBOR.
         std::fs::write(&path, [CARD_STORE_SCHEMA_V1, 0xA1, 0x66]).unwrap();
         assert!(matches!(
-            load_cards(&path),
+            load_cards(&crate::device_dataset_file::test_cipher(), &path),
             Err(PersistError::CborDecode(_) | PersistError::Corrupt)
         ));
         // Empty file.
         std::fs::write(&path, []).unwrap();
-        assert!(matches!(load_cards(&path), Err(PersistError::Corrupt)));
+        assert!(matches!(load_cards(&crate::device_dataset_file::test_cipher(), &path), Err(PersistError::Corrupt)));
     }
 
     #[test]
@@ -478,7 +525,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = PersistentCardStore::path_for_owner(dir.path(), "owner");
         std::fs::write(&path, [CARD_STORE_SCHEMA_V1, 0xDE, 0xAD]).unwrap();
-        let loaded = PersistentCardStore::load_for_owner(dir.path(), "owner");
+        let loaded = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "owner");
         assert!(loaded.is_empty());
     }
 
@@ -500,6 +547,7 @@ mod tests {
         // A store that froze writes (as `load_for_owner` does on a read I/O
         // error): empty in memory, pointed at the good file.
         let frozen = PersistentCardStore::from_cards_with_freeze(
+            crate::device_dataset_file::test_cipher(),
             path.clone(),
             DEFAULT_MAX_ENTRIES,
             vec![],
@@ -510,7 +558,7 @@ mod tests {
 
         // The good file is intact — all three original peers, none dropped, and
         // the partial sample was NOT written over them.
-        let on_disk = load_cards(&path).unwrap();
+        let on_disk = load_cards(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         let mut owners: Vec<u8> = on_disk.iter().map(|c| c.owner_id[0]).collect();
         owners.sort_unstable();
         assert_eq!(
@@ -534,10 +582,10 @@ mod tests {
         let io_path = PersistentCardStore::path_for_owner(dir.path(), "ioerr");
         std::fs::create_dir(&io_path).unwrap();
         assert!(
-            matches!(load_cards(&io_path), Err(PersistError::Io(_))),
+            matches!(load_cards(&crate::device_dataset_file::test_cipher(), &io_path), Err(PersistError::Io(_))),
             "a directory read must surface as a read I/O error, not NotFound"
         );
-        let frozen = PersistentCardStore::load_for_owner(dir.path(), "ioerr");
+        let frozen = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "ioerr");
         assert!(frozen.is_empty(), "unreadable start begins empty");
         frozen.upsert(&card(1, "Alice", 10));
         frozen.persist().unwrap(); // no-op; would Err if it tried to write
@@ -547,10 +595,10 @@ mod tests {
         // flush overwrites the junk and durably records new cards (self-heal).
         let ok_path = PersistentCardStore::path_for_owner(dir.path(), "corrupt");
         std::fs::write(&ok_path, [CARD_STORE_SCHEMA_V1, 0xDE, 0xAD]).unwrap();
-        let healed = PersistentCardStore::load_for_owner(dir.path(), "corrupt");
+        let healed = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "corrupt");
         healed.upsert(&card(2, "Bob", 10));
         healed.persist().unwrap();
-        let on_disk = load_cards(&ok_path).unwrap();
+        let on_disk = load_cards(&crate::device_dataset_file::test_cipher(), &ok_path).unwrap();
         assert_eq!(
             on_disk.iter().map(|c| c.owner_id[0]).collect::<Vec<_>>(),
             vec![2],
@@ -597,7 +645,7 @@ mod tests {
         store.upsert(&card(1, "a2", 20)); // seq 3 — owner 1 moves to most-recent
         store.persist().unwrap();
         // File order must be [owner2 (seq1), owner3 (seq2), owner1 (seq3)].
-        let on_disk = load_cards(&path).unwrap();
+        let on_disk = load_cards(&crate::device_dataset_file::test_cipher(), &path).unwrap();
         let order: Vec<u8> = on_disk.iter().map(|c| c.owner_id[0]).collect();
         assert_eq!(
             order,
@@ -620,7 +668,7 @@ mod tests {
         store.upsert(&card(1, "a2", 20)); // seq 3 — owner 1 refreshed (most recent)
         store.persist().unwrap();
 
-        let reloaded = PersistentCardStore::from_cards(path.clone(), 3, load_cards(&path).unwrap());
+        let reloaded = PersistentCardStore::from_cards(path.clone(), 3, load_cards(&crate::device_dataset_file::test_cipher(), &path).unwrap());
         assert_eq!(reloaded.len(), 3);
         reloaded.upsert(&card(4, "d", 10)); // evicts least-recently-updated
         assert_eq!(reloaded.len(), 3);

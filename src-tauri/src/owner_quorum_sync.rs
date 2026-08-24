@@ -2241,6 +2241,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let kt = Arc::new(KeyTree::derive(&[0x77u8; 32]).expect("kt"));
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
 
@@ -2274,6 +2275,10 @@ mod tests {
                       q_pub: mpsc::Sender<Vec<u8>>,
                       q_sub: mpsc::Receiver<Vec<u8>>| {
             std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            // ZEB-982: TrustPersist's doc write goes through
+            // save_owner_state_cbor_only, whose per-dir derive has no
+            // identity store in this fixture — install the test cipher.
+            crate::device_dataset_file::install_test_cipher(&dir.path().join(name));
             let trust_doc = Arc::new(tokio::sync::Mutex::new(trust_seed));
             let trust_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
                 keys: Some(crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt))),
@@ -2863,7 +2868,11 @@ mod tests {
         use tokio::sync::mpsc;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         std::fs::create_dir_all(dir.path().join("trust")).unwrap();
+        // The rig's TrustPersist identity_dir is the SUBDIR — the memo is
+        // keyed per-directory, so it needs its own install.
+        crate::device_dataset_file::install_test_cipher(&dir.path().join("trust"));
         let kt = Arc::new(KeyTree::derive(&[0x55u8; 32]).expect("kt"));
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let trust_doc = Arc::new(tokio::sync::Mutex::new(trust));
@@ -3015,6 +3024,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let carrier_doc = Arc::new(tokio::sync::Mutex::new(
             crate::fleet_key_epoch::FleetKeyEpochDoc::default(),
         ));
@@ -3751,6 +3761,7 @@ mod tests {
     #[test]
     fn persist_round_trips_doc_and_replay_and_quarantines_corrupt() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let doc_path = dir.path().join(OWNER_QUORUM_DOC_FILENAME);
         let replay_path = dir.path().join(OWNER_QUORUM_REPLAY_FILENAME);
         let mut doc = QuorumReqDoc::default();

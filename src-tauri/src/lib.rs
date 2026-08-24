@@ -13476,12 +13476,22 @@ pub async fn start_node_inner(
         // Best-effort: a corrupt/missing file starts empty and refills from
         // live broadcasts — never blocks node start.
         if !node_addr.is_empty() {
-            profile_card_cache_arc.set_store(std::sync::Arc::new(
-                crate::persistent_card_store::PersistentCardStore::load_for_owner(
-                    &app_data_dir,
-                    &node_addr,
-                ),
-            ));
+            // ZEB-982: the store seals under the device cipher (memo warm from
+            // boot). If the cipher is unavailable the cache runs memory-only
+            // this session (pre-ZEB-839 behavior) rather than risking the file.
+            match crate::device_dataset_file::get_or_derive(
+                &crate::owner_commands::resolve_identity_dir()?,
+            ) {
+                Ok(cipher) => profile_card_cache_arc.set_store(std::sync::Arc::new(
+                    crate::persistent_card_store::PersistentCardStore::load_for_owner(
+                        cipher,
+                        &app_data_dir,
+                        &node_addr,
+                    ),
+                )),
+                Err(e) => tracing::error!(error = %e,
+                    "ZEB-982: no device cipher for the profile-card store;                      running memory-only this session"),
+            }
         }
         // ZEB-679: storage-record v2 admission consults the same revoked-
         // device projection the DM/friend/PEX cutoffs use.
@@ -14647,10 +14657,24 @@ pub async fn start_node_inner(
                         // would silently abandon a request the user is still
                         // waiting on and restore the ZEB-784 dead end.
                         guard.pending_outbound_links = std::sync::Arc::new(
-                            crate::friend_requests::PendingOutboundLinks::load_or_recover(
-                                identity_dir.join(crate::friend_requests::OUTBOUND_LINKS_FILENAME),
-                                crate::iroh_friend_acceptor::wall_now_ms(),
-                            ),
+                            // ZEB-982: memo warm from boot; a derive failure
+                            // degrades to the ephemeral store (same stance as
+                            // the quarantine-rename-failure path inside).
+                            match crate::device_dataset_file::get_or_derive(&identity_dir) {
+                                Ok(cipher) => {
+                                    crate::friend_requests::PendingOutboundLinks::load_or_recover(
+                                        cipher,
+                                        identity_dir
+                                            .join(crate::friend_requests::OUTBOUND_LINKS_FILENAME),
+                                        crate::iroh_friend_acceptor::wall_now_ms(),
+                                    )
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e,
+                                        "ZEB-982: no device cipher for outbound-link store;                                          running WITHOUT persistence this session");
+                                    crate::friend_requests::PendingOutboundLinks::new()
+                                }
+                            },
                         );
                         // ZEB-236: stash the staged DM-invite store so the
                         // accept/decline/list IPCs (later tasks) reach the SAME

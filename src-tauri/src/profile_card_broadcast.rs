@@ -1019,7 +1019,7 @@ mod tests {
         card: &ProfileCardBroadcast,
     ) -> std::sync::Arc<crate::persistent_card_store::PersistentCardStore> {
         let store = std::sync::Arc::new(
-            crate::persistent_card_store::PersistentCardStore::load_for_owner(dir, owner_hex),
+            crate::persistent_card_store::PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir, owner_hex),
         );
         store.upsert(&crate::persistent_card_store::PersistedCard::from_broadcast(card));
         store
@@ -1138,6 +1138,7 @@ mod tests {
         let owner = crate::community_membership::mint_test_owner(0x86);
         let store = std::sync::Arc::new(
             crate::persistent_card_store::PersistentCardStore::load_for_owner(
+                crate::device_dataset_file::test_cipher(),
                 dir.path(),
                 "owner86",
             ),
@@ -1196,6 +1197,7 @@ mod tests {
         let owner = crate::community_membership::mint_test_owner(0x83);
         let store = std::sync::Arc::new(
             crate::persistent_card_store::PersistentCardStore::load_for_owner(
+                crate::device_dataset_file::test_cipher(),
                 dir.path(),
                 "owner83",
             ),
