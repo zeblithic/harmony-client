@@ -2147,10 +2147,10 @@ impl Default for NodeState {
                 observed_holders::ObservedHolders::new(),
             )),
             storage_records: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_records::StorageRecordStore::new(None),
+                storage_records::StorageRecordStore::new(None, None),
             )),
             storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_ledger::StorageLedger::new(None),
+                storage_ledger::StorageLedger::new(None, None),
             )),
             storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
                 storage_settings::StorageSettings::default(),
@@ -4318,15 +4318,19 @@ pub async fn start_node_inner(
     let storage_settings_path = storage_settings::settings_path(&app_data_dir);
     let storage_settings_loaded = storage_settings::load_or_default(&storage_settings_path);
     let storage_records_arc = std::sync::Arc::new(std::sync::Mutex::new({
-        let mut records = storage_records::StorageRecordStore::new(Some(
-            app_data_dir.join("storage_records.json"),
-        ));
+        let mut records = storage_records::StorageRecordStore::new(
+            device_cipher.clone(),
+            Some(app_data_dir.join("storage_records.json")),
+        );
         // ZEB-923: one-shot post-load grace floor — see apply_boot_grace.
         records.apply_boot_grace(wall_clock_ms());
         records
     }));
     let storage_ledger_arc = std::sync::Arc::new(std::sync::Mutex::new(
-        storage_ledger::StorageLedger::new(Some(app_data_dir.join("storage_ledger.json"))),
+        storage_ledger::StorageLedger::new(
+            device_cipher.clone(),
+            Some(app_data_dir.join("storage_ledger.json")),
+        ),
     ));
     let storage_settings_arc =
         std::sync::Arc::new(std::sync::Mutex::new(storage_settings_loaded.clone()));
@@ -83675,10 +83679,10 @@ mod start_node_race_tests {
                 observed_holders::ObservedHolders::new(),
             )),
             storage_records: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_records::StorageRecordStore::new(None),
+                storage_records::StorageRecordStore::new(None, None),
             )),
             storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_ledger::StorageLedger::new(None),
+                storage_ledger::StorageLedger::new(None, None),
             )),
             storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
                 storage_settings::StorageSettings::default(),

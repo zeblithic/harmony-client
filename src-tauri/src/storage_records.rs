@@ -79,6 +79,9 @@ const _: () = assert!(STORAGE_RECORD_BOOT_GRACE_MS < STORAGE_RECORD_TTL_MS);
 
 const RECORDS_FILE_VERSION: u32 = 1;
 
+/// Canonical filename, bound as the device-envelope AAD (ZEB-986 PR-3).
+const RECORDS_FILE: &str = "storage_records.json";
+
 /// Ingest outcome, shared by all three record families. `Rejected`
 /// carries a reason for debug logging; it implies ZERO state effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +234,16 @@ pub struct StorageRecordStore {
     hosting_reports: HashMap<String, HostingReportRecord>,
     signer_pins: HashMap<String, StorageSignerPin>,
     path: Option<PathBuf>,
+    /// ZEB-986 PR-3: device cipher for at-rest sealing. `None` for the path-less
+    /// placeholder and on a pre-identity boot.
+    cipher: Option<crate::device_dataset_file::DeviceCipher>,
+    /// ZEB-986 PR-3: fail-closed latch. Set when the sealed file could not be established
+    /// as a TRUSTWORTHY pin set at load (unreadable, undecryptable, corrupt, or an
+    /// unsupported version). While set, every ingest is rejected and `save()` is a no-op
+    /// (the on-disk file is preserved for forensics) — so the anti-rebind ratchet is never
+    /// silently reset to an attacker's benefit. A clean load, or a clean absence (first-run
+    /// TOFU), leaves it clear.
+    sealed_fault: bool,
     /// Strictly-increasing local counter stamped onto every inserted record
     /// as its `seq` (ZEB-863). One store-wide sequence across all record
     /// families; single-threaded `&mut self` access, so no atomics. Not
@@ -242,34 +255,69 @@ impl StorageRecordStore {
     /// Load from `path` (tolerant: missing/corrupt/foreign-version ⇒
     /// empty store) and re-apply every bound the ingest path enforces —
     /// a tampered disk file must not smuggle an over-cap record in.
-    pub fn new(path: Option<PathBuf>) -> Self {
+    pub fn new(
+        cipher: Option<crate::device_dataset_file::DeviceCipher>,
+        path: Option<PathBuf>,
+    ) -> Self {
         let mut store = Self {
             pledge_lists: HashMap::new(),
             backup_sets: HashMap::new(),
             hosting_reports: HashMap::new(),
             signer_pins: HashMap::new(),
             path,
+            cipher,
+            sealed_fault: false,
             insert_seq: 0,
         };
         let Some(p) = store.path.clone() else {
             return store;
         };
-        let Ok(bytes) = std::fs::read(&p) else {
-            return store;
+        // ZEB-986 PR-3: FAIL-CLOSED load. These are TOFU trust anchors, so any failure to
+        // establish a trustworthy pin set — unreadable, undecryptable, corrupt, or an
+        // unsupported version — must NOT silently start empty and re-TOFU. It latches
+        // `sealed_fault` (refuse ingest, freeze the file). Only a clean load, or a clean
+        // absence (first-run TOFU), accepts ingest.
+        let cipher = store.cipher.clone();
+        let image = match &cipher {
+            Some(c) => match crate::device_dataset_file::read_image(c, &p, RECORDS_FILE) {
+                Ok(Some(img)) => img,
+                // Absent file: legitimate first run — TOFU proceeds.
+                Ok(None) => return store,
+                Err(e) => {
+                    tracing::warn!(path = ?p, error = %e, "storage_records: sealed load failed — FAIL-CLOSED (refusing ingest, preserving file)");
+                    store.sealed_fault = true;
+                    return store;
+                }
+            },
+            None => {
+                // No device cipher (pre-identity boot). An existing file cannot be read →
+                // fail closed; an absent file is a legitimate first run.
+                if p.exists() {
+                    tracing::warn!(path = ?p, "storage_records: no device cipher — FAIL-CLOSED (refusing ingest, preserving file)");
+                    store.sealed_fault = true;
+                }
+                return store;
+            }
         };
-        let disk: StorageRecordsDiskV1 = match serde_json::from_slice(&bytes) {
+        let disk: StorageRecordsDiskV1 = match serde_json::from_slice(&image.bytes) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!("storage_records load failed, starting empty: {e}");
+                tracing::warn!("storage_records parse failed — FAIL-CLOSED (refusing ingest, preserving file): {e}");
+                store.sealed_fault = true;
                 return store;
             }
         };
         if disk.version != RECORDS_FILE_VERSION {
             tracing::warn!(
-                "storage_records version {} unsupported, starting empty",
+                "storage_records version {} unsupported — FAIL-CLOSED (refusing ingest, preserving file)",
                 disk.version
             );
+            store.sealed_fault = true;
             return store;
+        }
+        // Clean load: migrate a legacy plaintext file to the sealed envelope in place.
+        if let Some(c) = &cipher {
+            crate::device_dataset_file::reseal_if_legacy(c, &p, RECORDS_FILE, &image);
         }
         for row in disk.pledge_lists {
             if row.pledges.len() > MAX_PLEDGES_PER_LIST {
@@ -380,6 +428,20 @@ impl StorageRecordStore {
         let Some(path) = self.path.as_ref() else {
             return;
         };
+        if self.sealed_fault {
+            tracing::warn!(
+                path = ?path,
+                "storage_records save skipped — sealed-fault (preserving the on-disk file; ingest is refused this session)"
+            );
+            return;
+        }
+        let Some(cipher) = &self.cipher else {
+            tracing::warn!(
+                path = ?path,
+                "storage_records save skipped — no device cipher (pre-identity boot)"
+            );
+            return;
+        };
         let mut pledge_lists: Vec<PledgeListOnDisk> = self
             .pledge_lists
             .iter()
@@ -421,8 +483,11 @@ impl StorageRecordStore {
         };
         match serde_json::to_vec_pretty(&disk) {
             Ok(bytes) => {
-                if let Err(e) = crate::identity::write_atomic_0600(path, &bytes) {
-                    tracing::error!("storage_records save failed: {e}");
+                // ZEB-986 PR-3: seal + atomic write + fsync + 0600.
+                if let Err(e) =
+                    crate::device_dataset_file::write_image(cipher, path, RECORDS_FILE, &bytes)
+                {
+                    tracing::error!("storage_records sealed save failed: {e}");
                 }
             }
             Err(e) => tracing::error!("storage_records serialize failed: {e}"),
@@ -504,6 +569,11 @@ impl StorageRecordStore {
         revoked: &RevokedDeviceProjection,
         now_ms: u64,
     ) -> RecordOutcome {
+        if self.sealed_fault {
+            return RecordOutcome::Rejected(
+                "storage records sealed-fault: ingest refused (trust anchors could not be established at load)".to_string(),
+            );
+        }
         if payload.len() > MAX_PLEDGE_LIST_WIRE_BYTES {
             return RecordOutcome::Rejected(format!(
                 "pledge list {} bytes exceeds wire cap {MAX_PLEDGE_LIST_WIRE_BYTES}",
@@ -574,6 +644,11 @@ impl StorageRecordStore {
         revoked: &RevokedDeviceProjection,
         now_ms: u64,
     ) -> RecordOutcome {
+        if self.sealed_fault {
+            return RecordOutcome::Rejected(
+                "storage records sealed-fault: ingest refused (trust anchors could not be established at load)".to_string(),
+            );
+        }
         if payload.len() > MAX_BACKUP_SET_WIRE_BYTES {
             return RecordOutcome::Rejected(format!(
                 "backup set {} bytes exceeds wire cap {MAX_BACKUP_SET_WIRE_BYTES}",
@@ -643,6 +718,11 @@ impl StorageRecordStore {
         revoked: &RevokedDeviceProjection,
         now_ms: u64,
     ) -> RecordOutcome {
+        if self.sealed_fault {
+            return RecordOutcome::Rejected(
+                "storage records sealed-fault: ingest refused (trust anchors could not be established at load)".to_string(),
+            );
+        }
         if payload.len() > MAX_HOSTING_REPORT_WIRE_BYTES {
             return RecordOutcome::Rejected(format!(
                 "hosting report {} bytes exceeds wire cap {MAX_HOSTING_REPORT_WIRE_BYTES}",
@@ -1011,6 +1091,11 @@ mod tests {
     use super::*;
     use harmony_content::cid::{ContentFlags, ContentId};
 
+    /// Deterministic device cipher for the sealing tests (ZEB-986 PR-3).
+    fn tc() -> crate::device_dataset_file::DeviceCipher {
+        crate::device_dataset_file::test_cipher()
+    }
+
     fn test_identity() -> harmony_identity::PrivateIdentity {
         harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
     }
@@ -1093,7 +1178,7 @@ mod tests {
 
     #[test]
     fn signed_records_insert_and_read_back() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
 
@@ -1137,7 +1222,7 @@ mod tests {
 
     #[test]
     fn unsigned_and_tampered_records_rejected() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
 
@@ -1178,7 +1263,7 @@ mod tests {
 
     #[test]
     fn record_on_foreign_or_misshapen_topic_rejected() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let (_, bytes) = signed_pledge_bytes(&id, vec![], 1);
 
@@ -1198,7 +1283,7 @@ mod tests {
 
     #[test]
     fn lww_keeps_newest_ignores_equal_and_older() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
 
@@ -1231,7 +1316,7 @@ mod tests {
 
     #[test]
     fn oversized_records_rejected() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
 
         // Entry-count cap.
@@ -1254,7 +1339,7 @@ mod tests {
 
     #[test]
     fn backup_set_ineligible_cids_rejected_at_ingest() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
 
@@ -1295,7 +1380,7 @@ mod tests {
 
     #[test]
     fn backup_set_malformed_or_bad_checksum_or_duplicate_cid_rejected() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
 
         let (topic, bytes) = signed_backup_bytes(
@@ -1367,7 +1452,7 @@ mod tests {
         let owner = addr_of(&id);
 
         {
-            let mut store = StorageRecordStore::new(Some(path.clone()));
+            let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
             let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
             assert!(store
                 .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
@@ -1391,7 +1476,7 @@ mod tests {
                 .changed());
         }
 
-        let reloaded = StorageRecordStore::new(Some(path));
+        let reloaded = StorageRecordStore::new(Some(tc()), Some(path));
         assert_eq!(reloaded.pledge_list(&owner).unwrap().pledges[0].bytes, 7);
         assert_eq!(reloaded.backup_set(&owner).unwrap().entries.len(), 1);
         assert!(
@@ -1406,11 +1491,11 @@ mod tests {
         let path = dir.path().join("storage_records.json");
 
         std::fs::write(&path, b"{not json").unwrap();
-        let store = StorageRecordStore::new(Some(path.clone()));
+        let store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
         assert!(store.pledge_lists.is_empty());
 
         std::fs::write(&path, br#"{"version":99,"pledgeLists":[],"backupSets":[]}"#).unwrap();
-        let store = StorageRecordStore::new(Some(path));
+        let store = StorageRecordStore::new(Some(tc()), Some(path));
         assert!(store.pledge_lists.is_empty());
     }
 
@@ -1435,16 +1520,160 @@ mod tests {
             hex::encode(encrypted.to_bytes()),
         );
         std::fs::write(&path, tampered).unwrap();
-        let store = StorageRecordStore::new(Some(path));
+        let store = StorageRecordStore::new(Some(tc()), Some(path));
         assert!(
             store.backup_set("mallory").is_none(),
             "ineligible entries must not survive the reload path"
         );
     }
 
+    // ── ZEB-986 PR-3: at-rest sealing + fail-closed anchor contract ──────────
+
+    #[test]
+    fn first_run_missing_file_accepts_ingest_and_seals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_records.json");
+        let id = test_identity();
+        let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
+        assert!(
+            store
+                .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+                .changed(),
+            "first-run TOFU accepts ingest"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "sealed on first save"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_records.json");
+        let id = test_identity();
+        let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
+        store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "sealed storage_records is owner-only");
+    }
+
+    #[test]
+    fn foreign_cipher_fails_closed_refuses_ingest_and_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_records.json");
+        let id = test_identity();
+        {
+            let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
+            let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
+            assert!(store
+                .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+                .changed());
+        }
+        let sealed = std::fs::read(&path).unwrap();
+        assert_eq!(sealed[0], crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3);
+
+        // Reload under a foreign device key: cannot decrypt → fail closed.
+        let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
+        let mut store = StorageRecordStore::new(Some(foreign), Some(path.clone()));
+        assert!(store.pledge_lists.is_empty(), "undecryptable → empty in memory");
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 6);
+        assert!(
+            matches!(
+                store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000),
+                RecordOutcome::Rejected(_)
+            ),
+            "sealed-fault refuses all ingest (anti-rebind ratchet not reset)"
+        );
+        assert!(store.pledge_list(&addr_of(&id)).is_none(), "no ingest landed");
+        store.save(); // no-op while faulted
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            sealed,
+            "faulted store preserves the sealed file byte-identical (no wipe, no quarantine)"
+        );
+    }
+
+    #[test]
+    fn corrupt_disk_file_fails_closed_and_is_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_records.json");
+        std::fs::write(&path, b"{ corrupt").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
+        assert!(store.pledge_lists.is_empty());
+        let id = test_identity();
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
+        assert!(matches!(
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000),
+            RecordOutcome::Rejected(_)
+        ));
+        store.save(); // no-op
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "trust anchor preserved in place (not quarantined, not wiped)"
+        );
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("storage_records.json.corrupt-")
+        });
+        assert!(!quarantined, "trust anchor is never quarantined");
+    }
+
+    #[test]
+    fn no_cipher_existing_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_records.json");
+        let id = test_identity();
+        {
+            let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
+            let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000);
+        }
+        // No cipher (pre-identity boot) but a file exists → cannot read → fail closed.
+        let mut store = StorageRecordStore::new(None, Some(path));
+        assert!(store.pledge_lists.is_empty());
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 6);
+        assert!(matches!(
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000),
+            RecordOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_plaintext_migrates_to_sealed_and_accepts_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_records.json");
+        // A pre-PR-3 plaintext file that parses cleanly must load (not fault) and re-seal.
+        std::fs::write(
+            &path,
+            br#"{"version":1,"pledgeLists":[],"backupSets":[],"signerPins":[]}"#,
+        )
+        .unwrap();
+        let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
+        assert_eq!(
+            std::fs::read(&path).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "legacy plaintext migrated to sealed on load"
+        );
+        // Not faulted: ingest still accepted.
+        let id = test_identity();
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("a", 7)], 5);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+            .changed());
+    }
+
     #[test]
     fn owner_cap_evicts_overflow_newest_received_first() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         // Directly exercise the bounded-map helper: driving 1025 signed
         // ingests would mostly re-test signing. Ingest→evict wiring is
         // covered by the changed()-then-evict call sites above.
@@ -1479,7 +1708,7 @@ mod tests {
         // — `IgnoredAtCap`, not `Inserted` — so the caller fires neither
         // `save()` nor `storage-buddies-updated` for a row it did not
         // retain (both are gated solely on `.changed()`).
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         // Fill to cap directly; driving 1024 signed ingests would only
         // re-test signing (mirrors `owner_cap_evicts_overflow_*`).
         for i in 0..MAX_TRACKED_OWNERS {
@@ -1530,7 +1759,7 @@ mod tests {
         // ZEB-869 scope boundary: an LWW-replace of an EXISTING owner does
         // not grow the map, so it never self-evicts — the newcomer
         // downgrade must NOT swallow a legitimate update at cap.
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
 
@@ -1576,7 +1805,7 @@ mod tests {
         // victim under the old `min(owner)` same-ms tiebreak. It must
         // survive: eviction is ordered by local receipt sequence, not the
         // peer address.
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let same_ms = 5_000u64;
         // Honest, received first (lowest seq), smallest owner address.
         store.pledge_lists.insert(
@@ -1612,7 +1841,7 @@ mod tests {
 
     #[test]
     fn hosting_sweep_drops_stale_reports() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
         let (topic, bytes) = signed_hosting_bytes(&id, vec![], 1);
@@ -1632,7 +1861,7 @@ mod tests {
 
     #[test]
     fn record_ttl_sweep_boundary_is_strict_and_leaves_hosting_alone() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
         let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
@@ -1672,7 +1901,7 @@ mod tests {
 
     #[test]
     fn record_ttl_renewed_record_survives_the_sweep_that_kills_its_cohort() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let alice = test_identity();
         let bob = test_identity();
         let (topic, bytes) = signed_pledge_bytes(&alice, vec![pledge("x", 1)], 10);
@@ -1707,14 +1936,14 @@ mod tests {
         let id = test_identity();
         let owner = addr_of(&id);
         {
-            let mut store = StorageRecordStore::new(Some(path.clone()));
+            let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
             let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
             assert!(store
                 .on_pledge_list_sample(&topic, &bytes, &rvk(), 1_000)
                 .changed());
             assert!(store.sweep_stale_pledges_and_backups(1_000 + STORAGE_RECORD_TTL_MS));
         }
-        let reloaded = StorageRecordStore::new(Some(path));
+        let reloaded = StorageRecordStore::new(Some(tc()), Some(path));
         assert!(
             reloaded.pledge_list(&owner).is_none(),
             "sweep must save() — an expired record must not resurrect at reload"
@@ -1728,7 +1957,7 @@ mod tests {
         let id = test_identity();
         let owner = addr_of(&id);
         {
-            let mut store = StorageRecordStore::new(Some(path.clone()));
+            let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
             let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 7)], 10);
             assert!(store
                 .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
@@ -1738,7 +1967,7 @@ mod tests {
                 .on_backup_set_sample(&topic, &bytes, &rvk(), 9_500)
                 .changed());
         }
-        let reloaded = StorageRecordStore::new(Some(path));
+        let reloaded = StorageRecordStore::new(Some(tc()), Some(path));
         assert_eq!(
             reloaded.pledge_lists.get(&owner).unwrap().received_at_ms,
             9_000
@@ -1757,13 +1986,13 @@ mod tests {
             ),
         )
         .unwrap();
-        let store = StorageRecordStore::new(Some(legacy));
+        let store = StorageRecordStore::new(Some(tc()), Some(legacy));
         assert_eq!(store.pledge_lists.get(&owner).unwrap().received_at_ms, 0);
     }
 
     #[test]
     fn apply_boot_grace_floors_stale_stamps_and_leaves_fresh_ones() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let old = test_identity();
         let fresh = test_identity();
         let now = 10 * STORAGE_RECORD_TTL_MS;
@@ -1798,7 +2027,7 @@ mod tests {
         );
 
         // Small test clocks saturate to a no-op floor of 0.
-        let mut small = StorageRecordStore::new(None);
+        let mut small = StorageRecordStore::new(None, None);
         let (topic, bytes) = signed_pledge_bytes(&old, vec![pledge("x", 1)], 11);
         assert!(small
             .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
@@ -1816,7 +2045,7 @@ mod tests {
 
     #[test]
     fn record_ttl_expiry_unfreezes_the_owner_cap() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         // Fill to cap with direct rows (established working set), all stale.
         for i in 0..MAX_TRACKED_OWNERS {
             let seq = store.next_insert_seq();
@@ -1849,7 +2078,7 @@ mod tests {
 
     #[test]
     fn owners_pledging_to_filters_by_beneficiary() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let alice = test_identity();
         let bob = test_identity();
         let me = "me-address";
@@ -1933,7 +2162,7 @@ mod tests {
     #[test]
     fn v2_record_pins_and_accepts_zeb679() {
         let world = mint_quorum_world(0x20);
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let (topic, bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 1);
         assert!(store
@@ -1950,7 +2179,7 @@ mod tests {
     #[test]
     fn revoked_signer_rejected_zero_state_zeb679() {
         let world = mint_quorum_world(0x28);
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let revoked = rvk();
         let key = world.a_cert.device_pubkeys.classical.ed25519_verify;
@@ -1970,7 +2199,7 @@ mod tests {
     #[test]
     fn legacy_after_pin_rejected_cross_family_zeb679() {
         let world = mint_quorum_world(0x20);
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let (topic, bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 1);
         assert!(store
@@ -1999,7 +2228,7 @@ mod tests {
     fn rebind_to_different_owner_rejected_zeb679() {
         let world = mint_quorum_world(0x20);
         let other = mint_quorum_world(0x24);
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let (topic, bytes) = dual_signed_pledge_bytes(&id, &master_material(&world), vec![], 1);
         assert!(store
@@ -2025,7 +2254,7 @@ mod tests {
         let path = dir.path().join("storage_records.json");
         let id = test_identity();
         {
-            let mut store = StorageRecordStore::new(Some(path.clone()));
+            let mut store = StorageRecordStore::new(Some(tc()), Some(path.clone()));
             // Pin via a HOSTING report — the record itself is in-memory
             // only, so this also pins the "pin persists even when its
             // record doesn't" property.
@@ -2034,7 +2263,7 @@ mod tests {
                 .on_hosting_report_sample(&topic, &bytes, &rvk(), NOW_MS)
                 .changed());
         }
-        let mut reloaded = StorageRecordStore::new(Some(path));
+        let mut reloaded = StorageRecordStore::new(Some(tc()), Some(path));
         assert!(
             reloaded.hosting_report(&addr_of(&id)).is_none(),
             "hosting record itself is not persisted"
@@ -2053,7 +2282,7 @@ mod tests {
     #[test]
     fn invalid_v2_material_rejected_zero_state_zeb679() {
         let world = mint_quorum_world(0x20);
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let victim = test_identity();
         let attacker = test_identity();
         // Swap attack at the ingest boundary: victim's legacy record with
@@ -2087,7 +2316,7 @@ mod tests {
     #[test]
     fn older_v2_replay_still_pins_zeb679() {
         let world = mint_quorum_world(0x20);
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         // Legacy record lands first (unpinned bootstrap), newer clock.
         let (topic, legacy) = signed_pledge_bytes(&id, vec![], 10);
@@ -2244,7 +2473,7 @@ mod tests {
         // The counter advances once per insert through the real ingest path,
         // and an LWW-replace re-stamps a fresh (higher) seq. Pins the
         // uniqueness/monotonicity the owner-drop in eviction relies on.
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let a = test_identity();
         let b = test_identity();
 
@@ -2346,7 +2575,7 @@ mod tests {
         // Restart: reload. Over the pin cap by one, so exactly one pin evicts at
         // load. All pins are dead (no live records), so the victim is the newest
         // DEAD pin (highest seq) — never the oldest ratchet pin.
-        let store = StorageRecordStore::new(Some(path));
+        let store = StorageRecordStore::new(Some(tc()), Some(path));
         assert!(
             store.signer_pin(&ratchet_owner).is_some(),
             "old ratchet pin (largest owner, oldest pinned_at_ms) survives restart \
@@ -2362,7 +2591,7 @@ mod tests {
 
     #[test]
     fn ingest_stamps_local_received_clock_not_peer_updated_at() {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let owner = addr_of(&id);
         // Peer claims a far-future updated_at; local receipt is now_ms = 5_000.
@@ -2381,7 +2610,7 @@ mod tests {
     #[test]
     fn purge_revoked_drops_records_keeps_ratchet_zeb679_r1() {
         let world = mint_quorum_world(0x20);
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let id = test_identity();
         let addr = addr_of(&id);
         // Records land while the signer is in good standing.

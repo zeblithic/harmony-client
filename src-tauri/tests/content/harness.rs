@@ -284,10 +284,10 @@ pub async fn spawn_test_runtime_with_pins(
                     )),
                     // ZEB-669 S2: buddy records/ledger/settings not exercised
                     std::sync::Arc::new(std::sync::Mutex::new(
-                        harmony_app::storage_records::StorageRecordStore::new(None),
+                        harmony_app::storage_records::StorageRecordStore::new(None, None),
                     )),
                     std::sync::Arc::new(std::sync::Mutex::new(
-                        harmony_app::storage_ledger::StorageLedger::new(None),
+                        harmony_app::storage_ledger::StorageLedger::new(None, None),
                     )),
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::storage_settings::StorageSettings::default(),

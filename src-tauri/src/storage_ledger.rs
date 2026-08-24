@@ -57,41 +57,84 @@ struct LedgerDiskV1 {
     buddies: Vec<BuddyOnDisk>,
 }
 
+/// Canonical filename, bound as the device-envelope AAD (ZEB-986 PR-3).
+const LEDGER_FILE: &str = "storage_ledger.json";
+
 /// Refcounted (buddy → pinned entries) ledger, persisted to
-/// `storage_ledger.json` via the atomic 0600 writer.
+/// `storage_ledger.json`, sealed under the device envelope (ZEB-986 PR-3).
 #[derive(Debug)]
 pub struct StorageLedger {
     per_buddy: BTreeMap<String, Vec<LedgerEntry>>,
     path: Option<PathBuf>,
+    /// ZEB-986 PR-3: device cipher for at-rest sealing. `None` for the path-less
+    /// placeholder and on a pre-identity boot.
+    cipher: Option<crate::device_dataset_file::DeviceCipher>,
+    /// ZEB-986 PR-3: fail-closed latch. Set when the sealed file could not be read as a
+    /// trustworthy ledger at load (unreadable, undecryptable, corrupt, or an unsupported
+    /// version). While set, `save()` is a no-op so the still-good on-disk ledger is never
+    /// overwritten with an empty one. RAM mutations still occur but do not persist until
+    /// the fault clears (the local hosting ledger re-derives). A clean load or a clean
+    /// absence leaves it clear.
+    sealed_fault: bool,
 }
 
 impl StorageLedger {
-    /// Load from `path`; missing/corrupt/foreign-version ⇒ empty (WARN).
-    pub fn new(path: Option<PathBuf>) -> Self {
+    /// Load from `path`, sealed under the device envelope (ZEB-986 PR-3). Missing ⇒ empty
+    /// (first run). Any load failure — unreadable, undecryptable, corrupt, or an
+    /// unsupported version — FAILS CLOSED: empty + `sealed_fault` (freeze `save()`), so the
+    /// preserved on-disk ledger is never overwritten with an empty one. A legacy plaintext
+    /// file that parses is re-sealed in place.
+    pub fn new(
+        cipher: Option<crate::device_dataset_file::DeviceCipher>,
+        path: Option<PathBuf>,
+    ) -> Self {
         let mut ledger = Self {
             per_buddy: BTreeMap::new(),
             path,
+            cipher,
+            sealed_fault: false,
         };
         let Some(p) = ledger.path.clone() else {
             return ledger;
         };
-        let Ok(bytes) = std::fs::read(&p) else {
-            return ledger;
+        let cipher = ledger.cipher.clone();
+        let image = match &cipher {
+            Some(c) => match crate::device_dataset_file::read_image(c, &p, LEDGER_FILE) {
+                Ok(Some(img)) => img,
+                Ok(None) => return ledger, // first run
+                Err(e) => {
+                    tracing::warn!(path = ?p, error = %e, "storage_ledger: sealed load failed — FAIL-CLOSED (freezing writes, preserving file)");
+                    ledger.sealed_fault = true;
+                    return ledger;
+                }
+            },
+            None => {
+                if p.exists() {
+                    tracing::warn!(path = ?p, "storage_ledger: no device cipher — FAIL-CLOSED (freezing writes, preserving file)");
+                    ledger.sealed_fault = true;
+                }
+                return ledger;
+            }
         };
-        match serde_json::from_slice::<LedgerDiskV1>(&bytes) {
+        match serde_json::from_slice::<LedgerDiskV1>(&image.bytes) {
             Ok(disk) if disk.version == LEDGER_FILE_VERSION => {
                 for b in disk.buddies {
                     ledger.per_buddy.insert(b.owner, b.entries);
                 }
+                if let Some(c) = &cipher {
+                    crate::device_dataset_file::reseal_if_legacy(c, &p, LEDGER_FILE, &image);
+                }
             }
             Ok(disk) => {
                 tracing::warn!(
-                    "storage_ledger version {} unsupported, starting empty",
+                    "storage_ledger version {} unsupported — FAIL-CLOSED (freezing writes)",
                     disk.version
                 );
+                ledger.sealed_fault = true;
             }
             Err(e) => {
-                tracing::warn!("storage_ledger load failed, starting empty: {e}");
+                tracing::warn!("storage_ledger parse failed — FAIL-CLOSED (freezing writes): {e}");
+                ledger.sealed_fault = true;
             }
         }
         ledger
@@ -102,6 +145,20 @@ impl StorageLedger {
     /// already save.
     pub fn save(&self) {
         let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        if self.sealed_fault {
+            tracing::warn!(
+                path = ?path,
+                "storage_ledger save skipped — sealed-fault (preserving the on-disk ledger)"
+            );
+            return;
+        }
+        let Some(cipher) = &self.cipher else {
+            tracing::warn!(
+                path = ?path,
+                "storage_ledger save skipped — no device cipher (pre-identity boot)"
+            );
             return;
         };
         let disk = LedgerDiskV1 {
@@ -117,8 +174,11 @@ impl StorageLedger {
         };
         match serde_json::to_vec_pretty(&disk) {
             Ok(bytes) => {
-                if let Err(e) = crate::identity::write_atomic_0600(path, &bytes) {
-                    tracing::error!("storage_ledger save failed: {e}");
+                // ZEB-986 PR-3: seal + atomic write + fsync + 0600.
+                if let Err(e) =
+                    crate::device_dataset_file::write_image(cipher, path, LEDGER_FILE, &bytes)
+                {
+                    tracing::error!("storage_ledger sealed save failed: {e}");
                 }
             }
             Err(e) => tracing::error!("storage_ledger serialize failed: {e}"),
@@ -308,9 +368,14 @@ impl StorageLedger {
 mod tests {
     use super::*;
 
+    /// Deterministic device cipher for the sealing tests (ZEB-986 PR-3).
+    fn tc() -> crate::device_dataset_file::DeviceCipher {
+        crate::device_dataset_file::test_cipher()
+    }
+
     #[test]
     fn record_and_release_roundtrip() {
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         assert!(ledger.record_pin("alice", "cid1", 100, 1));
         assert!(
             !ledger.record_pin("alice", "cid1", 100, 2),
@@ -328,7 +393,7 @@ mod tests {
 
     #[test]
     fn shared_cid_counted_once_globally_but_attributed_to_both() {
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin("alice", "cid1", 100, 1);
         ledger.record_pin("bob", "cid1", 100, 2);
         ledger.record_pin("bob", "cid2", 40, 3);
@@ -355,7 +420,7 @@ mod tests {
 
     #[test]
     fn release_buddy_returns_only_last_ref_cids() {
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin("alice", "shared", 10, 1);
         ledger.record_pin("bob", "shared", 10, 2);
         ledger.record_pin("bob", "solo", 20, 3);
@@ -371,7 +436,7 @@ mod tests {
 
     #[test]
     fn evict_newest_first_reaches_target_without_double_freeing_shared_cids() {
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin("alice", "old", 100, 10);
         ledger.record_pin("alice", "shared", 50, 20);
         ledger.record_pin("bob", "shared", 50, 30); // newest entry, refcounted
@@ -388,7 +453,7 @@ mod tests {
 
     #[test]
     fn drop_cid_everywhere_removes_all_attributions() {
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin("alice", "gone", 10, 1);
         ledger.record_pin("bob", "gone", 10, 2);
         ledger.record_pin("bob", "kept", 5, 3);
@@ -408,10 +473,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("storage_ledger.json");
         {
-            let mut ledger = StorageLedger::new(Some(path.clone()));
+            let mut ledger = StorageLedger::new(Some(tc()), Some(path.clone()));
             ledger.record_pin("alice", "cid1", 100, 7);
         }
-        let reloaded = StorageLedger::new(Some(path));
+        let reloaded = StorageLedger::new(Some(tc()), Some(path));
         assert!(reloaded.holds("alice", "cid1"));
         assert_eq!(reloaded.distinct_pinned_bytes(), 100);
         assert_eq!(
@@ -426,7 +491,73 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("storage_ledger.json");
         std::fs::write(&path, b"nope").unwrap();
-        let ledger = StorageLedger::new(Some(path));
+        let ledger = StorageLedger::new(Some(tc()), Some(path));
         assert!(ledger.buddies().is_empty());
+    }
+
+    // ── ZEB-986 PR-3: at-rest sealing + fail-closed ──────────────────────────
+
+    #[test]
+    fn save_seals_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_ledger.json");
+        let mut ledger = StorageLedger::new(Some(tc()), Some(path.clone()));
+        ledger.record_pin("alice", "cid1", 100, 7);
+        assert_eq!(
+            std::fs::read(&path).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "storage_ledger sealed on disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_ledger.json");
+        let mut ledger = StorageLedger::new(Some(tc()), Some(path.clone()));
+        ledger.record_pin("alice", "cid1", 100, 7);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "sealed storage_ledger is owner-only");
+    }
+
+    #[test]
+    fn foreign_cipher_fails_closed_and_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_ledger.json");
+        {
+            let mut ledger = StorageLedger::new(Some(tc()), Some(path.clone()));
+            ledger.record_pin("alice", "cid1", 100, 7);
+        }
+        let sealed = std::fs::read(&path).unwrap();
+        let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
+        let mut ledger = StorageLedger::new(Some(foreign), Some(path.clone()));
+        assert!(ledger.buddies().is_empty(), "undecryptable → empty");
+        ledger.record_pin("mallory", "cid2", 5, 8); // RAM mutation; save() is a no-op
+        ledger.save();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            sealed,
+            "faulted ledger preserves the on-disk file byte-identical"
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_migrates_to_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_ledger.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"buddies":[{"owner":"alice","entries":[{"cid":"c","size":9,"pinnedAtMs":1}]}]}"#,
+        )
+        .unwrap();
+        let ledger = StorageLedger::new(Some(tc()), Some(path.clone()));
+        assert!(ledger.holds("alice", "c"), "legacy data recovered");
+        assert_eq!(
+            std::fs::read(&path).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "migrated to sealed on load"
+        );
     }
 }
