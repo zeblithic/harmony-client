@@ -3520,8 +3520,8 @@ async fn addrbook_replaces_announce_events_end_to_end() {
     let sidecar_path = addrbook_path(sidecar_dir.path(), &community_id);
     let rows_before = book_b.rows_for_community(&community_id, ts);
     assert_eq!(rows_before.len(), 1, "B's book holds exactly admin's row");
-    save_addrbook(&sidecar_path, &rows_before).expect("save addrbook");
-    let rows_after = load_addrbook(&sidecar_path, ts);
+    save_addrbook(&harmony_app::device_dataset_file::test_cipher(), &sidecar_path, &community_id, &rows_before).expect("save addrbook");
+    let rows_after = load_addrbook(&harmony_app::device_dataset_file::test_cipher(), &sidecar_path, &community_id, ts);
     assert_eq!(
         rows_after, rows_before,
         "B's book rows must survive a save_addrbook/load_addrbook round trip"

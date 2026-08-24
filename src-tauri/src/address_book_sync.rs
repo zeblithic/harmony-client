@@ -1057,6 +1057,7 @@ pub fn spawn_addrbook_snapshot_requester(
 /// (spec §2), so a persist failure must not take down the sync tasks.
 pub fn spawn_addrbook_persist_task(
     book: Arc<CommunityAddressBook>,
+    device_cipher: crate::device_dataset_file::DeviceCipher,
     path: PathBuf,
     community: SpaceId,
     dirty: Arc<Notify>,
@@ -1067,8 +1068,11 @@ pub fn spawn_addrbook_persist_task(
             tokio::time::sleep(Duration::from_millis(ADDRBOOK_PERSIST_DEBOUNCE_MS)).await;
             let rows = book.rows_for_community(&community, wall_now_ms());
             let path_for_write = path.clone();
-            let result =
-                tokio::task::spawn_blocking(move || save_addrbook(&path_for_write, &rows)).await;
+            let cipher_for_write = device_cipher.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                save_addrbook(&cipher_for_write, &path_for_write, &community, &rows)
+            })
+            .await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(

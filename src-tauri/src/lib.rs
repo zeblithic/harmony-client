@@ -9746,8 +9746,15 @@ pub async fn start_node_inner(
                                 continue;
                             };
                             let state_arc = engine.state();
+                            let Ok(addrbook_cipher) =
+                                crate::device_dataset_file::get_or_derive(&identity_dir)
+                            else {
+                                continue;
+                            };
                             let mut rows = crate::community_address_book::load_addrbook(
+                                &addrbook_cipher,
                                 &crate::community_address_book::addrbook_path(&identity_dir, cid),
+                                cid,
                                 now_ms,
                             );
                             // ZEB-329: the projection seed for this community is the
