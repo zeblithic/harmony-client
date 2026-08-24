@@ -4347,7 +4347,7 @@ pub async fn start_node_inner(
     // ZEB-147: load() reads vine_feed.json (if any) and arms save() so
     // every mutating outcome persists to disk atomically.
     let vine_feed_cache = std::sync::Arc::new(std::sync::Mutex::new(
-        vine_feed_cache::VineFeedCache::load(&app_data_dir),
+        vine_feed_cache::VineFeedCache::load(device_cipher.as_ref(), &app_data_dir),
     ));
     let vine_feed_cache_clone = vine_feed_cache.clone();
 

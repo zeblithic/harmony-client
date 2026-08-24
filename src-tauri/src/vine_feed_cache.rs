@@ -380,10 +380,14 @@ pub struct VineFeedCache {
     /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
     /// `None` for `new()`. `save()` checks this and is a no-op when None.
     path: Option<PathBuf>,
-    /// ZEB-986: set when the file was unreadable at load (transient Io) or corrupt
-    /// bytes could not be quarantined aside. Freezes `save()` so the still-good
-    /// on-disk cache is never overwritten with the empty in-memory default.
+    /// ZEB-986: set when the file was unreadable at load (transient Io), a sealed image
+    /// would not decrypt (wrong/rotated key), or corrupt bytes could not be quarantined
+    /// aside. Freezes `save()` so the still-good on-disk cache is never overwritten with
+    /// the empty in-memory default.
     disk_write_frozen: bool,
+    /// ZEB-986 PR-3: device cipher for at-rest sealing. `None` for `new()` (ephemeral,
+    /// no persistence) and on a pre-identity boot; `save()` is a no-op when `None`.
+    cipher: Option<crate::device_dataset_file::DeviceCipher>,
 }
 
 impl VineFeedCache {
@@ -399,7 +403,10 @@ impl VineFeedCache {
     /// `version`. Applies the age cutoff and capacity cap on load so
     /// the in-memory state mirrors what `on_descriptor_sample` would
     /// enforce going forward.
-    pub fn load(data_dir: &Path) -> Self {
+    pub fn load(
+        cipher: Option<&crate::device_dataset_file::DeviceCipher>,
+        data_dir: &Path,
+    ) -> Self {
         let path = data_dir.join(VINE_FEED_FILE);
         let mut cache = Self {
             descriptors: HashMap::new(),
@@ -413,9 +420,10 @@ impl VineFeedCache {
             authority: crate::feed_authority::FeedAuthorityCache::default(),
             path: Some(path.clone()),
             disk_write_frozen: false,
+            cipher: cipher.cloned(),
         };
         cache.disk_write_frozen =
-            Self::populate_from_disk(&mut cache, &path, crate::recoverable_load::now_ms());
+            Self::populate_from_disk(&mut cache, cipher, &path, crate::recoverable_load::now_ms());
         cache
     }
 
@@ -429,9 +437,16 @@ impl VineFeedCache {
     /// `version` (forward/foreign build) also FREEZES writes so the next `save()` cannot
     /// overwrite that file with an empty current-version cache — it is left intact in
     /// place for its originating build, not quarantined.
-    fn populate_from_disk(cache: &mut Self, path: &Path, now_ms: u64) -> bool {
-        let recovered = crate::recoverable_load::load_or_recover::<Option<VineFeedDiskV1>>(
+    fn populate_from_disk(
+        cache: &mut Self,
+        cipher: Option<&crate::device_dataset_file::DeviceCipher>,
+        path: &Path,
+        now_ms: u64,
+    ) -> bool {
+        let recovered = crate::recoverable_load::load_sealed_or_recover::<Option<VineFeedDiskV1>>(
+            cipher,
             path,
+            VINE_FEED_FILE,
             now_ms,
             // Parse only — the version check happens after so an unsupported version can
             // freeze in place rather than quarantine-and-heal (which would clobber it).
@@ -1491,10 +1506,17 @@ impl VineFeedCache {
         if self.disk_write_frozen {
             tracing::warn!(
                 path = %path.display(),
-                "vine_feed_cache save skipped — file unreadable at load; preserving existing cache"
+                "vine_feed_cache save skipped — file unreadable/undecryptable at load; preserving existing cache"
             );
             return;
         }
+        let Some(cipher) = &self.cipher else {
+            tracing::warn!(
+                path = %path.display(),
+                "vine_feed_cache save skipped — no device cipher (pre-identity boot); will persist once sealed"
+            );
+            return;
+        };
 
         let file = VineFeedDiskV1 {
             version: FILE_VERSION,
@@ -1559,25 +1581,10 @@ impl VineFeedCache {
             }
         };
 
-        let tmp_path = {
-            let mut name = path.file_name().unwrap_or_default().to_os_string();
-            name.push(".tmp");
-            path.with_file_name(name)
-        };
-
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(err = %e, "vine_feed_cache: create_dir_all failed; changes not persisted");
-                return;
-            }
-        }
-
-        if let Err(e) = std::fs::write(&tmp_path, &json) {
-            tracing::warn!(err = %e, "vine_feed_cache: write tmp failed; changes not persisted");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, path) {
-            tracing::warn!(err = %e, "vine_feed_cache: rename failed; tmp file may be stale");
+        // ZEB-986 PR-3: seal + atomic write + fsync + 0600 in one call.
+        if let Err(e) = crate::device_dataset_file::write_image(cipher, path, VINE_FEED_FILE, &json)
+        {
+            tracing::warn!(err = %e, "vine_feed_cache: sealed write failed; changes not persisted");
         }
     }
 
@@ -1651,6 +1658,17 @@ impl VineFeedCache {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Deterministic device cipher for the sealing tests (ZEB-986 PR-3).
+    fn tc() -> crate::device_dataset_file::DeviceCipher {
+        crate::device_dataset_file::test_cipher()
+    }
+
+    /// Seal `inner` bytes into `path` as a device-sealed file (test helper for
+    /// migration/forward-version fixtures that must be sealed on disk).
+    fn seal_to(path: &std::path::Path, inner: &[u8]) {
+        crate::device_dataset_file::write_image(&tc(), path, VINE_FEED_FILE, inner).unwrap();
+    }
 
     /// ZEB-673: strict wire admission requires real signer identities,
     /// but the tests' readable creator names ("alice-addr") are worth
@@ -1829,7 +1847,7 @@ mod tests {
             .unwrap()
             .as_secs();
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let desc = canonical_descriptor_bytes(
                 "vine-sig-rt",
                 "alice-addr",
@@ -1849,7 +1867,7 @@ mod tests {
             );
         }
 
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache2.len_descriptors(), 1);
         let page =
             cache2.descriptors_for_creator_page(&addr("alice-addr"), &(0, String::new()), 10);
@@ -1901,7 +1919,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache.len_descriptors(), 1);
         assert_eq!(
             cache.list_descriptors()[0].id,
@@ -2205,7 +2223,7 @@ mod tests {
         let followed = followed_set_with(&["alice-addr"]);
 
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
 
             // A far-future descriptor (400 days ahead). It only reaches disk
             // because at insert time we feed a matching future `now_ms`, so the
@@ -2259,7 +2277,7 @@ mod tests {
         // Reload uses the REAL wall clock. The future-dated descriptor is NOT
         // deleted — it stays in the store — but is excluded from the display feed;
         // the legit one is both retained and shown.
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         assert!(
             cache2.has_descriptor("vine-legit"),
             "legit descriptor survives reload"
@@ -2281,7 +2299,7 @@ mod tests {
         // The P1 regression guard: a write-back (the path any later mutation
         // takes) must NOT purge the future-dated descriptor from disk.
         cache2.save_for_test();
-        let cache3 = VineFeedCache::load(dir.path());
+        let cache3 = VineFeedCache::load(Some(&tc()), dir.path());
         assert!(
             cache3.has_descriptor("vine-future"),
             "future-dated descriptor survives write-back — no permanent deletion (P1)"
@@ -2786,21 +2804,28 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_atomic_file_when_path_is_set() {
+    fn save_writes_sealed_file_when_path_is_set() {
         // Construct a cache with path set, mutate it, call save() directly
         // (the method is private — we invoke it via a Task-2-internal
-        // test helper exposing `save_for_test`). Verify the file exists
-        // and contains expected JSON.
+        // test helper exposing `save_for_test`). Verify the file exists,
+        // is SEALED on disk (ZEB-986 PR-3), and its decrypted inner is JSON.
         let dir = tempfile::tempdir().expect("create tempdir");
-        let mut cache = VineFeedCache::load(dir.path());
+        let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
         cache.mark_viewed("v-saved".to_string());
         cache.save_for_test();
 
         let path = dir.path().join(VINE_FEED_FILE);
         assert!(path.exists(), "vine_feed.json must exist after save");
-        let bytes = std::fs::read(&path).expect("read saved file");
+        assert_eq!(
+            std::fs::read(&path).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "saved file is sealed on disk"
+        );
+        let image = crate::device_dataset_file::read_image(&tc(), &path, VINE_FEED_FILE)
+            .expect("read sealed image")
+            .expect("file present");
         let json: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("file must be valid JSON");
+            serde_json::from_slice(&image.bytes).expect("decrypted inner is valid JSON");
         assert_eq!(json["version"], FILE_VERSION);
         assert!(
             json["viewed"]
@@ -2814,7 +2839,7 @@ mod tests {
     #[test]
     fn load_empty_dir_returns_empty_cache() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
         assert!(!cache.is_viewed("anything"));
@@ -2833,7 +2858,7 @@ mod tests {
         // Phase 1: build + save state
         let dir = tempfile::tempdir().expect("create tempdir");
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let followed = followed_set_with(&["alice-addr"]);
             let desc = canonical_descriptor_bytes(
                 "vine-rt",
@@ -2863,7 +2888,7 @@ mod tests {
             cache.save_for_test();
         }
         // Phase 2: reload from same dir, assert state survived
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache2.len_descriptors(), 1);
         assert_eq!(cache2.len_reactions(), 1);
         assert!(cache2.is_viewed("vine-rt"));
@@ -2896,7 +2921,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
 
         // load() must treat wrong-version as "missing file" — empty cache
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
         assert!(!cache.is_viewed("v-ignored"));
@@ -2906,20 +2931,23 @@ mod tests {
     fn wrong_version_freezes_and_preserves_file() {
         // ZEB-986: a forward/foreign-version file must be left byte-identical — the load
         // freezes writes so the next save() cannot overwrite it with an empty
-        // current-version cache, and it is NOT quarantined.
+        // current-version cache, and it is NOT quarantined. Post-PR-3 the on-disk
+        // forward file is SEALED (every build seals), so freeze leaves the sealed bytes
+        // byte-identical with no reseal churn.
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join(VINE_FEED_FILE);
         let forward = br#"{"version":999,"descriptors":[],"reactions":[],"viewed":["v-x"]}"#;
-        std::fs::write(&path, forward).unwrap();
+        seal_to(&path, forward);
+        let sealed = std::fs::read(&path).unwrap();
 
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache.len_descriptors(), 0);
         // Frozen: save() is a no-op, so the foreign-version file is untouched.
         cache.save_for_test();
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            forward,
-            "foreign-version file left byte-identical"
+            sealed,
+            "foreign-version sealed file left byte-identical"
         );
         let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
             e.file_name()
@@ -2938,7 +2966,7 @@ mod tests {
         let path = dir.path().join(VINE_FEED_FILE);
         std::fs::write(&path, b"{ this is not valid json").unwrap();
 
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
     }
@@ -2951,7 +2979,7 @@ mod tests {
         let path = dir.path().join(VINE_FEED_FILE);
         std::fs::write(&path, b"{ not valid json").unwrap();
 
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache.len_descriptors(), 0);
         let has_sidecar = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
             e.file_name()
@@ -2960,15 +2988,62 @@ mod tests {
         });
         assert!(has_sidecar, "corrupt bytes quarantined aside");
 
-        // Not frozen: a save rewrites a fresh valid file that reloads cleanly.
+        // Not frozen: a save rewrites a fresh SEALED file that reloads cleanly.
         cache.save_for_test();
-        let reloaded = VineFeedCache::load(dir.path());
+        let reloaded = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(reloaded.len_descriptors(), 0);
         let bytes = std::fs::read(&path).unwrap();
-        assert!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).is_ok(),
-            "healed main file is valid JSON"
+        assert_eq!(
+            bytes[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "healed main file is sealed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
+        cache.mark_viewed("v".to_string());
+        cache.save_for_test();
+        let mode = std::fs::metadata(dir.path().join(VINE_FEED_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "sealed vine_feed file is owner-only");
+    }
+
+    #[test]
+    fn foreign_cipher_freezes_and_preserves_sealed_file() {
+        // A sealed cache loaded under the wrong device key must not be wiped or
+        // quarantined — it freezes and the file is left byte-identical.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        {
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
+            cache.mark_viewed("keepme".to_string());
+            cache.save_for_test();
+        }
+        let path = dir.path().join(VINE_FEED_FILE);
+        let sealed = std::fs::read(&path).unwrap();
+        let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
+        let mut cache = VineFeedCache::load(Some(&foreign), dir.path());
+        assert!(!cache.is_viewed("keepme"), "undecryptable → empty in memory");
+        cache.mark_viewed("newone".to_string());
+        cache.save_for_test(); // frozen: no-op
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            sealed,
+            "sealed file preserved byte-identical under a foreign cipher"
+        );
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("vine_feed.json.corrupt-")
+        });
+        assert!(!quarantined, "sealed decrypt failure freezes, never quarantines");
     }
 
     #[test]
@@ -3031,7 +3106,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(
             cache.len_descriptors(),
             1,
@@ -3050,7 +3125,7 @@ mod tests {
     fn descriptor_insert_persists_to_disk() {
         let dir = tempfile::tempdir().expect("create tempdir");
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let followed = followed_set_with(&["alice-addr"]);
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3073,7 +3148,7 @@ mod tests {
             // No explicit save_for_test() call — Task 4 wires save() into
             // on_descriptor_sample, so the disk must already reflect this.
         }
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache2.len_descriptors(), 1);
         assert_eq!(cache2.list_descriptors()[0].id, "vine-p1");
     }
@@ -3087,7 +3162,7 @@ mod tests {
             .as_secs();
         let recent = now_secs.saturating_sub(60);
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let followed = followed_set_with(&["alice-addr"]);
             // Need a descriptor first (otherwise reaction is orphaned and
             // load() drops it).
@@ -3123,7 +3198,7 @@ mod tests {
             assert_eq!(out2, Some(ReactionOutcome::UpdatedNewer));
         }
         // Reload — both descriptor and updated reaction must be persisted
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache2.len_reactions(), 1);
         // The final reaction value should be liked=false at recent+20
         let summary = cache2.get_reaction("vine-r1", &addr("bob-addr"));
@@ -3143,7 +3218,7 @@ mod tests {
             .as_secs();
         let recent = now_secs.saturating_sub(60);
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let followed = followed_set_with(&["alice-addr"]);
             let desc = canonical_descriptor_bytes(
                 "vine-ri",
@@ -3166,7 +3241,7 @@ mod tests {
             assert_eq!(out, Some(ReactionOutcome::Inserted));
             // No further mutations — the Inserted save must be sufficient.
         }
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(cache2.len_reactions(), 1);
         let summary = cache2.get_reaction("vine-ri", &addr("bob-addr"));
         assert_eq!(summary.count, 1);
@@ -3186,7 +3261,7 @@ mod tests {
             .as_secs();
         let recent = now_secs.saturating_sub(60);
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let followed = followed_set_with(&["alice-addr"]);
             let desc = canonical_descriptor_bytes(
                 "vine-lr",
@@ -3205,7 +3280,7 @@ mod tests {
             let r2 = canonical_reaction_bytes("vine-lr", "ann-addr", "Ann", false, recent + 11);
             cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "ann-addr"), &r2, 0);
         }
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         let rows = cache2.list_reactions();
         assert_eq!(rows.len(), 2);
         // Rows sort by (vine_id, reactor_address); derived signer
@@ -3261,7 +3336,7 @@ mod tests {
     fn mark_viewed_persists_to_disk() {
         let dir = tempfile::tempdir().expect("create tempdir");
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let first = cache.mark_viewed("v-mv".to_string());
             assert!(first);
             // Second call returns false; the disk write side-effect must
@@ -3271,7 +3346,7 @@ mod tests {
             let second = cache.mark_viewed("v-mv".to_string());
             assert!(!second);
         }
-        let cache2 = VineFeedCache::load(dir.path());
+        let cache2 = VineFeedCache::load(Some(&tc()), dir.path());
         assert!(cache2.is_viewed("v-mv"));
     }
 
@@ -3285,7 +3360,7 @@ mod tests {
 
         // First boot: insert a reshare with full attribution, drop the cache.
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let payload = canonical_descriptor_bytes(
                 "vine-reshare",
                 "addr-resharer",
@@ -3312,7 +3387,7 @@ mod tests {
 
         // Second boot: reload, verify attribution survived.
         {
-            let cache = VineFeedCache::load(dir.path());
+            let cache = VineFeedCache::load(Some(&tc()), dir.path());
             let dtos = cache.list_descriptors();
             let dto = dtos
                 .iter()
@@ -3552,7 +3627,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         let ids: HashSet<String> = cache
             .list_descriptors()
             .iter()
@@ -3650,7 +3725,7 @@ mod tests {
         )
         .unwrap();
 
-        let load_cache = VineFeedCache::load(dir.path());
+        let load_cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(load_cache.len_descriptors(), MAX_DESCRIPTORS);
         let load_ids: HashSet<String> = load_cache
             .list_descriptors()
@@ -4216,7 +4291,7 @@ mod tests {
         let (id, addr) = tombstone_identity();
         let dir = tempfile::tempdir().expect("create tempdir");
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             insert_descriptor(&mut cache, "vine-1", &addr, "cid-aaa");
             cache.on_tombstone_sample(
                 &format!("harmony/vines/{addr}/tombstones/vine-1"),
@@ -4224,7 +4299,7 @@ mod tests {
             );
         }
 
-        let mut reloaded = VineFeedCache::load(dir.path());
+        let mut reloaded = VineFeedCache::load(Some(&tc()), dir.path());
         assert_eq!(reloaded.len_descriptors(), 0);
         // Descriptor re-arrival after restart must still be blocked.
         let payload = canonical_descriptor_bytes(
@@ -4261,7 +4336,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache = VineFeedCache::load(dir.path());
+        let cache = VineFeedCache::load(Some(&tc()), dir.path());
         assert!(cache.is_viewed("vine-x"), "legacy file must load unchanged");
     }
 
@@ -4434,14 +4509,14 @@ mod tests {
     fn follow_lists_survive_disk_reload() {
         let dir = tempfile::tempdir().expect("create tempdir");
         {
-            let mut cache = VineFeedCache::load(dir.path());
+            let mut cache = VineFeedCache::load(Some(&tc()), dir.path());
             let outcome = cache.on_follow_list_sample(
                 &follows_topic("fl-alice"),
                 &follow_list_bytes("fl-alice", &["fl-bob"], 100),
             );
             assert_eq!(outcome, FollowListOutcome::Inserted);
         }
-        let reloaded = VineFeedCache::load(dir.path());
+        let reloaded = VineFeedCache::load(Some(&tc()), dir.path());
         let entry = reloaded
             .follow_lists()
             .get(&addr("fl-alice"))
@@ -4449,8 +4524,16 @@ mod tests {
         assert_eq!(entry.follows, vec![addr("fl-bob")]);
         assert_eq!(entry.updated_at, 100);
 
-        // Disk shape pin: sigs are NOT retained (verify-once-at-ingest).
-        let raw = std::fs::read_to_string(dir.path().join("vine_feed.json")).unwrap();
+        // Disk shape pin: sigs are NOT retained (verify-once-at-ingest). Decrypt the
+        // sealed envelope first (ZEB-986 PR-3 — the file is no longer plaintext).
+        let image = crate::device_dataset_file::read_image(
+            &tc(),
+            &dir.path().join("vine_feed.json"),
+            VINE_FEED_FILE,
+        )
+        .unwrap()
+        .unwrap();
+        let raw = String::from_utf8(image.bytes.to_vec()).unwrap();
         assert!(
             raw.contains("follow_lists"),
             "envelope key is snake_case like its siblings"
