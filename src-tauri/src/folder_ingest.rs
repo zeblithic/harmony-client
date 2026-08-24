@@ -693,7 +693,7 @@ mod tests {
     /// (matches the lib.rs `path_ingest_tests::fresh_content_index` pattern).
     fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let idx = ContentIndex::load(dir.path());
+        let idx = ContentIndex::load(Some(&crate::device_dataset_file::test_cipher()), dir.path());
         std::mem::forget(dir);
         Arc::new(Mutex::new(idx))
     }

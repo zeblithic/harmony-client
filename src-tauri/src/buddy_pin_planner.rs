@@ -87,6 +87,15 @@ pub fn plan(
 ) -> PinPlan {
     let mut out = PinPlan::default();
 
+    // ZEB-986 PR-3 (Greptile PR #731): a frozen ledger reads as empty, so
+    // planning against it would re-fetch and re-pin the entire pledged corpus
+    // — physical pins that `save()` (frozen) never records, diverging from the
+    // preserved on-disk ledger across a restart. Drive ZERO physical hosting
+    // work until the ledger loads a trustworthy image.
+    if ledger.sealed_fault() {
+        return out;
+    }
+
     let pledgers: HashSet<String> = records
         .owners_pledging_to(me)
         .into_iter()
@@ -209,7 +218,7 @@ mod tests {
     fn seeded_records(
         buddies: &[(&str, u64, Vec<BackupEntry>)],
     ) -> (StorageRecordStore, Vec<String>) {
-        let mut store = StorageRecordStore::new(None);
+        let mut store = StorageRecordStore::new(None, None);
         let mut owners = Vec::new();
         for (name, pledge_to_me, entries) in buddies {
             let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
@@ -274,7 +283,7 @@ mod tests {
             vec![entry(b"a", 40), entry(b"b", 40), entry(b"c", 40)],
         )]);
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
-        let ledger = StorageLedger::new(None);
+        let ledger = StorageLedger::new(None, None);
 
         let plan = plan(
             ME,
@@ -300,7 +309,7 @@ mod tests {
     fn zero_pledge_pact_is_active_but_fetches_nothing() {
         let (records, owners) = seeded_records(&[("alice", 50, vec![entry(b"a", 10)])]);
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 0)].into();
-        let ledger = StorageLedger::new(None);
+        let ledger = StorageLedger::new(None, None);
 
         let plan = plan(
             ME,
@@ -320,7 +329,7 @@ mod tests {
         // They pledge to me but I never pledged back ⇒ no fetching.
         let (records, owners) = seeded_records(&[("alice", 50, vec![entry(b"a", 10)])]);
         let my_pledges: BTreeMap<String, u64> = BTreeMap::new();
-        let ledger = StorageLedger::new(None);
+        let ledger = StorageLedger::new(None, None);
 
         let plan = plan(
             ME,
@@ -343,7 +352,7 @@ mod tests {
         ]);
         let my_pledges: BTreeMap<String, u64> =
             [(owners[0].clone(), 1_000), (owners[1].clone(), 1_000)].into();
-        let ledger = StorageLedger::new(None);
+        let ledger = StorageLedger::new(None, None);
         // 50 bytes already reserved by an in-flight fetch ⇒ budget 100
         // fits neither 60-byte entry.
         let inflight: HashMap<String, InflightFetch> = [(
@@ -380,7 +389,7 @@ mod tests {
         ]);
         let my_pledges: BTreeMap<String, u64> =
             [(owners[0].clone(), 100), (owners[1].clone(), 100)].into();
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         // Alice's copy already fetched+pinned (actual 70).
         ledger.record_pin(&owners[0], &shared.cid, 70, 1);
 
@@ -411,7 +420,7 @@ mod tests {
         // I pledge only to alice ⇒ bob's pact (with ledger residue) is
         // inactive; alice dropped "gone" from her set.
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin(&owners[0], &kept.cid, 10, 1);
         ledger.record_pin(&owners[0], &cid_hex(b"gone"), 5, 2);
         ledger.record_pin(&owners[1], &cid_hex(b"bobs"), 7, 3);
@@ -439,7 +448,7 @@ mod tests {
         let kept = entry(b"kept", 10);
         let (mut records, owners) = seeded_records(&[("alice", 50, vec![kept.clone()])]);
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin(&owners[0], &kept.cid, 10, 1);
 
         assert!(records.sweep_stale_pledges_and_backups(9_000 + STORAGE_RECORD_TTL_MS));
@@ -467,7 +476,7 @@ mod tests {
         // stays active and `desired` collapses to empty ⇒ every pinned
         // CID for the buddy lands in `release` (the unwrap_or_default
         // path), not `release_buddies`.
-        let mut records = StorageRecordStore::new(None);
+        let mut records = StorageRecordStore::new(None, None);
         let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
         let owner = hex::encode(id.public_identity().address_hash);
         let rvk = crate::revoked_device_projection::RevokedDeviceProjection::new();
@@ -523,7 +532,7 @@ mod tests {
         assert!(records.backup_set(&owner).is_none(), "backup set decayed");
 
         let my_pledges: BTreeMap<String, u64> = [(owner.clone(), 100)].into();
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin(&owner, &kept.cid, 10, 1);
         let plan = plan(
             ME,
@@ -542,7 +551,7 @@ mod tests {
     fn budget_shrink_sets_evict_target() {
         let (records, _) = seeded_records(&[]);
         let my_pledges = BTreeMap::new();
-        let mut ledger = StorageLedger::new(None);
+        let mut ledger = StorageLedger::new(None, None);
         ledger.record_pin("anyone", "cid", 500, 1);
 
         let plan = plan(
@@ -563,7 +572,7 @@ mod tests {
         let ok = entry(b"ok", 10);
         let (records, owners) = seeded_records(&[("alice", 0, vec![blocked.clone(), ok.clone()])]);
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
-        let ledger = StorageLedger::new(None);
+        let ledger = StorageLedger::new(None, None);
         let blocked_cid = blocked.cid.clone();
 
         let plan = plan(
@@ -591,7 +600,7 @@ mod tests {
         let e = entry(b"a", 10);
         let (records, owners) = seeded_records(&[("alice", 0, vec![e.clone()])]);
         let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
-        let ledger = StorageLedger::new(None);
+        let ledger = StorageLedger::new(None, None);
         let inflight: HashMap<String, InflightFetch> = [(
             e.cid.clone(),
             InflightFetch {
@@ -615,6 +624,36 @@ mod tests {
     }
 
     #[test]
+    fn faulted_ledger_plans_no_physical_work() {
+        // ZEB-986 PR-3 (Greptile PR #731): the same pact that WOULD drive
+        // fetches through a healthy empty ledger must produce an empty plan
+        // when the ledger is frozen — no fetch, no attribution, no release,
+        // no evict — so a faulted ledger drives zero physical hosting ops.
+        let (records, owners) = seeded_records(&[(
+            "alice",
+            0,
+            vec![entry(b"a", 40), entry(b"b", 40), entry(b"c", 40)],
+        )]);
+        let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 1_000)].into();
+        let ledger = StorageLedger::faulted_for_test();
+
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
+        assert_eq!(
+            plan,
+            PinPlan::default(),
+            "frozen ledger ⇒ empty plan (would otherwise fetch a, b, c)"
+        );
+    }
+
+    #[test]
     fn deterministic_across_calls() {
         let (records, owners) = seeded_records(&[
             ("alice", 0, vec![entry(b"a", 10)]),
@@ -622,7 +661,7 @@ mod tests {
         ]);
         let my_pledges: BTreeMap<String, u64> =
             [(owners[0].clone(), 100), (owners[1].clone(), 100)].into();
-        let ledger = StorageLedger::new(None);
+        let ledger = StorageLedger::new(None, None);
 
         let p1 = plan(
             ME,

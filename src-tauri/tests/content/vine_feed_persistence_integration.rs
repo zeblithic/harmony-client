@@ -81,7 +81,10 @@ fn cache_survives_reload() {
 
     // Phase 1: build state and let save-on-mutation persist it
     {
-        let mut cache = VineFeedCache::load(dir.path());
+        let mut cache = VineFeedCache::load(
+            Some(&harmony_app::device_dataset_file::test_cipher()),
+            dir.path(),
+        );
 
         let followed: HashSet<String> = [addr("alice-addr")].into_iter().collect();
 
@@ -145,7 +148,10 @@ fn cache_survives_reload() {
     }
 
     // Phase 2: reload from the same tempdir
-    let cache2 = VineFeedCache::load(dir.path());
+    let cache2 = VineFeedCache::load(
+        Some(&harmony_app::device_dataset_file::test_cipher()),
+        dir.path(),
+    );
 
     // Descriptors: both present, sorted DESC by created_at
     let dtos = cache2.list_descriptors();

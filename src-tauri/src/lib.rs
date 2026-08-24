@@ -2141,16 +2141,16 @@ impl Default for NodeState {
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
-                content_index::ContentIndex::load(std::path::Path::new("")),
+                content_index::ContentIndex::load(None, std::path::Path::new("")),
             )),
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),
             )),
             storage_records: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_records::StorageRecordStore::new(None),
+                storage_records::StorageRecordStore::new(None, None),
             )),
             storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_ledger::StorageLedger::new(None),
+                storage_ledger::StorageLedger::new(None, None),
             )),
             storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
                 storage_settings::StorageSettings::default(),
@@ -4292,7 +4292,25 @@ pub async fn start_node_inner(
             );
         });
     }
-    let follow_mgr = follows::FollowManager::load(&app_data_dir, crate::recoverable_load::now_ms());
+    // ZEB-986 PR-3: device cipher for at-rest sealing of the app-data + storage stores.
+    // Threaded into every store's load. Guarded on identity.key existence so a *fresh*
+    // profile boot never fresh-generates an identity as a side effect here (get_or_derive's
+    // seed chain would otherwise create one). On an existing profile identity.key already
+    // exists → `Some`, and the stores load their data sealed. On a fresh profile identity.key
+    // does not exist yet — it is created by `identity::load_or_generate` further down in this
+    // function — so this resolves to `None`; the store files are absent too, so those early
+    // loads are correctly first-run empty. The cipher is re-derived and armed onto those
+    // stores below (`arm_cipher`) once identity exists, so first-session writes persist.
+    let mut app_data_cipher: Option<crate::device_dataset_file::DeviceCipher> =
+        crate::owner_commands::resolve_identity_dir()
+            .ok()
+            .filter(|id| id.join("identity.key").exists())
+            .and_then(|id| crate::device_dataset_file::get_or_derive(&id).ok());
+    let mut follow_mgr = follows::FollowManager::load(
+        app_data_cipher.as_ref(),
+        &app_data_dir,
+        crate::recoverable_load::now_ms(),
+    );
     // ZEB-671: share_follows gate for follow-list wire publication.
     let vine_settings_path = vine_settings::settings_path(&app_data_dir);
     let vine_settings_loaded = vine_settings::load_or_default(&vine_settings_path);
@@ -4302,16 +4320,19 @@ pub async fn start_node_inner(
     let storage_settings_path = storage_settings::settings_path(&app_data_dir);
     let storage_settings_loaded = storage_settings::load_or_default(&storage_settings_path);
     let storage_records_arc = std::sync::Arc::new(std::sync::Mutex::new({
-        let mut records = storage_records::StorageRecordStore::new(Some(
-            app_data_dir.join("storage_records.json"),
-        ));
+        let mut records = storage_records::StorageRecordStore::new(
+            app_data_cipher.clone(),
+            Some(app_data_dir.join("storage_records.json")),
+        );
         // ZEB-923: one-shot post-load grace floor — see apply_boot_grace.
         records.apply_boot_grace(wall_clock_ms());
         records
     }));
-    let storage_ledger_arc = std::sync::Arc::new(std::sync::Mutex::new(
-        storage_ledger::StorageLedger::new(Some(app_data_dir.join("storage_ledger.json"))),
-    ));
+    let storage_ledger_arc =
+        std::sync::Arc::new(std::sync::Mutex::new(storage_ledger::StorageLedger::new(
+            app_data_cipher.clone(),
+            Some(app_data_dir.join("storage_ledger.json")),
+        )));
     let storage_settings_arc =
         std::sync::Arc::new(std::sync::Mutex::new(storage_settings_loaded.clone()));
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
@@ -4331,7 +4352,7 @@ pub async fn start_node_inner(
     // ZEB-147: load() reads vine_feed.json (if any) and arms save() so
     // every mutating outcome persists to disk atomically.
     let vine_feed_cache = std::sync::Arc::new(std::sync::Mutex::new(
-        vine_feed_cache::VineFeedCache::load(&app_data_dir),
+        vine_feed_cache::VineFeedCache::load(app_data_cipher.as_ref(), &app_data_dir),
     ));
     let vine_feed_cache_clone = vine_feed_cache.clone();
 
@@ -4825,6 +4846,60 @@ pub async fn start_node_inner(
             crate::identity::KeychainStore::new().ok(),
         )?;
         tracing::info!("BOOT-PROBE 01: owner state loaded (keychain reads done)");
+        // ZEB-986 PR-3: on a FRESH profile the device cipher was `None` when the app-data
+        // and storage stores first loaded, because `identity.key` is created by
+        // `identity::load_or_generate` above — AFTER those early loads. Now that identity
+        // exists, (re-)derive the cipher and ARM the early stores so their first-session
+        // mutations seal to disk instead of being silently dropped. Those stores loaded
+        // empty on a fresh profile (their files were absent), so arming the cipher is
+        // enough — no data reload is needed. On an existing profile the cipher was already
+        // `Some`, so this whole block is skipped. This also re-arms `device_cipher` for the
+        // stores that load LATER in this function (content-index, vine-pull), which pick up
+        // the re-derived value directly.
+        if app_data_cipher.is_none() {
+            // Distinguish the three cases so a genuine derive FAILURE is not silently masked
+            // as a benign pre-identity state (PR-731 review, CodeRabbit): identity.key still
+            // absent → genuinely pre-identity/local-only (stores stay first-run empty, no
+            // warn); identity.key present but derive errors → surface it (stores stay
+            // read-only this session, data preserved, recovers next boot); derive OK → arm.
+            match crate::owner_commands::resolve_identity_dir() {
+                Ok(id) if id.join("identity.key").exists() => {
+                    match crate::device_dataset_file::get_or_derive(&id) {
+                        Ok(cipher) => {
+                            app_data_cipher = Some(cipher.clone());
+                            follow_mgr.arm_cipher(cipher.clone());
+                            storage_records_arc
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .arm_cipher(cipher.clone());
+                            storage_ledger_arc
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .arm_cipher(cipher.clone());
+                            vine_feed_cache
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .arm_cipher(cipher);
+                            tracing::info!(
+                                "ZEB-986: device cipher armed onto early-loaded stores after fresh-profile identity creation"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "ZEB-986: identity.key exists but device-cipher derive failed; app-data/storage stores stay read-only this session (existing data preserved, recovers next boot)"
+                        ),
+                    }
+                }
+                Ok(_) => {
+                    // identity.key still absent (local-only / pre-mint path that did not
+                    // generate a node seed): stores remain first-run empty. Benign.
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "ZEB-986: identity dir unresolved after identity load; app-data/storage stores stay read-only this session"
+                ),
+            }
+        }
         // ZEB-668 S1 boot refusal: a device whose own enrollment is revoked
         // in the trust CRDT must not rejoin the fleet. Dropping the loaded
         // owner here makes every downstream owner-gated wiring block behave
@@ -12752,6 +12827,10 @@ pub async fn start_node_inner(
                                                 vine_pull_followed_creators,
                                                 vine_pull_last_received_ms,
                                                 app_data_dir.join("vine_pull.cbor"),
+                                                // `device_cipher` here is the plain (non-Option)
+                                                // owner-state cipher derived post-identity above;
+                                                // wrap in Some for the driver's Option param.
+                                                Some(device_cipher.clone()),
                                             )
                                             .with_telemetry(vine_pull_telemetry),
                                         );
@@ -13717,7 +13796,7 @@ pub async fn start_node_inner(
                 // (the next NEW-Arc save() overwrites). That end-to-end
                 // serialization is ZEB-160's territory.
                 let content_index = std::sync::Arc::new(std::sync::Mutex::new(
-                    content_index::ContentIndex::load(&app_data_dir),
+                    content_index::ContentIndex::load(app_data_cipher.as_ref(), &app_data_dir),
                 ));
                 let pin_intent: std::collections::HashSet<[u8; 32]> = {
                     let idx = content_index
@@ -20349,6 +20428,7 @@ mod follow_list_publish_tests {
         let state = Mutex::new(NodeState {
             follow_tx: Some(follow_tx),
             follow_mgr: Some(follows::FollowManager::load(
+                Some(&crate::device_dataset_file::test_cipher()),
                 &temp_data_dir(),
                 crate::recoverable_load::now_ms(),
             )),
@@ -25770,7 +25850,10 @@ mod path_ingest_tests {
 
     fn fresh_content_index() -> Arc<std::sync::Mutex<content_index::ContentIndex>> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let idx = content_index::ContentIndex::load(dir.path());
+        let idx = content_index::ContentIndex::load(
+            Some(&crate::device_dataset_file::test_cipher()),
+            dir.path(),
+        );
         // Leak the TempDir so the persist directory survives the test body
         // — we don't validate on-disk persistence here, only in-memory rows.
         std::mem::forget(dir);
@@ -77173,7 +77256,7 @@ mod tests {
     #[test]
     fn collect_reannouncements_public_only_deduped() {
         use content_index::Sensitivity;
-        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        let mut index = content_index::ContentIndex::load(None, std::path::Path::new(""));
         index.insert(reannounce_entry(
             [0xAA; 32],
             Sensitivity::Public,
@@ -77225,7 +77308,7 @@ mod tests {
 
     #[test]
     fn collect_reannouncements_saturates_oversized() {
-        let mut index = content_index::ContentIndex::load(std::path::Path::new(""));
+        let mut index = content_index::ContentIndex::load(None, std::path::Path::new(""));
         index.insert(reannounce_entry(
             [0xEE; 32],
             content_index::Sensitivity::Public,
@@ -78075,7 +78158,7 @@ mod pin_persistence_tests {
         .expect("cid")
         .to_bytes();
 
-        let mut idx = content_index::ContentIndex::load(std::path::Path::new(""));
+        let mut idx = content_index::ContentIndex::load(None, std::path::Path::new(""));
         idx.insert(content_index::ContentIndexEntry {
             sidecar_id: content_index::SidecarId::new(),
             cid: enc_cid,
@@ -83651,16 +83734,16 @@ mod start_node_race_tests {
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
-                content_index::ContentIndex::load(std::path::Path::new("")),
+                content_index::ContentIndex::load(None, std::path::Path::new("")),
             )),
             observed_holders: std::sync::Arc::new(std::sync::Mutex::new(
                 observed_holders::ObservedHolders::new(),
             )),
             storage_records: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_records::StorageRecordStore::new(None),
+                storage_records::StorageRecordStore::new(None, None),
             )),
             storage_ledger: std::sync::Arc::new(std::sync::Mutex::new(
-                storage_ledger::StorageLedger::new(None),
+                storage_ledger::StorageLedger::new(None, None),
             )),
             storage_settings: std::sync::Arc::new(std::sync::Mutex::new(
                 storage_settings::StorageSettings::default(),

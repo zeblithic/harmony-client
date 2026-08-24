@@ -16,7 +16,10 @@ use file_sharing_helpers::{reassemble_from_store, spawn_recording_store, write_t
 
 fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     let dir = tempfile::tempdir().expect("tempdir");
-    let idx = ContentIndex::load(dir.path());
+    let idx = ContentIndex::load(
+        Some(&harmony_app::device_dataset_file::test_cipher()),
+        dir.path(),
+    );
     std::mem::forget(dir);
     Arc::new(Mutex::new(idx))
 }

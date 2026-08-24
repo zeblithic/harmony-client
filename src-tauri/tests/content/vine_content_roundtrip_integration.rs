@@ -289,14 +289,17 @@ fn spawn_event_loop(
                     )),
                     // ZEB-612 S3: re-announce not exercised (empty index)
                     std::sync::Arc::new(std::sync::Mutex::new(
-                        harmony_app::content_index::ContentIndex::load(std::path::Path::new("")),
+                        harmony_app::content_index::ContentIndex::load(
+                            None,
+                            std::path::Path::new(""),
+                        ),
                     )),
                     // ZEB-669 S2: buddy records/ledger/settings not exercised
                     std::sync::Arc::new(std::sync::Mutex::new(
-                        harmony_app::storage_records::StorageRecordStore::new(None),
+                        harmony_app::storage_records::StorageRecordStore::new(None, None),
                     )),
                     std::sync::Arc::new(std::sync::Mutex::new(
-                        harmony_app::storage_ledger::StorageLedger::new(None),
+                        harmony_app::storage_ledger::StorageLedger::new(None, None),
                     )),
                     std::sync::Arc::new(std::sync::Mutex::new(
                         harmony_app::storage_settings::StorageSettings::default(),

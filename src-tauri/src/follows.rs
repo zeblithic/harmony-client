@@ -1,7 +1,10 @@
 //! Follow list persistence — tracks followed addresses with optional names.
 //!
-//! Uses atomic writes (write temp file, then rename) to avoid partial writes.
-//! The JSON format is:
+//! ZEB-986 PR-3: sealed at rest under the device envelope (the outbound follow graph
+//! is confidentiality-sensitive). Writes go through `device_dataset_file::write_image`
+//! (seal + atomic temp + fsync + 0600); loads through `recoverable_load::
+//! load_sealed_or_recover`, which decrypts, migrates a legacy plaintext file in place,
+//! and freezes rather than wiping on a decrypt failure. The inner (pre-seal) JSON is:
 //! ```json
 //! {
 //!   "version": 1,
@@ -36,28 +39,40 @@ struct FollowsFile {
 pub struct FollowManager {
     path: PathBuf,
     follows: Vec<FollowEntry>,
-    /// When the file was unreadable at load (transient Io), or corrupt bytes could not
-    /// be quarantined aside, writes are frozen so the still-good on-disk follow graph is
-    /// never overwritten with the empty in-memory default (ZEB-986).
+    /// When the file was unreadable at load (transient Io), a sealed image would not
+    /// decrypt (wrong/rotated key), or corrupt bytes could not be quarantined aside,
+    /// writes are frozen so the still-good on-disk follow graph is never overwritten with
+    /// the empty in-memory default (ZEB-986).
     disk_write_frozen: bool,
+    /// Device cipher for at-rest sealing (ZEB-986 PR-3). `None` on a pre-identity boot
+    /// (no derivable seed yet); in that state `save()` is a no-op and the graph persists
+    /// once a cipher is available.
+    cipher: Option<crate::device_dataset_file::DeviceCipher>,
 }
 
 impl FollowManager {
-    /// Load the follow list from `data_dir/follows.json`.
+    /// Load the follow list from `data_dir/follows.json`, sealed under the device envelope.
     ///
-    /// A missing file starts empty (first run). A transient read error starts empty but
-    /// FREEZES writes (the on-disk graph may still be good). Malformed/undecodable bytes
-    /// are quarantined aside (`follows.json.corrupt-<now_ms>`) and heal on the next write.
-    /// A parseable-but-unsupported `version` (forward/foreign build) FREEZES in place —
-    /// left intact, not quarantined — so the next `save()` cannot overwrite it with an
-    /// empty current-version file (a downgrade or later support can still use it).
-    pub fn load(data_dir: &Path, now_ms: u64) -> Self {
+    /// A missing file starts empty (first run). A transient read error, or a sealed image
+    /// that will not decrypt (wrong/rotated key), starts empty but FREEZES writes (the
+    /// on-disk graph may still be good). Malformed/undecodable *legacy plaintext* bytes are
+    /// quarantined aside (`follows.json.corrupt-<now_ms>`) and heal on the next write. A
+    /// parseable-but-unsupported `version` (forward/foreign build) FREEZES in place — left
+    /// intact, not quarantined — so the next `save()` cannot overwrite it with an empty
+    /// current-version file. A legacy plaintext file that parses is re-sealed in place.
+    pub fn load(
+        cipher: Option<&crate::device_dataset_file::DeviceCipher>,
+        data_dir: &Path,
+        now_ms: u64,
+    ) -> Self {
         let path = data_dir.join(FOLLOWS_FILE);
         // Parse only — the version check happens after so an unsupported-but-parseable
         // version freezes in place rather than being quarantined-and-healed (which would
         // drop the foreign-version follows on the next mutation).
-        let recovered = crate::recoverable_load::load_or_recover::<Option<FollowsFile>>(
+        let recovered = crate::recoverable_load::load_sealed_or_recover::<Option<FollowsFile>>(
+            cipher,
             &path,
+            FOLLOWS_FILE,
             now_ms,
             |bytes| {
                 serde_json::from_slice::<FollowsFile>(bytes)
@@ -83,18 +98,38 @@ impl FollowManager {
             path,
             follows,
             disk_write_frozen,
+            cipher: cipher.cloned(),
         }
     }
 
-    /// Atomically write the follow list to disk (temp file + rename).
+    /// ZEB-986 PR-3: arm the device cipher after a fresh-profile boot. `identity.key` is
+    /// created by `load_or_generate` partway through `start_node_inner`, AFTER this manager
+    /// first loads — so on a fresh profile it loads with `cipher = None` and `save()` is a
+    /// no-op. The follow graph loaded empty (the file was absent on a fresh profile), so
+    /// arming the cipher once identity exists is enough for later saves to seal; no reload
+    /// is needed. A no-op if a cipher is already present (existing profile).
+    pub fn arm_cipher(&mut self, cipher: crate::device_dataset_file::DeviceCipher) {
+        if self.cipher.is_none() {
+            self.cipher = Some(cipher);
+        }
+    }
+
+    /// Seal the follow list to disk (`write_image` = seal + atomic temp + fsync + 0600).
     fn save(&self) {
         if self.disk_write_frozen {
             tracing::warn!(
                 path = ?self.path,
-                "follows save skipped — file unreadable at load; preserving existing graph"
+                "follows save skipped — file unreadable/undecryptable at load; preserving existing graph"
             );
             return;
         }
+        let Some(cipher) = &self.cipher else {
+            tracing::warn!(
+                path = ?self.path,
+                "follows save skipped — no device cipher (pre-identity boot); will persist once sealed"
+            );
+            return;
+        };
         let file = FollowsFile {
             version: FILE_VERSION,
             follows: self.follows.clone(),
@@ -103,21 +138,10 @@ impl FollowManager {
             Ok(j) => j,
             Err(_) => return,
         };
-
-        // Build a temp path alongside the real path.
-        let tmp_path = {
-            let mut name = self.path.file_name().unwrap_or_default().to_os_string();
-            name.push(".tmp");
-            self.path.with_file_name(name)
-        };
-
-        // Ensure parent directory exists.
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        if std::fs::write(&tmp_path, &json).is_ok() {
-            let _ = std::fs::rename(&tmp_path, &self.path);
+        if let Err(e) =
+            crate::device_dataset_file::write_image(cipher, &self.path, FOLLOWS_FILE, &json)
+        {
+            tracing::warn!(path = ?self.path, error = %e, "follows save failed; changes not persisted");
         }
     }
 
@@ -183,17 +207,22 @@ mod tests {
         dir
     }
 
+    /// Deterministic device cipher for the sealing tests (ZEB-986 PR-3).
+    fn tc() -> crate::device_dataset_file::DeviceCipher {
+        crate::device_dataset_file::test_cipher()
+    }
+
     #[test]
     fn load_empty_dir_returns_empty_manager() {
         let dir = temp_dir();
-        let mgr = FollowManager::load(&dir, 1);
+        let mgr = FollowManager::load(Some(&tc()), &dir, 1);
         assert!(mgr.list().is_empty());
     }
 
     #[test]
     fn follow_and_list() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir, 1);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
         mgr.follow("addr1".to_string(), Some("Alice".to_string()));
         mgr.follow("addr2".to_string(), None);
         let list = mgr.list();
@@ -209,7 +238,7 @@ mod tests {
     #[test]
     fn follow_is_idempotent() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir, 1);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
         let first = mgr.follow("addr1".to_string(), Some("Alice".to_string()));
         let second = mgr.follow("addr1".to_string(), Some("Alice Again".to_string()));
         assert!(first, "first follow should return true");
@@ -223,7 +252,7 @@ mod tests {
     #[test]
     fn unfollow_returns_true_when_present() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir, 1);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
         mgr.follow("addr1".to_string(), None);
         let result = mgr.unfollow("addr1");
         assert!(result);
@@ -233,7 +262,7 @@ mod tests {
     #[test]
     fn unfollow_returns_false_when_absent() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir, 1);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
         let result = mgr.unfollow("nonexistent");
         assert!(!result);
     }
@@ -242,13 +271,13 @@ mod tests {
     fn persistence_round_trip() {
         let dir = temp_dir();
         {
-            let mut mgr = FollowManager::load(&dir, 1);
+            let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
             mgr.follow("addr1".to_string(), Some("Alice".to_string()));
             mgr.follow("addr2".to_string(), None);
             // mgr drops here, file is already saved after each follow()
         }
         // Reload from disk
-        let mgr2 = FollowManager::load(&dir, 1);
+        let mgr2 = FollowManager::load(Some(&tc()), &dir, 1);
         let list = mgr2.list();
         assert_eq!(list.len(), 2);
         assert!(mgr2.is_followed("addr1"));
@@ -260,7 +289,7 @@ mod tests {
     #[test]
     fn addresses_returns_all_followed() {
         let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir, 1);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
         mgr.follow("addr1".to_string(), None);
         mgr.follow("addr2".to_string(), None);
         mgr.follow("addr3".to_string(), None);
@@ -275,7 +304,7 @@ mod tests {
     fn corrupt_follows_quarantined_and_heals() {
         let dir = temp_dir();
         std::fs::write(dir.join(FOLLOWS_FILE), b"{ not json").unwrap();
-        let mut mgr = FollowManager::load(&dir, 4_242);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 4_242);
         assert!(mgr.list().is_empty(), "corrupt file starts empty");
         assert!(
             dir.join(format!("{FOLLOWS_FILE}.corrupt-4242")).exists(),
@@ -283,7 +312,7 @@ mod tests {
         );
         // Not frozen: the next follow() heals by writing a fresh file.
         mgr.follow("addr1".to_string(), Some("Alice".to_string()));
-        let reloaded = FollowManager::load(&dir, 5_000);
+        let reloaded = FollowManager::load(Some(&tc()), &dir, 5_000);
         assert!(reloaded.is_followed("addr1"), "healed write persisted");
     }
 
@@ -293,16 +322,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         {
-            let mut mgr = FollowManager::load(&dir, 1);
+            let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
             mgr.follow("keepme".to_string(), None);
         }
         let p = dir.join(FOLLOWS_FILE);
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let mut mgr = FollowManager::load(&dir, 3);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 3);
         // restore perms so the frozen no-op and reload can read the untouched file
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         mgr.follow("newguy".to_string(), None); // frozen: save is a no-op
-        let reloaded = FollowManager::load(&dir, 5);
+        let reloaded = FollowManager::load(Some(&tc()), &dir, 5);
         assert!(
             reloaded.is_followed("keepme"),
             "frozen save preserved original graph"
@@ -317,13 +346,16 @@ mod tests {
     fn wrong_version_freezes_and_preserves_follows() {
         // ZEB-986: a parseable-but-unsupported version is frozen in place (not
         // quarantined), so a downgrade cannot silently drop the foreign build's follows.
+        // Post-PR-3 a forward-version file on disk is SEALED (every build seals), so freeze
+        // leaves the sealed bytes byte-identical (no reseal churn on an already-sealed file).
         let dir = temp_dir();
         let forward =
             br#"{"version":999,"follows":[{"address":"keepme","name":null,"followed_at":1}]}"#;
         let p = dir.join(FOLLOWS_FILE);
-        std::fs::write(&p, forward).unwrap();
+        crate::device_dataset_file::write_image(&tc(), &p, FOLLOWS_FILE, forward).unwrap();
+        let sealed = std::fs::read(&p).unwrap();
 
-        let mut mgr = FollowManager::load(&dir, 5);
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 5);
         assert!(
             mgr.list().is_empty(),
             "unsupported version starts empty in-memory"
@@ -332,12 +364,149 @@ mod tests {
         mgr.follow("newguy".to_string(), None);
         assert_eq!(
             std::fs::read(&p).unwrap(),
-            forward,
-            "foreign-version file left byte-identical"
+            sealed,
+            "foreign-version sealed file left byte-identical"
         );
         assert!(
             !dir.join(format!("{FOLLOWS_FILE}.corrupt-5")).exists(),
             "unsupported version frozen in place, not quarantined"
+        );
+    }
+
+    #[test]
+    fn save_seals_on_disk() {
+        let dir = temp_dir();
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
+        mgr.follow("addr1".to_string(), Some("Alice".to_string()));
+        let bytes = std::fs::read(dir.join(FOLLOWS_FILE)).unwrap();
+        assert_eq!(
+            bytes[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "follows.json is sealed on disk"
+        );
+        // Not readable as plaintext JSON.
+        assert!(serde_json::from_slice::<FollowsFile>(&bytes).is_err());
+    }
+
+    #[test]
+    fn legacy_plaintext_migrates_to_sealed() {
+        let dir = temp_dir();
+        let p = dir.join(FOLLOWS_FILE);
+        // A pre-PR-3 plaintext file.
+        let legacy =
+            br#"{"version":1,"follows":[{"address":"addrX","name":"Xavier","followed_at":7}]}"#;
+        std::fs::write(&p, legacy).unwrap();
+        let mgr = FollowManager::load(Some(&tc()), &dir, 1);
+        assert!(mgr.is_followed("addrX"), "legacy data recovered");
+        assert_eq!(
+            std::fs::read(&p).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "migrated to sealed on load"
+        );
+        // Reloads through the sealed path.
+        let reloaded = FollowManager::load(Some(&tc()), &dir, 2);
+        assert!(reloaded.is_followed("addrX"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
+        mgr.follow("addr1".to_string(), None);
+        let mode = std::fs::metadata(dir.join(FOLLOWS_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "sealed follows file is owner-only");
+    }
+
+    #[test]
+    fn foreign_cipher_freezes_and_preserves_sealed_file() {
+        let dir = temp_dir();
+        // Seal under the real test cipher.
+        {
+            let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
+            mgr.follow("keepme".to_string(), None);
+        }
+        let p = dir.join(FOLLOWS_FILE);
+        let sealed = std::fs::read(&p).unwrap();
+        // Load under a foreign cipher: cannot decrypt → freeze, empty, no quarantine.
+        let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
+        let mut mgr = FollowManager::load(Some(&foreign), &dir, 5);
+        assert!(mgr.list().is_empty(), "undecryptable → empty in memory");
+        mgr.follow("newguy".to_string(), None); // frozen: no-op
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            sealed,
+            "sealed file preserved byte-identical (not wiped, not quarantined)"
+        );
+        assert!(
+            !dir.join(format!("{FOLLOWS_FILE}.corrupt-5")).exists(),
+            "sealed decrypt failure freezes, never quarantines"
+        );
+    }
+
+    #[test]
+    fn arm_cipher_after_fresh_profile_boot_persists_first_session() {
+        // Fresh profile: identity.key does not exist yet, so the manager loads with no
+        // cipher. A follow() before arming does not persist (save is a no-op). After
+        // arm_cipher (once identity exists), follow() seals and survives reload.
+        let dir = temp_dir();
+        let mut mgr = FollowManager::load(None, &dir, 1);
+        assert!(mgr.list().is_empty());
+        mgr.follow("early".to_string(), None); // no cipher yet → not persisted
+        assert!(
+            !dir.join(FOLLOWS_FILE).exists(),
+            "no file written without a cipher"
+        );
+        // Identity now exists → arm the cipher.
+        mgr.arm_cipher(tc());
+        mgr.follow("armed".to_string(), None); // now seals
+        assert_eq!(
+            std::fs::read(dir.join(FOLLOWS_FILE)).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "armed follow is sealed on disk"
+        );
+        let reloaded = FollowManager::load(Some(&tc()), &dir, 2);
+        assert!(reloaded.is_followed("armed"), "armed write persisted");
+        assert!(
+            reloaded.is_followed("early"),
+            "the pre-arm follow is in memory and re-saved after arming"
+        );
+    }
+
+    #[test]
+    fn arm_cipher_is_noop_when_already_armed() {
+        // An existing profile loaded with a cipher must not have it replaced by arm_cipher.
+        let dir = temp_dir();
+        let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
+        mgr.arm_cipher(crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap());
+        mgr.follow("a".to_string(), None);
+        // Still readable under the ORIGINAL test cipher (arm did not swap it).
+        let reloaded = FollowManager::load(Some(&tc()), &dir, 2);
+        assert!(reloaded.is_followed("a"));
+    }
+
+    #[test]
+    fn no_cipher_pre_identity_boot_does_not_wipe() {
+        let dir = temp_dir();
+        {
+            let mut mgr = FollowManager::load(Some(&tc()), &dir, 1);
+            mgr.follow("keepme".to_string(), None);
+        }
+        let p = dir.join(FOLLOWS_FILE);
+        let sealed = std::fs::read(&p).unwrap();
+        // No cipher available (pre-identity boot): freeze, preserve.
+        let mut mgr = FollowManager::load(None, &dir, 2);
+        assert!(mgr.list().is_empty());
+        mgr.follow("newguy".to_string(), None); // frozen no-op
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            sealed,
+            "file preserved when no cipher"
         );
     }
 }

@@ -14569,7 +14569,7 @@ mod note_storage_record_sample_tests {
     use crate::storage_signing::{self, HostingReportEntry, PledgeEntry, PledgeListPayload};
 
     fn store() -> Arc<std::sync::Mutex<StorageRecordStore>> {
-        Arc::new(std::sync::Mutex::new(StorageRecordStore::new(None)))
+        Arc::new(std::sync::Mutex::new(StorageRecordStore::new(None, None)))
     }
 
     fn signer() -> harmony_identity::PrivateIdentity {
