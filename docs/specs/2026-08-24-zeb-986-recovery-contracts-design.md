@@ -125,9 +125,17 @@ pass a fixed value). Callers of the changed load signatures are updated accordin
    calls `load_or_recover(path, now_ms, QuarantineAndHeal, parse)` where `parse`
    deserializes `FollowsFile` and enforces `version == FILE_VERSION`, returning
    `Ok(file.follows)` or `Err(reason)`. `save()` gets the frozen guard.
-2. **`friend_nicknames.rs`** — `load_or_default(path, now_ms)` → `QuarantineAndHeal`.
-   Struct gains `disk_write_frozen`; `save(&self, path)` gets the frozen guard. (`set`
-   stays in-memory-only; the guard lives on the save path the caller invokes.)
+2. **`friend_nicknames.rs`** — **EXCLUDED after code verification (implementation
+   finding).** The ticket's premise ("transient EIO + `set()` destroys all nicknames")
+   is stale: ZEB-977 made this a legacy migration-only store, and `save()`/`set()` now
+   have **zero production callers** (the write path is dead code). The two live readers
+   are already safe: the migration (`contacts_commands::migrate_friend_nicknames_to_contacts`)
+   uses an *error-preserving* read that leaves the file in place on any read/parse
+   failure — deliberately NOT `load_or_default` — and lib.rs's display read
+   (`FriendNicknames::load_or_default`) never writes back. Applying `QuarantineAndHeal`
+   here would be net-negative: renaming a corrupt legacy file aside on the display path
+   would make the migration's `legacy_nicknames_path.exists()` gate skip forever,
+   converting a retry-on-next-boot state into permanent loss. Left untouched.
 3. **`content_index.rs`** — `ContentIndex` gains `disk_write_frozen`.
    `load(data_dir, now_ms)` → `FreezeInPlace`. `save()` gains the frozen guard in
    addition to the existing bare-path guard. Corrupt ⇒ empty in-memory + frozen +
