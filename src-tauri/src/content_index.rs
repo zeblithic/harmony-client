@@ -181,6 +181,12 @@ struct IndexFile {
 pub struct ContentIndex {
     path: PathBuf,
     entries: HashMap<SidecarId, ContentIndexEntry>,
+    /// ZEB-986: set when the index was unreadable OR content-corrupt at load. Because
+    /// an empty index orphans every stored blob (and the sensitivity/provenance metadata
+    /// cannot be rebuilt from a directory scan), a corrupt index uses FreezeInPlace: the
+    /// file is left untouched and writes are frozen (degraded read-only) rather than
+    /// overwritten with the empty default.
+    disk_write_frozen: bool,
     /// Test-only one-shot hook armed via `arm_next_rekey_conflict`.
     /// When `Some((sid, fake_actual))`, the next `rekey` call targeting
     /// `sid` returns `Err(RekeyError::Conflict { actual: fake_actual })`
@@ -222,14 +228,27 @@ impl ContentIndex {
         // filename "content-index.json" and would resolve to CWD. Don't read
         // a stray CWD sidecar into the default/uninitialised state.
         let path_is_bare = path.parent().is_none_or(|p| p.as_os_str().is_empty());
-        let entries = if path_is_bare {
-            HashMap::new()
+        let (entries, disk_write_frozen) = if path_is_bare {
+            (HashMap::new(), false)
         } else {
-            Self::read_file(&path).unwrap_or_default()
+            // FreezeInPlace: a corrupt index must NOT be quarantined-and-healed —
+            // overwriting it with an empty index orphans every stored blob. Preserve
+            // the file and freeze writes so a transient error self-recovers next boot
+            // and genuine corruption stays available for a future rebuild feature.
+            // `now_ms` is unused under FreezeInPlace (no timestamped quarantine), so the
+            // load signature stays clock-free and its many call sites are untouched.
+            let recovered = crate::recoverable_load::load_or_recover(
+                &path,
+                crate::recoverable_load::now_ms(),
+                crate::recoverable_load::CorruptPolicy::FreezeInPlace,
+                Self::parse_index,
+            );
+            (recovered.value, recovered.disk_write_frozen)
         };
         ContentIndex {
             path,
             entries,
+            disk_write_frozen,
             #[cfg(any(test, feature = "test-fixtures"))]
             test_rekey_conflict_hook: None,
             #[cfg(any(test, feature = "test-fixtures"))]
@@ -237,11 +256,10 @@ impl ContentIndex {
         }
     }
 
-    fn read_file(path: &Path) -> Option<HashMap<SidecarId, ContentIndexEntry>> {
-        let data = std::fs::read(path).ok()?;
-        let file: IndexFile = serde_json::from_slice(&data).ok()?;
+    fn parse_index(data: &[u8]) -> Result<HashMap<SidecarId, ContentIndexEntry>, String> {
+        let file: IndexFile = serde_json::from_slice(data).map_err(|e| e.to_string())?;
         if file.version != FILE_VERSION {
-            return None;
+            return Err(format!("unexpected version {}", file.version));
         }
         let mut map = HashMap::with_capacity(file.entries.len());
         for entry in file.entries {
@@ -249,10 +267,18 @@ impl ContentIndex {
                 tracing::warn!("duplicate sidecar_id in content-index.json; last-write-wins");
             }
         }
-        Some(map)
+        Ok(map)
     }
 
     fn save(&self) {
+        if self.disk_write_frozen {
+            tracing::warn!(
+                path = ?self.path,
+                "content-index save skipped — file unreadable/corrupt at load; \
+                 preserving existing index (degraded read-only, blobs not orphaned)"
+            );
+            return;
+        }
         // Guard against the default/uninitialised state: NodeState::default()
         // constructs a ContentIndex with an empty data_dir before start_node
         // loads the real one. In that state `self.path` resolves to the
@@ -630,6 +656,40 @@ mod tests {
         let id = entry.sidecar_id;
         assert!(idx.insert(entry.clone()));
         assert_eq!(idx.get(&id), Some(&entry));
+    }
+
+    #[test]
+    fn corrupt_content_index_freezes_in_place_no_orphan() {
+        // ZEB-986: a corrupt content-index must NOT be quarantined-and-healed —
+        // overwriting it with an empty index would orphan every stored blob. It is
+        // preserved untouched and writes are frozen (degraded read-only).
+        let dir = tempdir().unwrap();
+        let p = dir.path().join(INDEX_FILE);
+        std::fs::write(&p, b"{ corrupt").unwrap();
+
+        let mut idx = ContentIndex::load(dir.path());
+        assert!(
+            idx.entries.is_empty(),
+            "corrupt index starts empty in-memory"
+        );
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"{ corrupt",
+            "file preserved untouched (no quarantine under FreezeInPlace)"
+        );
+        assert!(
+            !dir.path().join(format!("{INDEX_FILE}.corrupt-0")).exists(),
+            "no sidecar created"
+        );
+
+        // The next mutation's save() must be a frozen no-op: the file stays the
+        // original corrupt bytes, so nothing is orphaned.
+        idx.insert(sample_entry([0xAB; 32]));
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"{ corrupt",
+            "frozen: save did not overwrite, blobs not orphaned"
+        );
     }
 
     #[test]
