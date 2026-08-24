@@ -4301,13 +4301,13 @@ pub async fn start_node_inner(
     // function — so this resolves to `None`; the store files are absent too, so those early
     // loads are correctly first-run empty. The cipher is re-derived and armed onto those
     // stores below (`arm_cipher`) once identity exists, so first-session writes persist.
-    let mut device_cipher: Option<crate::device_dataset_file::DeviceCipher> =
+    let mut app_data_cipher: Option<crate::device_dataset_file::DeviceCipher> =
         crate::owner_commands::resolve_identity_dir()
             .ok()
             .filter(|id| id.join("identity.key").exists())
             .and_then(|id| crate::device_dataset_file::get_or_derive(&id).ok());
     let mut follow_mgr = follows::FollowManager::load(
-        device_cipher.as_ref(),
+        app_data_cipher.as_ref(),
         &app_data_dir,
         crate::recoverable_load::now_ms(),
     );
@@ -4321,7 +4321,7 @@ pub async fn start_node_inner(
     let storage_settings_loaded = storage_settings::load_or_default(&storage_settings_path);
     let storage_records_arc = std::sync::Arc::new(std::sync::Mutex::new({
         let mut records = storage_records::StorageRecordStore::new(
-            device_cipher.clone(),
+            app_data_cipher.clone(),
             Some(app_data_dir.join("storage_records.json")),
         );
         // ZEB-923: one-shot post-load grace floor — see apply_boot_grace.
@@ -4330,7 +4330,7 @@ pub async fn start_node_inner(
     }));
     let storage_ledger_arc =
         std::sync::Arc::new(std::sync::Mutex::new(storage_ledger::StorageLedger::new(
-            device_cipher.clone(),
+            app_data_cipher.clone(),
             Some(app_data_dir.join("storage_ledger.json")),
         )));
     let storage_settings_arc =
@@ -4352,7 +4352,7 @@ pub async fn start_node_inner(
     // ZEB-147: load() reads vine_feed.json (if any) and arms save() so
     // every mutating outcome persists to disk atomically.
     let vine_feed_cache = std::sync::Arc::new(std::sync::Mutex::new(
-        vine_feed_cache::VineFeedCache::load(device_cipher.as_ref(), &app_data_dir),
+        vine_feed_cache::VineFeedCache::load(app_data_cipher.as_ref(), &app_data_dir),
     ));
     let vine_feed_cache_clone = vine_feed_cache.clone();
 
@@ -4856,7 +4856,7 @@ pub async fn start_node_inner(
         // `Some`, so this whole block is skipped. This also re-arms `device_cipher` for the
         // stores that load LATER in this function (content-index, vine-pull), which pick up
         // the re-derived value directly.
-        if device_cipher.is_none() {
+        if app_data_cipher.is_none() {
             // Distinguish the three cases so a genuine derive FAILURE is not silently masked
             // as a benign pre-identity state (PR-731 review, CodeRabbit): identity.key still
             // absent → genuinely pre-identity/local-only (stores stay first-run empty, no
@@ -4866,7 +4866,7 @@ pub async fn start_node_inner(
                 Ok(id) if id.join("identity.key").exists() => {
                     match crate::device_dataset_file::get_or_derive(&id) {
                         Ok(cipher) => {
-                            device_cipher = Some(cipher.clone());
+                            app_data_cipher = Some(cipher.clone());
                             follow_mgr.arm_cipher(cipher.clone());
                             storage_records_arc
                                 .lock()
@@ -12827,6 +12827,9 @@ pub async fn start_node_inner(
                                                 vine_pull_followed_creators,
                                                 vine_pull_last_received_ms,
                                                 app_data_dir.join("vine_pull.cbor"),
+                                                // `device_cipher` here is the plain (non-Option)
+                                                // owner-state cipher derived post-identity above;
+                                                // wrap in Some for the driver's Option param.
                                                 Some(device_cipher.clone()),
                                             )
                                             .with_telemetry(vine_pull_telemetry),
@@ -13793,7 +13796,7 @@ pub async fn start_node_inner(
                 // (the next NEW-Arc save() overwrites). That end-to-end
                 // serialization is ZEB-160's territory.
                 let content_index = std::sync::Arc::new(std::sync::Mutex::new(
-                    content_index::ContentIndex::load(device_cipher.as_ref(), &app_data_dir),
+                    content_index::ContentIndex::load(app_data_cipher.as_ref(), &app_data_dir),
                 ));
                 let pin_intent: std::collections::HashSet<[u8; 32]> = {
                     let idx = content_index
