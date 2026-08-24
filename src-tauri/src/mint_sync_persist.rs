@@ -133,4 +133,32 @@ mod tests {
         );
         assert_eq!(entries[0].to_str().unwrap(), MINT_SYNC_STATE_FILENAME);
     }
+
+    #[test]
+    fn legacy_bare_cbor_loads_and_reseals() {
+        // PR #728 review: pin the legacy-compatibility path — a pre-982
+        // plaintext file (bare CBOR, no sentinel) loads, is rewritten
+        // sealed, and reloads identically through the sealed path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MINT_SYNC_STATE_FILENAME);
+        let cipher = crate::device_dataset_file::test_cipher();
+        let mut state = MintSyncState::default();
+        state
+            .account_deletion_floor
+            .insert("legacy".into(), "2026-08-23T00:00:00Z".into());
+        let mut plain = Vec::new();
+        ciborium::into_writer(&state, &mut plain).unwrap();
+        std::fs::write(&path, &plain).unwrap();
+
+        let loaded = load(&cipher, &path).unwrap();
+        assert_eq!(loaded, state, "legacy content preserved");
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(
+            on_disk[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "file rewritten sealed"
+        );
+        let reloaded = load(&cipher, &path).unwrap();
+        assert_eq!(reloaded, state, "sealed path round-trips");
+    }
 }

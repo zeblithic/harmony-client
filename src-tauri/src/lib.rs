@@ -5972,11 +5972,13 @@ pub async fn start_node_inner(
                     // free-function reader (owner_state.rs hot paths).
                     let device_cipher = crate::device_dataset_file::get_or_derive(&identity_dir)?;
                     let initial_crdt =
-                        crate::owner_state_persist::load_crdt(&device_cipher, &crdt_path)
+                        crate::owner_state_persist::load_crdt_migrating(&device_cipher, &crdt_path)
                             .map_err(|e| format!("load owner_state_crdt.cbor: {e}"))?;
-                    let initial_replay =
-                        crate::owner_state_persist::load_replay(&device_cipher, &replay_path)
-                            .map_err(|e| format!("load state_root_replay.cbor: {e}"))?;
+                    let initial_replay = crate::owner_state_persist::load_replay_migrating(
+                        &device_cipher,
+                        &replay_path,
+                    )
+                    .map_err(|e| format!("load state_root_replay.cbor: {e}"))?;
 
                     // ZEB-685 (S3): boot-replay seed the revoked-device
                     // projection from the persisted DM-only revocation store
@@ -55095,12 +55097,19 @@ async fn preview_recovery_state_sidecar(
         // load_crdt parses the same canonicalize() output that
         // save_atomically writes — matches the pattern in
         // recovery_cli::restore_recovery_file_pair_with_keychain.
-        let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        crate::owner_state_persist::save_atomically(tmp.path(), &snap.tree)
-            .map_err(|e| e.to_string())?;
+        // PR #728 review: derive first and write the snapshot SEALED — the
+        // decrypted HRSS tree must not touch the temp dir as plaintext.
         let preview_cipher = crate::device_dataset_file::get_or_derive(
             &crate::owner_commands::resolve_identity_dir()?,
         )?;
+        let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+        crate::device_dataset_file::write_image(
+            &preview_cipher,
+            tmp.path(),
+            crate::owner_state_persist::CRDT_FILENAME,
+            &snap.tree,
+        )
+        .map_err(|e| e.to_string())?;
         let state = crate::owner_state_persist::load_crdt(&preview_cipher, tmp.path())
             .map_err(|e| e.to_string())?;
         Ok(SidecarPreview {

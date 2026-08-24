@@ -449,9 +449,16 @@ impl PendingOutboundLinks {
         ) {
             Ok(None) => HashMap::new(),
             Err(crate::device_dataset_file::ImageError::Io(e)) => {
-                tracing::warn!(error = %e, path = %path.display(),
-                    "ZEB-784: outbound-link store unreadable; continuing empty");
-                HashMap::new()
+                // PR #728 review: the file may still hold good records — a
+                // transient read failure must NOT bind the path, or the
+                // immediate rewrite below would overwrite them with an empty
+                // map. Degrade to an ephemeral store for this session (the
+                // same stance as the quarantine-rename-failure arm): the
+                // bytes survive to be re-read on the next clean boot.
+                tracing::error!(error = %e, path = %path.display(),
+                    "ZEB-784: outbound-link store unreadable; running WITHOUT \
+                     persistence so the existing records survive for the next boot");
+                return Self::default();
             }
             other => {
                 // Content-corrupt: either the envelope failed (Crypto) or the
@@ -1375,5 +1382,27 @@ mod tests {
         assert!(store.is_pending("ff", 1_000));
         store.forget("ff");
         assert!(!store.is_pending("ff", 1_000));
+    }
+
+    #[test]
+    fn transient_read_error_degrades_to_ephemeral_and_preserves_bytes() {
+        // PR #728 review regression: a recoverable read I/O failure must not
+        // let the load-time rewrite destroy the on-disk records. A directory
+        // at the store path yields a deterministic non-NotFound read error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+        std::fs::create_dir(&path).unwrap();
+        let store = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path.clone(),
+            1_000,
+        );
+        // Mutations succeed in memory but never touch the path.
+        store.record("k", 1_000);
+        assert!(path.is_dir(), "store path untouched after mutation");
+        assert!(
+            store.list(1_500).iter().any(|(k, _)| k == "k"),
+            "ephemeral store still works in memory"
+        );
     }
 }

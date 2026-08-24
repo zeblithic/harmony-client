@@ -262,11 +262,36 @@ pub fn load_crdt(
     }
     let version = bytes[0];
     let payload = &bytes[1..];
-    let state = load_crdt_inner(path, version, payload)?;
-    // Eager byte-lossless migration AFTER the inner parse succeeded (a
-    // rejected image must never be laundered into a valid envelope).
-    // Boot's serial load migrates before any engine runs, so this write
-    // cannot race a live writer; best-effort — failure warns inside.
+    // NO reseal here (PR #728 review): this loader is called from paths
+    // that hold no write lock (backup staleness, recovery export, the
+    // sidecar preview). A reseal there could race a concurrent writer and
+    // atomically replace a NEWER file with this stale snapshot. Migration
+    // lives exclusively in [`load_crdt_migrating`], which only boot's
+    // serial pre-engine load calls.
+    load_crdt_inner(path, version, payload)
+}
+
+/// [`load_crdt`] + eager byte-lossless migration. ONLY for call sites that
+/// are provably serial with every writer — in practice boot's pre-engine
+/// load (`start_node`), which runs before any engine or command path can
+/// write. The reseal happens AFTER the inner parse succeeded (a rejected
+/// image must never be laundered into a valid envelope); best-effort —
+/// failure warns inside and the plaintext stays for the next boot.
+pub fn load_crdt_migrating(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> Result<OwnerState, PersistError> {
+    let image = match crate::device_dataset_file::read_image(cipher, path, CRDT_FILENAME)
+        .map_err(image_err)?
+    {
+        Some(img) => img,
+        None => return Ok(OwnerState::default()),
+    };
+    let bytes = &image.bytes;
+    if bytes.is_empty() {
+        return Err(PersistError::Corrupt);
+    }
+    let state = load_crdt_inner(path, bytes[0], &bytes[1..])?;
     crate::device_dataset_file::reseal_if_legacy(cipher, path, CRDT_FILENAME, &image);
     Ok(state)
 }
@@ -352,7 +377,42 @@ pub fn load_replay(
         }
         v => return Err(PersistError::UnknownSchemaVersion(v)),
     };
-    // See load_crdt: migrate only after a successful parse; best-effort.
+    // See load_crdt: NO reseal in the lock-free loader.
+    let _ = &image;
+    Ok(tracker)
+}
+
+/// [`load_replay`] + eager migration — boot's serial pre-engine load only
+/// (see [`load_crdt_migrating`]).
+pub fn load_replay_migrating(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+) -> Result<BTreeMap<String, Hlc>, PersistError> {
+    let image = match crate::device_dataset_file::read_image(cipher, path, REPLAY_FILENAME)
+        .map_err(image_err)?
+    {
+        Some(img) => img,
+        None => return Ok(BTreeMap::new()),
+    };
+    let tracker = {
+        let bytes = &image.bytes;
+        if bytes.is_empty() {
+            return Err(PersistError::Corrupt);
+        }
+        match bytes[0] {
+            REPLAY_FILE_SCHEMA_V1 => {
+                let payload = &bytes[1..];
+                let mut cursor = Cursor::new(payload);
+                let file: ReplayFileV1 = from_reader(&mut cursor)
+                    .map_err(|e| PersistError::CborDecode(e.to_string()))?;
+                if (cursor.position() as usize) != payload.len() {
+                    return Err(PersistError::Corrupt);
+                }
+                file.0
+            }
+            v => return Err(PersistError::UnknownSchemaVersion(v)),
+        }
+    };
     crate::device_dataset_file::reseal_if_legacy(cipher, path, REPLAY_FILENAME, &image);
     Ok(tracker)
 }
@@ -381,7 +441,7 @@ mod tests {
         assert_eq!(legacy_image[0], CRDT_FILE_SCHEMA_V2, "collision-critical");
         std::fs::write(&path, &legacy_image).unwrap();
 
-        let loaded = load_crdt(&cipher, &path).unwrap();
+        let loaded = load_crdt_migrating(&cipher, &path).unwrap();
         assert!(loaded.tombstones.contains(&SpaceId([9; 16])));
 
         let on_disk = std::fs::read(&path).unwrap();
@@ -816,6 +876,21 @@ mod tests {
     }
 
     #[test]
+    fn crdt_load_legacy_trailing_bytes_after_valid_cbor_errors() {
+        // PR #728 review: the trailing-bytes rejection must hold on the
+        // LEGACY (plaintext) path too, not only inside a sealed image.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_trailing.cbor");
+        let mut bytes = canonicalize(&OwnerState::default()).unwrap();
+        bytes.push(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            load_crdt(&crate::device_dataset_file::test_cipher(), &path),
+            Err(PersistError::Corrupt)
+        ));
+    }
+
+    #[test]
     fn crdt_load_trailing_bytes_after_valid_cbor_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("with_tail.cbor");
@@ -1001,15 +1076,20 @@ mod tests {
         )
         .unwrap();
 
-        // Confirm the field key was omitted by scanning raw bytes for
-        // the literal UTF-8 of the CBOR text key (CBOR text strings
-        // include the field name verbatim in the byte stream, so a
-        // substring check is sufficient).
-        let raw = std::fs::read(&path).unwrap();
+        // Confirm the field key was omitted by scanning the decrypted INNER
+        // image for the literal UTF-8 of the CBOR text key (PR #728 review:
+        // scanning the raw file is vacuous now that it is ciphertext).
+        let image = crate::device_dataset_file::read_image(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            CRDT_FILENAME,
+        )
+        .unwrap()
+        .unwrap();
         let key = b"owner_device_cache";
         assert!(
-            !raw.windows(key.len()).any(|w| w == key),
-            "`owner_device_cache` key should not appear in file when cache is empty",
+            !image.bytes.windows(key.len()).any(|w| w == key),
+            "`owner_device_cache` key should not appear in the image when cache is empty",
         );
 
         // Loading must succeed with an empty cache, not error.
@@ -1045,11 +1125,17 @@ mod tests {
         // Confirm the field key was omitted by scanning raw bytes
         // for the literal UTF-8 of the CBOR text key (CBOR text
         // strings include the field name verbatim in the byte stream).
-        let raw = std::fs::read(&path).unwrap();
+        let image = crate::device_dataset_file::read_image(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            CRDT_FILENAME,
+        )
+        .unwrap()
+        .unwrap();
         let key = b"libraries";
         assert!(
-            !raw.windows(key.len()).any(|w| w == key),
-            "`libraries` key should not appear in file when map is empty",
+            !image.bytes.windows(key.len()).any(|w| w == key),
+            "`libraries` key should not appear in the image when empty",
         );
 
         // Loading must succeed with an empty BTreeMap, not error on

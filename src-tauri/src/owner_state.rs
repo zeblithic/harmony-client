@@ -531,6 +531,11 @@ fn read_owner_state_image(
     identity_dir: &Path,
 ) -> Result<Option<crate::device_dataset_file::Image>, String> {
     let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    // Single capped read (PR #728 review): the size cap runs before the
+    // bytes are slurped, and the SAME bytes feed both the sentinel peek and
+    // the decrypt — no second read, no TOCTOU between peek and open.
+    crate::device_dataset_file::check_size_cap(&cbor_path, OWNER_STATE_FILENAME)
+        .map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
     let raw = match std::fs::read(&cbor_path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -545,8 +550,8 @@ fn read_owner_state_image(
     let cipher = crate::device_dataset_file::get_or_derive(identity_dir).map_err(|e| {
         format!("owner_state.cbor is sealed but the device key is unavailable: {e}")
     })?;
-    match crate::device_dataset_file::read_image(&cipher, &cbor_path, OWNER_STATE_FILENAME) {
-        Ok(opt) => Ok(opt),
+    match crate::device_dataset_file::open_raw_image(&cipher, OWNER_STATE_FILENAME, raw) {
+        Ok(img) => Ok(Some(img)),
         Err(crate::device_dataset_file::ImageError::Io(e)) => {
             Err(format!("failed to read {}: {e}", cbor_path.display()))
         }
@@ -697,6 +702,16 @@ pub fn save_owner_state_atomic(
     // (no `identity.key` yet — a bare test dir, or a first-boot mint race),
     // which acquires this same non-reentrant IDENTITY_FILE_WRITE_LOCK inside
     // `with_identity_write_guards` — deriving under the guard self-deadlocks.
+    //
+    // Staleness (PR #728 review): deriving outside the identity guard cannot
+    // seal under a superseded key in-process, because every in-process seed
+    // replacement (mnemonic restore, ZEB-439 re-adoption) runs under the
+    // OUTER `OWNER_STATE_WRITE_LOCK` this function's callers already hold —
+    // seed writes and owner-state saves are serialized one level up. The
+    // memo's generation check additionally discards any cipher whose derive
+    // raced an `invalidate`. A CLI restore racing a RUNNING app is cross-
+    // process concurrent mutation of live identity state, out of scope here
+    // as everywhere else in this module.
     let device_cipher = crate::device_dataset_file::get_or_derive(identity_dir)?;
     let _identity_file_guard = crate::identity::IDENTITY_FILE_WRITE_LOCK
         .lock()

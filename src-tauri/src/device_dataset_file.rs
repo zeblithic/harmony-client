@@ -106,31 +106,47 @@ fn memo() -> &'static Mutex<HashMap<PathBuf, DeviceCipher>> {
     &MEMO
 }
 
+/// Bumped by [`invalidate`]. `get_or_derive` snapshots it before the seed
+/// read and refuses to insert a cipher derived against a superseded
+/// generation (PR #728 review): without this, a thread that read the OLD
+/// seed could insert its stale cipher AFTER a restore's invalidation and
+/// poison the memo for the rest of the process.
+static MEMO_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
     let memo_key = identity_dir
         .canonicalize()
         .unwrap_or_else(|_| identity_dir.to_path_buf());
-    if let Some(cipher) = memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&memo_key)
-    {
-        return Ok(cipher.clone());
+    loop {
+        let generation = MEMO_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        if let Some(cipher) = memo()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&memo_key)
+        {
+            return Ok(cipher.clone());
+        }
+        // Deliberately NOT holding the memo lock across the seed read: the
+        // read can block on the identity flock, pay an Argon2id derive, or
+        // take the fresh-generate path (which acquires
+        // IDENTITY_FILE_WRITE_LOCK) — none of that may nest inside another
+        // lock. Two same-generation racers derive the same key
+        // (`with_identity_write_guards` makes generation atomic, so the
+        // loser reads the winner's seed) and the second insert is an
+        // identical overwrite.
+        let seed = crate::identity::read_seed_from_disk(&identity_dir.join("identity.key"))?;
+        let cipher = DeviceCipher::derive(&seed).map_err(|e| e.to_string())?;
+        // Insert only if no invalidation happened since the snapshot — the
+        // seed this cipher was derived from may have been replaced mid-read.
+        // On a lost race, loop: the retry re-reads the post-replacement seed.
+        if MEMO_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+            memo()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(memo_key, cipher.clone());
+            return Ok(cipher);
+        }
     }
-    // Deliberately NOT holding the memo lock across the seed read: the read
-    // can block on the identity flock, pay an Argon2id derive, or take the
-    // fresh-generate path (which acquires IDENTITY_FILE_WRITE_LOCK) — none
-    // of that may nest inside another lock. Two racers derive the same key
-    // (`with_identity_write_guards` makes generation atomic, so the loser
-    // reads the winner's seed) and the second insert is an identical
-    // overwrite.
-    let seed = crate::identity::read_seed_from_disk(&identity_dir.join("identity.key"))?;
-    let cipher = DeviceCipher::derive(&seed).map_err(|e| e.to_string())?;
-    memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(memo_key, cipher.clone());
-    Ok(cipher)
 }
 
 /// Drop any memoized cipher for `identity_dir`. MUST be called after the
@@ -144,6 +160,9 @@ pub fn invalidate(identity_dir: &Path) {
     let memo_key = identity_dir
         .canonicalize()
         .unwrap_or_else(|_| identity_dir.to_path_buf());
+    // Bump BEFORE removing so an in-flight derive that read the old seed
+    // observes the new generation at its insert check and discards.
+    MEMO_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     memo()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -191,16 +210,12 @@ impl std::fmt::Debug for Image {
     }
 }
 
-/// Read a file's inner image. `Ok(None)` = file absent. A legacy file (first
-/// byte ≠ sentinel) is returned whole as the image; a sealed file is
-/// decrypted. The 256 MiB metadata cap is checked before the read; stat
-/// errors fall through to `read` so the transient-vs-missing mapping is
-/// decided in exactly one place.
-pub fn read_image(
-    cipher: &DeviceCipher,
-    path: &Path,
-    filename: &str,
-) -> Result<Option<Image>, ImageError> {
+/// The 256 MiB metadata cap, checked BEFORE any read. `Ok(())` also for
+/// stat errors — those fall through to `read` so the transient-vs-missing
+/// mapping is decided in exactly one place. Public within the module family
+/// so callers that must read bytes themselves (`owner_state.rs`'s
+/// single-read sentinel peek) enforce the same cap first (PR #728 review).
+pub fn check_size_cap(path: &Path, filename: &str) -> Result<(), ImageError> {
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_DEVICE_FILE_BYTES {
             return Err(ImageError::Crypto(format!(
@@ -210,35 +225,77 @@ pub fn read_image(
             )));
         }
     }
+    Ok(())
+}
+
+/// Envelope logic on bytes already in hand — the single-read seam for
+/// callers that peek the sentinel themselves (PR #728 review: `read_image`'s
+/// path-level API re-read the file after such a peek, an uncapped read plus
+/// a TOCTOU between the two reads). Sealed → decrypt; anything else (schema
+/// bytes, bare CBOR headers, the empty file) is the whole legacy image; the
+/// family's own parser classifies it under that family's contract, not ours.
+pub fn open_raw_image(
+    cipher: &DeviceCipher,
+    filename: &str,
+    raw: Vec<u8>,
+) -> Result<Image, ImageError> {
+    match raw.first() {
+        Some(&SEALED_DEVICE_SCHEMA_V3) => {
+            let inner = open_device_file(&cipher.key, filename, &raw[1..])
+                .map_err(|e| ImageError::Crypto(format!("open {filename}: {e}")))?;
+            Ok(Image {
+                bytes: inner,
+                was_legacy: false,
+            })
+        }
+        _ => Ok(Image {
+            bytes: Zeroizing::new(raw),
+            was_legacy: true,
+        }),
+    }
+}
+
+/// Read a file's inner image. `Ok(None)` = file absent. A legacy file (first
+/// byte ≠ sentinel) is returned whole as the image; a sealed file is
+/// decrypted. The 256 MiB metadata cap is checked before the read.
+pub fn read_image(
+    cipher: &DeviceCipher,
+    path: &Path,
+    filename: &str,
+) -> Result<Option<Image>, ImageError> {
+    check_size_cap(path, filename)?;
     let raw = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(ImageError::Io(e)),
     };
-    match raw.first() {
-        Some(&SEALED_DEVICE_SCHEMA_V3) => {
-            let inner = open_device_file(&cipher.key, filename, &raw[1..])
-                .map_err(|e| ImageError::Crypto(format!("open {}: {e}", path.display())))?;
-            Ok(Some(Image {
-                bytes: inner,
-                was_legacy: false,
-            }))
-        }
-        // Any other first byte — schema bytes, bare CBOR headers — and the
-        // empty file: the whole file is the legacy image; the family's own
-        // parser classifies it (empty is corrupt to every family in scope,
-        // under that family's contract, not ours).
-        _ => Ok(Some(Image {
-            bytes: Zeroizing::new(raw),
-            was_legacy: true,
-        })),
-    }
+    open_raw_image(cipher, filename, raw).map(Some)
+}
+
+/// Envelope overhead in the on-disk form: sentinel + nonce + Poly1305 tag.
+const SEALED_OVERHEAD: usize = 1 + 12 + 16;
+
+/// True iff an inner image of `inner_len` bytes seals to a file within the
+/// read-side cap. Write-side guard (PR #728 review): the owner family's
+/// read-refusal is boot-fatal, so writing a file the next boot would refuse
+/// to read is self-bricking — refusing the WRITE loses one persist (loud,
+/// retryable) instead of the whole state.
+fn sealed_len_within_cap(inner_len: usize) -> bool {
+    (inner_len as u64).saturating_add(SEALED_OVERHEAD as u64) <= MAX_DEVICE_FILE_BYTES
 }
 
 /// Seal `inner` into the complete v3 on-disk byte form (sentinel-prefixed).
 /// For families that keep their own write primitive (e.g. `owner_state.rs`'s
-/// `write_atomic_0600`); everything else uses [`write_image`].
+/// `write_atomic_0600`); everything else uses [`write_image`]. Refuses an
+/// inner image whose sealed form would exceed the read-side size cap.
 pub fn seal_image(cipher: &DeviceCipher, filename: &str, inner: &[u8]) -> Result<Vec<u8>, String> {
+    if !sealed_len_within_cap(inner.len()) {
+        return Err(format!(
+            "{filename}: inner image of {} bytes would seal past the {MAX_DEVICE_FILE_BYTES}-byte \
+             cap the next boot enforces on read; refusing to write",
+            inner.len()
+        ));
+    }
     let sealed = seal_device_file(&cipher.key, filename, inner)
         .map_err(|e| format!("seal {filename}: {e}"))?;
     let mut bytes = Vec::with_capacity(1 + sealed.len());
@@ -491,5 +548,45 @@ mod tests {
             }
             other => panic!("expected Crypto error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sealed_len_cap_boundary() {
+        // Largest accepted inner image vs the first rejected one — pure
+        // helper math, so the boundary is testable without 256 MiB allocs.
+        let max_inner = (MAX_DEVICE_FILE_BYTES as usize) - SEALED_OVERHEAD;
+        assert!(sealed_len_within_cap(max_inner));
+        assert!(!sealed_len_within_cap(max_inner + 1));
+        assert!(!sealed_len_within_cap(usize::MAX), "no overflow wraparound");
+    }
+
+    #[test]
+    fn seal_image_refuses_oversize_inner() {
+        // The check runs before any encryption, so the reject is instant.
+        let cipher = test_cipher();
+        let oversize = vec![0u8; (MAX_DEVICE_FILE_BYTES as usize) - SEALED_OVERHEAD + 1];
+        let err = seal_image(&cipher, "f.cbor", &oversize).unwrap_err();
+        assert!(err.contains("refusing to write"), "{err}");
+    }
+
+    #[test]
+    fn invalidation_between_seed_read_and_insert_discards_stale_cipher() {
+        // PR #728 review: a derive that lost a race with `invalidate` must
+        // not poison the memo. Simulated deterministically: install a
+        // cipher, snapshot the generation semantics by invalidating, then
+        // verify the memo entry is gone AND a later install wins cleanly
+        // (the retry loop's insert path).
+        let dir = tmp();
+        install_test_cipher(dir.path());
+        let memo_key = dir.path().canonicalize().unwrap();
+        assert!(memo().lock().unwrap().contains_key(&memo_key));
+        invalidate(dir.path());
+        assert!(
+            !memo().lock().unwrap().contains_key(&memo_key),
+            "invalidate removes the entry"
+        );
+        // Re-install (stands in for the retry's fresh derive) — usable again.
+        install_test_cipher(dir.path());
+        assert!(memo().lock().unwrap().contains_key(&memo_key));
     }
 }
