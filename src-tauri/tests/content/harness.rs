@@ -120,6 +120,7 @@ pub async fn spawn_test_runtime_with_pins(
         harmony_app::vine_feed_cache::VineFeedCache::new(),
     ));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
+        Some(&harmony_app::device_dataset_file::test_cipher()),
         &app_data_dir.join("mail"),
         [0u8; 16],
     )));

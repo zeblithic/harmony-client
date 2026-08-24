@@ -838,6 +838,7 @@ mod tests {
     async fn walk_aborts_on_root_fetch_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -873,6 +874,7 @@ mod tests {
     async fn walk_aborts_on_folder_fetch_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -930,6 +932,7 @@ mod tests {
     async fn walk_single_page_registers_all_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1002,6 +1005,7 @@ mod tests {
     async fn walk_skips_missing_page_continues_others() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1072,6 +1076,7 @@ mod tests {
     async fn pending_root_during_walk_runs_after_current_pass() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1168,6 +1173,7 @@ mod tests {
     async fn fetch_body_returns_bytes_and_marks_local() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1208,6 +1214,7 @@ mod tests {
     async fn fetch_body_rejects_hash_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1233,6 +1240,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1298,6 +1306,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1419,6 +1428,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1464,6 +1474,7 @@ mod tests {
     async fn pending_root_runs_after_strict_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1515,6 +1526,7 @@ mod tests {
     async fn pending_root_dedups_against_prev_last_walked() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1561,6 +1573,7 @@ mod tests {
     async fn report_query_error_installs_error_state() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1597,6 +1610,7 @@ mod tests {
     async fn report_query_error_dedupes_identical_consecutive_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1628,6 +1642,7 @@ mod tests {
     async fn empty_startup_reply_clears_prior_error_state() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));
@@ -1662,6 +1677,7 @@ mod tests {
     async fn walk_preserves_newest_first_wire_order() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            Some(&crate::device_dataset_file::test_cipher()),
             &tmp.path().join("mail"),
             [0u8; 16],
         )));

@@ -4809,6 +4809,7 @@ pub async fn start_node_inner(
 
         // Initialize mail manager (needs owner address from identity).
         mail_mgr = std::sync::Arc::new(std::sync::Mutex::new(mail::MailManager::load(
+            app_data_cipher.as_ref(),
             &app_data_dir.join("mail"),
             our_addr_bytes,
         )));
@@ -4877,6 +4878,11 @@ pub async fn start_node_inner(
                                 .unwrap_or_else(|p| p.into_inner())
                                 .arm_cipher(cipher.clone());
                             vine_feed_cache
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .arm_cipher(cipher.clone());
+                            // ZEB-984: mail index + blobs seal under the same device cipher.
+                            mail_mgr
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .arm_cipher(cipher);
