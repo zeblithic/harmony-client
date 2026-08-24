@@ -161,6 +161,7 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
     // ── Bring up MailSync ──
     let tmp = tempfile::tempdir().unwrap();
     let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+        Some(&harmony_app::device_dataset_file::test_cipher()),
         &tmp.path().join("mail"),
         [0u8; 16],
     )));
@@ -255,9 +256,20 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
         .join("blobs")
         .join(format!("{}.bin", hex::encode(msg_cid)));
     assert!(blob_path.exists(), "body blob should be persisted");
+    // ZEB-984: the blob is sealed at rest, not plaintext on disk.
+    let on_disk = std::fs::read(&blob_path).unwrap();
     assert_eq!(
-        std::fs::read(&blob_path).unwrap(),
-        msg_bytes,
-        "persisted blob should match original bytes"
+        on_disk[0],
+        harmony_app::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+        "persisted blob is sealed at rest"
     );
+    assert_ne!(on_disk, msg_bytes, "plaintext body must not be on disk");
+    // …and it unseals + integrity-verifies back to the original message.
+    let detail = mail_mgr
+        .lock()
+        .unwrap()
+        .get_message(&hex::encode(msg_cid))
+        .unwrap();
+    assert_eq!(detail.subject, "test subject");
+    assert_eq!(detail.body, "test body");
 }

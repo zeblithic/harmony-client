@@ -4,13 +4,27 @@
 //! The Merkle mailbox is the conceptual model and network wire format;
 //! locally we use a pragmatic representation for fast reads/writes.
 //!
-//! Follows the `follows.rs` atomic-write pattern (write tmp → rename).
+//! ZEB-984 at-rest: both the index (`mail/index.json`) and every message-body
+//! blob (`mail/blobs/{cid}.bin`) are sealed under the ZEB-982 [`DeviceCipher`]
+//! device envelope (`sentinel 0x03`), so complete plaintext bodies, subjects,
+//! and recipient lists no longer sit on disk. The index rides
+//! [`crate::recoverable_load::load_sealed_or_recover`] for its
+//! Io-vs-content recovery contract (transient read → freeze writes; corrupt
+//! legacy plaintext → quarantine aside; undecryptable sealed → freeze, never
+//! wipe). Blob reads verify `blake3(inner) == cid` and, unlike the
+//! `avatar_blob_store` cache donor, **never delete** on a mismatch — a mail
+//! blob is the only copy of the body, so a failed check surfaces an error and
+//! leaves the file for recovery. Writes go through
+//! [`crate::device_dataset_file::write_image`] (`save_atomically`: fsync +
+//! 0600 + crash-durable rename), replacing the old fixed-`.tmp` writes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use harmony_mailbox::message::{HarmonyMessage, RecipientType, ADDRESS_HASH_LEN};
 use serde::{Deserialize, Serialize};
+
+use crate::device_dataset_file::DeviceCipher;
 
 // ── Public types (shared with Tauri commands) ────────────────────────
 
@@ -116,6 +130,11 @@ pub struct AttachmentDto {
 const INDEX_VERSION: u32 = 1;
 const MAX_SNIPPET_LEN: usize = 128;
 
+/// ZEB-984: AAD label bound into the sealed `mail/index.json` envelope. A
+/// globally-unique, path-qualified name so a mail index can never be confused
+/// with another store's `index.json` (the AAD would fail the tag).
+const MAIL_INDEX_LABEL: &str = "mail/index.json";
+
 /// The complete local mail state, persisted as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MailIndex {
@@ -153,11 +172,38 @@ pub struct MailManager {
     data_dir: PathBuf,
     owner_address: [u8; ADDRESS_HASH_LEN],
     index: MailIndex,
+    /// ZEB-984: device cipher for at-rest sealing of the index + blobs. `None`
+    /// on a pre-identity boot; armed later via [`MailManager::arm_cipher`] once
+    /// the identity (and thus the device seed) exists. Index and blob writes
+    /// are skipped while `None` (no plaintext fallback).
+    cipher: Option<DeviceCipher>,
+    /// ZEB-984: set when the index file was unreadable at load (transient Io) or
+    /// was a sealed image that would not decrypt (wrong/rotated key). While set,
+    /// `save_index()` refuses (returns `Err`, never a false `Ok`) so the
+    /// still-good on-disk index is never overwritten with the empty in-memory
+    /// default AND callers see that their mutation was not persisted;
+    /// `delete_message` additionally rejects up front so a frozen session can't
+    /// drop a body blob out from under a still-referencing on-disk index.
+    /// Cleared by [`MailManager::arm_cipher`] once a usable key arrives. Corrupt
+    /// *legacy plaintext* does NOT freeze — it quarantines aside and heals (see
+    /// [`crate::recoverable_load::load_sealed_or_recover`]).
+    disk_write_frozen: bool,
 }
 
 impl MailManager {
     /// Load existing mail state from disk, or create empty.
-    pub fn load(data_dir: &Path, owner_address: [u8; ADDRESS_HASH_LEN]) -> Self {
+    ///
+    /// `cipher` seals the index and blobs at rest (ZEB-984). It is `None` only
+    /// on a pre-identity boot (no device seed yet); in that case an existing
+    /// sealed index is left frozen (never wiped) and writes are deferred until
+    /// [`MailManager::arm_cipher`] supplies the key. On a normal boot the caller
+    /// passes `Some` — any still-plaintext legacy blobs are then eagerly
+    /// re-sealed in place.
+    pub fn load(
+        cipher: Option<&DeviceCipher>,
+        data_dir: &Path,
+        owner_address: [u8; ADDRESS_HASH_LEN],
+    ) -> Self {
         if let Err(e) = std::fs::create_dir_all(data_dir) {
             tracing::warn!(path = %data_dir.display(), error = %e, "failed to create mail dir");
         }
@@ -165,21 +211,46 @@ impl MailManager {
             tracing::warn!(path = %data_dir.display(), error = %e, "failed to create mail blobs dir");
         }
 
-        let index_path = data_dir.join("index.json");
-        let mut index: MailIndex = if index_path.exists() {
-            match std::fs::read(&index_path) {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tracing::warn!(path = %index_path.display(), error = %e, "corrupt mail index, starting fresh");
-                        MailIndex::default()
-                    }
-                },
-                Err(_) => MailIndex::default(),
-            }
-        } else {
-            MailIndex::default()
+        let (index, disk_write_frozen) = Self::load_index(cipher, data_dir);
+
+        let mgr = Self {
+            data_dir: data_dir.to_path_buf(),
+            owner_address,
+            index,
+            cipher: cipher.cloned(),
+            disk_write_frozen,
         };
+        // Eager at-rest migration: re-seal any still-plaintext blobs now, so no
+        // message body lingers in plaintext for messages the user never re-opens.
+        // Only existing upgraded profiles have plaintext blobs, and on those the
+        // cipher is already `Some` at load; a fresh profile's blobs dir is empty.
+        mgr.migrate_legacy_blobs();
+        mgr
+    }
+
+    /// Read + recover the index under the ZEB-984 recovery contract, delegated to
+    /// the sealed load-or-recover primitive: transient read Io → freeze (never
+    /// clobber maybe-good bytes); corrupt legacy plaintext → quarantine
+    /// `.corrupt-<ms>` aside and heal on next write (the blobs stay on disk,
+    /// recoverable); a sealed image that will not decrypt → freeze (wrong/rotated
+    /// key must not wipe the mailbox). Legacy plaintext index migrates to sealed
+    /// on load. A corrupt index quarantined here starts the mailbox empty rather
+    /// than orphaning every blob under a rewritten index. Returns the loaded
+    /// index and whether writes must be frozen.
+    fn load_index(cipher: Option<&DeviceCipher>, data_dir: &Path) -> (MailIndex, bool) {
+        let index_path = data_dir.join("index.json");
+        let recovered = crate::recoverable_load::load_sealed_or_recover::<Option<MailIndex>>(
+            cipher,
+            &index_path,
+            MAIL_INDEX_LABEL,
+            crate::recoverable_load::now_ms(),
+            |bytes| {
+                serde_json::from_slice::<MailIndex>(bytes)
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            },
+        );
+        let mut index = recovered.value.unwrap_or_default();
 
         // Ensure required folders exist even if the persisted index was
         // edited or written by an older version that omitted some.
@@ -191,12 +262,27 @@ impl MailManager {
                     entries: Vec::new(),
                 });
         }
+        (index, recovered.disk_write_frozen)
+    }
 
-        Self {
-            data_dir: data_dir.to_path_buf(),
-            owner_address,
-            index,
+    /// ZEB-984: supply the device cipher after a pre-identity boot armed the
+    /// stores with `None`. Mirrors the `content_index`/`storage_ledger` arm
+    /// path in `start_node`.
+    ///
+    /// If the pre-identity load froze writes because an existing index was
+    /// present but unreadable without a key, re-read it now that we can decrypt
+    /// — clearing the stale `disk_write_frozen` and loading the real state, so
+    /// this session's mail actually persists (CodeAnt PR #732). On a fresh
+    /// profile the index was absent (not frozen) and the blobs dir is empty, so
+    /// this is just enabling sealed writes for new mail.
+    pub fn arm_cipher(&mut self, cipher: DeviceCipher) {
+        self.cipher = Some(cipher);
+        if self.disk_write_frozen {
+            let (index, frozen) = Self::load_index(self.cipher.as_ref(), &self.data_dir);
+            self.index = index;
+            self.disk_write_frozen = frozen;
         }
+        self.migrate_legacy_blobs();
     }
 
     /// Process an inbound message (raw bytes from Zenoh subscription).
@@ -267,14 +353,8 @@ impl MailManager {
 
         if has_pending_match {
             // Write the blob FIRST so the `Local ⇒ blob exists` invariant holds
-            // even if I/O fails mid-promotion. (Atomic: tmp + rename.)
-            let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-            let tmp_blob = self
-                .data_dir
-                .join("blobs")
-                .join(format!("{cid_hex}.bin.tmp"));
-            std::fs::write(&tmp_blob, msg_bytes).map_err(|e| format!("write blob: {e}"))?;
-            std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
+            // even if I/O fails mid-promotion. (Sealed + atomic via write_blob.)
+            self.write_blob(&cid_hex, msg_bytes)?;
 
             // Promote all matching Pending entries. Preserve folder placement.
             // CID equality already verified in the scan — no need to re-check.
@@ -317,14 +397,8 @@ impl MailManager {
             body_state: BodyState::Local,
         };
 
-        // Store blob (atomic: write tmp then rename, matching save_index pattern)
-        let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let tmp_blob = self
-            .data_dir
-            .join("blobs")
-            .join(format!("{cid_hex}.bin.tmp"));
-        std::fs::write(&tmp_blob, msg_bytes).map_err(|e| format!("write blob: {e}"))?;
-        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
+        // Store blob (sealed + atomic via write_blob).
+        self.write_blob(&cid_hex, msg_bytes)?;
 
         // Prepend to inbox (newest first)
         let inbox = self.index.folders.get_mut("inbox").unwrap();
@@ -443,14 +517,8 @@ impl MailManager {
 
         // Write the blob BEFORE mutating in-memory state, so the invariant
         // `state == Local ⇒ blob exists on disk` holds even if I/O fails
-        // mid-way. (Atomic: tmp + rename.)
-        let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let tmp_blob = self
-            .data_dir
-            .join("blobs")
-            .join(format!("{cid_hex}.bin.tmp"));
-        std::fs::write(&tmp_blob, bytes).map_err(|e| format!("write blob: {e}"))?;
-        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
+        // mid-way. (Sealed + atomic via write_blob.)
+        self.write_blob(cid_hex, bytes)?;
 
         // Blob is durable; now flip every matching Pending entry to Local.
         for folder_name in ["inbox", "trash", "drafts"] {
@@ -473,14 +541,8 @@ impl MailManager {
         let hash = blake3::hash(msg_bytes);
         let cid_hex = hex::encode(hash.as_bytes());
 
-        // Store blob (atomic: write tmp then rename)
-        let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let tmp_blob = self
-            .data_dir
-            .join("blobs")
-            .join(format!("{cid_hex}.bin.tmp"));
-        std::fs::write(&tmp_blob, msg_bytes).map_err(|e| format!("write blob: {e}"))?;
-        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
+        // Store blob (sealed + atomic via write_blob).
+        self.write_blob(&cid_hex, msg_bytes)?;
 
         // Add to sent folder
         let snippet = truncate_snippet(&msg.subject);
@@ -517,8 +579,9 @@ impl MailManager {
     /// Get the full message detail by CID.
     pub fn get_message(&self, cid_hex: &str) -> Result<MailDetail, String> {
         validate_hex(cid_hex)?;
-        let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let bytes = std::fs::read(&blob_path).map_err(|e| format!("read blob: {e}"))?;
+        // Unseal + verify blake3(inner)==cid; a failed check surfaces here and
+        // never deletes the blob (the body's only copy).
+        let bytes = self.read_blob(cid_hex)?;
         let msg = HarmonyMessage::from_bytes(&bytes).map_err(|e| format!("parse: {e}"))?;
 
         let recipients: Vec<RecipientDto> = msg
@@ -654,6 +717,21 @@ impl MailManager {
     pub fn delete_message(&mut self, cid_hex: &str, folder: Option<&str>) -> Result<(), String> {
         validate_hex(cid_hex)?;
 
+        // ZEB-984 data-loss guard (CodeRabbit/CodeAnt PR #732): refuse to delete
+        // while the index cannot be durably rewritten. Otherwise we would remove
+        // the body blob but leave the on-disk index still referencing it — on the
+        // next boot the message renders with its header but its body is gone for
+        // good. Reject BEFORE mutating any state so a frozen session is a no-op.
+        if self.disk_write_frozen {
+            return Err(
+                "cannot delete mail: index writes are frozen this session (recovers next boot)"
+                    .to_string(),
+            );
+        }
+        if self.cipher.is_none() {
+            return Err("cannot delete mail: no device cipher armed yet".to_string());
+        }
+
         // Remove the entry from its folder
         if let Some(folder_name) = folder {
             let state = self
@@ -682,18 +760,19 @@ impl MailManager {
             }
         }
 
-        // Only remove blob if no remaining entry references this CID
+        // Persist the removal FIRST, then drop the blob — never the reverse.
+        // If the index write fails here, we return before touching the blob, so
+        // the body stays on disk and the (still-referencing) on-disk index stays
+        // consistent with it; nothing is lost.
         let still_referenced = self
             .index
             .folders
             .values()
             .any(|f| f.entries.iter().any(|e| e.message_cid == cid_hex));
-        if !still_referenced {
-            let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-            let _ = std::fs::remove_file(blob_path);
-        }
-
         self.save_index()?;
+        if !still_referenced {
+            let _ = std::fs::remove_file(self.blob_path(cid_hex));
+        }
         Ok(())
     }
 
@@ -721,15 +800,190 @@ impl MailManager {
 
     // ── Private ──────────────────────────────────────────────────────
 
-    /// Atomic save: write to tmp, then rename. Errors propagate to callers.
+    /// Path to a message-body blob. `cid_hex` must be validated first
+    /// (`validate_hex`) — valid hex cannot contain `/` or `..`.
+    fn blob_path(&self, cid_hex: &str) -> PathBuf {
+        self.data_dir.join("blobs").join(format!("{cid_hex}.bin"))
+    }
+
+    /// AAD label bound into a blob's sealed envelope: the CID-derived,
+    /// path-qualified filename, so a sealed blob's ciphertext cannot be moved
+    /// to a different CID's path without failing the tag.
+    fn blob_label(cid_hex: &str) -> String {
+        format!("mail/blobs/{cid_hex}.bin")
+    }
+
+    /// Seal `bytes` for `cid_hex` and write the blob atomically (fsync + 0600 +
+    /// crash-durable rename). Errors — including "no cipher armed" — propagate,
+    /// so a caller never records an index entry for a body it could not durably
+    /// (and confidentially) store.
+    fn write_blob(&self, cid_hex: &str, bytes: &[u8]) -> Result<(), String> {
+        let Some(cipher) = &self.cipher else {
+            return Err("cannot store mail body: no device cipher armed yet".to_string());
+        };
+        crate::device_dataset_file::write_image(
+            cipher,
+            &self.blob_path(cid_hex),
+            &Self::blob_label(cid_hex),
+            bytes,
+        )
+        .map_err(|e| format!("seal mail blob {cid_hex}: {e}"))
+    }
+
+    /// Read and unseal a message-body blob, verifying `blake3(inner) == cid`.
+    ///
+    /// Unlike the `avatar_blob_store` cache donor, a failed integrity check
+    /// does NOT delete the file — a mail blob is the only copy of the body, so
+    /// destroying it on a bad read would turn an integrity check into data
+    /// loss. Instead the error surfaces (the header stays visible; the body
+    /// degrades) and the bytes are left on disk for recovery. `cid_hex` must be
+    /// validated by the caller.
+    fn read_blob(&self, cid_hex: &str) -> Result<Vec<u8>, String> {
+        let Some(cipher) = &self.cipher else {
+            return Err("cannot read mail body: no device cipher armed yet".to_string());
+        };
+        let path = self.blob_path(cid_hex);
+        let label = Self::blob_label(cid_hex);
+        let image = match crate::device_dataset_file::read_image(cipher, &path, &label) {
+            Ok(Some(image)) => image,
+            Ok(None) => return Err(format!("mail body {cid_hex} not found")),
+            // Undecryptable sealed blob (bad tag / wrong key / truncated) OR a
+            // transient read error: surface, never delete the only copy.
+            Err(e) => return Err(format!("read mail body {cid_hex}: {e}")),
+        };
+        // Content-addressed integrity: the decrypted (or legacy-plaintext) bytes
+        // must hash to the CID that names the file. Catches a tampered legacy
+        // blob (no AAD protection) and re-checks sealed inner content.
+        if hex::encode(blake3::hash(image.bytes.as_slice()).as_bytes()) != cid_hex {
+            return Err(format!(
+                "mail body {cid_hex} failed integrity check (hash≠cid); leaving on disk for recovery"
+            ));
+        }
+        // Lazy migration fallback: if this blob was still plaintext, re-seal it
+        // now that we have verified it (eager load-time migration already covers
+        // the common case). `reseal_if_legacy` reseals only when `was_legacy`.
+        crate::device_dataset_file::reseal_if_legacy(cipher, &path, &label, &image);
+        Ok(image.bytes.to_vec())
+    }
+
+    /// Eagerly re-seal any still-plaintext message-body blobs (ZEB-984 at-rest
+    /// migration). Best-effort and non-fatal: a blob that fails its `hash==cid`
+    /// check is left in place (never laundered into a valid envelope, never
+    /// deleted — it is the only copy); a reseal write error is logged and
+    /// retried next boot. No-op when no cipher is armed. A legacy plaintext mail
+    /// blob always starts with `HarmonyMessage::VERSION` (`0x01`), never the
+    /// sealed sentinel `0x03`, so the sealed-vs-legacy peek is unambiguous.
+    fn migrate_legacy_blobs(&self) {
+        let Some(cipher) = &self.cipher else {
+            return;
+        };
+        let blobs_dir = self.data_dir.join("blobs");
+        let entries = match std::fs::read_dir(&blobs_dir) {
+            Ok(e) => e,
+            Err(_) => return, // absent/unreadable dir: nothing to migrate
+        };
+        let (mut migrated, mut skipped) = (0usize, 0usize);
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // Only {cid}.bin blobs; skip any stray tmp/quarantine sidecars.
+            let Some(cid_hex) = name.strip_suffix(".bin") else {
+                continue;
+            };
+            if validate_hex(cid_hex).is_err() {
+                continue;
+            }
+            let path = entry.path();
+            // Cheap sentinel peek: already-sealed blobs (the steady state after
+            // the first upgraded boot) are skipped WITHOUT a decrypt, so a large
+            // mailbox pays only one 1-byte read per blob on later boots instead
+            // of a full AEAD-decrypt-per-blob scan.
+            match Self::peek_sealed(&path) {
+                Some(true) | None => continue, // already sealed, or empty/unreadable
+                Some(false) => {}              // legacy plaintext: migrate below
+            }
+            // Legacy plaintext blob: verify hash==cid, then re-seal in place.
+            let raw = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(cid = %cid_hex, error = %e, "mail blob migration: unreadable; leaving in place");
+                    continue;
+                }
+            };
+            if hex::encode(blake3::hash(&raw).as_bytes()) != cid_hex {
+                skipped += 1;
+                tracing::warn!(
+                    cid = %cid_hex,
+                    "mail blob migration: legacy blob fails hash==cid; leaving in place (not sealing corrupt bytes)"
+                );
+                continue;
+            }
+            match crate::device_dataset_file::write_image(
+                cipher,
+                &path,
+                &Self::blob_label(cid_hex),
+                &raw,
+            ) {
+                Ok(()) => migrated += 1,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(cid = %cid_hex, error = %e, "mail blob migration: reseal write failed; leaving plaintext (retry next boot)");
+                }
+            }
+        }
+        if migrated > 0 || skipped > 0 {
+            tracing::info!(migrated, skipped, "mail blob at-rest migration complete");
+        }
+    }
+
+    /// Peek a blob's first byte to classify sealed-vs-legacy without a full read
+    /// or decrypt. `Some(true)` = sealed (sentinel `0x03`); `Some(false)` =
+    /// legacy plaintext (a `HarmonyMessage` always starts with `0x01`); `None` =
+    /// empty/unreadable (nothing to migrate).
+    fn peek_sealed(path: &Path) -> Option<bool> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut first = [0u8; 1];
+        f.read_exact(&mut first).ok()?;
+        Some(first[0] == crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3)
+    }
+
+    /// Seal the index and write it atomically (fsync + 0600 + crash-durable
+    /// rename via `device_dataset_file::write_image`).
+    ///
+    /// Returns `Err` — never a false `Ok` — when writes cannot be persisted
+    /// (frozen after a transient load Io / undecryptable sealed index, or no
+    /// cipher armed). It still leaves the on-disk index untouched in those
+    /// states (never clobbers maybe-good bytes with the default), but callers
+    /// (`receive_message`, `store_sent`, folder mutators, …) MUST see the
+    /// failure rather than treat a discarded mutation as a durable commit
+    /// (CodeAnt PR #732). Mutators that would destroy data on a silent no-op —
+    /// notably `delete_message` — additionally refuse up front while frozen.
     fn save_index(&self) -> Result<(), String> {
-        let index_path = self.data_dir.join("index.json");
-        let tmp_path = self.data_dir.join("index.json.tmp");
+        if self.disk_write_frozen {
+            return Err(
+                "mail index writes are frozen this session (index was unreadable/undecryptable \
+                 at load); mutation not persisted, recovers next boot"
+                    .to_string(),
+            );
+        }
+        let Some(cipher) = &self.cipher else {
+            return Err(
+                "mail index cannot be saved: no device cipher armed yet (pre-identity boot)"
+                    .to_string(),
+            );
+        };
         let json =
             serde_json::to_vec_pretty(&self.index).map_err(|e| format!("serialize index: {e}"))?;
-        std::fs::write(&tmp_path, &json).map_err(|e| format!("write index: {e}"))?;
-        std::fs::rename(&tmp_path, &index_path).map_err(|e| format!("replace index: {e}"))?;
-        Ok(())
+        crate::device_dataset_file::write_image(
+            cipher,
+            &self.data_dir.join("index.json"),
+            MAIL_INDEX_LABEL,
+            &json,
+        )
+        .map_err(|e| format!("seal mail index: {e}"))
     }
 }
 
@@ -770,6 +1024,13 @@ mod tests {
         unique_message_id, MailMessageType, MessageFlags, Recipient, RecipientType,
     };
 
+    /// Deterministic device cipher for the sealing tests (ZEB-984). Same key
+    /// across load/reload, so a blob/index sealed by one `MailManager` opens in
+    /// another (mirrors a real single-identity profile).
+    fn tc() -> DeviceCipher {
+        crate::device_dataset_file::test_cipher()
+    }
+
     fn make_message_entry(message_id: [u8; 16], snippet: &str) -> MessageEntry {
         MessageEntry {
             message_cid: [0xAA; 32],
@@ -803,7 +1064,7 @@ mod tests {
     #[test]
     fn mail_manager_load_creates_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = MailManager::load(dir.path(), [0xAA; 16]);
+        let mgr = MailManager::load(Some(&tc()), dir.path(), [0xAA; 16]);
         assert_eq!(mgr.index.folders.len(), 4);
         assert_eq!(mgr.folder_counts()["inbox"].total, 0);
     }
@@ -811,7 +1072,7 @@ mod tests {
     #[test]
     fn receive_and_list() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         let msg = make_test_message("Test Subject", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -834,7 +1095,7 @@ mod tests {
     #[test]
     fn dedup_by_message_id() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         let msg = make_test_message("Dupe", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -847,7 +1108,7 @@ mod tests {
     #[test]
     fn mark_read_updates_counts() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         let msg = make_test_message("Read Me", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -864,7 +1125,7 @@ mod tests {
     #[test]
     fn move_message_between_folders() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         let msg = make_test_message("Move Me", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -881,7 +1142,7 @@ mod tests {
     #[test]
     fn get_message_returns_detail() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         let msg = make_test_message("Detail Test", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -898,7 +1159,7 @@ mod tests {
     #[test]
     fn delete_message_removes_blob() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         let msg = make_test_message("Delete Me", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -923,7 +1184,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cid;
         {
-            let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+            let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
             let msg = make_test_message("Persist", [0xAA; 16]);
             let bytes = msg.to_bytes().unwrap();
             let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
@@ -932,7 +1193,7 @@ mod tests {
             cid = entry.message_cid;
         }
         // Reload from disk
-        let mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
         assert_eq!(mgr.folder_counts()["inbox"].total, 1);
         let listed = mgr.list_folder("inbox", 0, 50);
         assert_eq!(listed[0].message_cid, cid);
@@ -941,7 +1202,7 @@ mod tests {
     #[test]
     fn store_sent() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xAA; 16]);
 
         let msg = make_test_message("Outbound", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -955,7 +1216,7 @@ mod tests {
     #[test]
     fn self_send_lands_in_both_folders() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xAA; 16]);
 
         let msg = make_test_message("Self Send", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -977,7 +1238,7 @@ mod tests {
     #[test]
     fn invalid_hex_cid_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xAA; 16]);
 
         // Path traversal
         assert!(mgr.get_message("../../../etc/passwd").is_err());
@@ -997,7 +1258,7 @@ mod tests {
     #[test]
     fn list_folder_pagination() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         // Insert 5 messages
         for i in 0..5u8 {
@@ -1024,7 +1285,7 @@ mod tests {
         // When same CID exists in inbox + sent (self-send), mark_read with
         // a folder parameter deterministically targets the correct copy.
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xAA; 16]);
 
         let msg = make_test_message("Self Send", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -1097,7 +1358,7 @@ mod tests {
         }"#;
         std::fs::write(mail_dir.join("index.json"), old_json).unwrap();
 
-        let mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+        let mgr = MailManager::load(Some(&tc()), &mail_dir, [0u8; ADDRESS_HASH_LEN]);
         let inbox = mgr.list_folder("inbox", 0, 100);
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].body_state, BodyState::Local);
@@ -1106,7 +1367,11 @@ mod tests {
     #[test]
     fn register_header_only_inserts_pending_inbox_entry() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(
+            Some(&tc()),
+            &tmp.path().join("mail"),
+            [0u8; ADDRESS_HASH_LEN],
+        );
 
         let entry = make_message_entry([0x11; 16], "first message");
         let outcome = mgr.register_header_only(entry).unwrap();
@@ -1126,7 +1391,11 @@ mod tests {
     #[test]
     fn register_header_only_returns_duplicate_for_existing_inbox_message_id() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(
+            Some(&tc()),
+            &tmp.path().join("mail"),
+            [0u8; ADDRESS_HASH_LEN],
+        );
 
         // First, register via header-only (creates Pending in inbox).
         let entry1 = make_message_entry([0x22; 16], "first");
@@ -1146,7 +1415,11 @@ mod tests {
     #[test]
     fn register_header_only_dedups_across_inbox_trash_drafts() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(
+            Some(&tc()),
+            &tmp.path().join("mail"),
+            [0u8; ADDRESS_HASH_LEN],
+        );
 
         // Register, then move to trash.
         let entry = make_message_entry([0x33; 16], "msg");
@@ -1171,7 +1444,7 @@ mod tests {
     fn mark_body_received_promotes_pending_to_local() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_dir = tmp.path().join("mail");
-        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(Some(&tc()), &mail_dir, [0u8; ADDRESS_HASH_LEN]);
 
         // Create a real HarmonyMessage so the bytes parse cleanly.
         let msg = make_test_message("subject", [0xCC; 16]);
@@ -1197,17 +1470,25 @@ mod tests {
         let inbox = mgr.list_folder("inbox", 0, 100);
         assert_eq!(inbox[0].body_state, BodyState::Local);
 
-        // Blob exists on disk.
+        // Blob exists on disk and is SEALED (not plaintext bytes).
         let blob_path = mail_dir.join("blobs").join(format!("{real_cid_hex}.bin"));
         assert!(blob_path.exists(), "blob should be written");
-        assert_eq!(std::fs::read(&blob_path).unwrap(), bytes);
+        let on_disk = std::fs::read(&blob_path).unwrap();
+        assert_eq!(
+            on_disk[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "blob sealed at rest"
+        );
+        assert_ne!(on_disk, bytes, "plaintext body must not be on disk");
+        // And it round-trips back to the original body via get_message.
+        assert_eq!(mgr.get_message(&real_cid_hex).unwrap().body, msg.body);
     }
 
     #[test]
     fn mark_body_received_rejects_hash_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_dir = tmp.path().join("mail");
-        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(Some(&tc()), &mail_dir, [0u8; ADDRESS_HASH_LEN]);
 
         let claimed_cid_hex = hex::encode([0xDD; 32]);
         let wrong_bytes = b"not a harmony message";
@@ -1239,7 +1520,7 @@ mod tests {
     fn mark_body_received_is_idempotent_for_local_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_dir = tmp.path().join("mail");
-        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(Some(&tc()), &mail_dir, [0u8; ADDRESS_HASH_LEN]);
 
         let msg = make_test_message("s", [0xEE; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -1269,7 +1550,7 @@ mod tests {
     fn folder_counts_derived_from_entries() {
         // Verify folder_counts() reflects actual entry state, not stored fields.
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
 
         let msg = make_test_message("Derived", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -1286,7 +1567,7 @@ mod tests {
     fn receive_message_promotes_pending_to_local_preserving_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let mail_dir = tmp.path().join("mail");
-        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(Some(&tc()), &mail_dir, [0u8; ADDRESS_HASH_LEN]);
 
         // Build a real message and compute its real CID from serialized bytes.
         let msg = make_test_message("race", [0xFF; 16]);
@@ -1336,7 +1617,11 @@ mod tests {
     #[test]
     fn receive_message_still_dedups_when_already_local() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+        let mut mgr = MailManager::load(
+            Some(&tc()),
+            &tmp.path().join("mail"),
+            [0u8; ADDRESS_HASH_LEN],
+        );
 
         let msg = make_test_message("s", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
@@ -1346,5 +1631,292 @@ mod tests {
         let result = mgr.receive_message(&bytes);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("duplicate"));
+    }
+
+    // ── ZEB-984 at-rest sealing ───────────────────────────────────────
+
+    #[test]
+    fn index_and_blob_sealed_at_rest_no_plaintext() {
+        use crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3;
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+        let msg = make_test_message("Secret Subject", [0xAA; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted");
+        };
+
+        // Index sealed; the plaintext subject snippet is not on disk.
+        let index_raw = std::fs::read(dir.path().join("index.json")).unwrap();
+        assert_eq!(
+            index_raw[0], SEALED_DEVICE_SCHEMA_V3,
+            "index sealed at rest"
+        );
+        let subject: &[u8] = b"Secret Subject";
+        assert!(
+            !index_raw.windows(subject.len()).any(|w| w == subject),
+            "subject snippet must not be plaintext on disk"
+        );
+
+        // Blob sealed; the plaintext body is not on disk.
+        let blob_raw = std::fs::read(mgr.blob_path(&entry.message_cid)).unwrap();
+        assert_eq!(blob_raw[0], SEALED_DEVICE_SCHEMA_V3, "blob sealed at rest");
+        let body: &[u8] = b"Hello, world!";
+        assert!(
+            !blob_raw.windows(body.len()).any(|w| w == body),
+            "message body must not be plaintext on disk"
+        );
+
+        // Round-trips back through get_message.
+        assert_eq!(
+            mgr.get_message(&entry.message_cid).unwrap().body,
+            "Hello, world!"
+        );
+    }
+
+    #[test]
+    fn read_blob_rejects_hash_mismatch_and_preserves_file() {
+        // A blob whose bytes do not hash to its filename-CID (a tampered legacy
+        // plaintext blob) must fail the integrity check and be LEFT on disk —
+        // never deleted (it is the only copy of the body).
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+        let cid = hex::encode([0x11u8; 32]); // does NOT match the bytes below
+        let blob_path = mgr.blob_path(&cid);
+        std::fs::write(&blob_path, b"tampered bytes that do not hash to the cid").unwrap();
+
+        let err = mgr.read_blob(&cid).unwrap_err();
+        assert!(err.contains("integrity"), "got: {err}");
+        assert!(
+            blob_path.exists(),
+            "failed-integrity blob must be preserved, not deleted"
+        );
+    }
+
+    #[test]
+    fn tampered_sealed_blob_errors_on_get_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+        let msg = make_test_message("Tamper", [0xAA; 16]);
+        let ReceiveOutcome::Inserted(entry) =
+            mgr.receive_message(&msg.to_bytes().unwrap()).unwrap()
+        else {
+            panic!("expected Inserted");
+        };
+        let blob_path = mgr.blob_path(&entry.message_cid);
+
+        // Flip a byte in the sealed ciphertext → AEAD tag fails on read.
+        let mut sealed = std::fs::read(&blob_path).unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xFF;
+        std::fs::write(&blob_path, &sealed).unwrap();
+
+        assert!(
+            mgr.get_message(&entry.message_cid).is_err(),
+            "tampered blob must not render as authentic mail"
+        );
+        assert!(
+            blob_path.exists(),
+            "tampered blob preserved on disk, not deleted"
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_blob_migrated_to_sealed_on_load() {
+        use crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3;
+        let dir = tempfile::tempdir().unwrap();
+        let cid;
+        {
+            let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+            let msg = make_test_message("Legacy", [0xAA; 16]);
+            let bytes = msg.to_bytes().unwrap();
+            let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+                panic!("expected Inserted");
+            };
+            cid = entry.message_cid;
+            // Simulate a pre-ZEB-984 plaintext blob on disk (index stays sealed).
+            std::fs::write(mgr.blob_path(&cid), &bytes).unwrap();
+            assert_ne!(
+                std::fs::read(mgr.blob_path(&cid)).unwrap()[0],
+                SEALED_DEVICE_SCHEMA_V3,
+                "precondition: blob is plaintext"
+            );
+        }
+        // Reload → eager migration reseals the plaintext blob in place.
+        let mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+        assert_eq!(
+            std::fs::read(mgr.blob_path(&cid)).unwrap()[0],
+            SEALED_DEVICE_SCHEMA_V3,
+            "legacy plaintext blob migrated to sealed on load"
+        );
+        assert_eq!(mgr.get_message(&cid).unwrap().body, "Hello, world!");
+    }
+
+    #[test]
+    fn corrupt_legacy_index_quarantined_blobs_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("blobs")).unwrap();
+        // A blob on disk that must be preserved even when the index is lost.
+        let cid = hex::encode([0x22u8; 32]);
+        std::fs::write(dir.path().join("blobs").join(format!("{cid}.bin")), b"x").unwrap();
+        // Corrupt legacy plaintext index (unparseable JSON; first byte '{').
+        std::fs::write(dir.path().join("index.json"), b"{ this is not valid json").unwrap();
+
+        let mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+
+        // Mailbox starts empty; the corrupt index is quarantined aside, not
+        // rewritten over the surviving blobs.
+        assert_eq!(mgr.folder_counts()["inbox"].total, 0);
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("index.json.corrupt-")
+        });
+        assert!(quarantined, "corrupt index quarantined aside");
+        assert!(
+            dir.path().join("blobs").join(format!("{cid}.bin")).exists(),
+            "blobs preserved when the index is quarantined"
+        );
+    }
+
+    #[test]
+    fn no_cipher_freezes_existing_sealed_index() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+            let msg = make_test_message("Frozen", [0xAA; 16]);
+            mgr.receive_message(&msg.to_bytes().unwrap()).unwrap();
+        }
+        let sealed_before = std::fs::read(dir.path().join("index.json")).unwrap();
+
+        // Reload WITHOUT a cipher (pre-identity boot): cannot decrypt → freeze.
+        let mgr = MailManager::load(None, dir.path(), [0xBB; 16]);
+        assert_eq!(
+            mgr.folder_counts()["inbox"].total,
+            0,
+            "frozen load starts empty (could not decrypt)"
+        );
+        // save_index reports the failure (never a false Ok) AND leaves the sealed
+        // index untouched — no clobber, no misleading "durable commit" signal.
+        assert!(
+            mgr.save_index().is_err(),
+            "frozen save_index must surface an error, not a false Ok"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("index.json")).unwrap(),
+            sealed_before,
+            "frozen: existing sealed index left byte-identical"
+        );
+    }
+
+    #[test]
+    fn receive_without_cipher_errors_and_records_nothing() {
+        // No cipher armed (pre-identity): a receive cannot seal the body, so it
+        // must error rather than record an index entry for a body it never stored.
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(None, dir.path(), [0xBB; 16]);
+        let msg = make_test_message("No Cipher", [0xAA; 16]);
+        let bytes = msg.to_bytes().unwrap();
+
+        assert!(
+            mgr.receive_message(&bytes).is_err(),
+            "receive without a cipher must fail"
+        );
+        assert_eq!(
+            mgr.folder_counts()["inbox"].total,
+            0,
+            "no index entry recorded for an unstored body"
+        );
+        let cid = hex::encode(blake3::hash(&bytes).as_bytes());
+        assert!(
+            !mgr.blob_path(&cid).exists(),
+            "no blob written without a cipher"
+        );
+    }
+
+    #[test]
+    fn arm_cipher_clears_stale_freeze_and_persists_mail() {
+        use crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3;
+        let dir = tempfile::tempdir().unwrap();
+        // Seed an existing sealed profile with one message, plus a legacy
+        // plaintext blob to exercise the arm-time migration sweep.
+        let legacy_cid;
+        {
+            let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+            mgr.receive_message(&make_test_message("Seed", [0xAA; 16]).to_bytes().unwrap())
+                .unwrap();
+            let legacy = make_test_message("Legacy", [0xCC; 16]);
+            let lbytes = legacy.to_bytes().unwrap();
+            legacy_cid = hex::encode(blake3::hash(&lbytes).as_bytes());
+            mgr.receive_message(&lbytes).unwrap();
+            // Downgrade one blob to plaintext to simulate a pre-ZEB-984 file.
+            std::fs::write(mgr.blob_path(&legacy_cid), &lbytes).unwrap();
+        }
+
+        // Pre-identity load: existing sealed index present but no key → frozen.
+        let mut mgr = MailManager::load(None, dir.path(), [0xBB; 16]);
+        assert!(
+            mgr.disk_write_frozen,
+            "pre-identity load with an existing index freezes"
+        );
+        assert_eq!(
+            mgr.folder_counts()["inbox"].total,
+            0,
+            "frozen load is empty"
+        );
+
+        // Arm the cipher: frozen clears, the real index loads, migration runs.
+        mgr.arm_cipher(tc());
+        assert!(!mgr.disk_write_frozen, "arm_cipher clears the stale freeze");
+        assert_eq!(
+            mgr.folder_counts()["inbox"].total,
+            2,
+            "real mail state loaded after arming"
+        );
+        assert_eq!(
+            std::fs::read(mgr.blob_path(&legacy_cid)).unwrap()[0],
+            SEALED_DEVICE_SCHEMA_V3,
+            "arm-time migration sealed the legacy blob"
+        );
+
+        // A new receive now persists across a reload.
+        mgr.receive_message(
+            &make_test_message("Post-arm", [0xDD; 16])
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let reloaded = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+        assert_eq!(
+            reloaded.folder_counts()["inbox"].total,
+            3,
+            "post-arm mail persisted durably"
+        );
+    }
+
+    #[test]
+    fn delete_rejected_while_frozen_preserves_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let cid;
+        {
+            let mut mgr = MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]);
+            let ReceiveOutcome::Inserted(entry) = mgr
+                .receive_message(&make_test_message("Keep", [0xAA; 16]).to_bytes().unwrap())
+                .unwrap()
+            else {
+                panic!("expected Inserted");
+            };
+            cid = entry.message_cid;
+        }
+        // Reload frozen (no cipher). delete must refuse and leave the blob intact.
+        let mut mgr = MailManager::load(None, dir.path(), [0xBB; 16]);
+        assert!(
+            mgr.delete_message(&cid, None).is_err(),
+            "frozen delete rejected"
+        );
+        assert!(
+            mgr.blob_path(&cid).exists(),
+            "frozen delete must not remove the body blob"
+        );
     }
 }
