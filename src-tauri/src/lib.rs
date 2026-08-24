@@ -12768,6 +12768,7 @@ pub async fn start_node_inner(
                                                 vine_pull_followed_creators,
                                                 vine_pull_last_received_ms,
                                                 app_data_dir.join("vine_pull.cbor"),
+                                                Some(device_cipher.clone()),
                                             )
                                             .with_telemetry(vine_pull_telemetry),
                                         );

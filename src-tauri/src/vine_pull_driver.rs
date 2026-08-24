@@ -622,31 +622,42 @@ pub struct CreatorPullState {
 /// durability cost doesn't pencil out at this granularity). Like
 /// `save_addrbook`, the fixed `.tmp` name is only race-free with a single
 /// writer per `path` (true here — one `VinePullDriver` per process owns it).
-pub fn save_vine_pull(path: &Path, sidecar: &VinePullSidecar) -> Result<(), String> {
+/// Canonical AAD filename bound into the sealed envelope (ZEB-986 PR-3). Derived from the
+/// sidecar path so `save`/`load` always agree on the AAD for the same file.
+fn pull_aad(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("vine_pull.cbor")
+}
+
+/// Seal the sidecar to disk (ZEB-986 PR-3): `write_image` = seal + atomic temp + fsync +
+/// 0600 + parent-dir creation.
+pub fn save_vine_pull(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    sidecar: &VinePullSidecar,
+) -> Result<(), String> {
     let mut bytes = Vec::new();
     ciborium::into_writer(sidecar, &mut bytes)
         .map_err(|e| format!("encode vine pull sidecar: {e}"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-    Ok(())
+    crate::device_dataset_file::write_image(cipher, path, pull_aad(path), &bytes)
+        .map_err(|e| format!("seal {}: {e}", path.display()))
 }
 
-/// Load the sidecar with recovery classification (ZEB-986).
+/// Load the sidecar with recovery classification (ZEB-986), sealed under the device
+/// envelope (PR-3).
 ///
-/// A missing file (first run) or corrupt/undecodable CBOR yields an empty default;
-/// corrupt bytes are quarantined aside (`vine_pull.cbor.corrupt-<now_ms>`) and heal on
-/// the next write, since pull progress is fully re-derivable. A transient READ error
-/// (permissions, bad disk) also starts empty but sets `disk_write_frozen`, so the
-/// caller does not overwrite the still-good sidecar with an empty one.
+/// A missing file (first run) yields an empty default; malformed *legacy plaintext* CBOR
+/// is quarantined aside (`vine_pull.cbor.corrupt-<now_ms>`) and heals on the next write,
+/// since pull progress is fully re-derivable. A transient READ error, a sealed image that
+/// will not decrypt (wrong/rotated key), or an absent cipher starts empty but sets
+/// `disk_write_frozen`, so the caller does not overwrite the still-good sidecar.
 fn load_vine_pull_recovered(
+    cipher: Option<&crate::device_dataset_file::DeviceCipher>,
     path: &Path,
     now_ms: u64,
 ) -> crate::recoverable_load::Recovered<VinePullSidecar> {
-    crate::recoverable_load::load_or_recover(path, now_ms, |bytes| {
+    crate::recoverable_load::load_sealed_or_recover(cipher, path, pull_aad(path), now_ms, |bytes| {
         ciborium::from_reader(bytes).map_err(|e: ciborium::de::Error<_>| e.to_string())
     })
 }
@@ -654,8 +665,11 @@ fn load_vine_pull_recovered(
 /// Load the sidecar's value, discarding the freeze flag. Convenience for callers that
 /// only read progress and never write it back. The production driver uses
 /// [`load_vine_pull_recovered`] via `new()` so it can honor the freeze on save.
-pub fn load_vine_pull(path: &Path) -> VinePullSidecar {
-    load_vine_pull_recovered(path, crate::recoverable_load::now_ms()).value
+pub fn load_vine_pull(
+    cipher: Option<&crate::device_dataset_file::DeviceCipher>,
+    path: &Path,
+) -> VinePullSidecar {
+    load_vine_pull_recovered(cipher, path, crate::recoverable_load::now_ms()).value
 }
 
 // =====================================================================
@@ -680,10 +694,14 @@ pub struct VinePullDriver {
     last_received_ms: LastReceivedMsFn,
     sidecar_path: PathBuf,
     sidecar: std::sync::Mutex<VinePullSidecar>,
-    /// ZEB-986: set when the sidecar was unreadable at load (transient Io). Skips the
+    /// ZEB-986: set when the sidecar was unreadable at load (transient Io), a sealed image
+    /// would not decrypt (wrong/rotated key), or no cipher was available. Skips the
     /// per-pass save so a still-good sidecar is never overwritten with re-derived-empty
-    /// progress. Content corruption does not freeze (it quarantines and heals).
+    /// progress. Legacy-plaintext corruption does not freeze (it quarantines and heals).
     disk_write_frozen: bool,
+    /// ZEB-986 PR-3: device cipher for at-rest sealing. `None` on a pre-identity boot;
+    /// the per-pass save is then skipped (progress re-derives on the next pull).
+    cipher: Option<crate::device_dataset_file::DeviceCipher>,
     wake: Arc<Notify>,
     interval: Duration,
     /// ZEB-811: pull-side health telemetry, shared with
@@ -702,8 +720,13 @@ impl VinePullDriver {
         followed_creators: FollowedCreatorsFn,
         last_received_ms: LastReceivedMsFn,
         sidecar_path: PathBuf,
+        cipher: Option<crate::device_dataset_file::DeviceCipher>,
     ) -> Self {
-        let recovered = load_vine_pull_recovered(&sidecar_path, crate::recoverable_load::now_ms());
+        let recovered = load_vine_pull_recovered(
+            cipher.as_ref(),
+            &sidecar_path,
+            crate::recoverable_load::now_ms(),
+        );
         Self {
             self_endpoint_id,
             pkarr_resolver,
@@ -714,6 +737,7 @@ impl VinePullDriver {
             sidecar_path,
             sidecar: std::sync::Mutex::new(recovered.value),
             disk_write_frozen: recovered.disk_write_frozen,
+            cipher,
             wake: Arc::new(Notify::new()),
             interval: Duration::from_millis(VINE_PULL_INTERVAL_MS),
             telemetry: None,
@@ -783,13 +807,20 @@ impl VinePullDriver {
         if self.disk_write_frozen {
             tracing::warn!(
                 path = ?self.sidecar_path,
-                "ZEB-811 pull: sidecar save skipped — unreadable at load; preserving existing progress"
+                "ZEB-811 pull: sidecar save skipped — unreadable/undecryptable at load; preserving existing progress"
             );
             return;
         }
+        let Some(cipher) = self.cipher.clone() else {
+            tracing::warn!(
+                path = ?self.sidecar_path,
+                "ZEB-811 pull: sidecar save skipped — no device cipher (pre-identity boot)"
+            );
+            return;
+        };
         let snapshot = self.sidecar.lock().expect("vine pull sidecar lock").clone();
         let path = self.sidecar_path.clone();
-        match tokio::task::spawn_blocking(move || save_vine_pull(&path, &snapshot)).await {
+        match tokio::task::spawn_blocking(move || save_vine_pull(&cipher, &path, &snapshot)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "ZEB-811 pull: sidecar save failed"),
             Err(e) => tracing::warn!(error = %e, "ZEB-811 pull: sidecar save task panicked"),
@@ -1023,6 +1054,11 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use tokio::io::AsyncWriteExt;
+
+    /// Deterministic device cipher for the sealing tests (ZEB-986 PR-3).
+    fn tc() -> crate::device_dataset_file::DeviceCipher {
+        crate::device_dataset_file::test_cipher()
+    }
 
     // ── Pure client-session-loop tests (mock ingest, no driver) ──
 
@@ -1658,16 +1694,16 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&path, &sidecar).expect("save");
-        assert_eq!(load_vine_pull(&path), sidecar);
+        save_vine_pull(&tc(), &path, &sidecar).expect("save");
+        assert_eq!(load_vine_pull(Some(&tc()), &path), sidecar);
 
         // A truncated/garbage file must load as an empty default, not error.
         std::fs::write(&path, [0xFFu8, 0x00]).expect("write garbage");
-        assert_eq!(load_vine_pull(&path), VinePullSidecar::default());
+        assert_eq!(load_vine_pull(Some(&tc()), &path), VinePullSidecar::default());
 
         // A missing file must also load as an empty default.
         let missing = dir.path().join("does_not_exist.cbor");
-        assert_eq!(load_vine_pull(&missing), VinePullSidecar::default());
+        assert_eq!(load_vine_pull(Some(&tc()), &missing), VinePullSidecar::default());
     }
 
     #[test]
@@ -1677,21 +1713,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("vine_pull.cbor");
         std::fs::write(&p, [0xFFu8, 0x00]).unwrap();
-        let r = load_vine_pull_recovered(&p, 4_242);
+        let r = load_vine_pull_recovered(Some(&tc()), &p, 4_242);
         assert!(r.value.per_creator.is_empty());
         assert!(!r.disk_write_frozen, "corrupt heals (not frozen)");
         assert!(
             dir.path().join("vine_pull.cbor.corrupt-4242").exists(),
-            "corrupt bytes quarantined aside"
+            "legacy-plaintext corrupt bytes quarantined aside"
         );
     }
 
     #[test]
     fn missing_vine_pull_defaults_not_frozen() {
         let dir = tempfile::tempdir().unwrap();
-        let r = load_vine_pull_recovered(&dir.path().join("vine_pull.cbor"), 1);
+        let r = load_vine_pull_recovered(Some(&tc()), &dir.path().join("vine_pull.cbor"), 1);
         assert!(r.value.per_creator.is_empty());
         assert!(!r.disk_write_frozen);
+    }
+
+    #[test]
+    fn save_seals_and_freezes_under_foreign_cipher() {
+        // ZEB-986 PR-3: the sidecar is sealed on disk; a foreign cipher cannot decrypt it
+        // and freezes (never wipes, never quarantines a sealed decrypt failure).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vine_pull.cbor");
+        let sidecar = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                "addr1".to_string(),
+                CreatorPullState {
+                    cursor: (7, "cur".to_string()),
+                    ..Default::default()
+                },
+            )]),
+        };
+        save_vine_pull(&tc(), &p, &sidecar).expect("seal");
+        assert_eq!(
+            std::fs::read(&p).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "sidecar sealed on disk"
+        );
+        let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
+        let r = load_vine_pull_recovered(Some(&foreign), &p, 5);
+        assert!(r.value.per_creator.is_empty(), "undecryptable → empty");
+        assert!(r.disk_write_frozen, "sealed decrypt failure freezes");
+        assert!(
+            !dir.path().join("vine_pull.cbor.corrupt-5").exists(),
+            "sealed decrypt failure never quarantines"
+        );
+        assert!(p.exists(), "sealed file preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vine_pull.cbor");
+        save_vine_pull(&tc(), &p, &VinePullSidecar::default()).expect("seal");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "sealed sidecar is owner-only");
+    }
+
+    #[test]
+    fn legacy_plaintext_cbor_migrates_to_sealed() {
+        // A pre-PR-3 plaintext CBOR sidecar is recovered and re-sealed in place.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vine_pull.cbor");
+        let sidecar = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                "addrY".to_string(),
+                CreatorPullState {
+                    cursor: (3, "c".to_string()),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let mut plaintext = Vec::new();
+        ciborium::into_writer(&sidecar, &mut plaintext).unwrap();
+        std::fs::write(&p, &plaintext).unwrap();
+        let loaded = load_vine_pull(Some(&tc()), &p);
+        assert_eq!(loaded, sidecar, "legacy plaintext recovered");
+        assert_eq!(
+            std::fs::read(&p).unwrap()[0],
+            crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3,
+            "migrated to sealed on load"
+        );
     }
 
     // ── Driver-level tests (mock transport + mock ingest) ──
@@ -1848,7 +1953,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
             cursor: (now, "v1".to_string()),
@@ -1869,6 +1974,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
 
         driver.run_one_pass(now).await;
@@ -1878,7 +1984,7 @@ mod tests {
             1,
             "first follow must always pull, never skip"
         );
-        let st = load_vine_pull(&sidecar_path)
+        let st = load_vine_pull(Some(&tc()), &sidecar_path)
             .per_creator
             .get(&creator)
             .cloned()
@@ -1909,7 +2015,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
             cursor: (now0 + 100, "repair".to_string()),
@@ -1930,6 +2036,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
 
         for i in 1..=4u64 {
@@ -1946,7 +2053,7 @@ mod tests {
             "the 5th pass must force a repair pull"
         );
 
-        let st = load_vine_pull(&sidecar_path)
+        let st = load_vine_pull(Some(&tc()), &sidecar_path)
             .per_creator
             .get(&creator)
             .cloned()
@@ -1985,7 +2092,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
             cursor: (now, "v".to_string()),
@@ -2004,6 +2111,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path,
+            Some(tc()),
         );
 
         driver.run_one_pass(now).await;
@@ -2048,7 +2156,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         // First candidate (dead) fails; the pass must fail over to the
         // second (alive) rather than giving up after index 0.
@@ -2072,6 +2180,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
 
         driver.run_one_pass(now).await;
@@ -2085,7 +2194,7 @@ mod tests {
         assert_eq!(calls[0].0.iroh_endpoint_id, dead.iroh_endpoint_id);
         assert_eq!(calls[1].0.iroh_endpoint_id, alive.iroh_endpoint_id);
 
-        let st = load_vine_pull(&sidecar_path)
+        let st = load_vine_pull(Some(&tc()), &sidecar_path)
             .per_creator
             .get(&creator)
             .cloned()
@@ -2128,7 +2237,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
             cursor: (now, "v".to_string()),
@@ -2147,6 +2256,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
 
         driver.run_one_pass(now).await;
@@ -2158,7 +2268,7 @@ mod tests {
             "a failed resolve must fall back to the cached relay hint"
         );
 
-        let st = load_vine_pull(&sidecar_path)
+        let st = load_vine_pull(Some(&tc()), &sidecar_path)
             .per_creator
             .get(&creator)
             .cloned()
@@ -2180,7 +2290,7 @@ mod tests {
         let seeded = VinePullSidecar {
             per_creator: BTreeMap::from([(stale_creator.clone(), CreatorPullState::default())]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let transport = Arc::new(MockTransport::with_results(Vec::new()));
         let followed_fn: FollowedCreatorsFn = Arc::new(Vec::new);
@@ -2194,6 +2304,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
 
         driver.run_one_pass(now).await;
@@ -2202,7 +2313,7 @@ mod tests {
             transport.calls().is_empty(),
             "an unfollowed creator must never be dialed"
         );
-        let loaded = load_vine_pull(&sidecar_path);
+        let loaded = load_vine_pull(Some(&tc()), &sidecar_path);
         assert!(
             loaded.per_creator.is_empty(),
             "the unfollowed creator's state must be pruned"
@@ -2227,6 +2338,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path,
+            Some(tc()),
         )
         .with_telemetry(Arc::clone(&telemetry));
 
@@ -2277,7 +2389,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let driver = VinePullDriver::new(
             [0; 32],
@@ -2287,6 +2399,7 @@ mod tests {
             Arc::new(Vec::new),
             Arc::new(|_| None),
             sidecar_path,
+            Some(tc()),
         );
 
         assert_eq!(driver.cached_relays_for(&creator), relays);
@@ -2325,7 +2438,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         // Pages 1..n landed durably (committed), then the session died.
         let transport = Arc::new(
@@ -2344,12 +2457,13 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
 
         driver.run_one_pass(now).await;
 
         assert_eq!(transport.calls().len(), 1, "the one candidate is dialed");
-        let st = load_vine_pull(&sidecar_path)
+        let st = load_vine_pull(Some(&tc()), &sidecar_path)
             .per_creator
             .get(&creator)
             .cloned()
@@ -2400,7 +2514,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let transport = Arc::new(
             MockTransport::with_results(vec![
@@ -2425,6 +2539,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
 
         driver.run_one_pass(now).await;
@@ -2434,7 +2549,7 @@ mod tests {
         assert_eq!(calls[0].0.iroh_endpoint_id, died_ahead.iroh_endpoint_id);
         assert_eq!(calls[1].0.iroh_endpoint_id, lagging.iroh_endpoint_id);
 
-        let st = load_vine_pull(&sidecar_path)
+        let st = load_vine_pull(Some(&tc()), &sidecar_path)
             .per_creator
             .get(&creator)
             .cloned()
@@ -2480,7 +2595,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         // Candidate A backfilled 5 rows into the sink, then its session failed
         // (the `Err` carries no count). Candidate B succeeded with 3 more.
@@ -2508,6 +2623,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         )
         .with_telemetry(Arc::clone(&telemetry));
 
@@ -2551,7 +2667,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         // One candidate: backfills 4 rows into the sink AND returns them as
         // its result — exactly how a real single-candidate pass behaves.
@@ -2576,6 +2692,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         )
         .with_telemetry(Arc::clone(&telemetry));
 
@@ -2618,7 +2735,7 @@ mod tests {
                 },
             )]),
         };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+        save_vine_pull(&tc(), &sidecar_path, &seeded).expect("seed sidecar");
 
         let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
             cursor: (5, "rewound".to_string()),
@@ -2637,6 +2754,7 @@ mod tests {
             followed_fn,
             last_received,
             sidecar_path.clone(),
+            Some(tc()),
         );
         driver.run_one_pass(now).await;
 
@@ -2645,7 +2763,7 @@ mod tests {
             1,
             "the seeded relay must be pulled"
         );
-        let st = load_vine_pull(&sidecar_path)
+        let st = load_vine_pull(Some(&tc()), &sidecar_path)
             .per_creator
             .get(&creator)
             .cloned()
