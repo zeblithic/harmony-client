@@ -87,12 +87,14 @@ pub enum PersistError {
 /// `identity_dir/communities/{id_hex}/voting.cbor` — matches the
 /// `crdt.cbor` layout (`community_state_sync::paths_for`). `hex::encode`
 /// is the codebase convention for `SpaceId` rendering.
+pub(crate) const VOTING_FILENAME: &str = "voting.cbor";
+
 pub fn voting_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf {
     let id_hex = hex::encode(community_id.0);
     identity_dir
         .join("communities")
         .join(id_hex)
-        .join("voting.cbor")
+        .join(VOTING_FILENAME)
 }
 
 /// An owned, `Send + 'static` snapshot of the serde-clean subset of a
@@ -142,17 +144,26 @@ pub fn snapshot_for_persist(log: &VotingLog, community_id: &SpaceId) -> VotingLo
     })
 }
 
-/// CBOR-encode `snapshot` and atomically replace `path`. Blocking (`std::fs`
-/// write + rename) — run under `spawn_blocking`, never on an async worker
-/// while holding a lock. Plaintext CBOR at rest — voting events are signed
-/// (tamper-evident); the codebase convention encrypts only raw private
-/// keys, not materialized/log state (channel-log segments are likewise
-/// plaintext at rest).
-pub fn write_snapshot(path: &Path, snapshot: &VotingLogSnapshot) -> Result<(), PersistError> {
+/// CBOR-encode `snapshot` and atomically replace `path`, sealed under the
+/// device cipher (ZEB-983 — voting events are signed/tamper-evident, but
+/// ballots, poll metadata, and the restore overlay are confidentiality-
+/// sensitive at rest like every other community family). Blocking — run
+/// under `spawn_blocking`, never on an async worker while holding a lock.
+pub fn write_snapshot(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    snapshot: &VotingLogSnapshot,
+) -> Result<(), PersistError> {
     let mut bytes = Vec::new();
     ciborium::into_writer(&snapshot.0, &mut bytes)
         .map_err(|e| PersistError::CborEncode(e.to_string()))?;
-    write_atomic(path, &bytes)
+    crate::device_dataset_file::write_image(
+        cipher,
+        path,
+        &crate::community_state_persist::seal_label(&snapshot.0.community_id, VOTING_FILENAME),
+        &bytes,
+    )
+    .map_err(PersistError::Io)
 }
 
 /// Convenience sync wrapper: `snapshot_for_persist` + `write_snapshot` in one
@@ -161,11 +172,12 @@ pub fn write_snapshot(path: &Path, snapshot: &VotingLogSnapshot) -> Result<(), P
 /// Hot paths (`persist_now`, the tick archive sweep) use the split form so the
 /// `std::fs` write runs on a blocking thread with no lock held.
 pub fn save_voting_log(
+    cipher: &crate::device_dataset_file::DeviceCipher,
     path: &Path,
     log: &VotingLog,
     community_id: &SpaceId,
 ) -> Result<(), PersistError> {
-    write_snapshot(path, &snapshot_for_persist(log, community_id))
+    write_snapshot(cipher, path, &snapshot_for_persist(log, community_id))
 }
 
 /// Persist ONLY a policy change, preserving the on-disk `events` +
@@ -184,13 +196,14 @@ pub fn save_voting_log(
 ///   `new_policy` (preserves events even when the caller's in-memory log had
 ///   not loaded them).
 pub fn save_policy_only(
+    cipher: &crate::device_dataset_file::DeviceCipher,
     path: &Path,
     community_id: &SpaceId,
     new_policy: &CommunityVotingPolicy,
 ) -> Result<(), PersistError> {
     // `load_voting_log` returns `Err` ONLY on a non-NotFound I/O error
     // (present-but-unreadable); missing → empty, corrupt → quarantine + empty.
-    let (events, _old_policy, poll_restore) = load_voting_log(path, community_id)?;
+    let (events, _old_policy, poll_restore) = load_voting_log(cipher, path, community_id)?;
     let record = PersistedVotingLog {
         version: VOTING_LOG_SCHEMA_VERSION,
         community_id: *community_id,
@@ -201,7 +214,13 @@ pub fn save_policy_only(
     let mut bytes = Vec::new();
     ciborium::into_writer(&record, &mut bytes)
         .map_err(|e| PersistError::CborEncode(e.to_string()))?;
-    write_atomic(path, &bytes)
+    crate::device_dataset_file::write_image(
+        cipher,
+        path,
+        &crate::community_state_persist::seal_label(community_id, VOTING_FILENAME),
+        &bytes,
+    )
+    .map_err(PersistError::Io)
 }
 
 /// Load the persisted `(events, policy)` for `expected_id`.
@@ -220,6 +239,7 @@ pub fn save_policy_only(
 ///   sit in the wrong directory during manual recovery).
 #[allow(clippy::type_complexity)]
 pub fn load_voting_log(
+    cipher: &crate::device_dataset_file::DeviceCipher,
     path: &Path,
     expected_id: &SpaceId,
 ) -> Result<
@@ -231,15 +251,21 @@ pub fn load_voting_log(
     PersistError,
 > {
     let empty = || (Vec::new(), CommunityVotingPolicy::default(), HashMap::new());
-    // Single-syscall NotFound handling (no TOCTOU between exists+read).
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    let label = crate::community_state_persist::seal_label(expected_id, VOTING_FILENAME);
+    // ZEB-983 envelope beneath the contract: missing → empty; envelope
+    // Crypto (AEAD/tag/malformed) → SAME quarantine branch as a decode
+    // error; envelope Io → Err (the present-but-unreadable signal the
+    // boot reconcile turns into a session persist-disarm).
+    let image = match crate::device_dataset_file::read_image(cipher, path, &label) {
+        Ok(Some(image)) => image,
+        Ok(None) => return Ok(empty()),
+        Err(crate::device_dataset_file::ImageError::Io(e)) => return Err(PersistError::Io(e)),
+        Err(crate::device_dataset_file::ImageError::Crypto(msg)) => {
+            quarantine_corrupted(path, &msg);
             return Ok(empty());
         }
-        Err(e) => return Err(PersistError::Io(e)),
     };
-    match ciborium::from_reader::<PersistedVotingLog, _>(bytes.as_slice()) {
+    match ciborium::from_reader::<PersistedVotingLog, _>(image.bytes.as_slice()) {
         Ok(record) if record.version != VOTING_LOG_SCHEMA_VERSION => {
             quarantine_corrupted(path, &format!("unknown schema version {}", record.version));
             Ok(empty())
@@ -254,7 +280,12 @@ pub fn load_voting_log(
             );
             Ok(empty())
         }
-        Ok(record) => Ok((record.events, record.policy, record.poll_restore)),
+        Ok(record) => {
+            // Eager migration: reseal a legacy plaintext file only after
+            // version + community_id + decode all validated.
+            crate::device_dataset_file::reseal_if_legacy(cipher, path, &label, &image);
+            Ok((record.events, record.policy, record.poll_restore))
+        }
         Err(decode_err) => {
             quarantine_corrupted(path, &decode_err.to_string());
             Ok(empty())
@@ -263,7 +294,7 @@ pub fn load_voting_log(
 }
 
 /// Move a corrupted / misrouted file aside under `<path>.corrupt.<unix_ms>`
-/// so the next `write_atomic` lands cleanly while preserving the
+/// so the next sealed write lands cleanly while preserving the
 /// original bytes for forensics. Failures here are logged and swallowed
 /// — the caller still gets default state, so the engine spawns and
 /// resyncs from peers via backfill.
@@ -291,25 +322,12 @@ fn quarantine_corrupted(path: &Path, reason: &str) {
     }
 }
 
-/// Atomically replace `path` with `bytes` via temp-file + rename.
-///
-/// `create_dir_all` first so a fresh per-community directory doesn't
-/// ENOENT. The temp file shares the parent dir so `rename` is an
-/// in-volume atomic op. Like `community_state_persist::write_atomic`
-/// (and unlike `owner_state_persist::save_atomically`) we skip the
-/// dir-fsync: the voting log is peer-recoverable via backfill, so the
-/// per-mutation dir-fsync cost doesn't pencil out. Single writer per
-/// (community_id, file) — the engine serializes persist calls — so the
-/// fixed `.tmp` name can't race.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
+// ZEB-983: this module's private `write_atomic` (fixed `.tmp`, no fsync) is
+// retired — writes route through `device_dataset_file::write_image` →
+// `owner_state_persist::save_atomically` (randomized temp + fsync,
+// `create_dir_all` included). The fixed-temp single-writer constraint and
+// the hold-mutex-across-write rationale in `VotingLogEngine::persist_now`
+// disappear with it (the hold is harmless and stays).
 
 #[cfg(test)]
 mod tests {
@@ -344,8 +362,15 @@ mod tests {
         log.events.push(test_event(200, 1, "d2"));
         // policy stays default (fields are private) — round-trip still
         // exercises the serde path and Eq confirms fidelity.
-        save_voting_log(&path, &log, &cid).unwrap();
-        let (events, policy, _poll_meta) = load_voting_log(&path, &cid).unwrap();
+        save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
+        let (events, policy, _poll_meta) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert_eq!(events, log.events);
         assert_eq!(&policy, log.policy());
     }
@@ -355,7 +380,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cid = SpaceId([5u8; 16]);
         let path = voting_path_for(dir.path(), &cid);
-        let (events, policy, poll_meta) = load_voting_log(&path, &cid).unwrap();
+        let (events, policy, poll_meta) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
         assert!(poll_meta.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
@@ -370,8 +396,15 @@ mod tests {
         let path = voting_path_for(dir.path(), &cid_a);
         let mut log = VotingLog::default();
         log.events.push(test_event(1, 0, "d"));
-        save_voting_log(&path, &log, &cid_a).unwrap();
-        let (events, _policy, _pm) = load_voting_log(&path, &cid_b).unwrap();
+        save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid_a,
+        )
+        .unwrap();
+        let (events, _policy, _pm) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid_b).unwrap();
         assert!(
             events.is_empty(),
             "mismatch must not surface foreign events"
@@ -398,8 +431,10 @@ mod tests {
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&record, &mut bytes).unwrap();
-        write_atomic(&path, &bytes).unwrap();
-        let (events, _, _) = load_voting_log(&path, &cid).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let (events, _, _) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
     }
 
@@ -410,7 +445,8 @@ mod tests {
         let path = voting_path_for(dir.path(), &cid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
-        let (events, policy, _pm) = load_voting_log(&path, &cid).unwrap();
+        let (events, policy, _pm) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
     }
@@ -428,15 +464,28 @@ mod tests {
         let mut log = VotingLog::default();
         log.events.push(test_event(100, 0, "d1"));
         log.events.push(test_event(200, 1, "d2"));
-        save_voting_log(&path, &log, &cid).unwrap();
+        save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
 
         let new_policy = CommunityVotingPolicy {
             notify_on_delegate_signal: true,
             ..Default::default()
         };
-        save_policy_only(&path, &cid, &new_policy).unwrap();
+        save_policy_only(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &cid,
+            &new_policy,
+        )
+        .unwrap();
 
-        let (events, policy, _pm) = load_voting_log(&path, &cid).unwrap();
+        let (events, policy, _pm) =
+            load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert_eq!(events, log.events, "policy-only write must preserve events");
         assert_eq!(policy, new_policy, "policy must be updated");
     }
@@ -455,9 +504,87 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            save_policy_only(&path, &cid, &new_policy).is_err(),
+            save_policy_only(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &cid,
+                &new_policy
+            )
+            .is_err(),
             "an unreadable existing file must not be clobbered by a policy write"
         );
         assert!(path.is_dir(), "the file must be left untouched");
+    }
+
+    /// ZEB-983: legacy bare-CBOR voting.cbor loads, then reseals in place
+    /// byte-losslessly (inner image == the legacy bytes).
+    #[test]
+    fn legacy_plaintext_voting_log_migrates_to_sealed_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voting.cbor");
+        let cid = SpaceId([4u8; 16]);
+        let record = PersistedVotingLog {
+            version: VOTING_LOG_SCHEMA_VERSION,
+            community_id: cid,
+            events: Vec::new(),
+            policy: CommunityVotingPolicy::default(),
+            poll_restore: HashMap::new(),
+        };
+        let mut legacy = Vec::new();
+        ciborium::into_writer(&record, &mut legacy).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+
+        let cipher = crate::device_dataset_file::test_cipher();
+        let (events, _policy, _pm) = load_voting_log(&cipher, &path, &cid).unwrap();
+        assert!(events.is_empty());
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(
+            raw.first(),
+            Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3),
+            "legacy voting log resealed on load"
+        );
+        let label = crate::community_state_persist::seal_label(&cid, VOTING_FILENAME);
+        let image = crate::device_dataset_file::read_image(&cipher, &path, &label)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*image.bytes, &legacy[..], "inner image byte-lossless");
+    }
+
+    /// Sealed-corrupt (tag failure) → the SAME quarantine + empty branch
+    /// as a CBOR decode failure; Io (dir at path) → hard Err — the
+    /// "present but unreadable" signal boot turns into a session disarm.
+    #[test]
+    fn sealed_corrupt_quarantines_and_io_stays_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voting.cbor");
+        let cid = SpaceId([4u8; 16]);
+        let cipher = crate::device_dataset_file::test_cipher();
+        let log = VotingLog::default();
+        save_voting_log(&cipher, &path, &log, &cid).unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        std::fs::write(&path, &raw).unwrap();
+
+        let (events, _p, _pm) = load_voting_log(&cipher, &path, &cid).unwrap();
+        assert!(events.is_empty(), "quarantine + empty");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".corrupt.")),
+            "sealed-corrupt quarantined with the community dialect"
+        );
+
+        let io_path = dir.path().join("io.cbor");
+        std::fs::create_dir_all(&io_path).unwrap();
+        assert!(
+            matches!(
+                load_voting_log(&cipher, &io_path, &cid),
+                Err(PersistError::Io(_))
+            ),
+            "Io propagates hard, nothing relocated"
+        );
     }
 }

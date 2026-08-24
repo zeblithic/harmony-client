@@ -254,6 +254,7 @@ impl SimCommunity {
                 Duration::from_secs(2),
             ));
             let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adopt_floor: HlcAdoptFloor::new(),
                 community_id,
                 membership_key: membership_key.clone(),

@@ -49,13 +49,21 @@ pub const SEALED_DEVICE_SCHEMA_V3: u8 = 3;
 /// Coarse plausibility cap checked against file METADATA before the bytes
 /// are read — same rationale and value as
 /// `fleet_dataset_file::MAX_DATASET_FILE_BYTES` (PR #727 review).
-const MAX_DEVICE_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_DEVICE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Sealing context for device-sealed files: the seed-derived at-rest key.
 /// Cheap to clone; the key bytes are shared and zeroized on final drop.
 #[derive(Clone)]
 pub struct DeviceCipher {
     key: Arc<Zeroizing<[u8; 32]>>,
+}
+
+/// Redacting Debug: the key bytes must never reach logs or a `#[derive(Debug)]`
+/// on a struct that holds a cipher (e.g. `ChannelLog`).
+impl std::fmt::Debug for DeviceCipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceCipher(<redacted>)")
+    }
 }
 
 impl DeviceCipher {

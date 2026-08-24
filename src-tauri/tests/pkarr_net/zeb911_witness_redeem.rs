@@ -239,6 +239,7 @@ async fn spawn_witness_node(s: &TwoPartySetup) -> WitnessNode {
         Duration::from_secs(2),
     ));
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "witness-dev".into(),
         content_store,

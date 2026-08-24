@@ -14,6 +14,11 @@
 pub const SNAPSHOT_PER_CHANNEL_CAP: usize = 500;
 pub const SNAPSHOT_TOTAL_CAP: usize = 5000;
 
+/// Filename of the pre-fork snapshot under a fork community's dir. Used as
+/// BOTH the on-disk path component and the ZEB-983 AAD seal label — one
+/// constant so the two can never drift (a mismatch silently breaks the tag).
+pub(crate) const PRE_FORK_SNAPSHOT_FILENAME: &str = "pre_fork_snapshot.bin";
+
 /// §4.2 snapshot policy: per-channel cap + proportional total trim.
 ///
 /// 1. Per-channel cap: for each channel, sort descending by HLC, take
@@ -593,13 +598,19 @@ pub async fn fork_community(
         let snapshot_bytes = crate::owner_state_crypto::canonical_cbor_encode(&pre_fork_snapshot)
             .map_err(|e| format!("fork_community: encode snapshot: {e}"))?;
 
-        // Atomic write via tempfile + rename.
-        let snapshot_path = fork_dir.join("pre_fork_snapshot.bin");
-        let tmp_path = fork_dir.join("pre_fork_snapshot.bin.tmp");
-        std::fs::write(&tmp_path, &snapshot_bytes)
-            .map_err(|e| format!("fork_community: write snapshot tmp: {e}"))?;
-        std::fs::rename(&tmp_path, &snapshot_path)
-            .map_err(|e| format!("fork_community: rename snapshot: {e}"))?;
+        // ZEB-983: seal at rest (the snapshot carries message bodies +
+        // fork_reason). AAD binds the fork community id; write_image
+        // supplies the atomic tempfile + fsync + rename.
+        let cipher = crate::device_dataset_file::get_or_derive(&identity_dir)
+            .map_err(|e| format!("fork_community: device cipher unavailable: {e}"))?;
+        let snapshot_path = fork_dir.join(PRE_FORK_SNAPSHOT_FILENAME);
+        crate::device_dataset_file::write_image(
+            &cipher,
+            &snapshot_path,
+            &crate::community_state_persist::seal_label(&fork_space_id, PRE_FORK_SNAPSHOT_FILENAME),
+            &snapshot_bytes,
+        )
+        .map_err(|e| format!("fork_community: write snapshot: {e}"))?;
     }
 
     // Now spawn the fork community engine + persist owner-state space.
@@ -653,7 +664,7 @@ pub async fn fork_community(
         .map(|d| {
             d.join("communities")
                 .join(&fork_space_id_hex)
-                .join("pre_fork_snapshot.bin")
+                .join(PRE_FORK_SNAPSHOT_FILENAME)
         })
         .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
     let cleanup_disk_artifacts = || {

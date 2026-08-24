@@ -1248,8 +1248,18 @@ mod zeb846_accessor_ceiling {
             "precondition: join + future kick both in the log"
         );
 
-        community_state_persist::save_crdt(&path, &state).unwrap();
-        let reloaded = community_state_persist::load_crdt(&path, COMMUNITY).unwrap();
+        community_state_persist::save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &state,
+        )
+        .unwrap();
+        let reloaded = community_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            COMMUNITY,
+        )
+        .unwrap();
 
         // (a) the poison event is RETAINED after reload (non-destructive):
         assert!(

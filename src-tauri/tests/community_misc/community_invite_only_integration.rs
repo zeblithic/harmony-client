@@ -210,6 +210,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     let dir_b = tempfile::tempdir().expect("dir b");
 
     let registry_a = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "alice-dev".into(),
         content_store: Arc::clone(&cs_a),
@@ -229,6 +230,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // (Alice's registry_a above holds its own floor — a separate node.)
     let bob_adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: bob_adopt_floor.clone(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_b),
@@ -494,6 +496,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // ZEB-445: registry takes a mode-agnostic NodeEventSink; this test never
     // asserts on channel-log emissions, so an empty fan-out is sufficient.
     let bob_channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adapter_request_tx: bob_channel_log_adapter_tx,
         sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: dir_b.path().to_path_buf(),

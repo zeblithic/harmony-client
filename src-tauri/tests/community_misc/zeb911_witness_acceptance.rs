@@ -266,6 +266,7 @@ async fn setup_witness_community() -> WitnessFixture {
     // The registry models the WITNESS's node: self_owner + signing key are the
     // witness's, so the auto-counter-sign hook signs as the witness.
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "witness-dev".into(),
         content_store: make_content_store(),

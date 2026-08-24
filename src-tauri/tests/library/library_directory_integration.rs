@@ -822,6 +822,7 @@ async fn click_to_join_redeem_invite_smoke() {
     ));
 
     let community_registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "joiner-dev".into(),
         content_store: cs,
@@ -862,6 +863,7 @@ async fn click_to_join_redeem_invite_smoke() {
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
         mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
     let channel_log_registry = Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adapter_request_tx: channel_log_adapter_tx,
         sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
         identity_dir: tmp.path().to_path_buf(),

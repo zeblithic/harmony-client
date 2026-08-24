@@ -30,6 +30,7 @@ async fn registry_spawns_and_tears_down_per_community() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let registry = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "dev".into(),
         content_store: cs,
@@ -86,6 +87,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let registry = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "dev".into(),
         content_store: cs,
@@ -180,6 +182,7 @@ async fn shutdown_engine_and_cleanup_persistence_idempotent_on_unknown_id() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "dev".into(),
         content_store: cs,
@@ -228,6 +231,7 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
 
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "dev".into(),
         content_store: cs,
@@ -342,6 +346,7 @@ async fn pending_redemption_oneshot_not_fired_by_own_event_insert() {
     ));
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "admin-dev".into(),
         content_store: cs,
@@ -458,6 +463,7 @@ async fn pending_redemption_unregistered_when_no_match() {
     ));
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "admin-dev".into(),
         content_store: cs,

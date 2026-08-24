@@ -17,8 +17,18 @@ fn save_and_load_crdt_round_trips() {
 
     let community_id = SpaceId([1u8; 16]);
     let original = CommunityState::new(community_id);
-    save_crdt(&path, &original).expect("save");
-    let loaded = load_crdt(&path, community_id).expect("load");
+    save_crdt(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &original,
+    )
+    .expect("save");
+    let loaded = load_crdt(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        community_id,
+    )
+    .expect("load");
     assert_eq!(loaded.community_id, community_id);
     assert!(loaded.events_is_empty());
 }
@@ -28,7 +38,12 @@ fn load_crdt_missing_file_returns_empty_state() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("nonexistent.cbor");
     let community_id = SpaceId([1u8; 16]);
-    let loaded = load_crdt(&path, community_id).expect("load missing");
+    let loaded = load_crdt(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        community_id,
+    )
+    .expect("load missing");
     assert_eq!(loaded.community_id, community_id);
     assert!(loaded.events_is_empty());
 }
@@ -42,7 +57,12 @@ fn load_crdt_truncated_file_self_heals_to_default() {
     // map-shaped decoder rejects.
     std::fs::write(&path, b"\x82\x00").expect("write garbage");
     let community_id = SpaceId([1u8; 16]);
-    let recovered = load_crdt(&path, community_id).expect("self-heal returns default");
+    let recovered = load_crdt(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        community_id,
+    )
+    .expect("self-heal returns default");
     assert_eq!(recovered.community_id, community_id);
     assert!(recovered.events_is_empty());
 
@@ -69,7 +89,12 @@ fn load_replay_truncated_file_self_heals_to_default() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("replay.cbor");
     std::fs::write(&path, b"\xff\xff").expect("write garbage");
-    let recovered = load_replay(&path).expect("self-heal returns default");
+    let recovered = load_replay(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &SpaceId([9u8; 16]),
+    )
+    .expect("self-heal returns default");
     assert!(recovered.per_device.is_empty());
     assert!(
         !path.exists(),
@@ -78,17 +103,25 @@ fn load_replay_truncated_file_self_heals_to_default() {
 }
 
 #[test]
-fn load_crdt_misrouted_file_returns_mismatch_err() {
-    // Save with one community_id, load expecting a different one —
-    // the bytes parse cleanly but the routing guard must reject.
+fn load_crdt_misrouted_legacy_file_returns_mismatch_err() {
+    // A LEGACY plaintext file that parses as a different community must
+    // still hit the routing guard (hard error, deliberately not
+    // quarantined — the file probably belongs to that other community).
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("crdt.cbor");
 
     let saved_id = SpaceId([1u8; 16]);
     let expected_id = SpaceId([2u8; 16]);
-    save_crdt(&path, &CommunityState::new(saved_id)).expect("save");
+    let legacy =
+        harmony_app::owner_state_crypto::canonical_cbor_encode(&CommunityState::new(saved_id))
+            .expect("encode");
+    std::fs::write(&path, &legacy).expect("write legacy");
 
-    let result = load_crdt(&path, expected_id);
+    let result = load_crdt(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        expected_id,
+    );
     match result {
         Err(PersistError::CommunityIdMismatch { found, expected }) => {
             assert_eq!(found, saved_id);
@@ -96,6 +129,35 @@ fn load_crdt_misrouted_file_returns_mismatch_err() {
         }
         other => panic!("expected CommunityIdMismatch, got {other:?}"),
     }
+    assert!(path.exists(), "mismatched legacy file left in place");
+}
+
+#[test]
+fn load_crdt_misrouted_sealed_file_quarantines_via_aad() {
+    // ZEB-983: a SEALED file misrouted across communities never reaches
+    // the id check — the AAD label (which binds the community id) fails
+    // the tag first, classifying as content corruption → quarantine +
+    // default. The plaintext-era CommunityIdMismatch remains reachable
+    // only for legacy files (test above).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("crdt.cbor");
+
+    let saved_id = SpaceId([1u8; 16]);
+    let expected_id = SpaceId([2u8; 16]);
+    let cipher = harmony_app::device_dataset_file::test_cipher();
+    save_crdt(&cipher, &path, &CommunityState::new(saved_id)).expect("save sealed");
+
+    let loaded = load_crdt(&cipher, &path, expected_id).expect("quarantine + default");
+    assert_eq!(loaded.community_id, expected_id);
+    assert!(loaded.events_is_empty());
+    assert!(!path.exists(), "sealed misrouted file moved aside");
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt.")),
+        "quarantined sibling exists"
+    );
 }
 
 #[test]
@@ -116,8 +178,19 @@ fn save_and_load_replay_round_trips() {
             device_id: "dev".into(),
         },
     );
-    save_replay(&path, &tracker).expect("save");
-    let loaded = load_replay(&path).expect("load");
+    save_replay(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &SpaceId([9u8; 16]),
+        &tracker,
+    )
+    .expect("save");
+    let loaded = load_replay(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &SpaceId([9u8; 16]),
+    )
+    .expect("load");
     let key = (alice, "dev".to_string());
     assert_eq!(loaded.per_device.get(&key).map(|h| h.wall_ms), Some(1000));
     assert_eq!(loaded.per_device.get(&key).map(|h| h.logical), Some(5));
@@ -160,7 +233,12 @@ fn load_replay_quarantines_and_recovers_from_old_shape() {
     ciborium::ser::into_writer(&old, &mut old_bytes).expect("encode old shape");
     std::fs::write(&path, &old_bytes).expect("write");
 
-    let recovered = load_replay(&path).expect("load_replay self-heals");
+    let recovered = load_replay(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &SpaceId([9u8; 16]),
+    )
+    .expect("load_replay self-heals");
     assert!(
         recovered.per_device.is_empty(),
         "recovered tracker MUST be empty (default)"
@@ -190,8 +268,19 @@ fn load_replay_quarantines_and_recovers_from_old_shape() {
             device_id: "new-dev".into(),
         },
     );
-    save_replay(&path, &t).expect("save_replay");
-    let reloaded = load_replay(&path).expect("reload");
+    save_replay(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &SpaceId([9u8; 16]),
+        &t,
+    )
+    .expect("save_replay");
+    let reloaded = load_replay(
+        &harmony_app::device_dataset_file::test_cipher(),
+        &path,
+        &SpaceId([9u8; 16]),
+    )
+    .expect("reload");
     assert_eq!(reloaded.per_device.len(), 1);
     assert!(reloaded
         .per_device

@@ -27,6 +27,7 @@ use crate::community_channel_log::{
     MAX_WATERMARK_VECTOR_BYTES, MAX_WATERMARK_VECTOR_ENTRIES,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
+use crate::device_dataset_file::DeviceCipher;
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
 /// ZEB-969: which delivery path handed a packet to `process_inbound_packet`.
@@ -471,6 +472,10 @@ pub struct ChannelKeyLiveSource {
 pub struct ChannelLogEngineParams {
     pub community_id: SpaceId,
     pub channel_id: ChannelId,
+    /// ZEB-983: seals this channel's `manifest.cbor` / `tail.cbor` /
+    /// `segments/*.cbor` at rest. Threaded from
+    /// `ChannelLogRegistryConfig.device_cipher`.
+    pub device_cipher: DeviceCipher,
     pub channel_key: Arc<ChannelKey>,
     /// ZEB-920: `Some` in production spawns (live per-op key selection);
     /// `None` = degraded/test mode pinned to `channel_key`.
@@ -555,7 +560,8 @@ impl ChannelLogEngine {
         // ChannelLog::new in that case. The boolean second-tuple value
         // (segment_count + tail.len) is unused here; we just want the
         // tail in memory so the replay tracker rebuild below sees it.
-        let (log, _total_count) = ChannelLog::reload(
+        let (mut log, _total_count) = ChannelLog::reload(
+            params.device_cipher.clone(),
             params.community_id,
             params.channel_id,
             params.root_dir,
@@ -583,13 +589,53 @@ impl ChannelLogEngine {
         // replay check during a rebuild would falsely flag the SECOND
         // occurrence of any (author, device) lane as a replay. We just
         // want the high-water mark recorded.
+        //
+        // ZEB-983 recovery contract: a segment that fails to open/decode
+        // (Crypto → undecryptable, or content corruption) is quarantined
+        // and dropped from the manifest instead of failing engine spawn —
+        // the pre-983 hard `?` here is exactly the dead-channel cliff this
+        // ticket retires. `read_segment_migrating` also reseals a legacy
+        // plaintext segment in place (eager migration). Io stays hard.
+        // Collect-then-apply: we can't mutate the manifest while iterating
+        // it, and quarantining renumbers indices, so record the offending
+        // rel_paths first and quarantine after the walk.
         let mut tracker = ChannelLogReplayTracker::new();
-        for seg in &log.manifest.segments {
-            let events = log
-                .read_segment(seg)
-                .map_err(ChannelLogEngineError::Persist)?;
-            for ev in &events {
-                tracker.record(ev);
+        let mut corrupt_segment_indices: Vec<usize> = Vec::new();
+        for (idx, seg) in log.manifest.segments.iter().enumerate() {
+            match log.read_segment_migrating(seg) {
+                Ok(events) => {
+                    for ev in &events {
+                        tracker.record(ev);
+                    }
+                }
+                Err(ChannelLogPersistError::Io(e)) => {
+                    // Transient read failure — do NOT relocate state
+                    // (ZEB-460); surface it so the spawn site can log and
+                    // move on to the community's other channels.
+                    return Err(ChannelLogEngineError::Persist(ChannelLogPersistError::Io(
+                        e,
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = ?params.community_id,
+                        channel_id = ?params.channel_id,
+                        segment = ?seg.handle,
+                        error = %e,
+                        "channel-log: quarantining unreadable segment (RBSR will refill)"
+                    );
+                    corrupt_segment_indices.push(idx);
+                }
+            }
+        }
+        // Quarantine highest-index-first so each removal leaves the
+        // lower indices (still to be removed) valid.
+        for idx in corrupt_segment_indices.into_iter().rev() {
+            if let Err(e) = log.quarantine_segment(idx, "segment unreadable at boot") {
+                // A manifest-rewrite I/O failure during quarantine is a
+                // genuine disk fault — surface it rather than spawn with a
+                // manifest that still references the dropped segment.
+                return Err(ChannelLogEngineError::Persist(e));
             }
         }
         for ev in &log.tail {
@@ -738,6 +784,27 @@ impl ChannelLogEngine {
     /// events toward `limit`. Paging by retained events means a filtered-out
     /// run (e.g. a long reaction streak) cannot exhaust the budget before
     /// later kept events (CodeRabbit PR #314).
+    /// ZEB-983 (CodeRabbit): the off-lock segment readers all need the same
+    /// under-lock snapshot — the sealed segment descriptors, the in-memory
+    /// tail, the root dir, and the device cipher. Take the lock once here so
+    /// the three call sites stay in sync (and drop their tuple annotation).
+    async fn snapshot_for_offlock_read(
+        &self,
+    ) -> (
+        Vec<SegmentDescriptor>,
+        Vec<SignedChannelEvent>,
+        PathBuf,
+        DeviceCipher,
+    ) {
+        let log = self.log.lock().await;
+        (
+            log.manifest.segments.clone(),
+            log.tail.clone(),
+            log.root().to_path_buf(),
+            log.cipher().clone(),
+        )
+    }
+
     async fn collect_events(
         &self,
         since: Option<Hlc>,
@@ -757,14 +824,9 @@ impl ChannelLogEngine {
         // longer stalls concurrent log ops (e.g. live `append`) for the
         // duration of the disk reads. The tail is bounded by
         // `seal_threshold_events`, so the under-lock clone is cheap.
-        let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
-            let log = self.log.lock().await;
-            (
-                log.manifest.segments.clone(),
-                log.tail.clone(),
-                log.root().to_path_buf(),
-            )
-        };
+        let community_id = self.community_id;
+        let channel_id = self.channel_id;
+        let (segments, tail, root, cipher) = self.snapshot_for_offlock_read().await;
 
         // Phase 2 stores events in the tail (newest, in-memory) + sealed
         // segments (older, on-disk; sorted ascending by `range.0`). For correct
@@ -785,7 +847,7 @@ impl ChannelLogEngine {
                         continue;
                     }
                 }
-                let events = read_segment_at(&root, seg)?;
+                let events = read_segment_at(&cipher, &community_id, &channel_id, &root, seg)?;
                 for ev in events {
                     if let Some(since_hlc) = &since {
                         if !ev.at().is_strictly_newer_than(since_hlc) {
@@ -871,20 +933,15 @@ impl ChannelLogEngine {
         // segment), so it reads every segment — which is exactly where holding
         // the lock across the disk I/O hurts most. `vector` is cloned into the
         // blocking task.
-        let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
-            let log = self.log.lock().await;
-            (
-                log.manifest.segments.clone(),
-                log.tail.clone(),
-                log.root().to_path_buf(),
-            )
-        };
+        let community_id = self.community_id;
+        let channel_id = self.channel_id;
+        let (segments, tail, root, cipher) = self.snapshot_for_offlock_read().await;
         let vector = vector.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut out: Vec<SignedChannelEvent> = Vec::new();
             for seg in &segments {
-                let events = read_segment_at(&root, seg)?;
+                let events = read_segment_at(&cipher, &community_id, &channel_id, &root, seg)?;
                 for ev in events {
                     if !Self::vector_serves(&vector, &ev) || !keep(&ev) {
                         continue;
@@ -964,21 +1021,16 @@ impl ChannelLogEngine {
         // `spawn_blocking`. Behavior is identical: scan persisted segments
         // (oldest first) then the tail, returning the first matching
         // `ChannelAttachment` (within `scope`), else `None`.
-        let (segments, tail, root): (Vec<SegmentDescriptor>, Vec<SignedChannelEvent>, _) = {
-            let log = self.log.lock().await;
-            (
-                log.manifest.segments.clone(),
-                log.tail.clone(),
-                log.root().to_path_buf(),
-            )
-        };
+        let community_id = self.community_id;
+        let channel_id = self.channel_id;
+        let (segments, tail, root, cipher) = self.snapshot_for_offlock_read().await;
 
         // Read + scan the persisted segments off the async executor — the
         // reads use blocking `std::fs::read`. Early-exit on the first match.
         let cid = *cid;
         let seg_hit = tokio::task::spawn_blocking(move || {
             for seg in &segments {
-                let events = read_segment_at(&root, seg)?;
+                let events = read_segment_at(&cipher, &community_id, &channel_id, &root, seg)?;
                 for ev in &events {
                     if let Some(att) = attachment_with_cid(ev, &cid, scope) {
                         return Ok::<_, ChannelLogPersistError>(Some(att));
@@ -2244,6 +2296,11 @@ pub struct ChannelLogRegistryConfig {
     /// closure; for a user with 1000 channels, the queued requests
     /// are O(KB).
     pub adapter_request_tx: mpsc::UnboundedSender<crate::event_loop::ChannelLogAdapterRequest>,
+    /// ZEB-983: device cipher sealing every channel log file at rest.
+    /// Derived once at boot (`device_dataset_file::get_or_derive`);
+    /// available on keyless local-only boots. Cloned into each spawned
+    /// engine's params. Tests use `device_dataset_file::test_cipher()`.
+    pub device_cipher: DeviceCipher,
     /// ZEB-445: mode-agnostic event sink — propagated into each engine
     /// for `channel-message-received` / `channel-log-degraded` /
     /// `channel-backfill-progress` event emission.
@@ -2713,9 +2770,16 @@ impl ChannelLogRegistry {
         // restarts more often than hourly still gets its full reconcile.
         let backfill_state_root = root_dir.clone();
         let backfill_last_full_reconcile_ms =
-            crate::community_channel_log::ChannelBackfillState::load_async(&backfill_state_root)
-                .await
-                .map(|s| s.last_full_reconcile_ms);
+            crate::community_channel_log::ChannelBackfillState::load_async(
+                &self.config.device_cipher,
+                &backfill_state_root,
+                &crate::community_channel_log::ChannelBackfillState::channel_label(
+                    &community_id,
+                    &ds.channel_id,
+                ),
+            )
+            .await
+            .map(|s| s.last_full_reconcile_ms);
 
         let (publisher_tx, publisher_rx) = mpsc::channel::<Vec<u8>>(64);
         let (subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -2724,6 +2788,7 @@ impl ChannelLogRegistry {
         let params = ChannelLogEngineParams {
             community_id,
             channel_id: ds.channel_id,
+            device_cipher: self.config.device_cipher.clone(),
             channel_key: Arc::new(ds.channel_key),
             live_key_source: ds.live_key_source,
             root_dir,
@@ -3004,10 +3069,21 @@ impl ChannelLogRegistry {
             "backfill floor deadline computed (restart-aware)"
         );
         let persist_root = backfill_state_root;
+        let persist_cipher = self.config.device_cipher.clone();
+        let persist_channel_id = ds.channel_id;
         let on_full_reconcile: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |ts: u64| {
             let root = persist_root.clone();
+            let cipher = persist_cipher.clone();
             tokio::task::spawn_blocking(move || {
-                match crate::community_channel_log::ChannelBackfillState::save(&root, ts) {
+                match crate::community_channel_log::ChannelBackfillState::save(
+                    &cipher,
+                    &root,
+                    &crate::community_channel_log::ChannelBackfillState::channel_label(
+                        &community_id,
+                        &persist_channel_id,
+                    ),
+                    ts,
+                ) {
                     Err(e) => tracing::warn!(
                         error = %e,
                         "ZEB-599: failed to persist channel backfill_state sidecar"
@@ -3487,6 +3563,7 @@ mod tests {
         };
 
         let params = ChannelLogEngineParams {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             community_id,
             channel_id,
             channel_key: Arc::clone(&channel_key),
@@ -4152,6 +4229,7 @@ mod tests {
             ..Default::default()
         };
         let params = ChannelLogEngineParams {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             community_id,
             channel_id,
             channel_key: Arc::clone(&channel_key),
@@ -6195,6 +6273,116 @@ mod tests {
     ///    `ChannelEventError::Replay` — i.e. the rebuilt tracker's
     ///    high-water mark must reflect the LATEST event from that lane,
     ///    not whichever happened to be visited last in the rebuild.
+    /// ZEB-983 regression: the pre-983 dead-channel cliff. An unreadable
+    /// (Crypto-failing) sealed segment made `ChannelLogEngine::new` fail at
+    /// the replay-tracker walk — the channel then stayed dead every session
+    /// with no engine and no backfill driver. Under the new contract the
+    /// segment is quarantined and dropped, and the engine spawns.
+    #[tokio::test]
+    async fn unreadable_segment_quarantines_and_engine_spawns() {
+        let fix = build_engine_fixture(3, 5_000, 10_000).await;
+        let dir = fix.tmp.path().to_path_buf();
+        let community_id = fix.community_id;
+        let channel_id = fix.channel_id;
+        let self_owner = fix.self_owner;
+        let signing_key = Arc::clone(&fix.signing_key);
+        let channel_key = Arc::clone(&fix.channel_key);
+
+        // Create ≥1 sealed segment, then a tail event.
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for i in 0..4u64 {
+                let ev = make_signed_event(
+                    community_id,
+                    channel_id,
+                    self_owner,
+                    Hlc {
+                        wall_ms: 100 + i,
+                        logical: 0,
+                        device_id: "test-device".to_string(),
+                    },
+                    &format!("m{i}"),
+                    &signing_key,
+                );
+                log.append(ev).expect("append");
+                if i == 2 {
+                    log.seal_and_persist().expect("seal");
+                }
+            }
+            assert_eq!(log.manifest.segments.len(), 1, "one sealed segment");
+        }
+        fix.engine.flush_now().await.expect("flush");
+        fix.engine.shutdown().await.expect("shutdown");
+
+        // Corrupt the sealed segment's ciphertext → AEAD tag failure.
+        let seg_path = dir.join("segments/00000000.cbor");
+        let mut raw = std::fs::read(&seg_path).expect("read segment");
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        std::fs::write(&seg_path, &raw).expect("corrupt segment");
+
+        // Respawn against the same dir — must SUCCEED (pre-983: Err here).
+        let state = Arc::new(AlwaysJoinedState {
+            channel_id,
+            owner: self_owner,
+            enrolled_key: signing_key.verifying_key().to_bytes(),
+        });
+        let hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".to_string(),
+            )));
+        let (publisher_tx, _publisher_rx) = mpsc::channel(64);
+        let (_subscriber_tx, subscriber_rx) = mpsc::channel(64);
+        let (query_request_tx, _query_request_rx) = mpsc::channel(8);
+        let (_rec_sink, sink) = recording_sink_pair();
+        let config = ChannelLogEngineConfig {
+            log_config: ChannelLogConfig {
+                seal_threshold_events: 3,
+            },
+            flush_debounce_ms: 5_000,
+            max_dirty_ms: 10_000,
+            ..Default::default()
+        };
+        let params = ChannelLogEngineParams {
+            device_cipher: crate::device_dataset_file::test_cipher(),
+            community_id,
+            channel_id,
+            channel_key: Arc::clone(&channel_key),
+            live_key_source: None,
+            root_dir: dir.clone(),
+            state_at_hlc: state,
+            self_owner,
+            self_device_id: "test-device".to_string(),
+            signing_key: Arc::clone(&signing_key),
+            hlc_tracker,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            sink,
+            config,
+            publisher_tx,
+            subscriber_rx,
+            query_request_tx,
+        };
+        let engine2 = ChannelLogEngine::new(params).await.expect(
+            "engine must SPAWN despite the unreadable segment (dead-channel cliff retired)",
+        );
+
+        // The corrupt segment was quarantined and dropped from the manifest;
+        // its file moved aside under `.corrupt.<ms>`.
+        {
+            let log = engine2.log_for_test().lock().await;
+            assert!(
+                log.manifest.segments.is_empty(),
+                "the unreadable segment was dropped from the manifest"
+            );
+        }
+        let quarantined = std::fs::read_dir(dir.join("segments"))
+            .expect("segments dir")
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt."));
+        assert!(quarantined, "corrupt segment moved aside, not deleted");
+        engine2.shutdown().await.ok();
+    }
+
     #[tokio::test]
     async fn replay_tracker_survives_respawn_without_high_water_regression() {
         // Build first engine; small seal threshold so we get sealed segments.
@@ -6279,6 +6467,7 @@ mod tests {
             ..Default::default()
         };
         let params = ChannelLogEngineParams {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             community_id,
             channel_id,
             channel_key: Arc::clone(&channel_key),
@@ -6658,6 +6847,7 @@ mod tests {
         });
 
         let config = ChannelLogRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adapter_request_tx,
             sink,
             identity_dir: tmp.path().to_path_buf(),
@@ -6770,6 +6960,7 @@ mod tests {
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
 
         let config = ChannelLogRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adapter_request_tx,
             sink,
             identity_dir: tmp.path().to_path_buf(),
@@ -8427,6 +8618,7 @@ mod tests {
         let (query_tx_b, _query_rx_b) = mpsc::channel(8);
         let (rec_b, sink_b) = recording_sink_pair();
         let params_b = ChannelLogEngineParams {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             community_id: fix_a.community_id,
             channel_id: fix_a.channel_id,
             channel_key: Arc::clone(&fix_a.channel_key),
@@ -8689,6 +8881,7 @@ mod tests {
         let (query_tx_b, _query_rx_b) = mpsc::channel(8);
         let (_rec_b, sink_b) = recording_sink_pair();
         let params_b = ChannelLogEngineParams {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             community_id: fix_a.community_id,
             channel_id: fix_a.channel_id,
             channel_key: Arc::clone(&fix_a.channel_key),

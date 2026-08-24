@@ -443,6 +443,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
     let dir_bob = tempfile::tempdir().expect("bob tempdir");
 
     let registry_alice = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "alice-dev".into(),
         content_store: Arc::clone(&cs_alice),
@@ -460,6 +461,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
     // ZEB-790: Bob's single adoption floor (see OpenJoinSetup.bob_adopt_floor).
     let bob_adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry_bob = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: bob_adopt_floor.clone(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_bob),
@@ -653,6 +655,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
     });
     let bob_channel_log_registry: Arc<ChannelLogRegistry> =
         ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            device_cipher: harmony_app::device_dataset_file::test_cipher(),
             adapter_request_tx: bob_channel_log_adapter_tx,
             sink: Arc::new(harmony_app::node_event_sink::FanoutSink(vec![])),
             identity_dir: dir_bob.path().to_path_buf(),

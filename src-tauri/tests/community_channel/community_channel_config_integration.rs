@@ -191,6 +191,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
     let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
 
     let registry_a = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "alice-dev".into(),
         content_store: Arc::clone(&cs_a),
@@ -206,6 +207,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
         presence_resync_rx: None,
     }));
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_b),
@@ -430,6 +432,7 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
     let membership_key = EpochKey::new([0x66; 32]);
 
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_b),
@@ -596,6 +599,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
     let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
 
     let registry_a = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "alice-dev".into(),
         content_store: Arc::clone(&cs_a),
@@ -611,6 +615,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
         presence_resync_rx: None,
     }));
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_b),

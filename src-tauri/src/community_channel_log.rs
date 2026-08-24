@@ -31,6 +31,9 @@ use sha2::Sha256;
 
 use crate::channel_chunk_index::ChunkIndex;
 use crate::channel_rbsr::{RangeFingerprint, RangeReconcileSource, ReconcileKey};
+use crate::device_dataset_file::{
+    read_image, reseal_if_legacy, write_image, DeviceCipher, Image, ImageError,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -1769,6 +1772,69 @@ pub struct ChannelLogConfig {
 /// to a small value (e.g., 8) via `ChannelLogConfig`.
 pub const DEFAULT_SEAL_THRESHOLD_EVENTS: usize = 1024;
 
+/// Filenames under a channel-log `root` dir, used both as the on-disk
+/// name and (via [`channel_seal_label`]) as the ZEB-983 AAD label suffix.
+pub(crate) const MANIFEST_FILENAME: &str = "manifest.cbor";
+pub(crate) const TAIL_FILENAME: &str = "tail.cbor";
+pub(crate) const BACKFILL_STATE_FILENAME: &str = "backfill_state.cbor";
+
+/// ZEB-983 AAD label for a channel-log file: the identity-dir-relative
+/// path `communities/{cid_hex}/channels/{ch_hex}/{rel}`. Binding both ids
+/// AND the relative name means a sealed file swapped across communities,
+/// across channels, or (for a segment) across indices fails the AEAD tag
+/// rather than parsing as the wrong log's content — the stored events are
+/// not re-verified against their channel binding on reload, and legacy
+/// segment files carry no internal binding at all. `rel` for a segment is
+/// its manifest `rel_path` (e.g. `segments/0000000a.cbor`).
+pub(crate) fn channel_seal_label(
+    community_id: &SpaceId,
+    channel_id: &ChannelId,
+    rel: &str,
+) -> String {
+    format!(
+        "communities/{}/channels/{}/{rel}",
+        hex::encode(community_id.0),
+        hex::encode(channel_id.0),
+    )
+}
+
+/// Rename `path` aside under `<path>.corrupt.<unix_ms>` (ZEB-983 channel-log
+/// quarantine — the same `.corrupt.<ms>` dialect the other community
+/// families use). Best-effort: a rename failure is logged and swallowed so
+/// the caller still recovers with a fresh/empty structure and self-heals
+/// from peers. Returns whether the rename succeeded (callers that must NOT
+/// leave the file in place — e.g. the whole-dir manifest quarantine — treat
+/// a failure as fatal-to-that-path).
+fn quarantine_aside(path: &std::path::Path, reason: &str) -> bool {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut quarantine = path.as_os_str().to_owned();
+    quarantine.push(format!(".corrupt.{suffix}"));
+    let quarantine_path = PathBuf::from(quarantine);
+    match std::fs::rename(path, &quarantine_path) {
+        Ok(()) => {
+            tracing::warn!(
+                ?path,
+                quarantine = ?quarantine_path,
+                reason = %reason,
+                "channel-log: corrupted file quarantined; recovering"
+            );
+            true
+        }
+        Err(rename_err) => {
+            tracing::error!(
+                ?path,
+                reason = %reason,
+                rename_error = %rename_err,
+                "channel-log: failed to quarantine corrupted file"
+            );
+            false
+        }
+    }
+}
+
 /// Schema version byte prefixed to `manifest.cbor`. v3 will widen
 /// to handle CasBook segment handles, additional manifest fields,
 /// etc. — this byte lets reload dispatch on format version.
@@ -1807,9 +1873,9 @@ pub struct ChannelBackfillState {
 }
 
 impl ChannelBackfillState {
-    /// Sidecar path under a channel-log `root` directory.
+    /// Sidecar path under a `root` directory.
     fn path(root: &std::path::Path) -> PathBuf {
-        root.join("backfill_state.cbor")
+        root.join(BACKFILL_STATE_FILENAME)
     }
 
     /// Decode sidecar bytes. `None` on empty, unknown-version, or corrupt
@@ -1824,27 +1890,56 @@ impl ChannelBackfillState {
     }
 
     /// Read the sidecar synchronously (tests / non-async callers). `None`
-    /// on file absent / unreadable / [`parse`](Self::parse) failure.
-    pub fn load(root: &std::path::Path) -> Option<ChannelBackfillState> {
-        Self::parse(&std::fs::read(Self::path(root)).ok()?)
+    /// on file absent / unreadable / undecryptable / [`parse`](Self::parse)
+    /// failure. ZEB-983: sealed at rest under `label` (the type is shared
+    /// by the per-channel, community-root, and mail resync stamps, so the
+    /// caller supplies the AAD label for its own location). A legacy
+    /// plaintext sidecar is accepted on read (LAZY migration — the next
+    /// [`save`](Self::save) seals it), since it carries only a timestamp.
+    pub fn load(
+        cipher: &DeviceCipher,
+        root: &std::path::Path,
+        label: &str,
+    ) -> Option<ChannelBackfillState> {
+        let image = read_image(cipher, &Self::path(root), label).ok()??;
+        Self::parse(&image.bytes)
     }
 
     /// Async sibling of [`load`](Self::load) for the channel-log spawn
     /// path, which must not park a tokio worker on filesystem I/O
     /// (ZEB-467 — mirrors the `tokio::fs::create_dir_all` used there;
-    /// Qodo #380). Same `None`-on-any-error contract.
-    pub async fn load_async(root: &std::path::Path) -> Option<ChannelBackfillState> {
-        Self::parse(&tokio::fs::read(Self::path(root)).await.ok()?)
+    /// Qodo #380). Same `None`-on-any-error contract. The envelope open
+    /// itself is CPU-light and reads a tiny file, so it runs inline after
+    /// the async read.
+    pub async fn load_async(
+        cipher: &DeviceCipher,
+        root: &std::path::Path,
+        label: &str,
+    ) -> Option<ChannelBackfillState> {
+        let path = Self::path(root);
+        // ZEB-983 (CodeRabbit): enforce the same size cap the sync `load`
+        // gets from `read_image::check_size_cap`, so both paths refuse an
+        // implausibly-large sidecar before slurping it into memory.
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.len() > crate::device_dataset_file::MAX_DEVICE_FILE_BYTES {
+                return None;
+            }
+        }
+        let raw = tokio::fs::read(&path).await.ok()?;
+        let image = crate::device_dataset_file::open_raw_image(cipher, label, raw).ok()?;
+        Self::parse(&image.bytes)
     }
 
-    /// Atomically persist the sidecar with `last_full_reconcile_ms`.
-    /// Errors surface to the caller, which logs-and-continues: a missed
-    /// write only forfeits restart-awareness for that one cycle (the
-    /// floor falls back to interval-from-spawn next boot).
+    /// Atomically persist the sidecar with `last_full_reconcile_ms`, sealed
+    /// under `label` (ZEB-983). Errors surface to the caller, which
+    /// logs-and-continues: a missed write only forfeits restart-awareness
+    /// for that one cycle (the floor falls back to interval-from-spawn).
     pub fn save(
+        cipher: &DeviceCipher,
         root: &std::path::Path,
+        label: &str,
         last_full_reconcile_ms: u64,
-    ) -> Result<(), crate::owner_state_persist::PersistError> {
+    ) -> Result<(), std::io::Error> {
         let mut bytes = Vec::with_capacity(16);
         bytes.push(CHANNEL_BACKFILL_STATE_V1);
         ciborium::into_writer(
@@ -1853,8 +1948,13 @@ impl ChannelBackfillState {
             },
             &mut bytes,
         )
-        .map_err(|e| crate::owner_state_persist::PersistError::Io(std::io::Error::other(e)))?;
-        crate::owner_state_persist::save_atomically(&Self::path(root), &bytes)
+        .map_err(std::io::Error::other)?;
+        write_image(cipher, &Self::path(root), label, &bytes)
+    }
+
+    /// AAD label for a per-channel backfill-state sidecar.
+    pub fn channel_label(community_id: &SpaceId, channel_id: &ChannelId) -> String {
+        channel_seal_label(community_id, channel_id, BACKFILL_STATE_FILENAME)
     }
 }
 
@@ -1904,6 +2004,11 @@ pub struct ChannelLog {
     /// entirely belongs to the Slice 2b chunk-summary-only rework, not here.
     reconcile_entries: Vec<(ReconcileKey, [u8; 32])>,
     chunk_index: ChunkIndex,
+    /// ZEB-983: device cipher sealing `manifest.cbor` / `tail.cbor` /
+    /// `segments/*.cbor` at rest. Threaded from the engine
+    /// (`ChannelLogRegistryConfig.device_cipher`); tests use
+    /// `device_dataset_file::test_cipher()`.
+    cipher: DeviceCipher,
 }
 
 /// On-disk index of sealed segments + the path to the active tail.
@@ -1969,6 +2074,7 @@ impl ChannelLog {
     /// `seal_and_persist` are explicit. The Phase 3 engine will call
     /// `reload` on startup if the directory already exists.
     pub fn new(
+        cipher: DeviceCipher,
         community_id: SpaceId,
         channel_id: ChannelId,
         root: PathBuf,
@@ -1987,6 +2093,7 @@ impl ChannelLog {
             device_watermarks: WatermarkVector::new(),
             reconcile_entries: Vec::new(),
             chunk_index: ChunkIndex::new(),
+            cipher,
         }
     }
 
@@ -2068,24 +2175,36 @@ impl ChannelLog {
     /// list, so the stub is genuinely transient and never observably
     /// escapes its first-flush window.
     pub fn flush_tail(&self) -> Result<(), ChannelLogPersistError> {
-        std::fs::create_dir_all(&self.root)?;
-        let manifest_path = self.root.join("manifest.cbor");
+        let manifest_path = self.root.join(MANIFEST_FILENAME);
         if !manifest_path.exists() {
             let mut man_bytes = Vec::with_capacity(256);
             man_bytes.push(CHANNEL_LOG_MANIFEST_V1);
             ciborium::into_writer(&self.manifest, &mut man_bytes)
                 .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
-            crate::owner_state_persist::save_atomically(&manifest_path, &man_bytes)
-                .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+            self.write_channel_file(MANIFEST_FILENAME, &manifest_path, &man_bytes)?;
         }
         let mut bytes = Vec::with_capacity(1024);
         bytes.push(CHANNEL_LOG_TAIL_V1);
         ciborium::into_writer(&self.tail, &mut bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
-        let tail_path = self.root.join("tail.cbor");
-        crate::owner_state_persist::save_atomically(&tail_path, &bytes)
-            .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        let tail_path = self.root.join(TAIL_FILENAME);
+        self.write_channel_file(TAIL_FILENAME, &tail_path, &bytes)?;
         Ok(())
+    }
+
+    /// Seal `inner` (the legacy `[schema]‖CBOR` image) under the device
+    /// cipher and write it to `path` (ZEB-983). `rel` is the file's name
+    /// relative to the channel root, used to build the AAD label.
+    /// `write_image` supplies `create_dir_all` + `save_atomically`.
+    fn write_channel_file(
+        &self,
+        rel: &str,
+        path: &std::path::Path,
+        inner: &[u8],
+    ) -> Result<(), ChannelLogPersistError> {
+        let label = channel_seal_label(&self.manifest.community_id, &self.manifest.channel_id, rel);
+        write_image(&self.cipher, path, &label, inner)
+            .map_err(|e| ChannelLogPersistError::Io(e.to_string()))
     }
 
     /// Seal the current tail to a new segment file and append a
@@ -2135,18 +2254,30 @@ impl ChannelLog {
             // Nothing to seal. No-op.
             return Ok(());
         }
-        std::fs::create_dir_all(self.root.join("segments"))?;
-        let next_index = self.manifest.segments.len() as u32;
+        // ZEB-983: allocate the next segment index as (max surviving index
+        // + 1), NOT `segments.len()`. `quarantine_segment` can remove a
+        // non-last descriptor, after which `len()` would collide with a
+        // surviving descriptor's `rel_path` and OVERWRITE live segment data
+        // (CodeRabbit #729). Reusing the index of a quarantined-then-removed
+        // segment is safe — that file was renamed to `.corrupt.<ms>`, so a
+        // fresh write at its old name clobbers nothing referenced.
+        let next_index = self
+            .manifest
+            .segments
+            .iter()
+            .filter_map(segment_index_of)
+            .max()
+            .map_or(0, |m| m + 1);
         let rel_path = format!("segments/{:08x}.cbor", next_index);
         let abs_path = self.root.join(&rel_path);
 
-        // Step 1: write segment file (segment-level atomic via save_atomically).
+        // Step 1: write segment file, sealed (write_image supplies
+        // create_dir_all for the segments/ subdir + save_atomically).
         let mut seg_bytes = Vec::with_capacity(64 * self.tail.len());
         seg_bytes.push(CHANNEL_LOG_SEGMENT_V1);
         ciborium::into_writer(&self.tail, &mut seg_bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
-        crate::owner_state_persist::save_atomically(&abs_path, &seg_bytes)
-            .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        self.write_channel_file(&rel_path, &abs_path, &seg_bytes)?;
 
         // Compute true min/max HLC across the segment. Events aren't
         // globally HLC-monotonic across authors/devices (only per-lane
@@ -2209,11 +2340,11 @@ impl ChannelLog {
         empty_tail_bytes.push(CHANNEL_LOG_TAIL_V1);
         ciborium::into_writer(&empty_tail, &mut empty_tail_bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
-        crate::owner_state_persist::save_atomically(
-            &self.root.join("tail.cbor"),
+        self.write_channel_file(
+            TAIL_FILENAME,
+            &self.root.join(TAIL_FILENAME),
             &empty_tail_bytes,
-        )
-        .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        )?;
 
         // Step 3: build and persist the new manifest (with the
         // descriptor appended). Build on a CLONED + extended segment
@@ -2245,8 +2376,11 @@ impl ChannelLog {
         man_bytes.push(CHANNEL_LOG_MANIFEST_V1);
         ciborium::into_writer(&new_manifest, &mut man_bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
-        crate::owner_state_persist::save_atomically(&self.root.join("manifest.cbor"), &man_bytes)
-            .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        self.write_channel_file(
+            MANIFEST_FILENAME,
+            &self.root.join(MANIFEST_FILENAME),
+            &man_bytes,
+        )?;
 
         // Step 4: ALL persistence succeeded — now safe to commit
         // in-memory state. After this point the in-memory and on-disk
@@ -2261,32 +2395,67 @@ impl ChannelLog {
     /// Returns the count of events recovered (sum across segments + tail).
     ///
     /// If `root` doesn't exist, returns a fresh empty log.
+    ///
+    /// ZEB-983 recovery contract (Crypto/decode = content corruption →
+    /// quarantine; Io = transient → hard, per ZEB-460):
+    /// - **Manifest** undecryptable/corrupt → quarantine the WHOLE channel
+    ///   dir (`root` → `root.corrupt.<ms>`, recreated empty) and return a
+    ///   fresh log. The segments are unreachable without the manifest, and
+    ///   a fresh log would overwrite `segments/00000000.cbor` (orphan-index
+    ///   hazard) — so the segments must go aside with it. The empty log's
+    ///   `max_hlc() == None` makes the backfill driver request full history.
+    /// - **Manifest community_id/channel_id mismatch** → HARD `Manifest`
+    ///   error (routing/wrong-data-at-path bug, not corruption; a *sealed*
+    ///   misrouted manifest fails the community+channel-bound AAD first and
+    ///   lands in the Crypto→dir-quarantine arm instead).
+    /// - **Tail** undecryptable/corrupt/empty → quarantine `tail.cbor`
+    ///   alone; the manifest + segments stay, backfill refills the window.
+    /// - **Missing** manifest → fresh log; **missing** tail → empty tail.
     pub fn reload(
+        cipher: DeviceCipher,
         community_id: SpaceId,
         channel_id: ChannelId,
         root: PathBuf,
         config: ChannelLogConfig,
     ) -> Result<(Self, usize), ChannelLogPersistError> {
-        let manifest_path = root.join("manifest.cbor");
-        if !manifest_path.exists() {
-            return Ok((Self::new(community_id, channel_id, root, config), 0));
-        }
-        let manifest_bytes = std::fs::read(&manifest_path)?;
-        let mut manifest: ChannelLogManifest = match manifest_bytes.split_first() {
-            Some((&CHANNEL_LOG_MANIFEST_V1, rest)) => ciborium::from_reader(rest)
-                .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?,
-            Some((v, _)) => {
-                return Err(ChannelLogPersistError::CborDecode(format!(
-                    "manifest schema version {} not supported (expected {})",
-                    v, CHANNEL_LOG_MANIFEST_V1
-                )));
+        let manifest_path = root.join(MANIFEST_FILENAME);
+        let manifest_label = channel_seal_label(&community_id, &channel_id, MANIFEST_FILENAME);
+
+        // --- Manifest ---
+        let manifest_image = match read_image(&cipher, &manifest_path, &manifest_label) {
+            // Cold start: no manifest → fresh empty log.
+            Ok(None) => {
+                return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
             }
-            None => {
-                return Err(ChannelLogPersistError::CborDecode(
-                    "manifest file is empty".into(),
-                ));
+            Ok(Some(image)) => image,
+            Err(ImageError::Io(e)) => return Err(ChannelLogPersistError::Io(e.to_string())),
+            Err(ImageError::Crypto(msg)) => {
+                Self::quarantine_channel_dir(&root, &msg)?;
+                return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
             }
         };
+        let mut manifest: ChannelLogManifest = match manifest_image.bytes.split_first() {
+            Some((&CHANNEL_LOG_MANIFEST_V1, rest)) => match ciborium::from_reader(rest) {
+                Ok(m) => m,
+                Err(e) => {
+                    Self::quarantine_channel_dir(&root, &format!("manifest decode: {e}"))?;
+                    return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
+                }
+            },
+            Some((v, _)) => {
+                Self::quarantine_channel_dir(
+                    &root,
+                    &format!("manifest schema version {v} unsupported"),
+                )?;
+                return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
+            }
+            None => {
+                Self::quarantine_channel_dir(&root, "manifest image is empty")?;
+                return Ok((Self::new(cipher, community_id, channel_id, root, config), 0));
+            }
+        };
+        // Id mismatch stays HARD — a legacy manifest bearing another
+        // community/channel's id is a routing bug, not corruption.
         if manifest.community_id != community_id {
             return Err(ChannelLogPersistError::Manifest {
                 expected: format!("{:?}", community_id),
@@ -2299,6 +2468,9 @@ impl ChannelLog {
                 got: format!("{:?}", manifest.channel_id),
             });
         }
+        // Validated → reseal a legacy plaintext manifest in place.
+        reseal_if_legacy(&cipher, &manifest_path, &manifest_label, &manifest_image);
+
         // Restore the "ascending by range.0" invariant defensively.
         // seal_and_persist sorts before writing, but a corrupted/
         // hand-edited manifest or one written before the late-seal-
@@ -2317,33 +2489,46 @@ impl ChannelLog {
         // by the Phase 3 backfill code; reload doesn't materialize
         // them all into memory (could be megabytes per segment).
         let segment_count: usize = manifest.segments.iter().map(|s| s.count as usize).sum();
-        let tail_path = root.join("tail.cbor");
-        let tail: Vec<SignedChannelEvent> = if tail_path.exists() {
-            let bytes = std::fs::read(&tail_path)?;
-            match bytes.split_first() {
-                Some((&CHANNEL_LOG_TAIL_V1, rest)) => ciborium::from_reader(rest)
-                    .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?,
-                Some((v, _)) => {
-                    return Err(ChannelLogPersistError::CborDecode(format!(
-                        "tail schema version {} not supported (expected {})",
-                        v, CHANNEL_LOG_TAIL_V1
-                    )));
+
+        // --- Tail ---
+        let tail_path = root.join(TAIL_FILENAME);
+        let tail_label = channel_seal_label(&community_id, &channel_id, TAIL_FILENAME);
+        let tail: Vec<SignedChannelEvent> = match read_image(&cipher, &tail_path, &tail_label) {
+            // Missing tail.cbor is a legitimate fresh-log state.
+            Ok(None) => Vec::new(),
+            Ok(Some(image)) => match image.bytes.split_first() {
+                Some((&CHANNEL_LOG_TAIL_V1, rest)) => {
+                    match ciborium::from_reader::<Vec<SignedChannelEvent>, _>(rest) {
+                        Ok(t) if !events_all_bind(&t, &community_id, &channel_id) => {
+                            // Tampered/foreign tail (see `events_all_bind`): do
+                            // NOT reseal it into an authenticated envelope —
+                            // quarantine and continue with an empty tail.
+                            quarantine_aside(&tail_path, "tail contains foreign-channel events");
+                            Vec::new()
+                        }
+                        Ok(t) => {
+                            reseal_if_legacy(&cipher, &tail_path, &tail_label, &image);
+                            t
+                        }
+                        Err(e) => {
+                            quarantine_aside(&tail_path, &format!("tail decode: {e}"));
+                            Vec::new()
+                        }
+                    }
                 }
-                // Empty tail.cbor is corruption (a normal sealed log
-                // writes at least the schema-version byte + an empty
-                // CBOR array). Symmetric with the empty-manifest.cbor
-                // arm above — both surface as CborDecode rather than
-                // silently returning Vec::new() and losing events.
-                None => {
-                    return Err(ChannelLogPersistError::CborDecode(
-                        "tail file is empty".into(),
-                    ));
+                // Unknown version OR an empty image (zero-byte tail.cbor):
+                // quarantine the tail alone and continue with the intact
+                // manifest + segments.
+                _ => {
+                    quarantine_aside(&tail_path, "tail schema unsupported or empty");
+                    Vec::new()
                 }
+            },
+            Err(ImageError::Io(e)) => return Err(ChannelLogPersistError::Io(e.to_string())),
+            Err(ImageError::Crypto(msg)) => {
+                quarantine_aside(&tail_path, &msg);
+                Vec::new()
             }
-        } else {
-            // Distinct from "file exists but is zero bytes": a missing
-            // tail.cbor is a legitimate fresh-log state.
-            Vec::new()
         };
         let total = segment_count + tail.len();
         let mut log = Self {
@@ -2355,11 +2540,46 @@ impl ChannelLog {
             device_watermarks: WatermarkVector::new(),
             reconcile_entries: Vec::new(),
             chunk_index: ChunkIndex::new(),
+            cipher,
         };
         log.rebuild_reaction_index();
         log.rebuild_device_watermarks();
         log.rebuild_reconcile_index();
         Ok((log, total))
+    }
+
+    /// Quarantine an undecryptable/corrupt channel-log dir: rename `root`
+    /// aside under `root.corrupt.<ms>` (taking its segments with it, so a
+    /// fresh log can't overwrite `segments/00000000.cbor`) and recreate an
+    /// empty `root` so downstream writers and the adapter find it present.
+    ///
+    /// ZEB-983 (Greptile): if the rename FAILS the corrupt dir and its
+    /// orphaned segments stay in place — returning a fresh empty log then
+    /// would let the next seal overwrite `segments/00000000.cbor` (the very
+    /// data quarantine exists to preserve). So a failed move is a HARD error
+    /// (transient — a retry next boot may succeed); the channel does not
+    /// spawn and nothing is clobbered. A failed *recreate* after a
+    /// successful move is non-fatal: the next sealed write `create_dir_all`s
+    /// the dir.
+    fn quarantine_channel_dir(
+        root: &std::path::Path,
+        reason: &str,
+    ) -> Result<(), ChannelLogPersistError> {
+        if !quarantine_aside(root, reason) {
+            return Err(ChannelLogPersistError::Io(format!(
+                "failed to quarantine corrupt channel dir {} ({reason}); refusing to \
+                 spawn a fresh log that would overwrite the orphaned segments",
+                root.display()
+            )));
+        }
+        if let Err(e) = std::fs::create_dir_all(root) {
+            tracing::error!(
+                ?root,
+                error = %e,
+                "channel-log: failed to recreate dir after manifest quarantine (next write will)"
+            );
+        }
+        Ok(())
     }
 
     /// Return the highest locally-persisted event HLC for this channel.
@@ -2417,13 +2637,94 @@ impl ChannelLog {
         &self.root
     }
 
+    /// The device cipher this log seals with. Exposed so off-lock readers
+    /// (which snapshot `root` + descriptors under the async mutex) can also
+    /// snapshot the cipher and call [`read_segment_at`] in `spawn_blocking`.
+    pub fn cipher(&self) -> &DeviceCipher {
+        &self.cipher
+    }
+
     /// Read all events from a sealed segment. Used by Phase 3 backfill.
     /// Phase 2 ships this for tests (verify seal/reload byte-equality).
     pub fn read_segment(
         &self,
         descriptor: &SegmentDescriptor,
     ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
-        read_segment_at(&self.root, descriptor)
+        read_segment_at(
+            &self.cipher,
+            &self.manifest.community_id,
+            &self.manifest.channel_id,
+            &self.root,
+            descriptor,
+        )
+    }
+
+    /// Like [`read_segment`](Self::read_segment) but reseals the segment in
+    /// place if it was a legacy plaintext file (ZEB-983 eager migration).
+    /// Called from the boot tracker walk, which reads every segment anyway
+    /// — so migration adds one write per legacy segment, once ever.
+    pub fn read_segment_migrating(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
+        let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
+        let (image, abs_path, label) = open_segment_image(
+            &self.cipher,
+            &self.manifest.community_id,
+            &self.manifest.channel_id,
+            &self.root,
+            descriptor,
+        )?;
+        let events = decode_segment(&image.bytes, rel_path)?;
+        // ZEB-983 (Greptile): reject a segment holding foreign-channel events
+        // BEFORE resealing it — otherwise a downgraded plaintext segment
+        // would launder them into an authenticated envelope. The boot walk
+        // maps this error to a quarantine (CborDecode class = corruption).
+        if !events_all_bind(
+            &events,
+            &self.manifest.community_id,
+            &self.manifest.channel_id,
+        ) {
+            return Err(ChannelLogPersistError::CborDecode(format!(
+                "segment {rel_path} contains foreign-channel events"
+            )));
+        }
+        reseal_if_legacy(&self.cipher, &abs_path, &label, &image);
+        Ok(events)
+    }
+
+    /// Quarantine the sealed segment at `seg_index`: rename its file aside
+    /// under `.corrupt.<ms>`, drop its descriptor from the in-memory
+    /// manifest, and rewrite `manifest.cbor` sealed (ZEB-983). The dropped
+    /// segment's events are refilled from peers by RBSR set-reconciliation
+    /// (a mid-history hole, not a tail-watermark gap). The tracker rebuild
+    /// is a max-fold, so the skipped segment only lowers lane watermarks —
+    /// absorbed by the ZEB-969 append-side duplicate guard. Idempotent on
+    /// the rename (a best-effort quarantine failure still drops the
+    /// descriptor so the boot proceeds).
+    pub fn quarantine_segment(
+        &mut self,
+        seg_index: usize,
+        reason: &str,
+    ) -> Result<(), ChannelLogPersistError> {
+        if seg_index >= self.manifest.segments.len() {
+            return Ok(());
+        }
+        let SegmentHandle::LocalFile { rel_path } = &self.manifest.segments[seg_index].handle;
+        let abs_path = self.root.join(rel_path);
+        quarantine_aside(&abs_path, reason);
+        self.manifest.segments.remove(seg_index);
+        // Rewrite the manifest so the dropped descriptor doesn't resurrect
+        // on the next reload (and a fresh seal appends at the new count).
+        let mut man_bytes = Vec::with_capacity(256);
+        man_bytes.push(CHANNEL_LOG_MANIFEST_V1);
+        ciborium::into_writer(&self.manifest, &mut man_bytes)
+            .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
+        self.write_channel_file(
+            MANIFEST_FILENAME,
+            &self.root.join(MANIFEST_FILENAME),
+            &man_bytes,
+        )
     }
 
     /// Materialized reactions for a message (ZEB-536).
@@ -2671,15 +2972,39 @@ impl RangeReconcileSource for ChannelLog {
 /// `tokio::task::spawn_blocking`) WITHOUT holding the lock across the
 /// synchronous `std::fs::read`. Pure / sync / no shared state.
 pub fn read_segment_at(
+    cipher: &DeviceCipher,
+    community_id: &SpaceId,
+    channel_id: &ChannelId,
     root: &std::path::Path,
     descriptor: &SegmentDescriptor,
 ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
     let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
-    // Validate before joining: rel_path comes from deserialized
-    // manifest.cbor, which a Phase 3 backfill peer could ship.
-    // Reject absolute paths, parent-directory escapes, and
-    // current-directory tricks; require the path to start with
-    // the segments/ prefix where seal_and_persist writes them.
+    let (image, _abs_path, _label) =
+        open_segment_image(cipher, community_id, channel_id, root, descriptor)?;
+    decode_segment(&image.bytes, rel_path)
+}
+
+/// Open (envelope-decrypt) a sealed segment file. Validates the descriptor's
+/// `rel_path` (it may arrive from a Phase 3 backfill peer's manifest) BEFORE
+/// touching disk, then opens the ZEB-983 envelope with an AAD label bound to
+/// this segment's community, channel, AND index — so a ciphertext copied to
+/// a different index (or channel/community) fails the tag. Envelope `Io` →
+/// `Io` (transient); `Crypto` (tag/malformed) → `CborDecode` (content
+/// corruption, quarantine-eligible); a NotFound segment the manifest still
+/// references also surfaces as `CborDecode` (the index↔file relationship is
+/// broken — a corruption, not a transient fault). Returns the image plus its
+/// absolute path and AAD label for a caller that wants to reseal a legacy
+/// image.
+fn open_segment_image(
+    cipher: &DeviceCipher,
+    community_id: &SpaceId,
+    channel_id: &ChannelId,
+    root: &std::path::Path,
+    descriptor: &SegmentDescriptor,
+) -> Result<(Image, PathBuf, String), ChannelLogPersistError> {
+    let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
+    // Reject absolute paths, parent-directory escapes, and current-directory
+    // tricks; require the segments/ prefix where seal_and_persist writes.
     let rel_path_p = std::path::Path::new(rel_path);
     let valid = !rel_path_p.is_absolute()
         && rel_path_p
@@ -2693,17 +3018,67 @@ pub fn read_segment_at(
         )));
     }
     let abs_path = root.join(rel_path_p);
-    let bytes = std::fs::read(&abs_path)?;
+    let label = channel_seal_label(community_id, channel_id, rel_path);
+    match read_image(cipher, &abs_path, &label) {
+        Ok(Some(image)) => Ok((image, abs_path, label)),
+        // A manifest-referenced segment that has vanished is a broken
+        // index↔file relationship — corruption, not transient I/O.
+        Ok(None) => Err(ChannelLogPersistError::CborDecode(format!(
+            "segment file {rel_path} missing but referenced by the manifest"
+        ))),
+        Err(ImageError::Io(e)) => Err(ChannelLogPersistError::Io(e.to_string())),
+        Err(ImageError::Crypto(msg)) => Err(ChannelLogPersistError::CborDecode(msg)),
+    }
+}
+
+/// ZEB-983 (Greptile): every event loaded from disk into a channel log MUST
+/// bind to that log's `(community_id, channel_id)`. `append` enforces this
+/// for live/backfill ingest, but `reload` and the boot segment walk populate
+/// the log directly, bypassing it. A sealed file's AAD already authenticates
+/// the binding, but an offline attacker can DOWNGRADE a sealed file to a
+/// schema-v1 plaintext image holding validly-signed events copied from
+/// ANOTHER channel; without this check the legacy path would reseal those
+/// foreign events as authenticated target-channel state. Checked on BOTH
+/// paths (a correctly-written sealed file always passes, so this only ever
+/// rejects tampered/foreign content). The signature covers these fields, so
+/// an attacker cannot forge a matching binding — only copy a mismatched one,
+/// which this rejects.
+fn events_all_bind(
+    events: &[SignedChannelEvent],
+    community_id: &SpaceId,
+    channel_id: &ChannelId,
+) -> bool {
+    events
+        .iter()
+        .all(|e| e.community_id() == community_id && e.channel_id() == channel_id)
+}
+
+/// Parse the numeric index from a segment descriptor's `rel_path`
+/// (`segments/{N:08x}.cbor`). Returns `None` for a malformed/foreign
+/// handle — such a descriptor simply doesn't constrain the next index.
+fn segment_index_of(descriptor: &SegmentDescriptor) -> Option<u32> {
+    let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
+    let hex = rel_path
+        .strip_prefix("segments/")
+        .and_then(|s| s.strip_suffix(".cbor"))?;
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// Decode a segment's inner image (`[schema]‖CBOR(Vec<SignedChannelEvent>)`).
+fn decode_segment(
+    bytes: &[u8],
+    rel_path: &str,
+) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
     match bytes.split_first() {
         Some((&CHANNEL_LOG_SEGMENT_V1, rest)) => ciborium::from_reader(rest)
             .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string())),
         Some((v, _)) => Err(ChannelLogPersistError::CborDecode(format!(
-            "segment schema version {} not supported (expected {})",
+            "segment {rel_path} schema version {} not supported (expected {})",
             v, CHANNEL_LOG_SEGMENT_V1
         ))),
-        None => Err(ChannelLogPersistError::CborDecode(
-            "segment file is empty".into(),
-        )),
+        None => Err(ChannelLogPersistError::CborDecode(format!(
+            "segment {rel_path} is empty"
+        ))),
     }
 }
 
@@ -2727,9 +3102,19 @@ mod tests {
     #[test]
     fn backfill_state_round_trips() {
         let tmp = tempfile::tempdir().expect("tmp");
-        ChannelBackfillState::save(tmp.path(), 1_700_000_123_456).expect("save");
+        ChannelBackfillState::save(
+            &crate::device_dataset_file::test_cipher(),
+            tmp.path(),
+            "backfill_state.cbor",
+            1_700_000_123_456,
+        )
+        .expect("save");
         assert_eq!(
-            ChannelBackfillState::load(tmp.path()),
+            ChannelBackfillState::load(
+                &crate::device_dataset_file::test_cipher(),
+                tmp.path(),
+                "backfill_state.cbor"
+            ),
             Some(ChannelBackfillState {
                 last_full_reconcile_ms: 1_700_000_123_456
             }),
@@ -2740,7 +3125,14 @@ mod tests {
     fn backfill_state_absent_is_none() {
         let tmp = tempfile::tempdir().expect("tmp");
         // No sidecar written → "never reconciled" → None (legacy path).
-        assert_eq!(ChannelBackfillState::load(tmp.path()), None);
+        assert_eq!(
+            ChannelBackfillState::load(
+                &crate::device_dataset_file::test_cipher(),
+                tmp.path(),
+                "backfill_state.cbor"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2749,18 +3141,498 @@ mod tests {
         // A future/corrupt schema byte must degrade to None, never error.
         let path = tmp.path().join("backfill_state.cbor");
         std::fs::write(&path, [0xFF, 0x01, 0x02, 0x03]).expect("write");
-        assert_eq!(ChannelBackfillState::load(tmp.path()), None);
+        assert_eq!(
+            ChannelBackfillState::load(
+                &crate::device_dataset_file::test_cipher(),
+                tmp.path(),
+                "backfill_state.cbor"
+            ),
+            None
+        );
     }
 
     #[test]
     fn backfill_state_save_overwrites() {
         let tmp = tempfile::tempdir().expect("tmp");
-        ChannelBackfillState::save(tmp.path(), 100).expect("save 1");
-        ChannelBackfillState::save(tmp.path(), 999).expect("save 2");
+        ChannelBackfillState::save(
+            &crate::device_dataset_file::test_cipher(),
+            tmp.path(),
+            "backfill_state.cbor",
+            100,
+        )
+        .expect("save 1");
+        ChannelBackfillState::save(
+            &crate::device_dataset_file::test_cipher(),
+            tmp.path(),
+            "backfill_state.cbor",
+            999,
+        )
+        .expect("save 2");
         assert_eq!(
-            ChannelBackfillState::load(tmp.path()).map(|s| s.last_full_reconcile_ms),
+            ChannelBackfillState::load(
+                &crate::device_dataset_file::test_cipher(),
+                tmp.path(),
+                "backfill_state.cbor"
+            )
+            .map(|s| s.last_full_reconcile_ms),
             Some(999),
         );
+    }
+
+    // ── ZEB-983: sealed-at-rest recovery contract ──────────────────
+
+    /// Build a sealed log at `root` with `n` sealed segments (one event
+    /// each) plus one event in the live tail. Uses community 0xc0 /
+    /// channel 0x01 to match `fixture_signed_event`'s internal binding.
+    fn sealed_log_with_segments(root: &std::path::Path, n: usize) -> ChannelLog {
+        let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.to_path_buf(),
+            ChannelLogConfig::default(),
+        );
+        let mut wall = 100_000u64;
+        for _ in 0..n {
+            log.append(fixture_signed_event(wall, 0, "a-dev")).unwrap();
+            log.seal_and_persist().unwrap();
+            wall += 1;
+        }
+        // Leave one event unsealed in the tail.
+        log.append(fixture_signed_event(wall, 0, "a-dev")).unwrap();
+        log.flush_tail().unwrap();
+        log
+    }
+
+    fn has_quarantine_sibling(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().contains(".corrupt."))
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn zeb983_manifest_and_tail_are_sealed_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _log = sealed_log_with_segments(tmp.path(), 1);
+        for name in [MANIFEST_FILENAME, TAIL_FILENAME] {
+            let raw = std::fs::read(tmp.path().join(name)).unwrap();
+            assert_eq!(
+                raw.first(),
+                Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3),
+                "{name} must be sealed (sentinel 3)"
+            );
+        }
+        let seg = std::fs::read(tmp.path().join("segments/00000000.cbor")).unwrap();
+        assert_eq!(
+            seg.first(),
+            Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3),
+            "segment must be sealed"
+        );
+    }
+
+    #[test]
+    fn zeb983_reload_round_trips_sealed_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = sealed_log_with_segments(tmp.path(), 2);
+        let before_segs = before.manifest.segments.len();
+        drop(before);
+        let (log, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(log.manifest.segments.len(), before_segs);
+        assert_eq!(total, 3, "2 sealed events + 1 tail event");
+    }
+
+    /// Legacy plaintext manifest + tail migrate to sealed on reload,
+    /// byte-losslessly (the inner image equals the original legacy bytes).
+    #[test]
+    fn zeb983_legacy_manifest_and_tail_migrate_losslessly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        // Hand-write legacy plaintext manifest + tail.
+        let manifest = ChannelLogManifest {
+            community_id: cid,
+            channel_id: chid,
+            segments: Vec::new(),
+        };
+        let mut man_legacy = vec![CHANNEL_LOG_MANIFEST_V1];
+        ciborium::into_writer(&manifest, &mut man_legacy).unwrap();
+        std::fs::write(root.join(MANIFEST_FILENAME), &man_legacy).unwrap();
+        let tail = vec![fixture_signed_event(100_000, 0, "a-dev")];
+        let mut tail_legacy = vec![CHANNEL_LOG_TAIL_V1];
+        ciborium::into_writer(&tail, &mut tail_legacy).unwrap();
+        std::fs::write(root.join(TAIL_FILENAME), &tail_legacy).unwrap();
+
+        let (log, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            cid,
+            chid,
+            root.to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(log.tail.len(), 1);
+
+        // Both files now sealed, and their inner images byte-match the
+        // original legacy bytes.
+        let cipher = crate::device_dataset_file::test_cipher();
+        for (name, legacy) in [
+            (MANIFEST_FILENAME, &man_legacy),
+            (TAIL_FILENAME, &tail_legacy),
+        ] {
+            let raw = std::fs::read(root.join(name)).unwrap();
+            assert_eq!(
+                raw.first(),
+                Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3),
+                "{name} resealed"
+            );
+            let label = channel_seal_label(&cid, &chid, name);
+            let image = read_image(&cipher, &root.join(name), &label)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                &*image.bytes,
+                &legacy[..],
+                "{name} inner image byte-lossless"
+            );
+        }
+    }
+
+    /// Corrupt (Crypto) tail → quarantine `tail.cbor` alone; manifest +
+    /// segments stay, reload returns an empty tail.
+    #[test]
+    fn zeb983_tail_crypto_quarantines_tail_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        drop(sealed_log_with_segments(root, 1));
+        // Flip a byte in the sealed tail's ciphertext → AEAD tag failure.
+        let tail_path = root.join(TAIL_FILENAME);
+        let mut raw = std::fs::read(&tail_path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        std::fs::write(&tail_path, &raw).unwrap();
+
+        let (log, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .unwrap();
+        assert!(log.tail.is_empty(), "corrupt tail dropped");
+        assert_eq!(log.manifest.segments.len(), 1, "manifest + segment intact");
+        assert_eq!(total, 1, "the one sealed segment event still counts");
+        assert!(has_quarantine_sibling(root), "tail.cbor quarantined aside");
+        assert!(
+            !root.join(TAIL_FILENAME).exists(),
+            "corrupt tail moved, not left in place"
+        );
+    }
+
+    /// Corrupt (Crypto) manifest → quarantine the WHOLE channel dir and
+    /// return a fresh empty log (segments go aside with it — orphan-index
+    /// hazard). The dir is recreated empty.
+    #[test]
+    fn zeb983_manifest_crypto_quarantines_whole_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("communities").join("chan");
+        std::fs::create_dir_all(&root).unwrap();
+        drop(sealed_log_with_segments(&root, 2));
+        let man_path = root.join(MANIFEST_FILENAME);
+        let mut raw = std::fs::read(&man_path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        std::fs::write(&man_path, &raw).unwrap();
+
+        let (log, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.clone(),
+            ChannelLogConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(total, 0, "fresh empty log");
+        assert!(log.manifest.segments.is_empty());
+        assert!(root.exists(), "channel dir recreated empty");
+        assert!(
+            has_quarantine_sibling(root.parent().unwrap()),
+            "whole channel dir quarantined aside"
+        );
+        // The old segments went aside WITH the dir — none left to be
+        // overwritten by a fresh seal.
+        assert!(!root.join("segments/00000000.cbor").exists());
+    }
+
+    /// Transient Io (a directory where the manifest file should be) stays
+    /// HARD — never quarantined (ZEB-460).
+    #[test]
+    fn zeb983_manifest_io_error_stays_hard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(MANIFEST_FILENAME)).unwrap();
+        let err = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .expect_err("Io must be hard");
+        assert!(matches!(err, ChannelLogPersistError::Io(_)));
+        assert!(!has_quarantine_sibling(root), "nothing relocated on Io");
+    }
+
+    /// `quarantine_segment` renames the file aside, drops its descriptor,
+    /// and rewrites the manifest sealed.
+    #[test]
+    fn zeb983_quarantine_segment_drops_and_rewrites_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut log = sealed_log_with_segments(root, 2);
+        assert_eq!(log.manifest.segments.len(), 2);
+        log.quarantine_segment(0, "test").unwrap();
+        assert_eq!(log.manifest.segments.len(), 1, "descriptor dropped");
+        assert!(
+            has_quarantine_sibling(root.join("segments").as_path()),
+            "segment file moved aside"
+        );
+        // A reload sees the rewritten (1-segment) sealed manifest.
+        let (mut reloaded, _total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.manifest.segments.len(), 1);
+
+        // ZEB-983 (CodeRabbit #729 critical): the surviving descriptor is the
+        // ORIGINAL segment 1 (`segments/00000001.cbor`). Appending + sealing
+        // must NOT reuse index 1 (which `segments.len()==1` naively would),
+        // or it would overwrite the surviving segment's live data.
+        let survivor_rel = match &reloaded.manifest.segments[0].handle {
+            SegmentHandle::LocalFile { rel_path } => rel_path.clone(),
+        };
+        assert_eq!(survivor_rel, "segments/00000001.cbor");
+        reloaded
+            .append(fixture_signed_event(200_000, 0, "b-dev"))
+            .unwrap();
+        reloaded.seal_and_persist().unwrap();
+        let new_rel = match &reloaded.manifest.segments.last().unwrap().handle {
+            SegmentHandle::LocalFile { rel_path } => rel_path.clone(),
+        };
+        assert_ne!(
+            new_rel, survivor_rel,
+            "a fresh seal must not reuse the surviving segment's index (no overwrite)"
+        );
+        assert_eq!(
+            new_rel, "segments/00000002.cbor",
+            "next index = max survivor + 1"
+        );
+        // Both segments still readable → the survivor's data was not clobbered.
+        for seg in reloaded.manifest.segments.clone() {
+            reloaded
+                .read_segment(&seg)
+                .expect("segment intact after re-seal");
+        }
+    }
+
+    /// Build a signed event bound to an arbitrary `(community, channel)` —
+    /// used to forge a "foreign-channel" event for the binding tests.
+    fn signed_event_for(community: SpaceId, channel: ChannelId, wall: u64) -> SignedChannelEvent {
+        let key = fixture_signing_key(0xa1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: community,
+            channel_id: channel,
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(wall, "a-dev"),
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+            mentions: None,
+            attachments: None,
+        };
+        sign_channel_event(&payload, &key).expect("sign")
+    }
+
+    /// ZEB-983 (Greptile P1, security): an offline attacker downgrades a
+    /// sealed tail to a LEGACY plaintext image holding a validly-signed
+    /// event copied from ANOTHER channel. The legacy path must NOT reseal
+    /// those foreign events into the target channel — it quarantines the
+    /// tail and continues empty, so nothing foreign enters the log.
+    #[test]
+    fn zeb983_legacy_tail_with_foreign_channel_events_is_quarantined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Seal a legit 1-segment log for (0xc0, 0x01).
+        drop(sealed_log_with_segments(root, 1));
+        // Overwrite tail.cbor with a LEGACY plaintext image whose event is
+        // bound to a DIFFERENT channel (0xc0, 0x99).
+        let foreign = vec![signed_event_for(
+            fixture_community(0xc0),
+            fixture_channel(0x99),
+            500_000,
+        )];
+        let mut legacy = vec![CHANNEL_LOG_TAIL_V1];
+        ciborium::into_writer(&foreign, &mut legacy).unwrap();
+        std::fs::write(root.join(TAIL_FILENAME), &legacy).unwrap();
+
+        let (log, _total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .unwrap();
+        assert!(log.tail.is_empty(), "foreign tail rejected, not laundered");
+        assert_eq!(log.manifest.segments.len(), 1, "manifest intact");
+        assert!(
+            has_quarantine_sibling(root),
+            "foreign tail quarantined aside"
+        );
+        // The tail was NOT resealed: the quarantined file is still the
+        // attacker's plaintext (first byte is the schema byte, not sentinel 3).
+        let quarantined = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("tail.cbor.corrupt.")
+            })
+            .expect("quarantined tail exists");
+        assert_eq!(
+            std::fs::read(quarantined.path()).unwrap().first(),
+            Some(&CHANNEL_LOG_TAIL_V1),
+            "foreign bytes were NOT resealed into an authenticated envelope"
+        );
+    }
+
+    /// The segment twin: `read_segment_migrating` rejects a legacy segment
+    /// holding foreign-channel events (the boot walk then quarantines it).
+    #[test]
+    fn zeb983_segment_with_foreign_channel_events_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = sealed_log_with_segments(root, 1);
+        // Overwrite segment 0 with a legacy plaintext image of a foreign event.
+        let foreign = vec![signed_event_for(
+            fixture_community(0xc0),
+            fixture_channel(0x99),
+            500_000,
+        )];
+        let mut legacy = vec![CHANNEL_LOG_SEGMENT_V1];
+        ciborium::into_writer(&foreign, &mut legacy).unwrap();
+        std::fs::write(root.join("segments/00000000.cbor"), &legacy).unwrap();
+
+        let err = log
+            .read_segment_migrating(&log.manifest.segments[0])
+            .expect_err("foreign-channel segment must be rejected");
+        assert!(matches!(err, ChannelLogPersistError::CborDecode(_)));
+    }
+
+    /// ZEB-983 (Greptile P1): when the whole-dir quarantine RENAME fails, a
+    /// fresh log must NOT be returned (it would overwrite the orphaned
+    /// segments) — reload hard-errors instead. Forced by making the channel
+    /// dir's parent read-only so the rename fails.
+    #[cfg(unix)]
+    #[test]
+    fn zeb983_failed_dir_quarantine_hard_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let root = parent.join("chan");
+        std::fs::create_dir_all(&root).unwrap();
+        drop(sealed_log_with_segments(&root, 1));
+        // Corrupt the manifest (Crypto) so reload takes the dir-quarantine arm.
+        let man_path = root.join(MANIFEST_FILENAME);
+        let mut raw = std::fs::read(&man_path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        std::fs::write(&man_path, &raw).unwrap();
+        // Make the parent read-only → the rename of `chan` → `chan.corrupt.*`
+        // fails (no write permission on the directory entry's parent).
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            fixture_community(0xc0),
+            fixture_channel(0x01),
+            root.clone(),
+            ChannelLogConfig::default(),
+        );
+        // Restore perms before asserting so the tempdir cleans up.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(result, Err(ChannelLogPersistError::Io(_))),
+            "a failed dir quarantine must hard-error, not return a clobbering fresh log"
+        );
+        // The original segment is still present (not overwritten).
+        assert!(root.join("segments/00000000.cbor").exists());
+    }
+
+    /// A LEGACY plaintext segment with invalid inner CBOR fails to decode
+    /// (`CborDecode`, not `Io`), so the boot walk quarantines it — proving
+    /// the dead-channel cliff is retired for corrupt PLAINTEXT segments too
+    /// (not only sealed-Crypto ones). Io stays hard (pinned elsewhere).
+    #[test]
+    fn zeb983_legacy_invalid_segment_decode_is_quarantinable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = sealed_log_with_segments(root, 1);
+        // Overwrite segment 0 with a legacy plaintext file (first byte != 3)
+        // whose inner CBOR is garbage → open_segment_image treats it as a
+        // legacy image, decode fails → CborDecode (quarantine-eligible).
+        std::fs::write(
+            root.join("segments/00000000.cbor"),
+            [CHANNEL_LOG_SEGMENT_V1, 0xFF, 0xFF, 0xFF],
+        )
+        .unwrap();
+        let err = log
+            .read_segment(&log.manifest.segments[0])
+            .expect_err("garbage legacy segment must fail to decode");
+        assert!(
+            matches!(err, ChannelLogPersistError::CborDecode(_)),
+            "corrupt legacy segment is CborDecode (quarantine-eligible), not Io"
+        );
+    }
+
+    /// A sealed segment's ciphertext copied to a DIFFERENT index fails the
+    /// AAD (the label binds the segment index), so it reads as corruption.
+    #[test]
+    fn zeb983_segment_aad_swap_across_index_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = sealed_log_with_segments(root, 1);
+        // Copy segment 0's sealed bytes onto a fabricated index-1 path and
+        // point a descriptor at it.
+        let seg0 = std::fs::read(root.join("segments/00000000.cbor")).unwrap();
+        std::fs::write(root.join("segments/00000001.cbor"), &seg0).unwrap();
+        let mut descriptor = log.manifest.segments[0].clone();
+        descriptor.handle = SegmentHandle::LocalFile {
+            rel_path: "segments/00000001.cbor".to_string(),
+        };
+        let err = log
+            .read_segment(&descriptor)
+            .expect_err("index-swapped ciphertext must fail the tag");
+        assert!(matches!(err, ChannelLogPersistError::CborDecode(_)));
     }
 
     #[test]
@@ -2918,6 +3790,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root.clone(),
@@ -2951,6 +3824,7 @@ mod tests {
         // Reload rebuilds the index identically from segment + tail.
         log.flush_tail().expect("flush");
         let (reloaded, _total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root,
@@ -3617,6 +4491,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root.clone(),
@@ -3664,6 +4539,7 @@ mod tests {
 
         log.flush_tail().expect("flush");
         let (reloaded, _total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root,
@@ -3692,6 +4568,7 @@ mod tests {
         let mk = || {
             let tmp = tempfile::tempdir().expect("tmp");
             let log = ChannelLog::new(
+                crate::device_dataset_file::test_cipher(),
                 cid,
                 chid,
                 tmp.path().to_path_buf(),
@@ -4926,6 +5803,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -4953,6 +5831,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -4972,6 +5851,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5001,6 +5881,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root.clone(),
@@ -5042,6 +5923,7 @@ mod tests {
         );
         // Reload: byte-identical events recovered.
         let (reloaded, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root,
@@ -5066,6 +5948,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root.clone(),
@@ -5081,6 +5964,7 @@ mod tests {
         }
         log.flush_tail().expect("flush");
         let (reloaded, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root,
@@ -5100,6 +5984,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let (log, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5113,18 +5998,77 @@ mod tests {
 
     #[test]
     fn channel_log_reload_rejects_wrong_community() {
+        // ZEB-983: a SEALED manifest carries the community+channel in its
+        // AAD label. Reloading it under a different community fails the tag
+        // FIRST (Crypto), which quarantines the whole channel dir and
+        // returns a fresh empty log — the misrouted ciphertext can never be
+        // parsed as this community's manifest. (The legacy plaintext
+        // id-mismatch → hard `Manifest` path is pinned separately below.)
+        let cid = fixture_community(0xc0);
+        let other = fixture_community(0xff);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("communities").join("chan");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig::default(),
+        );
+        log.append(fixture_signed_event(100_000, 0, "a-dev"))
+            .expect("append");
+        log.flush_tail().expect("flush");
+        log.seal_and_persist().expect("seal");
+        let (fresh, count) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            other,
+            chid,
+            root.clone(),
+            ChannelLogConfig::default(),
+        )
+        .expect("cross-community sealed manifest quarantines, not errors");
+        assert_eq!(count, 0, "fresh empty log after quarantine");
+        assert!(fresh.manifest.segments.is_empty());
+        assert!(
+            std::fs::read_dir(root.parent().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".corrupt.")),
+            "channel dir quarantined aside"
+        );
+    }
+
+    /// A LEGACY plaintext manifest whose inner community_id doesn't match
+    /// the expected one stays a HARD `Manifest` error (routing bug, not
+    /// corruption — deliberately not quarantined).
+    #[test]
+    fn channel_log_reload_legacy_wrong_community_hard_errors() {
         let cid = fixture_community(0xc0);
         let other = fixture_community(0xff);
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
-        let mut log = ChannelLog::new(cid, chid, root.clone(), ChannelLogConfig::default());
-        log.append(fixture_signed_event(100_000, 0, "a-dev"))
-            .expect("append");
-        log.flush_tail().expect("flush");
-        log.seal_and_persist().expect("seal");
-        let err = ChannelLog::reload(other, chid, root, ChannelLogConfig::default())
-            .expect_err("manifest community mismatch must reject");
+        // Hand-write a LEGACY plaintext manifest (schema byte + CBOR, no
+        // envelope) bearing `cid`.
+        let manifest = ChannelLogManifest {
+            community_id: cid,
+            channel_id: chid,
+            segments: Vec::new(),
+        };
+        let mut bytes = vec![CHANNEL_LOG_MANIFEST_V1];
+        ciborium::into_writer(&manifest, &mut bytes).unwrap();
+        std::fs::write(root.join(MANIFEST_FILENAME), &bytes).unwrap();
+
+        let err = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            other,
+            chid,
+            root,
+            ChannelLogConfig::default(),
+        )
+        .expect_err("legacy manifest community mismatch must hard-error");
         assert!(matches!(err, ChannelLogPersistError::Manifest { .. }));
     }
 
@@ -5134,6 +6078,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5161,6 +6106,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root.clone(),
@@ -5199,6 +6145,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root.clone(),
@@ -5218,6 +6165,7 @@ mod tests {
         assert!(root.join("segments/00000000.cbor").exists());
         assert!(root.join("segments/00000001.cbor").exists());
         let (reloaded, total) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             root,
@@ -5243,6 +6191,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5288,6 +6237,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5337,6 +6287,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5372,6 +6323,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5464,8 +6416,14 @@ mod tests {
             .expect("save");
         // Also need a stub tail.cbor for reload (or none — reload
         // tolerates missing tail.cbor by returning empty).
-        let (reloaded, _) =
-            ChannelLog::reload(cid, chid, root, ChannelLogConfig::default()).expect("reload");
+        let (reloaded, _) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            cid,
+            chid,
+            root,
+            ChannelLogConfig::default(),
+        )
+        .expect("reload");
         assert_eq!(reloaded.manifest.segments.len(), 2);
         // After reload's defensive sort, b-dev (wall=100) must come
         // before a-dev (wall=200) regardless of on-disk order.
@@ -5523,6 +6481,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5541,6 +6500,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5567,6 +6527,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5599,6 +6560,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5637,6 +6599,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -5689,6 +6652,7 @@ mod tests {
         let chid = fixture_channel(0x01);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
             cid,
             chid,
             tmp.path().to_path_buf(),
@@ -6472,7 +7436,13 @@ mod tests {
         let cfg = ChannelLogConfig {
             seal_threshold_events: 4,
         };
-        let mut log = ChannelLog::new(cid, chid, dir.path().to_path_buf(), cfg.clone());
+        let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
+            cid,
+            chid,
+            dir.path().to_path_buf(),
+            cfg.clone(),
+        );
         // append a Post, then a React to it, enough to force a seal, then more
         let target = MessageId([9; 16]);
         let me = OwnerAddr([0xAA; 16]);
@@ -6491,7 +7461,14 @@ mod tests {
         }
         log.flush_tail().unwrap();
         // reload from disk — index must be rebuilt from the sealed segment
-        let (reloaded, _n) = ChannelLog::reload(cid, chid, dir.path().to_path_buf(), cfg).unwrap();
+        let (reloaded, _n) = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            cid,
+            chid,
+            dir.path().to_path_buf(),
+            cfg,
+        )
+        .unwrap();
         let r = reloaded.reactions_for(&target, &me);
         assert_eq!(r.iter().find(|d| d.emoji == "👍").unwrap().count, 1);
     }
@@ -6508,7 +7485,13 @@ mod tests {
         let cfg = ChannelLogConfig {
             seal_threshold_events: 2,
         };
-        let mut log = ChannelLog::new(cid, chid, dir.path().to_path_buf(), cfg.clone());
+        let mut log = ChannelLog::new(
+            crate::device_dataset_file::test_cipher(),
+            cid,
+            chid,
+            dir.path().to_path_buf(),
+            cfg.clone(),
+        );
         let me = OwnerAddr([0xCC; 16]);
         let target = MessageId([0xDD; 16]);
 
@@ -6532,7 +7515,13 @@ mod tests {
         std::fs::remove_file(&seg_path).expect("segment file must exist before we delete it");
 
         // reload MUST succeed despite the missing segment (non-critical reactions).
-        let result = ChannelLog::reload(cid, chid, dir.path().to_path_buf(), cfg);
+        let result = ChannelLog::reload(
+            crate::device_dataset_file::test_cipher(),
+            cid,
+            chid,
+            dir.path().to_path_buf(),
+            cfg,
+        );
         assert!(
             result.is_ok(),
             "reload must tolerate a missing sealed segment; got: {:?}",

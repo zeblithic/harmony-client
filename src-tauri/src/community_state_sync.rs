@@ -1137,6 +1137,11 @@ mod catch_up_channels_tests {
 /// owner-state engine has 9 positional args and is already at the limit.
 pub struct CommunitySyncEngineConfig {
     pub community_id: SpaceId,
+    /// ZEB-983: device cipher sealing every per-community file at rest
+    /// (`crdt.cbor`, `replay.cbor`, `segments.cbor`). Threaded from
+    /// `CommunityRegistryConfig`; tests use
+    /// `device_dataset_file::test_cipher()`.
+    pub device_cipher: crate::device_dataset_file::DeviceCipher,
     pub membership_key: EpochKey,
     pub admin_addr: OwnerAddr,
     /// Whether this community requires invite-only counter-sigs on
@@ -1433,6 +1438,7 @@ impl CommunitySyncEngine {
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
+            device_cipher: cfg.device_cipher,
             membership_key: cfg.membership_key,
             admin_addr: cfg.admin_addr,
             is_invite_only: cfg.is_invite_only,
@@ -2378,6 +2384,8 @@ impl CommunitySyncEngine {
 /// `internal_task` `select!` loop or its helpers.
 struct InternalCtx {
     community_id: SpaceId,
+    /// ZEB-983: seals every persist write / opens every load.
+    device_cipher: crate::device_dataset_file::DeviceCipher,
     membership_key: EpochKey,
     admin_addr: OwnerAddr,
     is_invite_only: bool,
@@ -3822,8 +3830,12 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     // (the ZEB-463 concurrent-rollback race) must reach the shutdown-flush
     // classifier as `PersistDirMissing`/`Persist`, or a benign rollback race
     // propagates as a hard shutdown-flush failure (CR).
-    let prior_index = crate::community_state_persist::load_segment_index(&segments_path)
-        .map_err(map_persist_err)?;
+    let prior_index = crate::community_state_persist::load_segment_index(
+        &ctx.device_cipher,
+        &segments_path,
+        &ctx.community_id,
+    )
+    .map_err(map_persist_err)?;
     let plan = crate::community_state_segments::plan_segments(
         ctx.community_id,
         &sorted_events,
@@ -3983,13 +3995,19 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     }
     // Persist the sidecar only when the index actually changed. `encode_root_
     // packet` runs on the query-serve path too (every peer GET), so an
-    // unconditional `write_atomic` here would be one disk write per serve
-    // request even when nothing was (re)sealed (CR). Map through
+    // unconditional write here would be one sealed disk write (fsync
+    // included, ZEB-983) per serve request even when nothing was (re)sealed
+    // (CR). Map through
     // `map_persist_err` for the same shutdown-race classification as
     // `crdt.cbor`/`replay.cbor` (CR).
     if plan.index != prior_index {
-        crate::community_state_persist::save_segment_index(&segments_path, &plan.index)
-            .map_err(map_persist_err)?;
+        crate::community_state_persist::save_segment_index(
+            &ctx.device_cipher,
+            &segments_path,
+            &ctx.community_id,
+            &plan.index,
+        )
+        .map_err(map_persist_err)?;
     }
 
     // 5. Build the SIGNED sub-payload with a strictly-newer HLC. ZEB-814: mark
@@ -6012,9 +6030,12 @@ async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     let tracker_snap = CommunityRootHlcTracker::from_runtime(&*ctx.tracker.lock().await);
     let crdt_path = ctx.paths.crdt.clone();
     let replay_path = ctx.paths.replay.clone();
+    let cipher = ctx.device_cipher.clone();
+    let community_id = ctx.community_id;
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
-        save_crdt(&crdt_path, &state_snap).map_err(map_persist_err)?;
-        save_replay(&replay_path, &tracker_snap).map_err(map_persist_err)?;
+        save_crdt(&cipher, &crdt_path, &state_snap).map_err(map_persist_err)?;
+        save_replay(&cipher, &replay_path, &community_id, &tracker_snap)
+            .map_err(map_persist_err)?;
         Ok(())
     })
     .await
@@ -6038,8 +6059,10 @@ async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError
     // is ctx-derived and deliberately absent from the on-disk shape.
     let tracker_snap = CommunityRootHlcTracker::from_runtime(&*ctx.tracker.lock().await);
     let replay_path = ctx.paths.replay.clone();
+    let cipher = ctx.device_cipher.clone();
+    let community_id = ctx.community_id;
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
-        save_replay(&replay_path, &tracker_snap).map_err(map_persist_err)
+        save_replay(&cipher, &replay_path, &community_id, &tracker_snap).map_err(map_persist_err)
     })
     .await
     .map_err(|join_err| {
@@ -6069,8 +6092,9 @@ async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError
 async fn persist_crdt_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     let state_snap = ctx.state.lock().await.clone();
     let crdt_path = ctx.paths.crdt.clone();
+    let cipher = ctx.device_cipher.clone();
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
-        save_crdt(&crdt_path, &state_snap).map_err(map_persist_err)
+        save_crdt(&cipher, &crdt_path, &state_snap).map_err(map_persist_err)
     })
     .await
     .map_err(|join_err| {
@@ -6259,6 +6283,12 @@ pub struct CommunityRegistryConfig {
     /// This device's stable ID, used as the publisher key in every
     /// engine's HLC and replay tracker.
     pub device_id: String,
+    /// ZEB-983: device cipher sealing every per-community file at rest.
+    /// Derived once at boot from the node identity seed
+    /// (`device_dataset_file::get_or_derive`) — available on every boot
+    /// mode, including ZEB-905 keyless local-only. Tests use
+    /// `device_dataset_file::test_cipher()`.
+    pub device_cipher: crate::device_dataset_file::DeviceCipher,
     /// Shared CAS handle. Cloned (Arc bump) into every engine.
     pub content_store: Arc<dyn ContentStore>,
     /// Resolver for `OwnerAddr` -> 64-byte identity_pub at receive-side
@@ -7262,11 +7292,12 @@ impl CommunitySyncRegistry {
         // idempotency check below.
         let paths = self.paths_for(community_id);
         let paths_for_io = paths.clone();
+        let cipher_for_io = self.cfg.device_cipher.clone();
         let (initial_state, initial_tracker) = tokio::task::spawn_blocking(
             move || -> Result<(CommunityState, CommunityRootHlcTracker), CommunitySyncError> {
-                let state = load_crdt(&paths_for_io.crdt, community_id)
+                let state = load_crdt(&cipher_for_io, &paths_for_io.crdt, community_id)
                     .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
-                let tracker = load_replay(&paths_for_io.replay)
+                let tracker = load_replay(&cipher_for_io, &paths_for_io.replay, &community_id)
                     .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
                 Ok((state, tracker))
             },
@@ -7302,6 +7333,7 @@ impl CommunitySyncRegistry {
 
         let engine = Arc::new(CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
+            device_cipher: self.cfg.device_cipher.clone(),
             membership_key,
             admin_addr,
             is_invite_only,
@@ -7435,29 +7467,44 @@ impl CommunitySyncRegistry {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let last =
-                            crate::community_channel_log::ChannelBackfillState::load_async(&dir)
-                                .await
-                                .map(|s| s.last_full_reconcile_ms);
+                        let root_label = crate::community_state_persist::seal_label(
+                            &community_id,
+                            "backfill_state.cbor",
+                        );
+                        let last = crate::community_channel_log::ChannelBackfillState::load_async(
+                            &self.cfg.device_cipher,
+                            &dir,
+                            &root_label,
+                        )
+                        .await
+                        .map(|s| s.last_full_reconcile_ms);
                         let first_deadline_ms = crate::channel_backfill::first_resync_deadline(
                             last,
                             interval_ms,
                             now_ms,
                         );
                         let persist_dir = dir.clone();
+                        let persist_cipher = self.cfg.device_cipher.clone();
                         (
                             interval_ms,
                             Some(crate::channel_backfill::ResyncPersist {
                                 first_deadline_ms,
                                 on_full_reconcile: std::sync::Arc::new(move |fired_at_ms| {
                                     let dir = persist_dir.clone();
+                                    let cipher = persist_cipher.clone();
+                                    let label = crate::community_state_persist::seal_label(
+                                        &community_id,
+                                        "backfill_state.cbor",
+                                    );
                                     // Tiny sidecar write off the driver task
                                     // (same shape as the mail-root / channel-log
                                     // ZEB-599 callbacks).
                                     tokio::task::spawn_blocking(move || {
                                         if let Err(e) =
                                             crate::community_channel_log::ChannelBackfillState::save(
+                                                &cipher,
                                                 &dir,
+                                                &label,
                                                 fired_at_ms,
                                             )
                                         {
@@ -8146,6 +8193,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -8191,6 +8239,7 @@ mod tests {
         let membership_key_for_decode = membership_key.clone();
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: bob_adopt_floor.clone(),
             community_id,
             membership_key,
@@ -8412,6 +8461,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let _engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -8451,6 +8501,7 @@ mod tests {
         tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
 
         let _engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -8596,6 +8647,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -8636,6 +8688,7 @@ mod tests {
         tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -8811,6 +8864,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -8849,6 +8903,7 @@ mod tests {
         tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -9037,6 +9092,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -9075,6 +9131,7 @@ mod tests {
         tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -9293,6 +9350,7 @@ mod tests {
         let cs_for_put = Arc::clone(&cs);
 
         let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: adopt_floor.clone(),
             community_id,
             membership_key: membership_key.clone(),
@@ -9723,6 +9781,7 @@ mod tests {
         let identity_dir = tempdir.path().to_path_buf();
 
         let registry = std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "dev".into(),
             content_store: cs,
@@ -10110,8 +10169,12 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create community dir");
         let crdt_path = dir.join("crdt.cbor");
         let preexisting = CommunityState::new(community_id);
-        crate::community_state_persist::save_crdt(&crdt_path, &preexisting)
-            .expect("seed pre-existing crdt.cbor");
+        crate::community_state_persist::save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            &preexisting,
+        )
+        .expect("seed pre-existing crdt.cbor");
 
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -10257,6 +10320,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let identity_dir = tempdir.path().to_path_buf();
         let registry = std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "dev".into(),
             content_store: cs,
@@ -10323,8 +10387,12 @@ mod tests {
             .join("communities")
             .join(hex::encode(community_id.0))
             .join("segments.cbor");
-        let index = crate::community_state_persist::load_segment_index(&segments_path)
-            .expect("segment index persisted by the publish");
+        let index = crate::community_state_persist::load_segment_index(
+            &crate::device_dataset_file::test_cipher(),
+            &segments_path,
+            &community_id,
+        )
+        .expect("segment index persisted by the publish");
         assert!(
             !index.sealed.is_empty(),
             "fixture must seal at least one segment or the test is vacuous"
@@ -10539,7 +10607,12 @@ mod tests {
         // has run, yet the CRDT must be on disk after this returns.
         engine.persist_now().await.expect("persist_now");
 
-        let loaded = load_crdt(&crdt_path, community_id).expect("load_crdt after persist_now");
+        let loaded = load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load_crdt after persist_now");
         assert!(
             loaded.contains_event(&eid),
             "persist_now must durably write the in-memory membership event"
@@ -10618,8 +10691,12 @@ mod tests {
             "publish must fail with the adapter receiver + CAS dropped"
         );
 
-        let loaded =
-            load_crdt(&crdt_path, community_id).expect("load_crdt after failed-publish flush");
+        let loaded = load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load_crdt after failed-publish flush");
         assert!(
             loaded.contains_event(&eid),
             "ZEB-462 B: CRDT must persist even when the publish failed"
@@ -11557,6 +11634,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -11596,6 +11674,7 @@ mod tests {
         let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key,
@@ -11773,6 +11852,7 @@ mod tests {
         let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -11805,6 +11885,7 @@ mod tests {
         });
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key,
@@ -11978,6 +12059,7 @@ mod tests {
         let (_sub_tx_held, sub_rx) = mpsc::channel::<Vec<u8>>(64);
 
         let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: EpochKey::new([0x58; 32]),
@@ -12096,6 +12178,7 @@ mod tests {
         tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
 
         let _engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: EpochKey::new([0x66; 32]),
@@ -12320,6 +12403,7 @@ mod tests {
             let a_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
             let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 community_id,
                 membership_key: membership_key.clone(),
@@ -12357,6 +12441,7 @@ mod tests {
             let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
             let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 community_id,
                 membership_key,
@@ -13136,6 +13221,7 @@ mod tests {
         let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -13305,6 +13391,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
@@ -13348,6 +13435,7 @@ mod tests {
         ))));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key,
@@ -13654,6 +13742,7 @@ mod tests {
             std::time::Duration::from_secs(2),
         ));
         let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: EpochKey::new([0x55; 32]),
@@ -13840,7 +13929,12 @@ mod tests {
 
         engine.shutdown().await.expect("shutdown");
 
-        let loaded = load_crdt(&crdt_path, community_id).expect("load persisted crdt");
+        let loaded = load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load persisted crdt");
         assert!(
             loaded.contains_event(&join_id),
             "pre-shutdown insert must reach disk via the shutdown arm's final flush"
@@ -13970,6 +14064,7 @@ mod tests {
         let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let membership_key = EpochKey::new([0x69; 32]);
         let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: adopt_floor.clone(),
             community_id,
             membership_key: membership_key.clone(),
@@ -15169,10 +15264,19 @@ mod tests {
         {
             let state = engine1.state();
             let g = state.lock().await;
-            crate::community_state_persist::save_crdt(&crdt_path, &g).expect("save_crdt");
+            crate::community_state_persist::save_crdt(
+                &crate::device_dataset_file::test_cipher(),
+                &crdt_path,
+                &g,
+            )
+            .expect("save_crdt");
         }
-        let reloaded =
-            crate::community_state_persist::load_crdt(&crdt_path, community_id).expect("load_crdt");
+        let reloaded = crate::community_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+            community_id,
+        )
+        .expect("load_crdt");
 
         // Engine #2 stands up around the RELOADED state.
         let dir2 = tempfile::tempdir().expect("tempdir2");

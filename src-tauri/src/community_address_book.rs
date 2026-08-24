@@ -296,39 +296,68 @@ pub fn addrbook_path(identity_dir: &Path, community: &SpaceId) -> PathBuf {
         .join("addrbook.cbor")
 }
 
-/// Persist `rows` to `path` via temp-file + rename — same durability
-/// posture as `community_state_persist::save_crdt` (no fsync: the address
-/// book is fully peer-recoverable via republish, so the extra durability
-/// cost doesn't pencil out at this granularity).
-///
-/// Like `save_crdt`, the fixed `.tmp` name is only race-free with a single
-/// writer per `path`; a future caller invoking this concurrently for the
-/// same community would need `tempfile::NamedTempFile::new_in` instead.
-pub fn save_addrbook(path: &Path, rows: &[AddressBookRow]) -> Result<(), String> {
+pub(crate) const ADDRBOOK_FILENAME: &str = "addrbook.cbor";
+
+/// Persist `rows` to `path`, sealed under the device cipher (ZEB-983 —
+/// the co-member network graph is confidentiality-sensitive at rest).
+/// Writes through `device_dataset_file::write_image` →
+/// `save_atomically` (randomized temp + fsync; this module's inline
+/// no-fsync tmp+rename copy is retired with the other community-family
+/// write paths).
+pub fn save_addrbook(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    community: &SpaceId,
+    rows: &[AddressBookRow],
+) -> Result<(), String> {
     let mut bytes = Vec::new();
     into_writer(rows, &mut bytes).map_err(|e| format!("encode addrbook: {e}"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-    Ok(())
+    crate::device_dataset_file::write_image(
+        cipher,
+        path,
+        &crate::community_state_persist::seal_label(community, ADDRBOOK_FILENAME),
+        &bytes,
+    )
+    .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// Load rows from `path`, TTL-filtering per [`row_ttl_ms`]. A missing or
-/// corrupt file returns an empty vec — loss-safe per spec §2: the address
-/// book fully reconstructs from peer republish, so a hard error here would
-/// needlessly block engine spawn.
-pub fn load_addrbook(path: &Path, now_ms: u64) -> Vec<AddressBookRow> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
+/// Load rows from `path`, TTL-filtering per [`row_ttl_ms`]. A missing,
+/// unreadable, undecryptable, or corrupt file returns an empty vec —
+/// loss-safe per spec §2: the address book fully reconstructs from peer
+/// republish (rows are signature-verified again on ingest), so a hard
+/// error here would needlessly block engine spawn. ZEB-983: the sealed
+/// envelope's failures land in the same swallow (no quarantine file —
+/// this family never created one); a legacy plaintext file that parses
+/// is resealed in place.
+pub fn load_addrbook(
+    cipher: &crate::device_dataset_file::DeviceCipher,
+    path: &Path,
+    community: &SpaceId,
+    now_ms: u64,
+) -> Vec<AddressBookRow> {
+    let label = crate::community_state_persist::seal_label(community, ADDRBOOK_FILENAME);
+    let image = match crate::device_dataset_file::read_image(cipher, path, &label) {
+        Ok(Some(image)) => image,
+        // Missing file (first boot / left community) is silent by design.
+        Ok(None) => return Vec::new(),
+        // ZEB-983 (CodeRabbit): an Io / AEAD failure still degrades to empty
+        // (loss-safe — rows re-verify on ingest), but log the reason so a
+        // wrong-key or unreadable addrbook is distinguishable from first boot.
+        Err(e) => {
+            tracing::warn!(
+                community = %hex::encode(&community.0[..4]),
+                path = %path.display(),
+                error = %e,
+                "addrbook: unreadable sealed sidecar; loading empty (peer-recoverable)"
+            );
+            return Vec::new();
+        }
     };
-    let rows: Vec<AddressBookRow> = match from_reader(bytes.as_slice()) {
+    let rows: Vec<AddressBookRow> = match from_reader(image.bytes.as_slice()) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
+    crate::device_dataset_file::reseal_if_legacy(cipher, path, &label, &image);
     rows.into_iter()
         .filter(|row| now_ms.saturating_sub(row.stamped_at_ms) <= row_ttl_ms(&row.entry))
         .collect()
@@ -720,10 +749,21 @@ mod tests {
         let now = 1_700_000_000_000;
         let rows = vec![reach_row(0x01, actor, now), relay_row(0x02, actor, now)];
 
-        save_addrbook(&path, &rows).unwrap();
+        save_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            &rows,
+        )
+        .unwrap();
         assert!(path.exists());
 
-        let loaded = load_addrbook(&path, now);
+        let loaded = load_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            now,
+        );
         assert_eq!(loaded.len(), 2);
         assert!(loaded
             .iter()
@@ -745,10 +785,22 @@ mod tests {
         let now = 1_700_000_000_000;
 
         let rows = vec![reach_row(0x01, actor, now), relay_row(0x02, actor, now)];
-        save_addrbook(&path, &rows).unwrap();
+        save_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            &rows,
+        )
+        .unwrap();
 
         assert_eq!(
-            load_addrbook(&path, now).len(),
+            load_addrbook(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &SpaceId([0xAB; 16]),
+                now
+            )
+            .len(),
             2,
             "both rows are fresh immediately after write"
         );
@@ -756,13 +808,24 @@ mod tests {
         // Past the relay TTL (15 min) but before the reachability TTL
         // (24h): relay row filtered, reachability row survives.
         let after_relay_ttl = now + COMMUNITY_RELAY_AD_FRESHNESS_MS + 1;
-        let loaded = load_addrbook(&path, after_relay_ttl);
+        let loaded = load_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            after_relay_ttl,
+        );
         assert_eq!(loaded.len(), 1);
         assert!(matches!(loaded[0].entry, AddressBookEntry::Reachability(_)));
 
         // Past the reachability TTL too: nothing survives.
         let after_reach_ttl = now + ADDRBOOK_REACHABILITY_TTL_MS + 1;
-        assert!(load_addrbook(&path, after_reach_ttl).is_empty());
+        assert!(load_addrbook(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &SpaceId([0xAB; 16]),
+            after_reach_ttl
+        )
+        .is_empty());
     }
 
     #[test]
@@ -772,15 +835,68 @@ mod tests {
         let path = addrbook_path(dir.path(), &community);
 
         assert!(
-            load_addrbook(&path, 1_700_000_000_000).is_empty(),
+            load_addrbook(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &SpaceId([0xAB; 16]),
+                1_700_000_000_000
+            )
+            .is_empty(),
             "nonexistent path returns empty, not an error"
         );
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"not cbor garbage").unwrap();
         assert!(
-            load_addrbook(&path, 1_700_000_000_000).is_empty(),
+            load_addrbook(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &SpaceId([0xAB; 16]),
+                1_700_000_000_000
+            )
+            .is_empty(),
             "corrupt bytes return empty, not an error"
         );
+    }
+
+    /// ZEB-983: legacy plaintext addrbook loads (rows intact) and reseals
+    /// in place; a sealed-corrupt file swallows to empty with NO
+    /// quarantine file (this family never created one); the ciphertext
+    /// copied across communities fails the AAD and reads empty.
+    #[test]
+    fn zeb983_sealed_addrbook_contract() {
+        let cipher = crate::device_dataset_file::test_cipher();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("addrbook.cbor");
+        let cid_a = SpaceId([0xAB; 16]);
+        let now = 1_700_000_000_000u64;
+        let rows = vec![reach_row(1, OwnerAddr([0x11; 16]), now)];
+
+        // Legacy plaintext → loads + reseals.
+        let mut legacy = Vec::new();
+        into_writer(&rows, &mut legacy).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        let loaded = load_addrbook(&cipher, &path, &cid_a, now);
+        assert_eq!(loaded.len(), 1, "legacy rows load");
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(
+            raw.first(),
+            Some(&crate::device_dataset_file::SEALED_DEVICE_SCHEMA_V3),
+            "legacy addrbook resealed on load"
+        );
+
+        // Cross-community swap → AAD failure → empty, no quarantine file.
+        let other = SpaceId([0xCD; 16]);
+        assert!(load_addrbook(&cipher, &path, &other, now).is_empty());
+        assert!(
+            !std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains("corrupt")),
+            "addrbook family never quarantines"
+        );
+        // Original still loads for the right community (swallow did not
+        // relocate or clobber the file).
+        assert_eq!(load_addrbook(&cipher, &path, &cid_a, now).len(), 1);
     }
 }

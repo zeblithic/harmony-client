@@ -430,6 +430,7 @@ impl PairedEngines {
         let dir_b = tempfile::tempdir().expect("tempdir B");
 
         let registry_a = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_cipher: harmony_app::device_dataset_file::test_cipher(),
             adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "a-dev".into(),
             content_store: Arc::clone(&cs),
@@ -446,6 +447,7 @@ impl PairedEngines {
         }));
 
         let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_cipher: harmony_app::device_dataset_file::test_cipher(),
             adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "b-dev".into(),
             content_store: Arc::clone(&cs),

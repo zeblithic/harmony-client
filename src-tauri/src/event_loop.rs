@@ -4783,21 +4783,37 @@ pub async fn run(
                                 // ZEB-919: live epoch-key open candidates.
                                 crdt_state_for_addrbook.clone(),
                             );
-                        let persist_handle = crate::address_book_sync::spawn_addrbook_persist_task(
-                            std::sync::Arc::clone(&book),
-                            crate::community_address_book::addrbook_path(&identity_dir, &community),
-                            community,
-                            dirty,
-                        );
-                        handles.insert(
-                            community_id,
-                            vec![
-                                queryable_handle,
-                                subscriber_handle,
-                                requester_handle,
-                                persist_handle,
-                            ],
-                        );
+                        // ZEB-983: memoized derive (boot warmed it); if the
+                        // device cipher is somehow unavailable the persist
+                        // task is skipped — the book stays in-memory-only
+                        // this session (peer-recoverable), never plaintext.
+                        let persist_handle =
+                            match crate::device_dataset_file::get_or_derive(&identity_dir) {
+                                Ok(addrbook_cipher) => {
+                                    Some(crate::address_book_sync::spawn_addrbook_persist_task(
+                                        std::sync::Arc::clone(&book),
+                                        addrbook_cipher,
+                                        crate::community_address_book::addrbook_path(
+                                            &identity_dir,
+                                            &community,
+                                        ),
+                                        community,
+                                        dirty,
+                                    ))
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        community = %hex::encode(&community.0[..4]),
+                                        err = %e,
+                                        "addrbook persist disabled: device cipher unavailable"
+                                    );
+                                    None
+                                }
+                            };
+                        let mut community_handles =
+                            vec![queryable_handle, subscriber_handle, requester_handle];
+                        community_handles.extend(persist_handle);
+                        handles.insert(community_id, community_handles);
                     }
                     AddressBookRequest::Unsubscribe { community_id } => {
                         if let Some(hs) = handles.remove(&community_id) {
