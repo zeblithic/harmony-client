@@ -185,25 +185,22 @@ pub fn load_trust_replay_or_recover(
     cipher: &crate::device_dataset_file::DeviceCipher,
     path: &Path,
 ) -> BTreeMap<String, Hlc> {
-    let image = match crate::device_dataset_file::read_image(
-        cipher,
-        path,
-        OWNER_TRUST_REPLAY_FILENAME,
-    ) {
-        Ok(None) => return BTreeMap::new(),
-        Ok(Some(img)) => img,
-        Err(crate::device_dataset_file::ImageError::Io(e)) => {
-            tracing::warn!(path = %path.display(), error = %e,
+    let image =
+        match crate::device_dataset_file::read_image(cipher, path, OWNER_TRUST_REPLAY_FILENAME) {
+            Ok(None) => return BTreeMap::new(),
+            Ok(Some(img)) => img,
+            Err(crate::device_dataset_file::ImageError::Io(e)) => {
+                tracing::warn!(path = %path.display(), error = %e,
                 "trust replay read failed; starting with empty tracker");
-            return BTreeMap::new();
-        }
-        // AEAD/envelope failure is content-corrupt: same quarantine path as
-        // corrupt CBOR (ZEB-982 — the aside file now holds ciphertext).
-        Err(crate::device_dataset_file::ImageError::Crypto(e)) => {
-            quarantine(path, &e);
-            return BTreeMap::new();
-        }
-    };
+                return BTreeMap::new();
+            }
+            // AEAD/envelope failure is content-corrupt: same quarantine path as
+            // corrupt CBOR (ZEB-982 — the aside file now holds ciphertext).
+            Err(crate::device_dataset_file::ImageError::Crypto(e)) => {
+                quarantine(path, &e);
+                return BTreeMap::new();
+            }
+        };
     let decoded = match image.bytes.split_first() {
         Some((&OWNER_TRUST_REPLAY_SCHEMA_V1, rest)) => {
             from_reader::<TrustReplayFileV1, _>(rest).map(|f| f.0)
@@ -664,7 +661,8 @@ mod tests {
         let reloaded = load_owner_state_cbor(dir.path()).unwrap();
         assert_eq!(reloaded.enrollments.len(), state.enrollments.len());
         assert_eq!(reloaded.owner_id, state.owner_id);
-        let replay = load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &replay_path);
+        let replay =
+            load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &replay_path);
         assert_eq!(replay.get("device-a"), tracker.get("device-a"));
     }
 
@@ -707,10 +705,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::device_dataset_file::install_test_cipher(dir.path());
         let missing = dir.path().join("nope.cbor");
-        assert!(load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &missing).is_empty());
+        assert!(
+            load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &missing)
+                .is_empty()
+        );
         let corrupt = dir.path().join("bad.cbor");
         std::fs::write(&corrupt, b"not cbor at all").unwrap();
-        assert!(load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &corrupt).is_empty());
+        assert!(
+            load_trust_replay_or_recover(&crate::device_dataset_file::test_cipher(), &corrupt)
+                .is_empty()
+        );
         // Quarantined aside, original gone.
         assert!(!corrupt.exists());
     }

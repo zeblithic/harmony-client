@@ -3778,15 +3778,22 @@ mod tests {
             cipher: crate::device_dataset_file::test_cipher(),
         };
         FleetPersist::persist(&persist, &doc, &tracker).unwrap();
-        assert_eq!(load_quorum_doc_or_recover(&crate::device_dataset_file::test_cipher(), &doc_path), doc);
         assert_eq!(
-            load_quorum_replay_or_recover(&crate::device_dataset_file::test_cipher(), &replay_path).get("device-a"),
+            load_quorum_doc_or_recover(&crate::device_dataset_file::test_cipher(), &doc_path),
+            doc
+        );
+        assert_eq!(
+            load_quorum_replay_or_recover(&crate::device_dataset_file::test_cipher(), &replay_path)
+                .get("device-a"),
             tracker.get("device-a")
         );
 
         // Missing → default; corrupt → quarantined + default.
         assert_eq!(
-            load_quorum_doc_or_recover(&crate::device_dataset_file::test_cipher(), &dir.path().join("nope.cbor")),
+            load_quorum_doc_or_recover(
+                &crate::device_dataset_file::test_cipher(),
+                &dir.path().join("nope.cbor")
+            ),
             QuorumReqDoc::default()
         );
         std::fs::write(&doc_path, b"definitely not cbor").unwrap();

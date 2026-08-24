@@ -481,7 +481,11 @@ mod tests {
         store.persist().unwrap();
 
         // Reload from disk via the production load path.
-        let loaded = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "owner");
+        let loaded = PersistentCardStore::load_for_owner(
+            crate::device_dataset_file::test_cipher(),
+            dir.path(),
+            "owner",
+        );
         assert_eq!(loaded.len(), 2);
         let a = loaded.get(&[7; 16]).unwrap();
         assert_eq!(a.display_name, "Alice");
@@ -493,7 +497,11 @@ mod tests {
     #[test]
     fn load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let loaded = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "never-written");
+        let loaded = PersistentCardStore::load_for_owner(
+            crate::device_dataset_file::test_cipher(),
+            dir.path(),
+            "never-written",
+        );
         assert!(loaded.is_empty());
     }
 
@@ -515,7 +523,10 @@ mod tests {
         ));
         // Empty file.
         std::fs::write(&path, []).unwrap();
-        assert!(matches!(load_cards(&crate::device_dataset_file::test_cipher(), &path), Err(PersistError::Corrupt)));
+        assert!(matches!(
+            load_cards(&crate::device_dataset_file::test_cipher(), &path),
+            Err(PersistError::Corrupt)
+        ));
     }
 
     #[test]
@@ -525,7 +536,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = PersistentCardStore::path_for_owner(dir.path(), "owner");
         std::fs::write(&path, [CARD_STORE_SCHEMA_V1, 0xDE, 0xAD]).unwrap();
-        let loaded = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "owner");
+        let loaded = PersistentCardStore::load_for_owner(
+            crate::device_dataset_file::test_cipher(),
+            dir.path(),
+            "owner",
+        );
         assert!(loaded.is_empty());
     }
 
@@ -582,10 +597,17 @@ mod tests {
         let io_path = PersistentCardStore::path_for_owner(dir.path(), "ioerr");
         std::fs::create_dir(&io_path).unwrap();
         assert!(
-            matches!(load_cards(&crate::device_dataset_file::test_cipher(), &io_path), Err(PersistError::Io(_))),
+            matches!(
+                load_cards(&crate::device_dataset_file::test_cipher(), &io_path),
+                Err(PersistError::Io(_))
+            ),
             "a directory read must surface as a read I/O error, not NotFound"
         );
-        let frozen = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "ioerr");
+        let frozen = PersistentCardStore::load_for_owner(
+            crate::device_dataset_file::test_cipher(),
+            dir.path(),
+            "ioerr",
+        );
         assert!(frozen.is_empty(), "unreadable start begins empty");
         frozen.upsert(&card(1, "Alice", 10));
         frozen.persist().unwrap(); // no-op; would Err if it tried to write
@@ -595,7 +617,11 @@ mod tests {
         // flush overwrites the junk and durably records new cards (self-heal).
         let ok_path = PersistentCardStore::path_for_owner(dir.path(), "corrupt");
         std::fs::write(&ok_path, [CARD_STORE_SCHEMA_V1, 0xDE, 0xAD]).unwrap();
-        let healed = PersistentCardStore::load_for_owner(crate::device_dataset_file::test_cipher(), dir.path(), "corrupt");
+        let healed = PersistentCardStore::load_for_owner(
+            crate::device_dataset_file::test_cipher(),
+            dir.path(),
+            "corrupt",
+        );
         healed.upsert(&card(2, "Bob", 10));
         healed.persist().unwrap();
         let on_disk = load_cards(&crate::device_dataset_file::test_cipher(), &ok_path).unwrap();
@@ -668,7 +694,11 @@ mod tests {
         store.upsert(&card(1, "a2", 20)); // seq 3 — owner 1 refreshed (most recent)
         store.persist().unwrap();
 
-        let reloaded = PersistentCardStore::from_cards(path.clone(), 3, load_cards(&crate::device_dataset_file::test_cipher(), &path).unwrap());
+        let reloaded = PersistentCardStore::from_cards(
+            path.clone(),
+            3,
+            load_cards(&crate::device_dataset_file::test_cipher(), &path).unwrap(),
+        );
         assert_eq!(reloaded.len(), 3);
         reloaded.upsert(&card(4, "d", 10)); // evicts least-recently-updated
         assert_eq!(reloaded.len(), 3);

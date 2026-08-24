@@ -855,9 +855,8 @@ pub fn load_owner_state_cbor(identity_dir: &Path) -> Result<OwnerState, String> 
     let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
     // A missing file stays an Err here (unlike `load_owner_state`) — the
     // FileOnly trust-mutation callers require existing state.
-    let image = read_owner_state_image(identity_dir)?.ok_or_else(|| {
-        format!("failed to read {}: file not found", cbor_path.display())
-    })?;
+    let image = read_owner_state_image(identity_dir)?
+        .ok_or_else(|| format!("failed to read {}: file not found", cbor_path.display()))?;
     let state: OwnerState =
         cbor::from_bytes(&image.bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
     // Callers hold OWNER_STATE_WRITE_LOCK (this fn's contract), so eager

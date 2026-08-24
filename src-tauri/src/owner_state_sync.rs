@@ -1942,7 +1942,11 @@ mod subscriber_tests {
         // Round 2: boot a fresh engine, load tracker from disk,
         // verify peer-bob's HLC is 5000. Then send an OLDER publish
         // and confirm rejection.
-        let tracker_loaded = crate::owner_state_persist::load_replay(&crate::device_dataset_file::test_cipher(), &paths.replay).unwrap();
+        let tracker_loaded = crate::owner_state_persist::load_replay(
+            &crate::device_dataset_file::test_cipher(),
+            &paths.replay,
+        )
+        .unwrap();
         assert_eq!(tracker_loaded.get("peer-bob").unwrap().wall_ms, 5000);
 
         let (_pub_tx2, _pub_rx2) = mpsc::channel(16);

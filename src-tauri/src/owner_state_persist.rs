@@ -742,7 +742,8 @@ mod tests {
         let path = dir.path().join("future.cbor");
         // 0xFF is reserved-future; v1 is 0x01.
         std::fs::write(&path, [0xFF_u8, 0x00, 0x01]).unwrap();
-        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
+        let err =
+            load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(err, PersistError::UnknownSchemaVersion(0xFF)));
     }
 
@@ -754,7 +755,8 @@ mod tests {
         // (V1 is now the discard path, so we use V2 to exercise the
         // CBOR-decode error path.)
         std::fs::write(&path, [CRDT_FILE_SCHEMA_V2, 0xA1, 0x66]).unwrap();
-        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
+        let err =
+            load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(
             err,
             PersistError::CborDecode(_) | PersistError::Corrupt
@@ -769,7 +771,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("phase3a.cbor");
         std::fs::write(&path, [CRDT_FILE_SCHEMA_V1, 0x42, 0x43, 0x44]).unwrap();
-        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect("V1 load returns Ok with default state, not error");
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path)
+            .expect("V1 load returns Ok with default state, not error");
         assert!(
             loaded.spaces.is_empty(),
             "V1 load should produce empty spaces"
@@ -797,7 +800,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.cbor");
         std::fs::write(&path, []).unwrap();
-        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
+        let err =
+            load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(err, PersistError::Corrupt));
     }
 
@@ -806,7 +810,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future_replay.cbor");
         std::fs::write(&path, [0xFE_u8]).unwrap();
-        let err = load_replay(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
+        let err = load_replay(&crate::device_dataset_file::test_cipher(), &path)
+            .expect_err("should error");
         assert!(matches!(err, PersistError::UnknownSchemaVersion(0xFE)));
     }
 
@@ -815,11 +820,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("with_tail.cbor");
         // Save a valid file, then append a junk byte.
-        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &OwnerState::default()).unwrap();
+        save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &OwnerState::default(),
+        )
+        .unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.push(0xFF);
         std::fs::write(&path, bytes).unwrap();
-        let err = load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
+        let err =
+            load_crdt(&crate::device_dataset_file::test_cipher(), &path).expect_err("should error");
         assert!(matches!(err, PersistError::Corrupt));
     }
 
@@ -983,7 +994,12 @@ mod tests {
         // skip_serializing_if will omit the field entirely, mimicking
         // a pre-Task-8 file on disk.
         let state_no_cache = OwnerState::default();
-        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &state_no_cache).unwrap();
+        save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &state_no_cache,
+        )
+        .unwrap();
 
         // Confirm the field key was omitted by scanning raw bytes for
         // the literal UTF-8 of the CBOR text key (CBOR text strings
@@ -1019,7 +1035,12 @@ mod tests {
         // skip_serializing_if = "BTreeMap::is_empty" omits the field
         // entirely, mimicking a pre-Task-1 file on disk.
         let state_no_libs = OwnerState::default();
-        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &state_no_libs).unwrap();
+        save_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &state_no_libs,
+        )
+        .unwrap();
 
         // Confirm the field key was omitted by scanning raw bytes
         // for the literal UTF-8 of the CBOR text key (CBOR text

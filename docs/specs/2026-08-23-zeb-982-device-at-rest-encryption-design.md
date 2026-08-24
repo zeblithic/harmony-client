@@ -157,14 +157,48 @@ impl DeviceCipher {
 /// HARMONY_PASSPHRASE / plaintext fallback applies).
 pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String>;
 
+/// Drop the memo entry for `identity_dir`. Wired into
+/// `identity::write_seed_to_disk_with_keychain` (the seed-write choke
+/// point): the memo is keyed by directory, not seed value, so a recovery
+/// restore that rewrites the seed would otherwise keep sealing under the
+/// pre-restore key and strand every sealed file.
+pub fn invalidate(identity_dir: &Path);
+
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn test_cipher() -> DeviceCipher;   // DeviceCipher::derive(&[7u8; 32])
+
+/// Pre-populate the memo with `test_cipher` for a fixture dir, so tests of
+/// the free-function owner-state paths need no identity store. The memo is
+/// per-directory — fixtures using subdirs install for each.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn install_test_cipher(identity_dir: &Path);
+
+/// The full sealed on-disk byte form (sentinel-prefixed), for families
+/// that keep their own write primitive (owner_state.rs's 0600 writes).
+pub fn seal_image(cipher, filename, inner) -> Result<Vec<u8>, String>;
 ```
 
-In-app, the cipher is derived once right after `identity::load_or_generate`
-(`lib.rs:4706` area) — the seed is in hand there, so the boot path never
-pays a second keychain read — and threaded to every construction site.
-`recovery_cli` derives via `read_seed_from_disk_with_keychain`.
+In-app, the cipher is derived at boot just before `load_owner_state` and
+threaded to every construction site; the derive also warms the process-wide
+memo for the free-function readers. `recovery_cli` restore derives directly
+from the just-written seed (never through the memo the seed write just
+invalidated).
+
+**Lazy acquisition (implementation refinement):** callers that read files
+which may still be legacy plaintext (the `owner_state.rs` free functions)
+acquire the cipher only when the file's first byte IS the sentinel. Legacy
+files therefore parse with no identity store at all — pre-982 behavior for
+store-less fixtures, and a structural guarantee that a pure read never
+fresh-generates a node identity as a side effect. A sealed file implies the
+device had a working store when it sealed it, and a derive failure there
+surfaces as "sealed but the device key is unavailable", never "corrupt".
+
+**Lock ordering (hard constraint, discovered as a live deadlock):** the
+seed read behind `get_or_derive` can take `IDENTITY_FILE_WRITE_LOCK` (the
+fresh-generate path via `with_identity_write_guards`), so the cipher MUST
+be derived BEFORE that lock is acquired — `save_owner_state_atomic`
+hoists the derive above its guard — and `get_or_derive` never holds its
+own memo lock across the seed read. Documented at both acquisition sites.
 
 **Envelope API (image-level, not value-level):**
 
@@ -284,9 +318,13 @@ schema-byte/CBOR handling runs against `image.bytes`:
   in-place format change) — the fold-in *adds* `owner_trust_replay.cbor`
   to it. Reset-backup dirs will contain sealed copies going forward,
   which strictly improves on today's plaintext copies.
-- **`friend_nicknames.json.migrated` cleanup:** after a successful
-  verified load of sealed `contacts.cbor`, delete the leftover file
-  (migration provenly durable at that point); absence is not an error.
+- **`friend_nicknames.json.migrated` cleanup:** after a successful load of
+  sealed `contacts.cbor` **with at least one contact entry**, delete the
+  leftover file; absence is not an error. The non-empty guard matters:
+  `load_doc_or_recover` quarantine-defaults on corruption, and deleting the
+  plaintext backup after a quarantine reset would destroy the last copy of
+  the nicknames. An empty legacy import leaves an empty leftover — nothing
+  protected, nothing leaked.
 
 ## Out of scope (follow-up tickets, filed at PR time)
 

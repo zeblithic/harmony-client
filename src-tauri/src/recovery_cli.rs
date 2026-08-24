@@ -830,9 +830,12 @@ pub fn restore_recovery_file_pair_with_keychain(
         // deriving directly from the in-hand seed is race-free and lock-free.
         let cipher = crate::device_dataset_file::DeviceCipher::derive(&seed_bytes)
             .map_err(|e| format!("identity restored but owner-state write failed: {e}"))?;
-        if let Err(e) =
-            crate::device_dataset_file::write_image(&cipher, &state_path, crate::owner_state_persist::CRDT_FILENAME, &snap.tree)
-        {
+        if let Err(e) = crate::device_dataset_file::write_image(
+            &cipher,
+            &state_path,
+            crate::owner_state_persist::CRDT_FILENAME,
+            &snap.tree,
+        ) {
             return Err(format!(
                 "identity restored but owner-state write failed: {e}"
             ));
@@ -2480,7 +2483,7 @@ mod tests {
             &super::owner_state_path(dir.path()),
             &state,
         )
-            .unwrap();
+        .unwrap();
 
         // force=true overwrites.
         super::restore_recovery_file_pair_with_keychain(

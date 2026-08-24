@@ -114,7 +114,12 @@ mod tests {
     fn save_does_not_leave_tmp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MINT_SYNC_STATE_FILENAME);
-        save(&crate::device_dataset_file::test_cipher(), &path, &MintSyncState::default()).unwrap();
+        save(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &MintSyncState::default(),
+        )
+        .unwrap();
         // tempfile uses random names in the same dir, not a fixed .tmp suffix.
         // Verify no files remain other than the target file.
         let entries: Vec<_> = std::fs::read_dir(dir.path())

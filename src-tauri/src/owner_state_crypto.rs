@@ -752,9 +752,7 @@ const INFO_DEVICE_DATASET_AEAD: &[u8] = b"device-dataset-aead";
 /// (ZEB-905), pre-mint, recovery CLI — which is exactly why this key, and
 /// not the fleet KeyTree, seals the owner-state family. Same seed → same
 /// key, so files survive re-pairing as long as the node identity does.
-pub fn derive_device_dataset_key(
-    seed: &[u8; 32],
-) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+pub fn derive_device_dataset_key(seed: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(DEVICE_DATASET_SALT), seed);
     let mut key = Zeroizing::new([0u8; 32]);
     hk.expand(INFO_DEVICE_DATASET_AEAD, key.as_mut())
@@ -774,8 +772,8 @@ pub fn seal_device_file(
     OsRng
         .try_fill_bytes(&mut nonce_bytes)
         .map_err(|e| CryptoError::Rng(e.to_string()))?;
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key).expect("ChaCha20-Poly1305 accepts a 32-byte key");
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce_bytes),
@@ -805,8 +803,8 @@ pub fn open_device_file(
         return Err(CryptoError::AeadDecrypt);
     }
     let (nonce_bytes, ciphertext) = sealed.split_at(12);
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key).expect("ChaCha20-Poly1305 accepts a 32-byte key");
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(nonce_bytes),
@@ -1715,8 +1713,7 @@ mod tests {
         let key = derive_device_dataset_key(&[7u8; 32]).unwrap();
         let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex,
-            "7f58aa4a60e8c386d2098a08589a17ee171745f2bb8f53f3d1ebd3c0360dd11a",
+            hex, "7f58aa4a60e8c386d2098a08589a17ee171745f2bb8f53f3d1ebd3c0360dd11a",
             "device dataset key derivation drifted"
         );
     }

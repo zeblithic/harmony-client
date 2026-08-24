@@ -1941,6 +1941,9 @@ const OWNER_RESET_FILES: &[&str] = &[
     crate::owner_state::OWNER_STATE_FILENAME,
     "owner_state_crdt.cbor",
     "state_root_replay.cbor",
+    // ZEB-982 fold-in: previously missing — the trust replay tracker survived
+    // a "Reset this device" wipe.
+    crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME,
     "device_sk.enc",
     "master_seed.enc",
     crate::owner_state::FLEET_KEYTREE_FILENAME,

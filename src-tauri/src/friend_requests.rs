@@ -465,31 +465,31 @@ impl PendingOutboundLinks {
                     _ => unreachable!("Ok(None) and Io handled above"),
                 };
                 match decode_err {
-                Ok(m) => m,
-                Err(e) => {
-                    let aside = path.with_extension(format!("corrupt-{now_ms}"));
-                    match std::fs::rename(&path, &aside) {
-                        Ok(()) => {
-                            tracing::warn!(error = %e, quarantined = %aside.display(),
+                    Ok(m) => m,
+                    Err(e) => {
+                        let aside = path.with_extension(format!("corrupt-{now_ms}"));
+                        match std::fs::rename(&path, &aside) {
+                            Ok(()) => {
+                                tracing::warn!(error = %e, quarantined = %aside.display(),
                                 "ZEB-784: outbound-link store corrupt; quarantined, continuing empty");
-                        }
-                        Err(rename_err) => {
-                            // The rewrite below would overwrite `path` with the
-                            // empty map and destroy the very bytes the
-                            // quarantine exists to preserve. Bail out to an
-                            // ephemeral store instead: this session degrades to
-                            // pre-ZEB-784 behaviour (no durable retry), which is
-                            // strictly better than silently shredding the
-                            // evidence of whatever corrupted the file.
-                            tracing::error!(error = %e, rename_error = %rename_err,
+                            }
+                            Err(rename_err) => {
+                                // The rewrite below would overwrite `path` with the
+                                // empty map and destroy the very bytes the
+                                // quarantine exists to preserve. Bail out to an
+                                // ephemeral store instead: this session degrades to
+                                // pre-ZEB-784 behaviour (no durable retry), which is
+                                // strictly better than silently shredding the
+                                // evidence of whatever corrupted the file.
+                                tracing::error!(error = %e, rename_error = %rename_err,
                                 path = %path.display(),
                                 "ZEB-784: outbound-link store corrupt AND quarantine failed; \
                                  running WITHOUT persistence so the bad bytes survive for diagnosis");
-                            return Self::default();
+                                return Self::default();
+                            }
                         }
+                        HashMap::new()
                     }
-                    HashMap::new()
-                }
                 }
             }
         };
@@ -1155,13 +1155,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
 
-        let store = PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path.clone(), 1_000);
+        let store = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path.clone(),
+            1_000,
+        );
         store.record("dd", 1_000);
         store.record("ee", 2_000);
         store.forget("ee");
         drop(store);
 
-        let rehydrated = PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path, 3_000);
+        let rehydrated = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path,
+            3_000,
+        );
         let rows = rehydrated.list(3_000);
         assert_eq!(rows.len(), 1, "exactly the un-forgotten record survives");
         assert_eq!(rows[0], ("dd".to_string(), 1_000));
@@ -1174,21 +1182,33 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
 
-        let store = PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path.clone(), 1_000);
+        let store = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path.clone(),
+            1_000,
+        );
         store.record("old", 1_000);
         store.record("new", 1_000 + OUTBOUND_LINK_TTL_MS);
         drop(store);
 
         // Boot far enough ahead that only the second record is still live.
         let boot = 1_000 + OUTBOUND_LINK_TTL_MS + 1;
-        let rehydrated = PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path.clone(), boot);
+        let rehydrated = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path.clone(),
+            boot,
+        );
         let rows = rehydrated.list(boot);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "new");
         drop(rehydrated);
 
         // The prune was written through, not just applied in memory.
-        let again = PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path, boot);
+        let again = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path,
+            boot,
+        );
         assert_eq!(again.list(boot).len(), 1, "prune persisted to disk");
     }
 
@@ -1201,7 +1221,11 @@ mod tests {
         let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
         std::fs::write(&path, b"this is not cbor").expect("seed corrupt file");
 
-        let store = PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path.clone(), 7_777);
+        let store = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path.clone(),
+            7_777,
+        );
         assert!(store.list(7_777).is_empty(), "corrupt file → empty store");
 
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())
@@ -1246,7 +1270,11 @@ mod tests {
     fn outbound_links_persist_matches_memory_under_concurrency() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
-        let store = Arc::new(PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path.clone(), 1_000));
+        let store = Arc::new(PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path.clone(),
+            1_000,
+        ));
 
         let mut handles = Vec::new();
         for t in 0..8u64 {
@@ -1315,7 +1343,11 @@ mod tests {
         let blocked = path.with_extension(format!("corrupt-{now_ms}"));
         std::fs::create_dir(&blocked).expect("occupy the quarantine path");
 
-        let store = PendingOutboundLinks::load_or_recover(crate::device_dataset_file::test_cipher(), path.clone(), now_ms);
+        let store = PendingOutboundLinks::load_or_recover(
+            crate::device_dataset_file::test_cipher(),
+            path.clone(),
+            now_ms,
+        );
         assert!(store.list(now_ms).is_empty(), "comes up empty either way");
 
         assert_eq!(

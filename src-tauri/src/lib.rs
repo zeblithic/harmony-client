@@ -179,6 +179,7 @@ pub mod contacts_crdt;
 pub mod contacts_persist;
 pub mod content_index;
 pub mod content_store;
+pub mod device_dataset_file;
 pub mod dm_crypto;
 pub mod dm_envelope;
 pub mod dm_inbox_crdt;
@@ -197,7 +198,6 @@ pub mod event_loop;
 pub mod feed_authority;
 pub mod file_sharing;
 pub mod file_stream_crypto;
-pub mod device_dataset_file;
 pub mod fleet_dataset_file;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
@@ -6429,13 +6429,34 @@ pub async fn start_node_inner(
                             &app_data_dir.join("friend_nicknames.json"),
                             &device_id,
                         );
-                        let contacts_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                            crate::contacts_persist::load_doc_or_recover(
-                                &dataset_cipher,
-                                &contacts_path,
-                            )
-                            .map_err(|e| format!("load contacts doc: {e}"))?,
-                        ));
+                        let loaded_contacts = crate::contacts_persist::load_doc_or_recover(
+                            &dataset_cipher,
+                            &contacts_path,
+                        )
+                        .map_err(|e| format!("load contacts doc: {e}"))?;
+                        // ZEB-982 fold-in: the ZEB-981 nickname migration left
+                        // the plaintext legacy file behind as `.migrated`. Once
+                        // the (sealed) contacts store loads with actual content
+                        // the plaintext copy has served its safety-net purpose —
+                        // delete it. Guarded on non-empty: load_doc_or_recover
+                        // quarantine-DEFAULTS on corruption, and deleting the
+                        // backup after a quarantine reset would destroy the last
+                        // copy of the nicknames. (An empty legacy import leaves
+                        // an empty leftover — nothing to protect, nothing leaked.)
+                        if !loaded_contacts.contacts.is_empty() {
+                            let migrated_leftover =
+                                app_data_dir.join("friend_nicknames.json.migrated");
+                            match std::fs::remove_file(&migrated_leftover) {
+                                Ok(()) => tracing::info!(
+                                    "ZEB-982: removed plaintext friend_nicknames.json.migrated                                      (sealed contacts store verified non-empty)"
+                                ),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => tracing::warn!(error = %e,
+                                    "ZEB-982: could not remove friend_nicknames.json.migrated"),
+                            }
+                        }
+                        let contacts_doc =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(loaded_contacts));
                         let contacts_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                             harmony_crdt_sync::ReplayTracker::from_accepted(
                                 device_id.clone(),
@@ -48893,8 +48914,11 @@ mod zeb427_leave_left_at_tests {
         .await;
 
         assert!(crdt_path.exists(), "fence must have written the crdt file");
-        let loaded =
-            crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path).expect("crdt file must decode");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("crdt file must decode");
         let row = loaded
             .spaces
             .get(&SpaceId([7; 16]))
@@ -64348,8 +64372,11 @@ mod zeb427_fence_tests {
         // wedged reached disk. Pre-ZEB-710 the fence could only return via
         // its timeout here, persisting nothing — this load would miss the
         // tombstone.
-        let persisted = crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &paths.crdt)
-            .expect("crdt file must load after the fence");
+        let persisted = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &paths.crdt,
+        )
+        .expect("crdt file must load after the fence");
         assert!(
             persisted.tombstones.contains(&tombstoned),
             "the fence on a wedged engine must persist the mutation directly \
@@ -81836,7 +81863,10 @@ mod zeb703_outbox_runtime_durability_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if crdt_path.exists() {
-                if let Ok(loaded) = crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path) {
+                if let Ok(loaded) = crate::owner_state_persist::load_crdt(
+                    &crate::device_dataset_file::test_cipher(),
+                    &crdt_path,
+                ) {
                     if loaded.outbox.contains_key(&entry_id) {
                         break; // durable at runtime — ZEB-703 fixed
                     }
@@ -81861,7 +81891,10 @@ mod zeb703_outbox_runtime_durability_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if path.exists() {
-                if let Ok(loaded) = crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), path) {
+                if let Ok(loaded) = crate::owner_state_persist::load_crdt(
+                    &crate::device_dataset_file::test_cipher(),
+                    path,
+                ) {
                     if pred(&loaded) {
                         return;
                     }
@@ -82422,8 +82455,11 @@ mod zeb703_outbox_runtime_durability_tests {
         // trailing flush (the pre-fix behavior: ack first, stop_inner
         // later) fails here because this harness never runs stop_inner at
         // all — exactly the supervisor's view after kill-on-200.
-        let loaded = crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path)
-            .expect("owner_state_crdt.cbor must exist by ack time (pre-ack flush)");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("owner_state_crdt.cbor must exist by ack time (pre-ack flush)");
         assert!(
             loaded.outbox.contains_key(&entry_id),
             "ZEB-703: /v1/shutdown acked 200 before persisting owner-state — \
@@ -82746,8 +82782,11 @@ mod zeb703_outbox_runtime_durability_tests {
             .expect("request task must not panic");
         assert!(resp.contains("200"), "shutdown must ack 200, got: {resp}");
 
-        let loaded = crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path)
-            .expect("owner_state_crdt.cbor must exist by ack time");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("owner_state_crdt.cbor must exist by ack time");
         assert!(
             loaded.outbox.contains_key(&entry_id),
             "ZEB-703: a mutation landed while the barrier awaited Phase C \
@@ -82921,9 +82960,12 @@ mod zeb708_gui_exit_flush_tests {
         // 600s debounce is still pending). Otherwise the final assert would
         // pass without the quit flush doing anything.
         let already_persisted = crdt_path.exists()
-            && crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path)
-                .map(|s| s.outbox.contains_key(&entry_id))
-                .unwrap_or(false);
+            && crate::owner_state_persist::load_crdt(
+                &crate::device_dataset_file::test_cipher(),
+                &crdt_path,
+            )
+            .map(|s| s.outbox.contains_key(&entry_id))
+            .unwrap_or(false);
         assert!(
             !already_persisted,
             "fixture: entry must NOT be persisted before the quit flush"
@@ -82936,8 +82978,11 @@ mod zeb708_gui_exit_flush_tests {
             "quit flush must complete within the bound AND report a real flush"
         );
 
-        let loaded = crate::owner_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path)
-            .expect("crdt file must exist after the quit flush");
+        let loaded = crate::owner_state_persist::load_crdt(
+            &crate::device_dataset_file::test_cipher(),
+            &crdt_path,
+        )
+        .expect("crdt file must exist after the quit flush");
         assert!(
             loaded.outbox.contains_key(&entry_id),
             "ZEB-708: the un-debounced outbox entry must be persisted by the \

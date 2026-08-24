@@ -1861,7 +1861,11 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
         // on disk by the time the IPC returns. With a 10-minute debounce
         // and no other owner-state writes in this test, only the ZEB-427
         // fence can have produced this file.
-        let loaded = harmony_app::owner_state_persist::load_crdt(&harmony_app::device_dataset_file::test_cipher(), &persist_paths.crdt).expect(
+        let loaded = harmony_app::owner_state_persist::load_crdt(
+            &harmony_app::device_dataset_file::test_cipher(),
+            &persist_paths.crdt,
+        )
+        .expect(
             "owner_state_crdt.cbor must exist and decode immediately after the joined \
              outcome — the ZEB-427 durability fence did not run",
         );

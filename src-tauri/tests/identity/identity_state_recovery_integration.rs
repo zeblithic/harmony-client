@@ -383,12 +383,11 @@ fn last_backup_record_drives_staleness() {
     let last = backup_state::load_last_backup(&recovery_cli::last_backup_path(dir.path()))
         .unwrap()
         .expect("file present");
-    let state =
-        owner_state_persist::load_crdt(
-            &harmony_app::device_dataset_file::get_or_derive(dir.path()).unwrap(),
-            &recovery_cli::owner_state_path(dir.path()),
-        )
-        .unwrap();
+    let state = owner_state_persist::load_crdt(
+        &harmony_app::device_dataset_file::get_or_derive(dir.path()).unwrap(),
+        &recovery_cli::owner_state_path(dir.path()),
+    )
+    .unwrap();
 
     // 1 minute later — no mutation, not stale.
     let r = backup_state::should_warn_about_stale_backup(

@@ -238,11 +238,7 @@ pub fn read_image(
 /// Seal `inner` into the complete v3 on-disk byte form (sentinel-prefixed).
 /// For families that keep their own write primitive (e.g. `owner_state.rs`'s
 /// `write_atomic_0600`); everything else uses [`write_image`].
-pub fn seal_image(
-    cipher: &DeviceCipher,
-    filename: &str,
-    inner: &[u8],
-) -> Result<Vec<u8>, String> {
+pub fn seal_image(cipher: &DeviceCipher, filename: &str, inner: &[u8]) -> Result<Vec<u8>, String> {
     let sealed = seal_device_file(&cipher.key, filename, inner)
         .map_err(|e| format!("seal {filename}: {e}"))?;
     let mut bytes = Vec::with_capacity(1 + sealed.len());
@@ -312,9 +308,11 @@ mod tests {
     fn missing_file_is_none() {
         let dir = tmp();
         let cipher = test_cipher();
-        assert!(read_image(&cipher, &dir.path().join("absent.cbor"), "absent.cbor")
-            .unwrap()
-            .is_none());
+        assert!(
+            read_image(&cipher, &dir.path().join("absent.cbor"), "absent.cbor")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -324,7 +322,10 @@ mod tests {
         // the envelope. Same for schema byte 1.
         let dir = tmp();
         let cipher = test_cipher();
-        for (name, first) in [("owner_state_crdt.cbor", 2u8), ("state_root_replay.cbor", 1u8)] {
+        for (name, first) in [
+            ("owner_state_crdt.cbor", 2u8),
+            ("state_root_replay.cbor", 1u8),
+        ] {
             let path = dir.path().join(name);
             let legacy = [&[first][..], b"payload"].concat();
             std::fs::write(&path, &legacy).unwrap();
@@ -343,7 +344,9 @@ mod tests {
         let legacy = b"\xa5rest-of-map".to_vec();
         std::fs::write(&path, &legacy).unwrap();
         let cipher = test_cipher();
-        let img = read_image(&cipher, &path, "owner_state.cbor").unwrap().unwrap();
+        let img = read_image(&cipher, &path, "owner_state.cbor")
+            .unwrap()
+            .unwrap();
         assert!(img.was_legacy);
         assert_eq!(&img.bytes[..], &legacy[..]);
     }
@@ -354,7 +357,9 @@ mod tests {
         let path = dir.path().join("owner_state.cbor");
         std::fs::write(&path, b"").unwrap();
         let cipher = test_cipher();
-        let img = read_image(&cipher, &path, "owner_state.cbor").unwrap().unwrap();
+        let img = read_image(&cipher, &path, "owner_state.cbor")
+            .unwrap()
+            .unwrap();
         assert!(img.was_legacy);
         assert!(img.bytes.is_empty());
     }
