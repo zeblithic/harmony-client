@@ -50,18 +50,13 @@ impl FollowManager {
     /// quarantined aside (`follows.json.corrupt-<now_ms>`) and heals on the next write.
     pub fn load(data_dir: &Path, now_ms: u64) -> Self {
         let path = data_dir.join(FOLLOWS_FILE);
-        let recovered = crate::recoverable_load::load_or_recover(
-            &path,
-            now_ms,
-            crate::recoverable_load::CorruptPolicy::QuarantineAndHeal,
-            |bytes| {
-                let file: FollowsFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-                if file.version != FILE_VERSION {
-                    return Err(format!("unexpected version {}", file.version));
-                }
-                Ok(file.follows)
-            },
-        );
+        let recovered = crate::recoverable_load::load_or_recover(&path, now_ms, |bytes| {
+            let file: FollowsFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            if file.version != FILE_VERSION {
+                return Err(format!("unexpected version {}", file.version));
+            }
+            Ok(file.follows)
+        });
         FollowManager {
             path,
             follows: recovered.value,

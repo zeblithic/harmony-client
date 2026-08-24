@@ -181,11 +181,10 @@ struct IndexFile {
 pub struct ContentIndex {
     path: PathBuf,
     entries: HashMap<SidecarId, ContentIndexEntry>,
-    /// ZEB-986: set when the index was unreadable OR content-corrupt at load. Because
-    /// an empty index orphans every stored blob (and the sensitivity/provenance metadata
-    /// cannot be rebuilt from a directory scan), a corrupt index uses FreezeInPlace: the
-    /// file is left untouched and writes are frozen (degraded read-only) rather than
-    /// overwritten with the empty default.
+    /// ZEB-986: set only when the index file was unreadable at load (transient Io) or
+    /// corrupt bytes could not be quarantined aside. Freezes `save()` so the still-good
+    /// on-disk index is never overwritten with the empty in-memory default. Content
+    /// corruption itself does NOT freeze — it quarantines aside and heals (see `load`).
     disk_write_frozen: bool,
     /// Test-only one-shot hook armed via `arm_next_rekey_conflict`.
     /// When `Some((sid, fake_actual))`, the next `rekey` call targeting
@@ -231,16 +230,19 @@ impl ContentIndex {
         let (entries, disk_write_frozen) = if path_is_bare {
             (HashMap::new(), false)
         } else {
-            // FreezeInPlace: a corrupt index must NOT be quarantined-and-healed —
-            // overwriting it with an empty index orphans every stored blob. Preserve
-            // the file and freeze writes so a transient error self-recovers next boot
-            // and genuine corruption stays available for a future rebuild feature.
-            // `now_ms` is unused under FreezeInPlace (no timestamped quarantine), so the
-            // load signature stays clock-free and its many call sites are untouched.
+            // QuarantineAndHeal (ZEB-986): a corrupt index is renamed aside — preserving
+            // its bytes for recovery — and healed on the next write, so NEW ingests
+            // persist durably (a FreezeInPlace no-op would report ingest success while
+            // silently dropping the entry, orphaning the just-stored blob after restart —
+            // CodeAnt Critical). A corrupt index can't be read into memory under either
+            // policy, so old blobs are unreferenced regardless; quarantine keeps their
+            // metadata in the `.corrupt-<ms>` sidecar. A transient READ error still
+            // freezes (never overwrite maybe-good bytes). `load()` stays clock-free (the
+            // sidecar name uses the wall clock internally), so its call sites are
+            // untouched.
             let recovered = crate::recoverable_load::load_or_recover(
                 &path,
                 crate::recoverable_load::now_ms(),
-                crate::recoverable_load::CorruptPolicy::FreezeInPlace,
                 Self::parse_index,
             );
             (recovered.value, recovered.disk_write_frozen)
@@ -274,8 +276,8 @@ impl ContentIndex {
         if self.disk_write_frozen {
             tracing::warn!(
                 path = ?self.path,
-                "content-index save skipped — file unreadable/corrupt at load; \
-                 preserving existing index (degraded read-only, blobs not orphaned)"
+                "content-index save skipped — file unreadable at load; \
+                 preserving existing index (transient error; self-recovers next boot)"
             );
             return;
         }
@@ -659,10 +661,11 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_content_index_freezes_in_place_no_orphan() {
-        // ZEB-986: a corrupt content-index must NOT be quarantined-and-healed —
-        // overwriting it with an empty index would orphan every stored blob. It is
-        // preserved untouched and writes are frozen (degraded read-only).
+    fn corrupt_content_index_quarantined_and_heals() {
+        // ZEB-986: a corrupt content-index is quarantined aside (its bytes preserved for
+        // recovery) and heals on the next write, so a NEW ingest persists durably rather
+        // than reporting success while silently dropping the entry (which would orphan
+        // the just-stored blob after restart — CodeAnt Critical).
         let dir = tempdir().unwrap();
         let p = dir.path().join(INDEX_FILE);
         std::fs::write(&p, b"{ corrupt").unwrap();
@@ -672,23 +675,22 @@ mod tests {
             idx.entries.is_empty(),
             "corrupt index starts empty in-memory"
         );
-        assert_eq!(
-            std::fs::read(&p).unwrap(),
-            b"{ corrupt",
-            "file preserved untouched (no quarantine under FreezeInPlace)"
-        );
-        assert!(
-            !dir.path().join(format!("{INDEX_FILE}.corrupt-0")).exists(),
-            "no sidecar created"
-        );
+        // Corrupt bytes preserved in a timestamped sidecar (not destroyed).
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("content-index.json.corrupt-")
+        });
+        assert!(quarantined, "corrupt bytes quarantined aside");
 
-        // The next mutation's save() must be a frozen no-op: the file stays the
-        // original corrupt bytes, so nothing is orphaned.
-        idx.insert(sample_entry([0xAB; 32]));
-        assert_eq!(
-            std::fs::read(&p).unwrap(),
-            b"{ corrupt",
-            "frozen: save did not overwrite, blobs not orphaned"
+        // Not frozen: the next ingest persists durably (heals the index).
+        let entry = sample_entry([0xAB; 32]);
+        let id = entry.sidecar_id;
+        assert!(idx.insert(entry));
+        let reloaded = ContentIndex::load(dir.path());
+        assert!(
+            reloaded.get(&id).is_some(),
+            "healed write persisted — new blob is durably indexed, not orphaned"
         );
     }
 

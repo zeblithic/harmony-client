@@ -426,31 +426,33 @@ impl VineFeedCache {
     /// read error starts empty AND freezes writes (returns `true`) so the still-good
     /// cache is not overwritten. Malformed JSON is quarantined aside
     /// (`vine_feed.json.corrupt-<ms>`) and heals on the next write. An unexpected
-    /// `version` is ignored in place (NOT quarantined — a forward/foreign build's file
-    /// is left intact for that build to read).
+    /// `version` (forward/foreign build) also FREEZES writes so the next `save()` cannot
+    /// overwrite that file with an empty current-version cache — it is left intact in
+    /// place for its originating build, not quarantined.
     fn populate_from_disk(cache: &mut Self, path: &Path, now_ms: u64) -> bool {
         let recovered = crate::recoverable_load::load_or_recover::<Option<VineFeedDiskV1>>(
             path,
             now_ms,
-            crate::recoverable_load::CorruptPolicy::QuarantineAndHeal,
+            // Parse only — the version check happens after so an unsupported version can
+            // freeze in place rather than quarantine-and-heal (which would clobber it).
             |bytes| {
-                let file: VineFeedDiskV1 =
-                    serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-                if file.version != FILE_VERSION {
-                    tracing::warn!(
-                        version = file.version,
-                        expected = FILE_VERSION,
-                        "vine_feed_cache: ignoring vine_feed.json with unexpected version (left in place)",
-                    );
-                    return Ok(None);
-                }
-                Ok(Some(file))
+                serde_json::from_slice::<VineFeedDiskV1>(bytes)
+                    .map(Some)
+                    .map_err(|e| e.to_string())
             },
         );
         let disk_write_frozen = recovered.disk_write_frozen;
         let Some(file) = recovered.value else {
             return disk_write_frozen;
         };
+        if file.version != FILE_VERSION {
+            tracing::warn!(
+                version = file.version,
+                expected = FILE_VERSION,
+                "vine_feed_cache: unexpected version; freezing writes to preserve the foreign-version file in place",
+            );
+            return true;
+        }
 
         // Age-prune (one-shot on load).
         // Broken clock fallback: now_secs = 0 → age_cutoff = 0 → all
@@ -2898,6 +2900,36 @@ mod tests {
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
         assert!(!cache.is_viewed("v-ignored"));
+    }
+
+    #[test]
+    fn wrong_version_freezes_and_preserves_file() {
+        // ZEB-986: a forward/foreign-version file must be left byte-identical — the load
+        // freezes writes so the next save() cannot overwrite it with an empty
+        // current-version cache, and it is NOT quarantined.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(VINE_FEED_FILE);
+        let forward = br#"{"version":999,"descriptors":[],"reactions":[],"viewed":["v-x"]}"#;
+        std::fs::write(&path, forward).unwrap();
+
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(cache.len_descriptors(), 0);
+        // Frozen: save() is a no-op, so the foreign-version file is untouched.
+        cache.save_for_test();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            forward,
+            "foreign-version file left byte-identical"
+        );
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("vine_feed.json.corrupt-")
+        });
+        assert!(
+            !quarantined,
+            "unexpected version is frozen in place, not quarantined"
+        );
     }
 
     #[test]

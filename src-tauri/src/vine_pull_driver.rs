@@ -646,12 +646,9 @@ fn load_vine_pull_recovered(
     path: &Path,
     now_ms: u64,
 ) -> crate::recoverable_load::Recovered<VinePullSidecar> {
-    crate::recoverable_load::load_or_recover(
-        path,
-        now_ms,
-        crate::recoverable_load::CorruptPolicy::QuarantineAndHeal,
-        |bytes| ciborium::from_reader(bytes).map_err(|e: ciborium::de::Error<_>| e.to_string()),
-    )
+    crate::recoverable_load::load_or_recover(path, now_ms, |bytes| {
+        ciborium::from_reader(bytes).map_err(|e: ciborium::de::Error<_>| e.to_string())
+    })
 }
 
 /// Load the sidecar's value, discarding the freeze flag. Convenience for callers that

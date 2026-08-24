@@ -47,44 +47,34 @@ A plaintext load-or-recover primitive. It owns the `fs::read` so it can classify
 Io vs content; the store supplies a `parse` closure for deserialize + version/shape
 validation.
 
+> **Note:** this block shows the final single-policy shape. The original design had a
+> two-policy `CorruptPolicy` enum; it was collapsed during review — see *Review-round
+> revisions* at the end.
+
 ```rust
 /// Outcome of a recoverable load.
 pub struct Recovered<T> {
     pub value: T,
     /// True iff writes MUST be frozen: the on-disk bytes may still be good and must
     /// not be overwritten with `value` (which is a default). Set on a transient read
-    /// error, and on a content-corrupt file under `FreezeInPlace`, and on a
-    /// quarantine-rename failure under `QuarantineAndHeal`.
+    /// error, and on a quarantine-rename failure (could not move the corrupt file
+    /// aside, so healing over it would clobber recoverable bytes — the ZEB-784 rule).
     pub disk_write_frozen: bool,
-}
-
-/// What to do when the file's *content* is corrupt (bad bytes / parse error /
-/// version mismatch). A read Io error always freezes regardless of policy.
-pub enum CorruptPolicy {
-    /// Rename the bad file aside (`.corrupt-<now_ms>`), start from `T::default()`,
-    /// heal on the next write. If the rename FAILS, fall back to freeze (do not heal
-    /// over a file we could not move aside — the ZEB-784 rule).
-    /// For stores whose empty-default is non-destructive and user-rebuildable
-    /// in-session: follows, friend_nicknames, vine_feed_cache, vine_pull.
-    QuarantineAndHeal,
-    /// Leave the bad file untouched, start from `T::default()`, and FREEZE writes.
-    /// For stores where overwriting-with-empty is destructive to *other* data:
-    /// content_index (an empty index orphans every stored blob; the sensitivity /
-    /// provenance metadata cannot be rebuilt from a directory scan).
-    FreezeInPlace,
 }
 
 /// Classification:
 ///   missing file        -> (default, frozen=false)            [first run, silent]
 ///   read Io error       -> (default, frozen=true)  + warn      [preserve maybe-good bytes]
-///   parse Err(reason)   -> QuarantineAndHeal: quarantine ok  -> (default, frozen=false) + warn
-///                                             quarantine fail -> (default, frozen=true)  + warn
-///                          FreezeInPlace:                      -> (default, frozen=true)  + warn (file untouched)
+///   parse Err(reason)   -> quarantine aside (`.corrupt-<ms>`), heal next write
+///                          -> (default, frozen=false) + warn; rename fail -> frozen=true
 ///   parse Ok(v)         -> (v, frozen=false)
+///
+/// A store that wants an unsupported-but-parseable file frozen *in place* (rather than
+/// quarantined) — e.g. vine-feed's forward-version case — parses it as `Ok` and decides
+/// to freeze at its own layer.
 pub fn load_or_recover<T: Default>(
     path: &Path,
     now_ms: u64,
-    policy: CorruptPolicy,
     parse: impl FnOnce(&[u8]) -> Result<T, String>,
 ) -> Recovered<T>;
 
@@ -137,11 +127,10 @@ pass a fixed value). Callers of the changed load signatures are updated accordin
    would make the migration's `legacy_nicknames_path.exists()` gate skip forever,
    converting a retry-on-next-boot state into permanent loss. Left untouched.
 3. **`content_index.rs`** — `ContentIndex` gains `disk_write_frozen`.
-   `load(data_dir, now_ms)` → `FreezeInPlace`. `save()` gains the frozen guard in
-   addition to the existing bare-path guard. Corrupt ⇒ empty in-memory + frozen +
-   file left untouched (degraded read-only; transient corruption self-recovers next
-   boot; genuine corruption awaits a future rebuild-from-scan feature — noted as a
-   follow-up, not built here).
+   `load` → `QuarantineAndHeal` (revised in review — see the revisions section below).
+   `save()` gains the frozen guard in addition to the existing bare-path guard. Corrupt
+   ⇒ quarantine aside + empty in-memory + heal on next write (new ingests persist);
+   transient Io ⇒ freeze.
 4. **`vine_feed_cache.rs`** — `VineFeedCache` gains `disk_write_frozen`.
    `populate_from_disk` routes through `load_or_recover` (`QuarantineAndHeal`); the
    existing backward age-prune still runs on a successful parse. `save()` frozen guard.
@@ -215,5 +204,45 @@ untouched (no tsc/vitest needed, but run them to confirm zero drift).
 - At-rest sealing of these families + `storage_records`/`storage_ledger` TOFU anchors
   with signature re-verify on load — **PR 3**.
 - content-index rebuild-from-directory-scan (recover the file→id mapping when the
-  index is genuinely corrupt) — a possible future ticket; `FreezeInPlace` preserves
-  the corrupt file so that feature can consume it later.
+  index is genuinely corrupt) — a possible future ticket; the quarantined
+  `content-index.json.corrupt-<ms>` sidecar preserves the bytes (30-day window) so that
+  feature can consume it.
+
+## Review-round revisions (PR #730, bot convergence)
+
+The initial design shipped a two-policy `CorruptPolicy` (`QuarantineAndHeal` /
+`FreezeInPlace`), with content-index on `FreezeInPlace`. Bot review surfaced three
+issues that revised this:
+
+1. **content-index → `QuarantineAndHeal`** (CodeAnt *Critical*). Under `FreezeInPlace`
+   a corrupt index still let `insert()` mutate in-memory and return `true` while `save()`
+   was a no-op, so `send_ingest_with_name` reported ingest success while the entry never
+   persisted — orphaning the just-stored blob after restart. A corrupt index cannot be
+   read into memory under *either* policy, so old blobs are unreferenced regardless; the
+   real difference is that `QuarantineAndHeal` lets **new** ingests persist and preserves
+   the old bytes in a `.corrupt-<ms>` sidecar. Decision confirmed with the maintainer.
+2. **`FreezeInPlace` removed.** With content-index moved off it, no store used it, so the
+   `CorruptPolicy` enum was dropped entirely: `load_or_recover(path, now_ms, parse)` now
+   always quarantine-and-heals (Io still freezes; a failed quarantine-rename still
+   freezes). A store that wants an unsupported-but-parseable file frozen *in place*
+   (vine-feed's forward-version case) parses it as `Ok` and freezes at its own layer.
+3. **vine-feed unsupported version now freezes** (CodeRabbit + CodeAnt *Major*). The
+   version check moved out of the parse closure; a forward/foreign-version file is frozen
+   in place (not quarantined) so the next `save()` cannot overwrite it — honoring the
+   "left intact for its originating build" rule the original comment claimed but did not
+   enforce.
+4. **Collision-safe quarantine** (CodeRabbit *Major*). Two corrupt loads of the same path
+   at the same `now_ms` (e.g. a stuck clock) would have had the second `rename` replace
+   the first sidecar (Unix) or fail (Windows). `quarantine` now probes for a free
+   `<stamp>` (incrementing keeps the name sweep-parseable) so both payloads stay
+   recoverable.
+
+**Accepted degradation (not fixed):** while frozen (transient Io or failed quarantine),
+`follows`/`vine_feed`/`vine_pull` mutations still return success and, for follows, publish
+to the wire, even though the write did not persist and reverts next boot. This is a rare,
+self-healing transient-error state (the freeze exists precisely to protect the existing
+on-disk data, which is the PR's goal); surfacing a persistence error through every
+mutator's return type and caller is disproportionate. content-index is exempt because its
+`QuarantineAndHeal` path is never frozen on corruption, and the Io-freeze case is equally
+rare — the CodeAnt Critical there was specifically the *silent-drop-then-orphan* under the
+old `FreezeInPlace`, which the policy switch resolves.

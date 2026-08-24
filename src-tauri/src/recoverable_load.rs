@@ -35,41 +35,25 @@ pub struct Recovered<T> {
     pub value: T,
     /// When `true`, the store MUST treat its `save()` as a no-op: the on-disk bytes may
     /// still be good and must not be overwritten with `value` (a default). Set on a
-    /// transient read error, on a content-corrupt file under [`CorruptPolicy::FreezeInPlace`],
-    /// and on a quarantine-rename failure under [`CorruptPolicy::QuarantineAndHeal`].
+    /// transient read error, and on a quarantine-rename failure (we could not move the
+    /// corrupt file aside, so healing over it would clobber recoverable bytes).
     pub disk_write_frozen: bool,
-}
-
-/// What to do when the file's *content* is corrupt (bad bytes / parse error / version
-/// mismatch). A read `Io` error always freezes regardless of policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CorruptPolicy {
-    /// Rename the bad file aside (`<path>.corrupt-<now_ms>`), start from `T::default()`,
-    /// and heal on the next write. If the rename fails, fall back to freeze (never heal
-    /// over a file we could not move aside). For stores whose empty-default is
-    /// non-destructive and user-rebuildable in-session: follows, friend_nicknames,
-    /// vine_feed_cache, vine_pull.
-    QuarantineAndHeal,
-    /// Leave the bad file untouched, start from `T::default()`, and freeze writes. For
-    /// stores where overwriting-with-empty is destructive to *other* data: content_index
-    /// (an empty index orphans every stored blob; its sensitivity / provenance metadata
-    /// cannot be rebuilt from a directory scan).
-    FreezeInPlace,
 }
 
 /// Load `path`, classifying failures so a possibly-good file is never silently clobbered.
 ///
-/// * missing file        → `(default, frozen = false)` — first run, silent.
-/// * read `Io` error     → `(default, frozen = true)` + warn — preserve maybe-good bytes.
-/// * `parse` `Err`       → per `policy` (see [`CorruptPolicy`]).
-/// * `parse` `Ok(v)`     → `(v, frozen = false)`.
+/// - **missing file** → `(default, frozen = false)` — first run, silent.
+/// - **read `Io` error** → `(default, frozen = true)` + warn — preserve maybe-good bytes.
+/// - **`parse` `Err`** → quarantine aside (`<path>.corrupt-<now_ms>`) and heal on next write → `(default, frozen = false)`; if the rename fails, freeze instead (never heal over a file we could not move aside — ZEB-784).
+/// - **`parse` `Ok(v)`** → `(v, frozen = false)`.
 ///
 /// `parse` performs deserialize plus any version/shape validation, returning `Err(reason)`
-/// for content corruption. This function never panics.
+/// for content corruption. A store that wants an unsupported-but-parseable file *frozen in
+/// place* (rather than quarantined) — e.g. a forward-version file — parses it as `Ok` and
+/// decides to freeze at its own layer. This function never panics.
 pub fn load_or_recover<T: Default>(
     path: &Path,
     now_ms: u64,
-    policy: CorruptPolicy,
     parse: impl FnOnce(&[u8]) -> Result<T, String>,
 ) -> Recovered<T> {
     let bytes = match std::fs::read(path) {
@@ -97,50 +81,55 @@ pub fn load_or_recover<T: Default>(
             value,
             disk_write_frozen: false,
         },
-        Err(reason) => match policy {
-            CorruptPolicy::FreezeInPlace => {
+        Err(reason) => {
+            if quarantine(path, now_ms) {
                 tracing::warn!(
                     path = ?path,
                     reason = %reason,
-                    "recoverable_load: content corrupt; FREEZING in place (file preserved, degraded read-only)"
+                    "recoverable_load: content corrupt; quarantined aside, healing on next write"
+                );
+                Recovered {
+                    value: T::default(),
+                    disk_write_frozen: false,
+                }
+            } else {
+                tracing::warn!(
+                    path = ?path,
+                    reason = %reason,
+                    "recoverable_load: content corrupt but quarantine rename FAILED; FREEZING to avoid clobber"
                 );
                 Recovered {
                     value: T::default(),
                     disk_write_frozen: true,
                 }
             }
-            CorruptPolicy::QuarantineAndHeal => {
-                if quarantine(path, now_ms) {
-                    tracing::warn!(
-                        path = ?path,
-                        reason = %reason,
-                        "recoverable_load: content corrupt; quarantined aside, healing on next write"
-                    );
-                    Recovered {
-                        value: T::default(),
-                        disk_write_frozen: false,
-                    }
-                } else {
-                    tracing::warn!(
-                        path = ?path,
-                        reason = %reason,
-                        "recoverable_load: content corrupt but quarantine rename FAILED; FREEZING to avoid clobber"
-                    );
-                    Recovered {
-                        value: T::default(),
-                        disk_write_frozen: true,
-                    }
-                }
-            }
-        },
+        }
     }
 }
 
-/// Rename `path` → `<path>.corrupt-<now_ms>` (dash dialect, matching the fleet/sync
+/// Rename `path` → `<path>.corrupt-<stamp>` (dash dialect, matching the fleet/sync
 /// majority). Best-effort; returns `false` and warns on rename failure.
+///
+/// `std::fs::rename` replaces the destination on Unix (and can fail on Windows) if it
+/// already exists, so two corrupt loads of the same `path` at the same `now_ms` — e.g.
+/// under a stuck clock — would otherwise clobber the first sidecar's bytes. Probe for a
+/// free `<stamp>` (incrementing keeps the name parseable by [`sweep_corrupt_sidecars`])
+/// so both payloads stay recoverable.
 fn quarantine(path: &Path, now_ms: u64) -> bool {
-    let mut aside = path.as_os_str().to_os_string();
-    aside.push(format!(".corrupt-{now_ms}"));
+    let mut stamp = now_ms;
+    let aside = loop {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(format!(".corrupt-{stamp}"));
+        if !Path::new(&candidate).exists() {
+            break candidate;
+        }
+        stamp = stamp.saturating_add(1);
+        if stamp.saturating_sub(now_ms) > 1_000 {
+            // Pathological (1000 sidecars at this timestamp): stop probing and replace
+            // the last candidate rather than spin. Recovery robustness, not a guarantee.
+            break candidate;
+        }
+    };
     match std::fs::rename(path, &aside) {
         Ok(()) => true,
         Err(e) => {
@@ -264,12 +253,7 @@ mod tests {
     #[test]
     fn missing_file_defaults_not_frozen() {
         let dir = tempfile::tempdir().unwrap();
-        let r = load_or_recover::<Vec<u32>>(
-            &dir.path().join("nope.json"),
-            1_000,
-            CorruptPolicy::QuarantineAndHeal,
-            parse_json,
-        );
+        let r = load_or_recover::<Vec<u32>>(&dir.path().join("nope.json"), 1_000, parse_json);
         assert!(r.value.is_empty());
         assert!(!r.disk_write_frozen);
     }
@@ -279,8 +263,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("v.json");
         std::fs::write(&p, b"[1,2,3]").unwrap();
-        let r =
-            load_or_recover::<Vec<u32>>(&p, 1_000, CorruptPolicy::QuarantineAndHeal, parse_json);
+        let r = load_or_recover::<Vec<u32>>(&p, 1_000, parse_json);
         assert_eq!(r.value, vec![1, 2, 3]);
         assert!(!r.disk_write_frozen);
     }
@@ -290,28 +273,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("v.json");
         std::fs::write(&p, b"not json").unwrap();
-        let r =
-            load_or_recover::<Vec<u32>>(&p, 4_242, CorruptPolicy::QuarantineAndHeal, parse_json);
+        let r = load_or_recover::<Vec<u32>>(&p, 4_242, parse_json);
         assert!(r.value.is_empty());
         assert!(!r.disk_write_frozen);
         assert!(!p.exists(), "original renamed aside");
         let aside = dir.path().join("v.json.corrupt-4242");
         assert_eq!(std::fs::read(&aside).unwrap(), b"not json");
-    }
-
-    #[test]
-    fn corrupt_freeze_in_place_leaves_file_and_freezes() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("v.json");
-        std::fs::write(&p, b"not json").unwrap();
-        let r = load_or_recover::<Vec<u32>>(&p, 4_242, CorruptPolicy::FreezeInPlace, parse_json);
-        assert!(r.value.is_empty());
-        assert!(r.disk_write_frozen);
-        assert_eq!(std::fs::read(&p).unwrap(), b"not json", "file untouched");
-        assert!(
-            !dir.path().join("v.json.corrupt-4242").exists(),
-            "no sidecar under freeze-in-place"
-        );
     }
 
     #[cfg(unix)]
@@ -321,12 +288,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let subdir = dir.path().join("asdir");
         std::fs::create_dir(&subdir).unwrap();
-        let r = load_or_recover::<Vec<u32>>(
-            &subdir,
-            1_000,
-            CorruptPolicy::QuarantineAndHeal,
-            parse_json,
-        );
+        let r = load_or_recover::<Vec<u32>>(&subdir, 1_000, parse_json);
         assert!(
             r.disk_write_frozen,
             "read error on a directory path freezes"
@@ -343,8 +305,7 @@ mod tests {
         let p = sub.join("v.json");
         std::fs::write(&p, b"not json").unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let r =
-            load_or_recover::<Vec<u32>>(&p, 4_242, CorruptPolicy::QuarantineAndHeal, parse_json);
+        let r = load_or_recover::<Vec<u32>>(&p, 4_242, parse_json);
         // restore perms before assertions so tempdir cleanup succeeds regardless
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
@@ -352,6 +313,28 @@ mod tests {
             "failed quarantine falls back to freeze"
         );
         assert!(p.exists(), "original left in place");
+    }
+
+    #[test]
+    fn quarantine_same_timestamp_keeps_both_payloads() {
+        // Two corruptions of the same path at the SAME now_ms must not clobber each
+        // other's sidecar (stuck-clock robustness).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.json");
+        std::fs::write(&p, b"first-corrupt").unwrap();
+        let _ = load_or_recover::<Vec<u32>>(&p, 100, parse_json);
+        std::fs::write(&p, b"second-corrupt").unwrap();
+        let _ = load_or_recover::<Vec<u32>>(&p, 100, parse_json);
+        assert_eq!(
+            std::fs::read(dir.path().join("v.json.corrupt-100")).unwrap(),
+            b"first-corrupt",
+            "first sidecar preserved"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("v.json.corrupt-101")).unwrap(),
+            b"second-corrupt",
+            "second sidecar got a collision-free name"
+        );
     }
 
     #[test]
