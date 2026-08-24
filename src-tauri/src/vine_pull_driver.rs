@@ -635,17 +635,30 @@ pub fn save_vine_pull(path: &Path, sidecar: &VinePullSidecar) -> Result<(), Stri
     Ok(())
 }
 
-/// Load the sidecar. Missing or corrupt (truncated/undecodable) loads as an
-/// empty default — loss-safe: a lost sidecar just means the next pull pass
-/// re-derives cursors from scratch (a slower re-pull, never a boot-time
-/// hard failure), and every row it seeds is re-verified on arrival anyway
-/// (see [`CreatorPullState`]'s doc comment).
+/// Load the sidecar with recovery classification (ZEB-986).
+///
+/// A missing file (first run) or corrupt/undecodable CBOR yields an empty default;
+/// corrupt bytes are quarantined aside (`vine_pull.cbor.corrupt-<now_ms>`) and heal on
+/// the next write, since pull progress is fully re-derivable. A transient READ error
+/// (permissions, bad disk) also starts empty but sets `disk_write_frozen`, so the
+/// caller does not overwrite the still-good sidecar with an empty one.
+fn load_vine_pull_recovered(
+    path: &Path,
+    now_ms: u64,
+) -> crate::recoverable_load::Recovered<VinePullSidecar> {
+    crate::recoverable_load::load_or_recover(
+        path,
+        now_ms,
+        crate::recoverable_load::CorruptPolicy::QuarantineAndHeal,
+        |bytes| ciborium::from_reader(bytes).map_err(|e: ciborium::de::Error<_>| e.to_string()),
+    )
+}
+
+/// Load the sidecar's value, discarding the freeze flag. Convenience for callers that
+/// only read progress and never write it back. The production driver uses
+/// [`load_vine_pull_recovered`] via `new()` so it can honor the freeze on save.
 pub fn load_vine_pull(path: &Path) -> VinePullSidecar {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return VinePullSidecar::default(),
-    };
-    ciborium::from_reader(bytes.as_slice()).unwrap_or_default()
+    load_vine_pull_recovered(path, crate::recoverable_load::now_ms()).value
 }
 
 // =====================================================================
@@ -670,6 +683,10 @@ pub struct VinePullDriver {
     last_received_ms: LastReceivedMsFn,
     sidecar_path: PathBuf,
     sidecar: std::sync::Mutex<VinePullSidecar>,
+    /// ZEB-986: set when the sidecar was unreadable at load (transient Io). Skips the
+    /// per-pass save so a still-good sidecar is never overwritten with re-derived-empty
+    /// progress. Content corruption does not freeze (it quarantines and heals).
+    disk_write_frozen: bool,
     wake: Arc<Notify>,
     interval: Duration,
     /// ZEB-811: pull-side health telemetry, shared with
@@ -689,7 +706,7 @@ impl VinePullDriver {
         last_received_ms: LastReceivedMsFn,
         sidecar_path: PathBuf,
     ) -> Self {
-        let sidecar = load_vine_pull(&sidecar_path);
+        let recovered = load_vine_pull_recovered(&sidecar_path, crate::recoverable_load::now_ms());
         Self {
             self_endpoint_id,
             pkarr_resolver,
@@ -698,7 +715,8 @@ impl VinePullDriver {
             followed_creators,
             last_received_ms,
             sidecar_path,
-            sidecar: std::sync::Mutex::new(sidecar),
+            sidecar: std::sync::Mutex::new(recovered.value),
+            disk_write_frozen: recovered.disk_write_frozen,
             wake: Arc::new(Notify::new()),
             interval: Duration::from_millis(VINE_PULL_INTERVAL_MS),
             telemetry: None,
@@ -765,6 +783,13 @@ impl VinePullDriver {
             self.pull_one_creator(creator, now_ms).await;
         }
 
+        if self.disk_write_frozen {
+            tracing::warn!(
+                path = ?self.sidecar_path,
+                "ZEB-811 pull: sidecar save skipped — unreadable at load; preserving existing progress"
+            );
+            return;
+        }
         let snapshot = self.sidecar.lock().expect("vine pull sidecar lock").clone();
         let path = self.sidecar_path.clone();
         match tokio::task::spawn_blocking(move || save_vine_pull(&path, &snapshot)).await {
@@ -1646,6 +1671,30 @@ mod tests {
         // A missing file must also load as an empty default.
         let missing = dir.path().join("does_not_exist.cbor");
         assert_eq!(load_vine_pull(&missing), VinePullSidecar::default());
+    }
+
+    #[test]
+    fn corrupt_vine_pull_quarantined_and_defaults() {
+        // ZEB-986: undecodable CBOR is quarantined aside (not silently discarded) and
+        // heals on the next write — pull progress is re-derivable.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("vine_pull.cbor");
+        std::fs::write(&p, [0xFFu8, 0x00]).unwrap();
+        let r = load_vine_pull_recovered(&p, 4_242);
+        assert!(r.value.per_creator.is_empty());
+        assert!(!r.disk_write_frozen, "corrupt heals (not frozen)");
+        assert!(
+            dir.path().join("vine_pull.cbor.corrupt-4242").exists(),
+            "corrupt bytes quarantined aside"
+        );
+    }
+
+    #[test]
+    fn missing_vine_pull_defaults_not_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = load_vine_pull_recovered(&dir.path().join("vine_pull.cbor"), 1);
+        assert!(r.value.per_creator.is_empty());
+        assert!(!r.disk_write_frozen);
     }
 
     // ── Driver-level tests (mock transport + mock ingest) ──
