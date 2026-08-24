@@ -45646,6 +45646,10 @@ mod zeb436_orphan_adoption_tests {
     /// instead (a forged invite whose only defect is the token signature —
     /// the admin bootstrap stays genuine, since an attacker can always
     /// copy the admin's public bootstrap Join).
+    // ZEB-983: the orphan-check + repair path derive the per-dir device
+    // cipher via `get_or_derive`; seeding the memo with the test cipher (in
+    // the rig below, after `tmp` is created) makes every derive return the
+    // same key the fixtures seal with.
     async fn build_invite_only_orphan_rig(
         community_id: SpaceId,
         token_signer: Option<&ed25519_dalek::SigningKey>,
@@ -45660,6 +45664,7 @@ mod zeb436_orphan_adoption_tests {
         use tokio::sync::mpsc;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        crate::device_dataset_file::install_test_cipher(tmp.path());
 
         let joiner_owner = crate::community_membership::mint_test_owner(0xBB);
         let joiner_self_owner = joiner_owner.owner;
@@ -58119,6 +58124,7 @@ mod zeb718_voting_reconcile_tests {
         // is enqueued per community (the event loop turns each request into the
         // live subscriber + backfill requester — the actual receive path).
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid_a = SpaceId([0x91; 16]);
         let cid_b = SpaceId([0x92; 16]);
         let actor = OwnerAddr([0xee; 16]);
@@ -58215,6 +58221,7 @@ mod zeb718_voting_reconcile_tests {
     #[tokio::test]
     async fn reconcile_replays_persisted_voting_log() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x74; 16]);
         let actor = OwnerAddr([0xaa; 16]);
 
@@ -58262,6 +58269,7 @@ mod zeb718_voting_reconcile_tests {
     #[tokio::test]
     async fn reconcile_missing_file_is_noop() {
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x75; 16]);
         let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
             snapshot: MembershipSnapshot {
@@ -58282,6 +58290,7 @@ mod zeb718_voting_reconcile_tests {
     async fn reconcile_restores_tick_driven_finalized_lifecycle() {
         use crate::community_voting_core::Lifecycle;
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x76; 16]);
         let actor = OwnerAddr([0xbb; 16]);
 
@@ -58346,6 +58355,7 @@ mod zeb718_voting_reconcile_tests {
         // it 0, which would make the reloaded poll derive its beacon seed with
         // epoch 0 and stall (Greptile P1-1). The overlay must restore it.
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x79; 16]);
         let actor = OwnerAddr([0xcc; 16]);
 
@@ -58448,6 +58458,7 @@ mod zeb718_voting_reconcile_tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x7b; 16]);
         let creator = OwnerAddr([0xc0; 16]);
         let author = OwnerAddr([0x01; 16]); // mini-public member A → posts kd=ds
@@ -58594,6 +58605,7 @@ mod zeb718_voting_reconcile_tests {
         // restart" claim — and its timing must survive.
         use crate::community_voting_core::Lifecycle;
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x7a; 16]);
         let actor = OwnerAddr([0xdd; 16]);
 
@@ -58699,6 +58711,7 @@ mod zeb718_voting_reconcile_tests {
         // community failure so one unreadable file never blocks the others.
         use crate::community_voting_core::Lifecycle;
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid_ok_tier2 = SpaceId([0x81; 16]);
         let cid_ok_tier1 = SpaceId([0x82; 16]);
         let cid_unreadable = SpaceId([0x83; 16]);
@@ -58816,6 +58829,7 @@ mod zeb718_voting_reconcile_tests {
         // NOT treat "no events" as "nothing to restore" — the policy would be
         // silently lost across restart otherwise.
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x77; 16]);
 
         let policy = crate::community_voting_conviction::CommunityVotingPolicy {
@@ -58861,6 +58875,7 @@ mod zeb718_voting_reconcile_tests {
         // the caller (`ensure_voting_engine_for`) leaves persistence disarmed
         // rather than clobbering the recoverable on-disk state with empty.
         let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
         let cid = SpaceId([0x78; 16]);
         let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
         std::fs::create_dir_all(&path).unwrap();
