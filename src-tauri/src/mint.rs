@@ -1044,12 +1044,13 @@ pub async fn mint_delete_account(
     // Extract the sync_state handle + persist path from the engine — required;
     // we do NOT fall back to a temporary floor when the engine is absent (see
     // the doc-comment above the command).
-    let (sync_state_handle, sync_state_path_opt) = {
+    let (sync_state_handle, sync_state_path_opt, sync_cipher_opt) = {
         let node = state.lock().expect("NodeState poisoned");
         match node.mint_sync.as_ref() {
             Some(e) => (
                 e.sync_state_handle(),
                 e.sync_state_path().map(|p| p.to_path_buf()),
+                e.dataset_cipher(),
             ),
             None => {
                 return Err(
@@ -1083,7 +1084,10 @@ pub async fn mint_delete_account(
 
         if let Some(ref path) = sync_state_path_opt {
             let st_snap = st.clone();
-            if let Err(e) = crate::mint_sync_persist::save(path, &st_snap) {
+            let cipher = sync_cipher_opt
+                .as_ref()
+                .expect("ZEB-982: a path-ful mint engine always carries a cipher");
+            if let Err(e) = crate::mint_sync_persist::save(cipher, path, &st_snap) {
                 // Floor persist failed. Abort — do NOT proceed with the SQLite
                 // delete, because if we did and then crashed, the floor entry
                 // would vanish on restart (the in-memory insert is not durable

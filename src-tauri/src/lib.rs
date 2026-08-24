@@ -6195,6 +6195,7 @@ pub async fn start_node_inner(
                             // node start normally. The user will see mint sync disabled
                             // but all other features keep working.
                             let initial_sync_state = match crate::mint_sync_persist::load(
+                                &device_cipher,
                                 &mint_sync_state_path,
                             ) {
                                 Ok(state) => state,
@@ -6297,6 +6298,7 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&content_store),
                                     mint_sync_state,
                                     mint_sync_state_path,
+                                    device_cipher.clone(),
                                     mint_out_tx,
                                     mint_in_rx,
                                     crate::mint_sync::DEFAULT_DEBOUNCE_MS,
