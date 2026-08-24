@@ -274,6 +274,7 @@ pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
 pub mod protocol_versioning;
+pub mod recoverable_load;
 pub mod referral_catalog;
 pub mod relay_acceptor_watchdog;
 pub mod relay_hold_persist;
@@ -4274,7 +4275,24 @@ pub async fn start_node_inner(
     // ZEB-445: resolved Tauri-free (identical path to `app.path().app_data_dir()`).
     let app_data_dir = crate::resolve_app_data_dir()?;
     std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
-    let follow_mgr = follows::FollowManager::load(&app_data_dir);
+    // ZEB-986: bound unbounded `.corrupt` quarantine-sidecar growth. Runs OFF the boot
+    // critical path in a detached thread — a full-tree scan plus recursive deletion of
+    // quarantined directories must never stall node startup. Best-effort and non-fatal.
+    // 30-day retention, always keeping the newest sidecar per base name as a forensics
+    // floor; covers both dialects (`.corrupt.<ms>` / `.corrupt-<ms>`) and quarantined
+    // directories tree-wide.
+    {
+        let sweep_dir = app_data_dir.clone();
+        let sweep_now = crate::recoverable_load::now_ms();
+        std::thread::spawn(move || {
+            crate::recoverable_load::sweep_corrupt_sidecars(
+                &sweep_dir,
+                sweep_now,
+                30 * 24 * 60 * 60 * 1000,
+            );
+        });
+    }
+    let follow_mgr = follows::FollowManager::load(&app_data_dir, crate::recoverable_load::now_ms());
     // ZEB-671: share_follows gate for follow-list wire publication.
     let vine_settings_path = vine_settings::settings_path(&app_data_dir);
     let vine_settings_loaded = vine_settings::load_or_default(&vine_settings_path);
@@ -20330,7 +20348,10 @@ mod follow_list_publish_tests {
         let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(8);
         let state = Mutex::new(NodeState {
             follow_tx: Some(follow_tx),
-            follow_mgr: Some(follows::FollowManager::load(&temp_data_dir())),
+            follow_mgr: Some(follows::FollowManager::load(
+                &temp_data_dir(),
+                crate::recoverable_load::now_ms(),
+            )),
             followed_set: Some(std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             ))),

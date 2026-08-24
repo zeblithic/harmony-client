@@ -380,6 +380,10 @@ pub struct VineFeedCache {
     /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
     /// `None` for `new()`. `save()` checks this and is a no-op when None.
     path: Option<PathBuf>,
+    /// ZEB-986: set when the file was unreadable at load (transient Io) or corrupt
+    /// bytes could not be quarantined aside. Freezes `save()` so the still-good
+    /// on-disk cache is never overwritten with the empty in-memory default.
+    disk_write_frozen: bool,
 }
 
 impl VineFeedCache {
@@ -408,46 +412,46 @@ impl VineFeedCache {
             reach: HashMap::new(),
             authority: crate::feed_authority::FeedAuthorityCache::default(),
             path: Some(path.clone()),
+            disk_write_frozen: false,
         };
-        Self::populate_from_disk(&mut cache, &path);
+        cache.disk_write_frozen =
+            Self::populate_from_disk(&mut cache, &path, crate::recoverable_load::now_ms());
         cache
     }
 
-    /// Read `path` (if it exists) and populate `cache`. A missing file
-    /// (`NotFound`) silently produces an empty cache — the expected first-run
-    /// path. Other IO errors (permissions, etc.), version mismatches, and
-    /// malformed JSON log a `tracing::warn!` and fall back to an empty cache,
-    /// matching `follows.rs::FollowManager::load`'s graceful-degrade.
-    fn populate_from_disk(cache: &mut Self, path: &Path) {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    path = %path.display(),
-                    "vine_feed_cache: load() failed; starting with empty cache",
-                );
-                return;
-            }
-        };
-        let file: VineFeedDiskV1 = match serde_json::from_slice(&bytes) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    "vine_feed_cache: load() ignoring malformed vine_feed.json",
-                );
-                return;
-            }
+    /// Read `path` (if it exists) and populate `cache`, returning `disk_write_frozen`.
+    ///
+    /// ZEB-986: routed through `recoverable_load` so failures are classified rather
+    /// than silently collapsed. A missing file (first run) starts empty. A transient
+    /// read error starts empty AND freezes writes (returns `true`) so the still-good
+    /// cache is not overwritten. Malformed JSON is quarantined aside
+    /// (`vine_feed.json.corrupt-<ms>`) and heals on the next write. An unexpected
+    /// `version` (forward/foreign build) also FREEZES writes so the next `save()` cannot
+    /// overwrite that file with an empty current-version cache — it is left intact in
+    /// place for its originating build, not quarantined.
+    fn populate_from_disk(cache: &mut Self, path: &Path, now_ms: u64) -> bool {
+        let recovered = crate::recoverable_load::load_or_recover::<Option<VineFeedDiskV1>>(
+            path,
+            now_ms,
+            // Parse only — the version check happens after so an unsupported version can
+            // freeze in place rather than quarantine-and-heal (which would clobber it).
+            |bytes| {
+                serde_json::from_slice::<VineFeedDiskV1>(bytes)
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            },
+        );
+        let disk_write_frozen = recovered.disk_write_frozen;
+        let Some(file) = recovered.value else {
+            return disk_write_frozen;
         };
         if file.version != FILE_VERSION {
             tracing::warn!(
                 version = file.version,
                 expected = FILE_VERSION,
-                "vine_feed_cache: load() ignoring vine_feed.json with unexpected version",
+                "vine_feed_cache: unexpected version; freezing writes to preserve the foreign-version file in place",
             );
-            return;
+            return true;
         }
 
         // Age-prune (one-shot on load).
@@ -590,6 +594,8 @@ impl VineFeedCache {
                 },
             );
         }
+
+        disk_write_frozen
     }
 
     /// Parse + insert a vine descriptor.
@@ -1482,6 +1488,13 @@ impl VineFeedCache {
         let Some(path) = self.path.as_ref() else {
             return;
         };
+        if self.disk_write_frozen {
+            tracing::warn!(
+                path = %path.display(),
+                "vine_feed_cache save skipped — file unreadable at load; preserving existing cache"
+            );
+            return;
+        }
 
         let file = VineFeedDiskV1 {
             version: FILE_VERSION,
@@ -2890,6 +2903,36 @@ mod tests {
     }
 
     #[test]
+    fn wrong_version_freezes_and_preserves_file() {
+        // ZEB-986: a forward/foreign-version file must be left byte-identical — the load
+        // freezes writes so the next save() cannot overwrite it with an empty
+        // current-version cache, and it is NOT quarantined.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(VINE_FEED_FILE);
+        let forward = br#"{"version":999,"descriptors":[],"reactions":[],"viewed":["v-x"]}"#;
+        std::fs::write(&path, forward).unwrap();
+
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(cache.len_descriptors(), 0);
+        // Frozen: save() is a no-op, so the foreign-version file is untouched.
+        cache.save_for_test();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            forward,
+            "foreign-version file left byte-identical"
+        );
+        let quarantined = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("vine_feed.json.corrupt-")
+        });
+        assert!(
+            !quarantined,
+            "unexpected version is frozen in place, not quarantined"
+        );
+    }
+
+    #[test]
     fn load_corrupt_json_returns_empty_cache() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join(VINE_FEED_FILE);
@@ -2898,6 +2941,34 @@ mod tests {
         let cache = VineFeedCache::load(dir.path());
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
+    }
+
+    #[test]
+    fn corrupt_vine_feed_quarantined_and_heals() {
+        // ZEB-986: malformed JSON is quarantined aside (not silently discarded) and
+        // heals on the next write, since the feed cache is regenerable from the network.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(VINE_FEED_FILE);
+        std::fs::write(&path, b"{ not valid json").unwrap();
+
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(cache.len_descriptors(), 0);
+        let has_sidecar = std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("vine_feed.json.corrupt-")
+        });
+        assert!(has_sidecar, "corrupt bytes quarantined aside");
+
+        // Not frozen: a save rewrites a fresh valid file that reloads cleanly.
+        cache.save_for_test();
+        let reloaded = VineFeedCache::load(dir.path());
+        assert_eq!(reloaded.len_descriptors(), 0);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_ok(),
+            "healed main file is valid JSON"
+        );
     }
 
     #[test]
