@@ -4275,6 +4275,15 @@ pub async fn start_node_inner(
     // ZEB-445: resolved Tauri-free (identical path to `app.path().app_data_dir()`).
     let app_data_dir = crate::resolve_app_data_dir()?;
     std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
+    // ZEB-986: bound unbounded `.corrupt` quarantine-sidecar growth. Best-effort and
+    // non-fatal — a sweep failure never blocks boot. 30-day retention, always keeping
+    // the newest sidecar per base name as a forensics floor. Covers both dialects
+    // (`.corrupt.<ms>` / `.corrupt-<ms>`) and quarantined directories tree-wide.
+    crate::recoverable_load::sweep_corrupt_sidecars(
+        &app_data_dir,
+        crate::recoverable_load::now_ms(),
+        30 * 24 * 60 * 60 * 1000,
+    );
     let follow_mgr = follows::FollowManager::load(&app_data_dir, crate::recoverable_load::now_ms());
     // ZEB-671: share_follows gate for follow-list wire publication.
     let vine_settings_path = vine_settings::settings_path(&app_data_dir);
