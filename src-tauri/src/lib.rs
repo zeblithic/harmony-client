@@ -4292,7 +4292,23 @@ pub async fn start_node_inner(
             );
         });
     }
-    let follow_mgr = follows::FollowManager::load(&app_data_dir, crate::recoverable_load::now_ms());
+    // ZEB-986 PR-3: device cipher for at-rest sealing of the app-data + storage stores.
+    // Derived once here and threaded into every store's load. Guarded on identity.key
+    // existence so a pre-identity boot never fresh-generates an identity as a side effect
+    // (get_or_derive's seed chain would otherwise create one). `None` on such a boot: the
+    // store files do not exist yet, so loads are first-run empty and saves no-op until a
+    // cipher is available. The node seed backs this key and is established during network
+    // init above, so in practice this resolves to `Some` on every real boot.
+    let device_cipher: Option<crate::device_dataset_file::DeviceCipher> =
+        crate::owner_commands::resolve_identity_dir()
+            .ok()
+            .filter(|id| id.join("identity.key").exists())
+            .and_then(|id| crate::device_dataset_file::get_or_derive(&id).ok());
+    let follow_mgr = follows::FollowManager::load(
+        device_cipher.as_ref(),
+        &app_data_dir,
+        crate::recoverable_load::now_ms(),
+    );
     // ZEB-671: share_follows gate for follow-list wire publication.
     let vine_settings_path = vine_settings::settings_path(&app_data_dir);
     let vine_settings_loaded = vine_settings::load_or_default(&vine_settings_path);
@@ -20349,6 +20365,7 @@ mod follow_list_publish_tests {
         let state = Mutex::new(NodeState {
             follow_tx: Some(follow_tx),
             follow_mgr: Some(follows::FollowManager::load(
+                Some(&crate::device_dataset_file::test_cipher()),
                 &temp_data_dir(),
                 crate::recoverable_load::now_ms(),
             )),
