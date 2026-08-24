@@ -87,6 +87,15 @@ pub fn plan(
 ) -> PinPlan {
     let mut out = PinPlan::default();
 
+    // ZEB-986 PR-3 (Greptile PR #731): a frozen ledger reads as empty, so
+    // planning against it would re-fetch and re-pin the entire pledged corpus
+    // — physical pins that `save()` (frozen) never records, diverging from the
+    // preserved on-disk ledger across a restart. Drive ZERO physical hosting
+    // work until the ledger loads a trustworthy image.
+    if ledger.sealed_fault() {
+        return out;
+    }
+
     let pledgers: HashSet<String> = records
         .owners_pledging_to(me)
         .into_iter()
@@ -612,6 +621,36 @@ mod tests {
         );
         assert!(plan.fetch.is_empty(), "already in flight");
         assert!(plan.catching_up);
+    }
+
+    #[test]
+    fn faulted_ledger_plans_no_physical_work() {
+        // ZEB-986 PR-3 (Greptile PR #731): the same pact that WOULD drive
+        // fetches through a healthy empty ledger must produce an empty plan
+        // when the ledger is frozen — no fetch, no attribution, no release,
+        // no evict — so a faulted ledger drives zero physical hosting ops.
+        let (records, owners) = seeded_records(&[(
+            "alice",
+            0,
+            vec![entry(b"a", 40), entry(b"b", 40), entry(b"c", 40)],
+        )]);
+        let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 1_000)].into();
+        let ledger = StorageLedger::faulted_for_test();
+
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
+        assert_eq!(
+            plan,
+            PinPlan::default(),
+            "frozen ledger ⇒ empty plan (would otherwise fetch a, b, c)"
+        );
     }
 
     #[test]

@@ -254,3 +254,21 @@ during iteration, full `--workspace --all-targets` sweep before push; frontend u
    peer-invalid rejection in the logs. A mid-session reload path, if ever wanted, is a separate
    follow-up. Note the fresh-profile fix (#1) removes the most common benign trigger: a fresh
    profile now loads un-faulted (absent file) and is armed, rather than faulting.
+4. **Faulted `storage_ledger` still mutated** (Greptile *P1*, "Comments Outside Diff"). The
+   design above (§*Storage anchors*) states the ledger's mutators reject when sealed-fault, but
+   the first implementation gated only `save()` — the mutators (`record_pin`, `release`,
+   `release_buddy`, `evict_newest_first`, `drop_cid_everywhere`) still changed RAM and returned
+   success outcomes. Because a faulted ledger reads as **empty**, the pure `buddy_pin_planner`
+   then saw "nothing pinned" against still-active pacts and planned to **re-fetch and re-pin the
+   entire pledged corpus** — physical pins (`runtime.pin_content`) that the frozen `save()` never
+   recorded, so durable hosting state and actually-hosted content diverged across a restart; the
+   release/evict paths were the mirror latent hazard (physical unpins absent from the preserved
+   ledger). Fixed in **two layers**: (a) `buddy_pin_planner::plan` now returns an empty plan when
+   `ledger.sealed_fault()`, so a faulted ledger drives **zero** physical hosting work (the primary
+   barrier — this also stops the fetch/re-pin thrash, since a mutator-only gate would leave the
+   pre-`record_pin` physical pin in place and re-plan it every tick); (b) every `StorageLedger`
+   mutator now rejects with a neutral outcome (`record_pin → false`, `release → NotHeld`,
+   `release_buddy`/`evict_newest_first → empty`, `drop_cid_everywhere → no-op`) when sealed-fault,
+   enforcing the invariant at the type and covering the two `drop_cid_everywhere` boot-sweep call
+   sites that bypass the planner. The spec's §*Storage anchors* wording ("the ledger's mutators
+   reject") now matches the code.

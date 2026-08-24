@@ -71,10 +71,14 @@ pub struct StorageLedger {
     cipher: Option<crate::device_dataset_file::DeviceCipher>,
     /// ZEB-986 PR-3: fail-closed latch. Set when the sealed file could not be read as a
     /// trustworthy ledger at load (unreadable, undecryptable, corrupt, or an unsupported
-    /// version). While set, `save()` is a no-op so the still-good on-disk ledger is never
-    /// overwritten with an empty one. RAM mutations still occur but do not persist until
-    /// the fault clears (the local hosting ledger re-derives). A clean load or a clean
-    /// absence leaves it clear.
+    /// version). While set the ledger is FROZEN: `save()` is a no-op (the still-good
+    /// on-disk file is never overwritten with an empty one) AND every mutator
+    /// (`record_pin`/`release`/`release_buddy`/`evict_newest_first`/`drop_cid_everywhere`)
+    /// rejects — returns a neutral outcome without touching RAM. A faulted ledger reads as
+    /// empty, so leaving mutations live would let the planner drive divergent physical
+    /// pin/unpin from an untrustworthy state (Greptile PR #731); refusing them keeps the
+    /// durable hosting state and the actually-hosted content in lock-step across a restart.
+    /// A clean load or a clean absence leaves it clear.
     sealed_fault: bool,
 }
 
@@ -151,6 +155,27 @@ impl StorageLedger {
         }
     }
 
+    /// ZEB-986 PR-3: the ledger failed to load a trustworthy image and is FROZEN — reads as
+    /// empty, and both `save()` and every mutator reject. Consumers (the buddy-pin planner)
+    /// must plan no physical hosting work from a faulted ledger; see [`Self::sealed_fault`].
+    pub fn sealed_fault(&self) -> bool {
+        self.sealed_fault
+    }
+
+    /// A ledger already in the sealed-fault (frozen) state, for consumer tests
+    /// — the planner — that must exercise the faulted path without staging an
+    /// undecryptable file on disk. The real latch is engaged only by
+    /// [`Self::new`] on a genuine load failure.
+    #[cfg(test)]
+    pub(crate) fn faulted_for_test() -> Self {
+        Self {
+            per_buddy: BTreeMap::new(),
+            path: None,
+            cipher: None,
+            sealed_fault: true,
+        }
+    }
+
     /// Persist. Public so callers batching several mutations via the
     /// non-saving internals can flush once — the standard mutators below
     /// already save.
@@ -197,8 +222,13 @@ impl StorageLedger {
     }
 
     /// Record that `cid` (of ACTUAL `size` bytes) is pinned on behalf of
-    /// `buddy`. Returns false (no-op) when the buddy already holds it.
+    /// `buddy`. Returns false (no-op) when the buddy already holds it, or
+    /// when the ledger is frozen by `sealed_fault` (reject the mutation so a
+    /// faulted, empty-reading ledger records nothing and signals no change).
     pub fn record_pin(&mut self, buddy: &str, cid: &str, size: u64, now_ms: u64) -> bool {
+        if self.sealed_fault {
+            return false;
+        }
         let entries = self.per_buddy.entry(buddy.to_string()).or_default();
         if entries.iter().any(|e| e.cid == cid) {
             return false;
@@ -212,8 +242,13 @@ impl StorageLedger {
         true
     }
 
-    /// Release `buddy`'s attribution of `cid`.
+    /// Release `buddy`'s attribution of `cid`. `NotHeld` (no-op) when the
+    /// ledger is frozen by `sealed_fault` — a faulted ledger claims nothing,
+    /// so it can release nothing and must queue no physical unpin.
     pub fn release(&mut self, buddy: &str, cid: &str) -> ReleaseOutcome {
+        if self.sealed_fault {
+            return ReleaseOutcome::NotHeld;
+        }
         let outcome = self.release_inner(buddy, cid);
         if outcome != ReleaseOutcome::NotHeld {
             self.save();
@@ -245,7 +280,11 @@ impl StorageLedger {
 
     /// Release every attribution held for `buddy` (pact revoked/removed).
     /// Returns the cids that hit last-reference — the caller unpins them.
+    /// Empty (no unpins) when the ledger is frozen by `sealed_fault`.
     pub fn release_buddy(&mut self, buddy: &str) -> Vec<String> {
+        if self.sealed_fault {
+            return Vec::new();
+        }
         let Some(entries) = self.per_buddy.remove(buddy) else {
             return Vec::new();
         };
@@ -262,7 +301,11 @@ impl StorageLedger {
     /// distinct-bytes numerator fits `target_bytes`. Returns the cids
     /// that hit last-reference (to unpin). Attribution-only removals of
     /// still-referenced cids free no bytes but honor eviction order.
+    /// Empty (no evictions) when the ledger is frozen by `sealed_fault`.
     pub fn evict_newest_first(&mut self, target_bytes: u64) -> Vec<String> {
+        if self.sealed_fault {
+            return Vec::new();
+        }
         let mut freed = Vec::new();
         let mut removed_any = false;
         while self.distinct_pinned_bytes() > target_bytes {
@@ -292,8 +335,14 @@ impl StorageLedger {
     /// Boot honesty sweep: the RAM-only cache lost `cid` across restart,
     /// so every attribution of it is dropped — hosting reports must only
     /// ever claim actually-held bytes. The cid re-enters via the normal
-    /// fetch path when pacts still want it.
+    /// fetch path when pacts still want it. No-op when the ledger is frozen
+    /// by `sealed_fault` — a faulted ledger has no trustworthy attributions
+    /// to sweep (this call bypasses the planner, so gating it here is the
+    /// only barrier).
     pub fn drop_cid_everywhere(&mut self, cid: &str) {
+        if self.sealed_fault {
+            return;
+        }
         for entries in self.per_buddy.values_mut() {
             entries.retain(|e| e.cid != cid);
         }
@@ -544,14 +593,58 @@ mod tests {
         let sealed = std::fs::read(&path).unwrap();
         let foreign = crate::device_dataset_file::DeviceCipher::derive(&[9u8; 32]).unwrap();
         let mut ledger = StorageLedger::new(Some(foreign), Some(path.clone()));
+        assert!(ledger.sealed_fault(), "undecryptable → frozen");
         assert!(ledger.buddies().is_empty(), "undecryptable → empty");
-        ledger.record_pin("mallory", "cid2", 5, 8); // RAM mutation; save() is a no-op
+        // Greptile PR #731: a frozen ledger REJECTS the mutation — no RAM
+        // change, no signalled outcome — not merely a no-op save.
+        assert!(
+            !ledger.record_pin("mallory", "cid2", 5, 8),
+            "frozen ledger rejects record_pin"
+        );
+        assert!(
+            ledger.buddies().is_empty(),
+            "rejected mutation left RAM empty"
+        );
         ledger.save();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             sealed,
             "faulted ledger preserves the on-disk file byte-identical"
         );
+    }
+
+    #[test]
+    fn frozen_ledger_rejects_every_mutation_so_no_physical_op_is_driven() {
+        // Greptile PR #731 P1: `sealed_fault` must gate the mutators, not just
+        // `save()`. Otherwise the frozen (empty-reading) ledger would let the
+        // event loop drive physical pin/unpin absent from the preserved file.
+        let mut ledger = StorageLedger::faulted_for_test();
+        assert!(ledger.sealed_fault());
+
+        assert!(
+            !ledger.record_pin("alice", "cid1", 100, 1),
+            "record_pin rejected → no attribution, no contribution change"
+        );
+        assert_eq!(
+            ledger.release("alice", "cid1"),
+            ReleaseOutcome::NotHeld,
+            "release rejected → nothing queued to unpin"
+        );
+        assert!(
+            ledger.release_buddy("alice").is_empty(),
+            "release_buddy rejected → no unpins"
+        );
+        assert!(
+            ledger.evict_newest_first(0).is_empty(),
+            "evict rejected → no unpins even under a zero budget"
+        );
+        ledger.drop_cid_everywhere("cid1"); // must not panic or mutate
+
+        assert!(
+            ledger.buddies().is_empty(),
+            "RAM never mutated while frozen"
+        );
+        assert_eq!(ledger.distinct_pinned_bytes(), 0);
     }
 
     #[test]
