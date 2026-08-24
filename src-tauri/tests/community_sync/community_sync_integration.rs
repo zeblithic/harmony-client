@@ -203,6 +203,7 @@ async fn two_members_dag_sync_full_event_log() {
     let dir_b = tempfile::tempdir().expect("tempdir B");
 
     let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "a-dev".into(),
         content_store: Arc::clone(&cs),
@@ -219,6 +220,7 @@ async fn two_members_dag_sync_full_event_log() {
         presence_resync_rx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -433,6 +435,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
 
     let dir_b = tempfile::tempdir().expect("tempdir B");
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -667,6 +670,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     let dir_b = tempfile::tempdir().expect("tempdir B");
 
     let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "a-dev".into(),
         content_store: Arc::clone(&cs),
@@ -683,6 +687,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         presence_resync_rx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -888,6 +893,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
     let dir_b = tempfile::tempdir().expect("tempdir B");
 
     let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "a-dev".into(),
         content_store: Arc::clone(&cs),
@@ -904,6 +910,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         presence_resync_rx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -1207,6 +1214,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     let dir_b = tempfile::tempdir().expect("tempdir B");
 
     let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "a-dev".into(),
         content_store: Arc::clone(&cs),
@@ -1224,6 +1232,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         presence_resync_rx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -1679,6 +1688,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
     let dir_b = tempfile::tempdir().expect("tempdir B");
 
     let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "a-dev".into(),
         content_store: Arc::clone(&cs),
@@ -1694,6 +1704,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         presence_resync_rx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -2045,6 +2056,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     // create_community_inner all share ONE floor.
     let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: adopt_floor.clone(),
         device_id: "test-dev".into(),
         content_store: cs,
@@ -2357,6 +2369,7 @@ mod task3_kick_setpower_round_trip {
 
         let adopt_floor_a = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: harmony_app::device_dataset_file::test_cipher(),
             adopt_floor: adopt_floor_a.clone(),
             community_id,
             membership_key: minted_a.membership_key.clone(),
@@ -2385,6 +2398,7 @@ mod task3_kick_setpower_round_trip {
             root_serve_rx: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: harmony_app::device_dataset_file::test_cipher(),
             adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: minted_a.membership_key.clone(),
@@ -2897,6 +2911,7 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     let dir = tempfile::tempdir().expect("tempdir");
     let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: adopt_floor.clone(),
         device_id: "bob-dev".into(),
         content_store: cs,
@@ -3234,6 +3249,7 @@ async fn addrbook_replaces_announce_events_end_to_end() {
     let dir_b = tempfile::tempdir().expect("tempdir B");
 
     let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "a-dev".into(),
         content_store: Arc::clone(&cs),
@@ -3249,6 +3265,7 @@ async fn addrbook_replaces_announce_events_end_to_end() {
         presence_resync_rx: None,
     });
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -3569,6 +3586,7 @@ async fn peer_ingest_stamps_receipt_time_not_wire_value() {
 
     let dir_b = tempfile::tempdir().expect("tempdir B");
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),
@@ -3871,6 +3889,7 @@ async fn addrbook_snapshot_path_ingest_end_to_end() {
     // A is the ingesting side here (mirroring the snapshot REQUESTER), so it
     // needs `Arc` for `ingest_sealed_packet`.
     let registry_a = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "a-dev".into(),
         content_store: Arc::clone(&cs),
@@ -3886,6 +3905,7 @@ async fn addrbook_snapshot_path_ingest_end_to_end() {
         presence_resync_rx: None,
     }));
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "b-dev".into(),
         content_store: Arc::clone(&cs),

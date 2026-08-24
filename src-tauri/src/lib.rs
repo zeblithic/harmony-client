@@ -8010,6 +8010,10 @@ pub async fn start_node_inner(
                         );
                         let cfg = crate::community_state_sync::CommunityRegistryConfig {
                             device_id: device_id.clone(),
+                            // ZEB-983: seals every per-community file at
+                            // rest; derived once at boot (line ~5973),
+                            // available on keyless local-only boots too.
+                            device_cipher: device_cipher.clone(),
                             content_store: std::sync::Arc::clone(&content_store),
                             identity_resolver: resolver,
                             identity_dir: identity_dir.clone(),
@@ -37985,6 +37989,7 @@ mod create_community_inner_tests {
 
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "test-dev".into(),
                 content_store: cs,
@@ -40724,6 +40729,7 @@ mod zeb_315_membership_at_event_hlc_tests {
             Duration::from_millis(1000),
         ));
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "test-dev".into(),
             content_store: cs,
@@ -40953,6 +40959,7 @@ mod list_bootstrap_hint_tests {
         ));
 
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "test-dev".into(),
             content_store: cs,
@@ -44041,6 +44048,7 @@ mod redeem_invite_inner_tests {
         ));
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "joiner-dev".into(),
                 content_store: cs,
@@ -45332,7 +45340,7 @@ mod zeb436_orphan_adoption_tests {
         let mut on_disk = crate::community_state_crdt::CommunityState::new(community_id);
         let event_count = events.len();
         on_disk.set_event_log_for_test(events);
-        crate::community_state_persist::save_crdt(&crdt_path, &on_disk)
+        crate::community_state_persist::save_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, &on_disk)
             .expect("persist orphaned community CRDT");
 
         let rebooted = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
@@ -45476,7 +45484,7 @@ mod zeb436_orphan_adoption_tests {
             "failed redeem must NOT delete the pre-existing community dir \
              (the user's entire local history)"
         );
-        let survived = crate::community_state_persist::load_crdt(&crdt_path, community_id)
+        let survived = crate::community_state_persist::load_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, community_id)
             .expect("orphaned CRDT must remain loadable after the failed attempt");
         assert_eq!(
             survived.event_count(),
@@ -45606,6 +45614,7 @@ mod zeb436_orphan_adoption_tests {
         ));
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "joiner-dev".into(),
                 content_store: cs,
@@ -45708,7 +45717,7 @@ mod zeb436_orphan_adoption_tests {
             .join(hex::encode(community_id.0))
             .join("crdt.cbor");
         std::fs::create_dir_all(crdt_path.parent().expect("parent")).expect("create dir");
-        crate::community_state_persist::save_crdt(&crdt_path, &orphaned)
+        crate::community_state_persist::save_crdt(&crate::device_dataset_file::test_cipher(), &crdt_path, &orphaned)
             .expect("persist orphaned community CRDT");
 
         // ── Fresh invite from the admin (valid token + sealed epoch key,
@@ -48980,6 +48989,7 @@ mod zeb268_leave_detach_fence_tests {
         ));
         let self_owner = OwnerAddr([0xAA; 16]);
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "leaver-dev".into(),
             content_store,
@@ -64422,12 +64432,21 @@ async fn invite_targets_orphaned_community_dir(
         .join("communities")
         .join(hex::encode(payload.community_id.0))
         .join("crdt.cbor");
+    // ZEB-983: existence-check BEFORE the cipher derive — a read-only
+    // probe must never fresh-generate a node identity as a side effect
+    // (same stance as `backup_state::staleness_from_dir`). Missing file
+    // ⇒ empty state ⇒ "not an orphan" — short-circuit identically.
+    if !crdt_path.exists() {
+        return false;
+    }
+    let Ok(device_cipher) = crate::device_dataset_file::get_or_derive(dir) else {
+        return false;
+    };
     let community_id = payload.community_id;
     // Blocking file read off the async path (same discipline as engine
-    // spawn's phase-1 spawn_blocking). A missing file loads as an empty
-    // state, which the events gate below treats as "not an orphan".
+    // spawn's phase-1 spawn_blocking).
     let state = match tokio::task::spawn_blocking(move || {
-        crate::community_state_persist::load_crdt(&crdt_path, community_id)
+        crate::community_state_persist::load_crdt(&device_cipher, &crdt_path, community_id)
     })
     .await
     {
@@ -86141,6 +86160,7 @@ mod owner_loaded_tests {
 
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_cipher: crate::device_dataset_file::test_cipher(),
                 adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "owner-loaded-test".into(),
                 content_store: cs,

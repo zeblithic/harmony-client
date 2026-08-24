@@ -210,6 +210,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     let dir_b = tempfile::tempdir().expect("dir b");
 
     let registry_a = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "alice-dev".into(),
         content_store: Arc::clone(&cs_a),
@@ -229,6 +230,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // (Alice's registry_a above holds its own floor — a separate node.)
     let bob_adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: bob_adopt_floor.clone(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_b),

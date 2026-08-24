@@ -95,6 +95,7 @@ async fn seeded_registry(
     let dir = tempfile::tempdir().expect("tempdir");
 
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "device-sub".into(),
         content_store: cs,

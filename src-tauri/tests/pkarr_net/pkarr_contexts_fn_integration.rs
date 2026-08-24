@@ -220,6 +220,7 @@ async fn setup_one_community(
 
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "test-dev".into(),
         content_store: Arc::clone(&cs),

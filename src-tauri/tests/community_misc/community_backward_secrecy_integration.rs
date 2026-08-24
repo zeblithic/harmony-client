@@ -835,6 +835,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     // that mint/feed HLC share ONE floor.
     let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: adopt_floor.clone(),
         device_id: "admin-dev".into(),
         content_store: cs,
@@ -1232,6 +1233,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
     // that mint/feed HLC share ONE floor.
     let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: adopt_floor.clone(),
         device_id: "admin-dev".into(),
         content_store: cs,

@@ -822,6 +822,7 @@ async fn click_to_join_redeem_invite_smoke() {
     ));
 
     let community_registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "joiner-dev".into(),
         content_store: cs,

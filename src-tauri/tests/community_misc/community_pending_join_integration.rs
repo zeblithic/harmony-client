@@ -127,6 +127,7 @@ async fn pending_join_accepted_via_engine_insert_without_admin_pub_bind() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
@@ -264,6 +265,7 @@ fn build_engine_with_resolver(
         )),
     ));
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
@@ -674,6 +676,7 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
 
     // Joiner's engine: self_owner = joiner_addr, crdt_state = Some, nav_emitter = Some.
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        device_cipher: harmony_app::device_dataset_file::test_cipher(),
         adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
