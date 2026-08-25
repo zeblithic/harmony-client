@@ -333,6 +333,32 @@
   // 'incoming' (the groupCallStateUnsub subscription below). The toast body reads
   // "{caller} is calling {group name}".
   let groupIncomingCall = $state<{ callId: string; spaceId: string; callerName: ResolvedName; callerOwner: string; groupName: string; callerAvatarUrl?: string } | null>(null);
+  // ZEB-980 (CodeAnt): the toast `callerName` above is snapshotted at invite time.
+  // The $effect just above refreshes the SESSION state (so the in-call bar upgrades
+  // when a card/petname lands mid-ring, ZEB-959) but NOT these toast models — so a
+  // still-ringing toast would keep the stale name/hex while the bar shows the live
+  // one. Re-resolve the toast caller name reactively from `callerOwner` + the live
+  // resolvers (keyed on the same cardVersion/contactPetnames deps) so provenance
+  // stays live on the incoming-call surface. A $derived (not an $effect write) so it
+  // can't self-loop. The stored snapshot is kept only for the one-shot OS notify.
+  const incomingCallToast = $derived.by(() => {
+    cardVersion; contactPetnames; // reactive deps
+    if (!incomingCall) return null;
+    const card = resolveCard(incomingCall.callerOwner);
+    return {
+      ...incomingCall,
+      callerName: resolveMemberName(resolveNickname(incomingCall.callerOwner), card?.displayName) ?? hexName(incomingCall.callerOwner.slice(0, 8)),
+    };
+  });
+  const groupIncomingCallToast = $derived.by(() => {
+    cardVersion; contactPetnames; // reactive deps
+    if (!groupIncomingCall) return null;
+    const card = resolveCard(groupIncomingCall.callerOwner);
+    return {
+      ...groupIncomingCall,
+      callerName: resolveMemberName(resolveNickname(groupIncomingCall.callerOwner), card?.displayName) ?? hexName(groupIncomingCall.callerOwner.slice(0, 8)),
+    };
+  });
   // ZEB-364: buffers for incoming-call signaling that lands during the startup
   // window — after the `incoming-call` / `incoming-group-call` listeners are
   // registered but before buildVoiceSession builds callSession / groupCall.
@@ -4233,7 +4259,7 @@
 -->
 {#if callSession}
   <IncomingCallToast
-    {incomingCall}
+    incomingCall={incomingCallToast}
     onAccept={() => {
       // accept() uses the spaceId pinned by onIncoming() — guard only on there
       // being an incoming call to acknowledge.
@@ -4253,15 +4279,7 @@
 -->
 {#if groupCall}
   <IncomingCallToast
-    incomingCall={groupIncomingCall
-      ? {
-          callId: groupIncomingCall.callId,
-          callerName: groupIncomingCall.callerName,
-          callerOwner: groupIncomingCall.callerOwner,
-          groupName: groupIncomingCall.groupName,
-          ...(groupIncomingCall.callerAvatarUrl ? { callerAvatarUrl: groupIncomingCall.callerAvatarUrl } : {}),
-        }
-      : null}
+    incomingCall={groupIncomingCallToast}
     onAccept={() => { if (groupIncomingCall) swallow(leaveOtherVoiceThen(() => groupCall!.accept())); }}
     onDecline={() => swallow(groupCall!.decline())}
   />
