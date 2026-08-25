@@ -17,7 +17,7 @@ import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
 import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
-import { resolveMemberName } from './display-label';
+import { resolveMemberName, resolvedNameEqual, type ResolvedName } from './display-label';
 
 export type GroupCallPhase = 'idle' | 'incoming' | 'connecting' | 'active' | 'leaving';
 
@@ -26,7 +26,9 @@ export interface Participant {
   deviceHex: string;
   muted: boolean;
   speaking: boolean;
-  displayName?: string;
+  /** Resolved name (label + provenance) rendered via `PeerName.svelte` so the
+   *  ZEB-977 petname badge survives into the group-call roster (ZEB-980). */
+  displayName?: ResolvedName;
   avatarUrl?: string;
   state: 'in-call' | 'ringing' | 'declined';
 }
@@ -40,7 +42,7 @@ function participantsEqual(a: Participant[], b: Participant[]): boolean {
     if (
       x.ownerHex !== y.ownerHex || x.deviceHex !== y.deviceHex ||
       x.muted !== y.muted || x.speaking !== y.speaking ||
-      x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl ||
+      !resolvedNameEqual(x.displayName, y.displayName) || x.avatarUrl !== y.avatarUrl ||
       x.state !== y.state
     ) {
       return false;
@@ -292,7 +294,7 @@ export class GroupCallSession {
         ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
         : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
       const card = this.deps.resolveCard?.(r.ownerHex);
-      const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName)?.label;
+      const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName);
       out.push({ ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking, state: 'in-call',
         ...(displayName ? { displayName } : {}),
         ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}) });
@@ -300,7 +302,7 @@ export class GroupCallSession {
     for (const ownerHex of members) {
       if (live.has(ownerHex) || ownerHex === this.deps.selfOwnerHex) continue;
       const card = this.deps.resolveCard?.(ownerHex);
-      const displayName = resolveMemberName(this.deps.resolveNickname?.(ownerHex), card?.displayName)?.label;
+      const displayName = resolveMemberName(this.deps.resolveNickname?.(ownerHex), card?.displayName);
       out.push({ ownerHex, deviceHex: '', muted: true, speaking: false,
         state: this.declinedOwners.has(ownerHex) ? 'declined' : 'ringing',
         ...(displayName ? { displayName } : {}),

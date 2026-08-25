@@ -73,9 +73,9 @@ describe('GroupCallBar', () => {
       phase: 'active',
       startedAt: Date.now(),
       participants: [
-        participant({ ownerHex: 'aaaa', displayName: 'Alice', state: 'in-call' }),
-        participant({ ownerHex: 'bbbb', displayName: 'Bob', state: 'ringing' }),
-        participant({ ownerHex: 'cccc', displayName: 'Carol', state: 'declined' }),
+        participant({ ownerHex: 'aaaa', displayName: { label: 'Alice', source: 'card' }, state: 'in-call' }),
+        participant({ ownerHex: 'bbbb', displayName: { label: 'Bob', source: 'card' }, state: 'ringing' }),
+        participant({ ownerHex: 'cccc', displayName: { label: 'Carol', source: 'card' }, state: 'declined' }),
       ],
     });
     render(GroupCallBar, { props: { session: session as never } });
@@ -84,6 +84,37 @@ describe('GroupCallBar', () => {
     expect(screen.getByText('Alice')).toBeInTheDocument();
     expect(screen.getByText('Ringing…')).toBeInTheDocument();
     expect(screen.getByText('Declined')).toBeInTheDocument();
+  });
+
+  // ZEB-980 — tiles render through PeerName: a petname-sourced participant keeps
+  // the provenance badge; a card-sourced one (same label) does not.
+  it('shows the petname badge only for a petname-sourced participant', () => {
+    const session = fakeSession({
+      phase: 'active',
+      startedAt: Date.now(),
+      participants: [
+        participant({ ownerHex: 'aaaa', displayName: { label: 'Alice', source: 'petname' } }),
+        participant({ ownerHex: 'bbbb', displayName: { label: 'Bob', source: 'card' } }),
+      ],
+    });
+    const { container } = render(GroupCallBar, { props: { session: session as never } });
+    const tiles = screen.getAllByTestId('group-call-tile');
+    // Alice (petname) carries a badge inside her tile; Bob (card) does not.
+    expect(tiles[0].querySelector('.petname-badge')).not.toBeNull();
+    expect(tiles[1].querySelector('.petname-badge')).toBeNull();
+    // Sanity: exactly one badge in the whole bar.
+    expect(container.querySelectorAll('.petname-badge')).toHaveLength(1);
+  });
+
+  it('falls back to a hex short-id (no badge) when a participant has no resolved name', () => {
+    const session = fakeSession({
+      phase: 'active',
+      startedAt: Date.now(),
+      participants: [participant({ ownerHex: 'abcdef0123', state: 'in-call' })],
+    });
+    const { container } = render(GroupCallBar, { props: { session: session as never } });
+    expect(screen.getByText('abcdef…')).toBeInTheDocument();
+    expect(container.querySelector('.petname-badge')).toBeNull();
   });
 
   it('marks ringing/declined tiles with a data-state attribute', () => {

@@ -105,7 +105,7 @@
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant, ReceivedFile } from './lib/types';
   import { getThreadMeta, feedAuthorOwnerIds } from './lib/feed-utils';
   import { resolveAuthorLabel } from './lib/mention-render';
-  import { resolveMemberName } from './lib/display-label';
+  import { resolveMemberName, hexName, type ResolvedName } from './lib/display-label';
   import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
   import { onMount } from 'svelte';
@@ -326,13 +326,39 @@
   // Incoming-call banner model. Set when an `incoming-call` event lands AND the
   // session actually entered the 'incoming' phase (not busy-auto-declined);
   // cleared whenever the call leaves that phase (accepted / declined / canceled).
-  let incomingCall = $state<{ callId: string; spaceId: string; callerName: string; callerAvatarUrl?: string } | null>(null);
+  let incomingCall = $state<{ callId: string; spaceId: string; callerName: ResolvedName; callerOwner: string; callerAvatarUrl?: string } | null>(null);
   // ZEB-360 T13: incoming GROUP-call banner model, mirroring `incomingCall`. Set
   // when an `incoming-group-call` event lands AND the group session entered the
   // 'incoming' phase (not busy-ignored); cleared when the group phase leaves
   // 'incoming' (the groupCallStateUnsub subscription below). The toast body reads
   // "{caller} is calling {group name}".
-  let groupIncomingCall = $state<{ callId: string; spaceId: string; callerName: string; groupName: string; callerAvatarUrl?: string } | null>(null);
+  let groupIncomingCall = $state<{ callId: string; spaceId: string; callerName: ResolvedName; callerOwner: string; groupName: string; callerAvatarUrl?: string } | null>(null);
+  // ZEB-980 (CodeAnt): the toast `callerName` above is snapshotted at invite time.
+  // The $effect just above refreshes the SESSION state (so the in-call bar upgrades
+  // when a card/petname lands mid-ring, ZEB-959) but NOT these toast models — so a
+  // still-ringing toast would keep the stale name/hex while the bar shows the live
+  // one. Re-resolve the toast caller name reactively from `callerOwner` + the live
+  // resolvers (keyed on the same cardVersion/contactPetnames deps) so provenance
+  // stays live on the incoming-call surface. A $derived (not an $effect write) so it
+  // can't self-loop. The stored snapshot is kept only for the one-shot OS notify.
+  const incomingCallToast = $derived.by(() => {
+    cardVersion; contactPetnames; // reactive deps
+    if (!incomingCall) return null;
+    const card = resolveCard(incomingCall.callerOwner);
+    return {
+      ...incomingCall,
+      callerName: resolveMemberName(resolveNickname(incomingCall.callerOwner), card?.displayName) ?? hexName(incomingCall.callerOwner.slice(0, 8)),
+    };
+  });
+  const groupIncomingCallToast = $derived.by(() => {
+    cardVersion; contactPetnames; // reactive deps
+    if (!groupIncomingCall) return null;
+    const card = resolveCard(groupIncomingCall.callerOwner);
+    return {
+      ...groupIncomingCall,
+      callerName: resolveMemberName(resolveNickname(groupIncomingCall.callerOwner), card?.displayName) ?? hexName(groupIncomingCall.callerOwner.slice(0, 8)),
+    };
+  });
   // ZEB-364: buffers for incoming-call signaling that lands during the startup
   // window — after the `incoming-call` / `incoming-group-call` listeners are
   // registered but before buildVoiceSession builds callSession / groupCall.
@@ -671,14 +697,16 @@
       incomingCall = {
         callId: p.callId,
         spaceId: p.spaceId,
-        callerName: resolveMemberName(resolveNickname(p.callerOwner), card?.displayName)?.label ?? p.callerOwner.slice(0, 8),
+        callerName: resolveMemberName(resolveNickname(p.callerOwner), card?.displayName) ?? hexName(p.callerOwner.slice(0, 8)),
+        callerOwner: p.callerOwner,
         ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
       };
       // ZEB-356: escalate to the OS if the window is unfocused (no-op if focused).
+      // OS-notification text is flattened to `.label` (no rich rendering there).
       void incomingCallAlerter?.notify({
         id: p.callId,
         title: 'Incoming call',
-        body: `${incomingCall.callerName} is calling`,
+        body: `${incomingCall.callerName.label} is calling`,
       });
     }
   }
@@ -701,7 +729,7 @@
     const gst = groupCall ? get(groupCall.state) : null;
     if (gst && gst.phase === 'incoming' && gst.callId === p.callId) {
       const card = resolveCard(p.callerOwner);
-      const name = resolveMemberName(resolveNickname(p.callerOwner), card?.displayName)?.label ?? p.callerOwner.slice(0, 8);
+      const name = resolveMemberName(resolveNickname(p.callerOwner), card?.displayName) ?? hexName(p.callerOwner.slice(0, 8));
       const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
       // T13: raise the in-app ring toast (cleared when the group phase leaves
       // 'incoming' via the subscription in buildVoiceSession).
@@ -709,13 +737,15 @@
         callId: p.callId,
         spaceId: p.spaceId,
         callerName: name,
+        callerOwner: p.callerOwner,
         groupName,
         ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
       };
+      // OS-notification text is flattened to `.label` (no rich rendering there).
       void incomingCallAlerter?.notify({
         id: p.callId,
         title: 'Incoming group call',
-        body: `${name} is calling ${groupName}`,
+        body: `${name.label} is calling ${groupName}`,
       });
     }
   }
@@ -4229,7 +4259,7 @@
 -->
 {#if callSession}
   <IncomingCallToast
-    {incomingCall}
+    incomingCall={incomingCallToast}
     onAccept={() => {
       // accept() uses the spaceId pinned by onIncoming() — guard only on there
       // being an incoming call to acknowledge.
@@ -4249,13 +4279,7 @@
 -->
 {#if groupCall}
   <IncomingCallToast
-    incomingCall={groupIncomingCall
-      ? {
-          callId: groupIncomingCall.callId,
-          callerName: `${groupIncomingCall.callerName} · ${groupIncomingCall.groupName}`,
-          ...(groupIncomingCall.callerAvatarUrl ? { callerAvatarUrl: groupIncomingCall.callerAvatarUrl } : {}),
-        }
-      : null}
+    incomingCall={groupIncomingCallToast}
     onAccept={() => { if (groupIncomingCall) swallow(leaveOtherVoiceThen(() => groupCall!.accept())); }}
     onDecline={() => swallow(groupCall!.decline())}
   />

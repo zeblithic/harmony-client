@@ -197,7 +197,7 @@ describe('VoiceSession lifecycle + gate', () => {
       community: 'comm', channel: 'chan',
       roster: [{ owner: PEER, device: 'dd'.repeat(16), muted: false }],
     });
-    expect(get(s.state).roster.find((m) => m.ownerHex === PEER)?.displayName).toBe('Ziggy');
+    expect(get(s.state).roster.find((m) => m.ownerHex === PEER)?.displayName).toEqual({ label: 'Ziggy', source: 'petname' });
   });
 
   it('leaves a roster displayName undefined for a whitespace-only published card name', async () => {

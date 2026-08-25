@@ -38,7 +38,7 @@ function roster(n: number) {
     deviceHex: String(i).repeat(16),
     muted: false,
     speaking: i === 0,
-    displayName: `User${i}`,
+    displayName: { label: `User${i}`, source: 'card' },
     modMuted: false,
     power: 0,
   }));

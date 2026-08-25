@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { CallSession } from '../call-session';
+  import { hexName } from '../display-label';
+  import PeerName from './PeerName.svelte';
 
   let { session, onEnd }: { session: CallSession | null; onEnd: () => void } = $props();
 
@@ -28,11 +30,6 @@
     return `${mm}:${ss}`;
   }
 
-  function peerLabel(hex: string | null | undefined): string {
-    if (!hex) return 'In call';
-    return `${hex.slice(0, 6)}…`;
-  }
-
   // Fire-and-forget control actions (mirror VoiceChannelView).
   const swallow = (p: unknown) => { void Promise.resolve(p).catch(() => {}); };
   const toggleMute = () => { if (session && $callState) swallow(session.setMuted(!$callState.muted)); };
@@ -44,7 +41,13 @@
 
 {#if $callState?.phase === 'active' || $callState?.phase === 'connecting'}
   <div class="call-bar" data-testid="call-bar">
-    <span class="peer-label">{$callState?.peerDisplayName ?? peerLabel($callState?.peerOwnerHex)}</span>
+    <span class="peer-label">{#if $callState?.peerDisplayName}<PeerName
+        name={$callState.peerDisplayName}
+        ownerIdHex={$callState.peerOwnerHex ?? undefined}
+      />{:else if $callState?.peerOwnerHex}<PeerName
+        name={hexName(`${$callState.peerOwnerHex.slice(0, 6)}…`)}
+        ownerIdHex={$callState.peerOwnerHex}
+      />{:else}In call{/if}</span>
     <time class="elapsed">{fmtElapsed($callState?.startedAt)}</time>
     {#if $callState?.reconnecting}
       <!-- ZEB-353: the inbound DM media subscriber dropped and is re-declaring

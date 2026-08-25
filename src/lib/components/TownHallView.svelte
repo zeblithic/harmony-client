@@ -22,6 +22,8 @@
   import type { MentionCandidate } from '../mention-compose';
   import ChannelMessageFeed from './ChannelMessageFeed.svelte';
   import TownHallMotionCard from './TownHallMotionCard.svelte';
+  import PeerName from './PeerName.svelte';
+  import { hexName, type ResolvedName } from '../display-label';
 
   let {
     session,
@@ -281,8 +283,8 @@
   }
   const onWindowBlur = () => session.setPttHeld(false);
 
-  function label(m: Pick<RosterMember, 'displayName' | 'ownerHex'>): string {
-    return m.displayName ?? `${m.ownerHex.slice(0, 6)}…`;
+  function label(m: Pick<RosterMember, 'displayName' | 'ownerHex'>): ResolvedName {
+    return m.displayName ?? hexName(`${m.ownerHex.slice(0, 6)}…`);
   }
 </script>
 
@@ -330,7 +332,7 @@
               {/if}
               <div class="sp-info">
                 <span class="sp-name">
-                  {label(spotlight)}
+                  <PeerName name={label(spotlight)} ownerIdHex={spotlight.ownerHex} />
                   {#if spotlight.power >= MOD_POWER}
                     <span class="mod-pill" data-testid="th-mod-pill">MOD</span>
                   {/if}
@@ -379,7 +381,7 @@
                 {#if m.modMuted}
                   <span class="mod-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡</span>
                 {/if}
-                <span class="name">{label(m)}</span>
+                <span class="name"><PeerName name={label(m)} ownerIdHex={m.ownerHex} /></span>
                 {#if canModerate(m)}
                   <div class="mod-controls">
                     <button class="mod-btn" data-testid="mod-mute" onclick={() => modMute(m)}
@@ -420,7 +422,7 @@
                     <div class="q-avatar q-avatar-fallback" aria-hidden="true"></div>
                   {/if}
                   <span class="q-text">
-                    <span class="q-name">{label(m)}</span>
+                    <span class="q-name"><PeerName name={label(m)} ownerIdHex={m.ownerHex} /></span>
                     <span class="q-wants">wants to speak ✋</span>
                   </span>
                   {#if m.invited}

@@ -22,7 +22,7 @@ import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
 import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
-import { resolveMemberName } from './display-label';
+import { resolveMemberName, resolvedNameEqual, type ResolvedName } from './display-label';
 
 export type CallPhase =
   | 'idle'
@@ -38,11 +38,13 @@ export interface CallSessionState {
   peerOwnerHex: string | null;
   /**
    * The peer's name resolved through the `nickname → card` ladder (ZEB-958),
-   * or `null` when neither yields a non-blank name (the in-call bar then renders
-   * its own hex short-id). Only the callee side carries a peer here — the caller
-   * side leaves `peerOwnerHex`/`peerDisplayName` null and shows "In call".
+   * carried as a full {@link ResolvedName} (label + provenance) so the in-call
+   * bar renders it through `PeerName.svelte` and keeps the ZEB-977 petname badge
+   * (ZEB-980), or `null` when neither yields a non-blank name (the bar then
+   * renders its own hex short-id). Only the callee side carries a peer here — the
+   * caller side leaves `peerOwnerHex`/`peerDisplayName` null and shows "In call".
    */
-  peerDisplayName: string | null;
+  peerDisplayName: ResolvedName | null;
   muted: boolean;
   pttMode: boolean;
   pttHeld: boolean;
@@ -252,7 +254,7 @@ export class CallSession {
     this.spaceId = spaceId;
     this.patch({
       phase: 'incoming', callId, peerOwnerHex: callerOwnerHex,
-      peerDisplayName: resolveMemberName(this.deps.resolveNickname?.(callerOwnerHex), this.deps.resolveCard?.(callerOwnerHex)?.displayName)?.label ?? null,
+      peerDisplayName: resolveMemberName(this.deps.resolveNickname?.(callerOwnerHex), this.deps.resolveCard?.(callerOwnerHex)?.displayName) ?? null,
       muted: true, deafened: false, pttMode: false, pttHeld: false,
       startedAt: null, endReason: null,
     });
@@ -275,8 +277,8 @@ export class CallSession {
     const name = resolveMemberName(
       this.deps.resolveNickname?.(s.peerOwnerHex),
       this.deps.resolveCard?.(s.peerOwnerHex)?.displayName,
-    )?.label ?? null;
-    if (name !== s.peerDisplayName) this.patch({ peerDisplayName: name });
+    ) ?? null;
+    if (!resolvedNameEqual(name, s.peerDisplayName)) this.patch({ peerDisplayName: name });
   }
 
   /** Callee side: accept the inbound call and connect the media engine. */

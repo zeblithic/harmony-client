@@ -69,13 +69,13 @@ describe('CallSession peer name ladder (ZEB-958)', () => {
       (h) => (h === CALLER ? 'Ziggy' : undefined),
     );
     s.onIncoming('call-1', CALLER, 'space-1');
-    expect(get(s.state).peerDisplayName).toBe('Ziggy');
+    expect(get(s.state).peerDisplayName).toEqual({ label: 'Ziggy', source: 'petname' });
   });
 
   it('falls to the card name when there is no nickname', () => {
     const s = sessionWith((h) => (h === CALLER ? { displayName: 'CallerCard' } : undefined), () => undefined);
     s.onIncoming('call-1', CALLER, 'space-1');
-    expect(get(s.state).peerDisplayName).toBe('CallerCard');
+    expect(get(s.state).peerDisplayName).toEqual({ label: 'CallerCard', source: 'card' });
   });
 
   it('leaves peerDisplayName null for a whitespace-only published card name (bar shows hex)', () => {
@@ -116,18 +116,18 @@ describe('CallSession reactive peer-name refresh (ZEB-959)', () => {
 
     ref.card = 'CallerCard'; // card subscription resolves mid-call
     s.refreshPeerName();
-    expect(get(s.state).peerDisplayName).toBe('CallerCard');
+    expect(get(s.state).peerDisplayName).toEqual({ label: 'CallerCard', source: 'card' });
   });
 
   it('prefers a nickname that arrives after a card was already shown', () => {
     const { s, ref } = sessionWithRefs();
     ref.card = 'CallerCard';
     s.onIncoming('call-1', CALLER, 'space-1');
-    expect(get(s.state).peerDisplayName).toBe('CallerCard');
+    expect(get(s.state).peerDisplayName).toEqual({ label: 'CallerCard', source: 'card' });
 
     ref.nick = 'Ziggy'; // friend nickname lands after the card
     s.refreshPeerName();
-    expect(get(s.state).peerDisplayName).toBe('Ziggy');
+    expect(get(s.state).peerDisplayName).toEqual({ label: 'Ziggy', source: 'petname' });
   });
 
   it('is a no-op when no peer is present (caller side / idle)', () => {

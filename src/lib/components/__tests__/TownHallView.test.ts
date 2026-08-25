@@ -44,7 +44,7 @@ function member(i: number, over: Record<string, unknown> = {}) {
     deviceHex: String(i).padStart(2, '0').repeat(32),
     muted: false,
     speaking: false,
-    displayName: `User${i}`,
+    displayName: { label: `User${i}`, source: 'card' },
     modMuted: false,
     power: 0,
     handRaisedAt: null,
