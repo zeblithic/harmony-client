@@ -308,6 +308,60 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 - **Build effect:** edits within mail/mint/identity now recompile only those crates. **Risk:** low.
 
 ### Stage 2 — Transport/DM spine + vine
+
+> **Ground-truth correction (2026-08-25, ZEB-990; decided with Jake).** A per-file
+> production-dependency scan of post-#740 `main` falsified this stage's bottom-up
+> premise — the same class of correction as every Stage-1 stage. **`transport`,
+> `dm`, and `owner-fleet` are a strongly-connected cycle, not a layered chain:**
+>
+> - **dm ↔ transport** (real cycle): transport→dm 25 (`iroh_butler_acceptor` /
+>   `iroh_tunnel_dm_transport` / `iroh_friend_acceptor` deserialize and route DM
+>   envelopes) *and* dm→transport (dm→`tunnel_manager` 3, plus dm→`butler_deposit`
+>   23, which itself depends on `iroh_framing` 8 / `iroh_endpoint` 2). The DM
+>   protocol runs over the iroh tunnels and the tunnel acceptors speak DM.
+> - **owner-fleet ↔ (dm+transport)** (real cycle): owner-fleet CRDT/sync →
+>   `network_health` 24 + `butler_deposit` 14 + `dm_signing` 5, while
+>   dm → `owner_state_crdt` 18. This is why Stage-1 correction #2 already deferred
+>   owner-fleet here — it is *inside* the spine.
+> - The doc's 3 surgeries (I/B/C) touch only the community seam (~27 edges); the
+>   scan shows the transport cluster alone carries ~160 blocker edges, incl.
+>   **social 39** (`friend_intro` 17, `friend_graph` 11) unlisted — though
+>   `friend_graph` lives *inside* the owner-state CRDT, so much of that becomes
+>   intra-spine once owner-fleet joins.
+>
+> **Decision: coarse — extract the spine as ONE crate.** Foundation-first prep,
+> then pull `transport` + `dm` + `owner-fleet` + the mid-tier (`butler_deposit`,
+> `reachability_resolver`/`reachability_record`, `peer_liveness`,
+> `protocol_versioning`, …) into a single `harmony-transport`/spine crate, cutting
+> only the **external** community/social seams (not the internal cycles). Captures
+> the ~120k-LOC build win (transport 52k + owner-fleet 43k + dm 25k) at the lowest
+> risk; `vine` extracts cleanly on top afterward. Seam-cutting the internal cycles
+> into separate dm/transport/vine crates was considered and rejected as far higher
+> mechanical risk (≈4–5 wide trait extractions) for speculative fine granularity.
+>
+> **Re-scoped Stage-2 sequence:**
+> - **PR #1 — foundation-first leaves → `harmony-core-types`** *(current)*.
+>   `revoked_device_projection` (51L; `crate::owner_state_types` only — a
+>   self-documented "standalone leaf") + `enrollment_verify` (313L;
+>   `harmony_owner::certs` only, zero monolith `crate::` deps). Both are genuine
+>   downward leaves used across the spine (dm 11, transport 20, vine 1). Home is
+>   core-types (already deps `harmony-owner` + holds `owner_state_types`);
+>   foundation cannot hold them without a `harmony-owner`+core-types dep that would
+>   pollute its pure-primitives character. `enrollment_verify::quorum_fixtures`
+>   (`#[cfg(any(test, feature = "test-fixtures"))]`, used by ~13 modules' seam
+>   tests) rides a new core-types `test-fixtures` feature + a harmony-app dev-dep
+>   (the crate-split test-fixtures pattern). Only new core-types dep: `ed25519-dalek`
+>   (`"2"`, unifies to the locked 2.2.0).
+> - **PR #2+ — the spine crate.** External-boundary scan (spine→community/social/
+>   orchestrator seams, and which mid-tier modules come along) is the next design
+>   pass; the seam-cutting plan will be surfaced before cutting.
+> - **PR #N — `harmony-vine`** on top of the spine.
+>
+> `peer_liveness` / `admission_oracle` are **not** downward leaves
+> (`peer_liveness`→`reconnect_supervisor`; `admission_oracle`→`community_topology`)
+> — they are spine / community-tier and extract with their cluster.
+
+*(Original plan, retained for context — superseded by the correction above.)*
 - Surgeries **I** (`file_sharing` → dm), **B** (`CommunityRelayDepositClient` + `lookup_pubkey` seam), **C** (`community_neighbors` → shared) — each removes a cross-edge before the crate on the depending side is extracted.
 - Extract `harmony-dm` (after idc), `harmony-transport` (after dm), `harmony-vine` (after transport).
 - **Build effect:** the transport/dm spine (transport 52k, dm 25k) recompiles independently. **Risk:** medium — trait extractions are mechanical but wide; land each surgery as its own commit, `cargo build --lib` + `scripts/test-select` between.
