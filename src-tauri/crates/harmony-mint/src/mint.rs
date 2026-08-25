@@ -355,6 +355,15 @@ pub fn delete_account(
                 "account has transactions; pass reassign_to".into(),
             ));
         }
+        // No LIVE transactions — but tombstoned (soft-deleted) rows may still
+        // reference this account through the enforced FK (the schema has no
+        // ON DELETE CASCADE). Without purging them, the account DELETE below
+        // fails with a foreign-key violation, and in the command path the
+        // deletion floor has already been persisted → a phantom floor for an
+        // account that still exists. Purge the dead rows first, mirroring the
+        // sync-apply path (`mint_sync::apply_remote_snapshot`, which likewise
+        // DELETEs an account's transactions before the account itself).
+        tx.execute("DELETE FROM transactions WHERE account_id = ?", params![id])?;
     }
 
     // ── Mutations ─────────────────────────────────────────────────────────────
@@ -557,6 +566,31 @@ fn validate_metadata(s: &str) -> Result<(), MintError> {
     serde_json::from_str::<serde_json::Value>(s)
         .map(|_| ())
         .map_err(|e| MintError::Validation(format!("metadata is not valid JSON: {e}")))
+}
+
+/// Validate the user-controllable fields of a transaction, applying exactly the
+/// same rules as `create_transaction` / `update_transaction`.
+///
+/// Exposed within the crate so the sync ingest path
+/// (`mint_sync::upsert_transaction_lww`) can reject a malformed peer row before
+/// it persists invalid ledger data (bad date/amount/currency/description/
+/// metadata) that list/export would then surface — the local command path
+/// already enforces these, but a peer snapshot bypasses it (ZEB-989/CA4).
+pub(crate) fn validate_transaction_fields(
+    transaction_date: &str,
+    amount: &str,
+    currency: &str,
+    description: &str,
+    metadata: Option<&str>,
+) -> Result<(), MintError> {
+    validate_date(transaction_date)?;
+    validate_amount(amount)?;
+    validate_currency(currency)?;
+    validate_description(description)?;
+    if let Some(m) = metadata {
+        validate_metadata(m)?;
+    }
+    Ok(())
 }
 
 // ── Transaction CRUD ──────────────────────────────────────────────────────────
@@ -1198,6 +1232,65 @@ mod tests {
             matches!(err, MintError::Validation(ref s) if s.contains("has transactions")),
             "expected 'has transactions' in Validation error, got: {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn delete_account_with_only_tombstoned_txns_succeeds() {
+        // ZEB-989/CA3: an account whose only transactions are soft-deleted
+        // (tombstoned) has no LIVE transactions, so delete-without-reassign is
+        // allowed — but the tombstoned rows still reference the account through
+        // the enforced FK (no ON DELETE CASCADE). delete_account must purge them
+        // first so the account DELETE cannot fail with a foreign-key violation
+        // (which, in the command path, would leave a persisted phantom floor).
+        let conn = fresh_db();
+        let account = create_account(&conn, "Chase").unwrap();
+
+        // Create then soft-delete a transaction, leaving a tombstoned row.
+        let txn = create_transaction(
+            &conn,
+            NewTransaction {
+                transaction_date: "2026-05-19".into(),
+                amount: "-10.00".into(),
+                currency: "USD".into(),
+                account_id: account.id.clone(),
+                description: "coffee".into(),
+                metadata: None,
+            },
+        )
+        .unwrap();
+        delete_transaction(&conn, &txn.id).unwrap();
+
+        // The tombstoned row physically remains and still FK-references the account.
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
+                params![account.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "tombstoned row must still be present pre-delete"
+        );
+
+        // Delete without reassign must SUCCEED (previously failed with an FK error).
+        delete_account(&conn, &account.id, None).unwrap();
+
+        assert!(
+            list_accounts(&conn).unwrap().is_empty(),
+            "account must be gone"
+        );
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
+                params![account.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphans, 0,
+            "tombstoned rows must be purged with the account"
         );
     }
 

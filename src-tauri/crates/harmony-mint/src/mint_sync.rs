@@ -272,6 +272,26 @@ fn upsert_transaction_lww(
     ) {
         return Ok(());
     }
+    // ZEB-989/CA4: defense-in-depth. The local command path validates every
+    // field via create_transaction/update_transaction, but a peer snapshot
+    // bypasses it — a malformed remote row would otherwise persist an invalid
+    // date/amount/currency/description/metadata that list/export then surface.
+    // Validate with the same rules and DROP just this row (not the whole
+    // snapshot) if it fails, so unrelated valid rows still apply.
+    if let Err(e) = crate::mint::validate_transaction_fields(
+        &r.transaction_date,
+        &r.amount,
+        &r.currency,
+        &r.description,
+        r.metadata.as_deref(),
+    ) {
+        tracing::warn!(
+            id = %r.id,
+            error = %e,
+            "mint sync: dropping remote transaction with invalid fields"
+        );
+        return Ok(());
+    }
     let local_updated_at: Option<String> = tx
         .query_row(
             "SELECT updated_at FROM transactions WHERE id = ?",
@@ -1924,6 +1944,70 @@ mod tests {
         let snap = snapshot_current_db(&mut local).unwrap();
         assert_eq!(snap.accounts.len(), 1);
         assert_eq!(snap.transactions.len(), 1);
+    }
+
+    #[test]
+    fn apply_drops_transaction_with_invalid_fields() {
+        // ZEB-989/CA4: a malformed peer transaction (here: an unparseable
+        // amount) must be dropped without persisting, and must NOT abort the
+        // surrounding snapshot apply — the sibling valid row still lands.
+        let mut local = fresh_db();
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![AccountRow {
+                id: "a1".into(),
+                name: "Chase".into(),
+                created_at: "2026-05-01T00:00:00Z".into(),
+                updated_at: "2026-05-01T00:00:00Z".into(),
+            }],
+            transactions: vec![
+                TransactionRow {
+                    id: "good".into(),
+                    transaction_date: "2026-05-01".into(),
+                    amount: "-12.34".into(),
+                    currency: "USD".into(),
+                    account_id: "a1".into(),
+                    description: "Coffee".into(),
+                    metadata: None,
+                    created_at: "2026-05-01T00:00:00Z".into(),
+                    updated_at: "2026-05-01T00:00:00Z".into(),
+                    deleted_at: None,
+                },
+                TransactionRow {
+                    id: "bad".into(),
+                    transaction_date: "2026-05-01".into(),
+                    amount: "not-a-number".into(), // fails validate_amount
+                    currency: "USD".into(),
+                    account_id: "a1".into(),
+                    description: "Malformed".into(),
+                    metadata: None,
+                    created_at: "2026-05-01T00:00:00Z".into(),
+                    updated_at: "2026-05-01T00:00:00Z".into(),
+                    deleted_at: None,
+                },
+            ],
+            settings: vec![],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        apply_remote_snapshot(&mut local, &remote, &HashMap::new(), None).unwrap();
+
+        let good: i64 = local
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE id = ?",
+                ["good"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let bad: i64 = local
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE id = ?",
+                ["bad"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(good, 1, "valid row must persist");
+        assert_eq!(bad, 0, "malformed row must be dropped, apply not aborted");
     }
 
     #[test]

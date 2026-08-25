@@ -263,7 +263,7 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 >   the bare type). The `RecordingSink` test recorder moves *with* the trait
 >   (its `impl` is on `Arc<RecordingSink>`, legal only where the trait is local),
 >   exposed under `test-fixtures`.
-> - **PR #5 — `recoverable_load` → `harmony-identity-crypto`** *(this PR)*. The
+> - **PR #5 — `recoverable_load` → `harmony-identity-crypto`** *(#739, merged)*. The
 >   ZEB-986 recovery read-path is idc-tier, not orchestrator glue: its only
 >   production code deps are `device_dataset_file::{DeviceCipher, read_image,
 >   reseal_if_legacy, ImageError}`. Moving the whole module (plaintext
