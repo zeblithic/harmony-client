@@ -267,7 +267,9 @@ pub use harmony_foundation::{clock_trust, hlc_adopt_floor, profile};
 // content-addressing leaf tier extracted to harmony-identity-crypto. Re-exported
 // so existing crate::identity::* / crate::device_dataset_file::* /
 // crate::content_store::* / crate::avatar_blob_store::* call sites resolve
-// unchanged. Depends only on harmony-core-types + harmony-foundation.
+// unchanged. Among the workspace's split crates it depends only downward on
+// harmony-core-types + harmony-foundation (plus the harmony-* crypto/content
+// crates and third-party primitives) — never sideways into harmony-app.
 pub use harmony_identity_crypto::{
     avatar_blob_store, content_store, device_dataset_file, identity,
 };
