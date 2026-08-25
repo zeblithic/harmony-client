@@ -62,6 +62,46 @@ cd src-tauri && cargo nextest run --locked -p harmony-app --features test-fixtur
 
 The `-p` flag scopes to one workspace member — much faster than the full `--workspace` run during dev.
 
+### The fast inner loop: `--lib` (one binary)
+
+When iterating on a single library module, add `--lib` to build and run **only
+the crate's own unit tests** — the inline `#[cfg(test)] mod tests` blocks
+compiled into the lib target:
+
+```bash
+cd src-tauri && cargo nextest run --locked -p harmony-app --lib --features test-fixtures -E 'test(<module>)'
+```
+
+Why it is faster: `--lib` links **exactly one** test binary. The default
+`--all-targets` set also links every `tests/*.rs` integration binary (~25 of
+them), and touching `src/lib.rs` forces **all of them to re-link** against the
+rebuilt ~88k-line crate. Measured on this workspace (warm tree, hot sccache):
+
+| Relink after touching `src/lib.rs` (build + link only) | Time |
+|---|---|
+| `--lib` (1 binary) | ~15 s |
+| `--all-targets` (~25 binaries) | ~31 s |
+
+On a warm tree the gap is modest — the extra 24 re-links cost ~16 s total.
+It blows out when the tree is **cold**, or when a public-API change forces
+every integration binary to *recompile* (not just re-link) from scratch: the
+`--all-targets` set then runs into the 10-min range while `--lib` stays in the
+tens of seconds. That cold case is the tax the inner loop is built to avoid.
+
+**Backstop discipline (load-bearing — see [`--all-targets` is
+load-bearing](#--all-targets-is-load-bearing)):** `--lib` compiles **none** of
+the integration tests, so it *cannot* catch a break in `tests/*.rs` — exactly
+the ZEB-164 failure mode where main stayed "green" for two days under lib-only
+local runs. `--lib` is the innermost loop **only**. The mandatory ladder:
+
+| Loop | Command | Catches |
+|---|---|---|
+| Innermost — one module | `… --lib -E 'test(<module>)'` | lib unit tests only |
+| Per-task gate | `scripts/test-select --context task` | changed-file tests + a rotating `--all-targets` partition |
+| Pre-PR / CI backstop | `cargo nextest run --locked --workspace --all-targets --features test-fixtures` | everything |
+
+Never open a PR on the strength of a `--lib` run alone.
+
 ### Running a single test by name
 
 ```bash
@@ -139,8 +179,9 @@ Wire-format pinning tests (`tests/wire_format_*_fixtures.rs`) use deterministic 
 ### `--all-targets` is load-bearing
 
 Always include `--all-targets` in clippy and full-gate test commands (the
-ZEB-631 iterative selection below is the one documented exception — and it is
-backstopped by full runs). Without it, integration test compile errors slip through the lib-only `cargo test` invocation. ZEB-164's SidecarId migration proved this: main stayed "green" for two days while contributors only ran `cargo test --lib` locally; the breakage was in `tests/content_index_integration.rs` and `tests/folder_primitive_integration.rs`.
+`--lib` inner loop above and the ZEB-631 iterative selection below are the
+documented exceptions — both are inner-loop-only and backstopped by full runs).
+Without it, integration test compile errors slip through the lib-only `cargo test` invocation. ZEB-164's SidecarId migration proved this: main stayed "green" for two days while contributors only ran `cargo test --lib` locally; the breakage was in `tests/content_index_integration.rs` and `tests/folder_primitive_integration.rs`.
 
 ### `--locked` is load-bearing
 
