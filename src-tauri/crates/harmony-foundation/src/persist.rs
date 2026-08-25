@@ -1,12 +1,14 @@
 //! Durable atomic file replacement (ZEB-548 Stage 1).
 //!
-//! A broadly-shared persistence primitive — 11+ call sites spanning the
+//! A broadly-shared persistence primitive — 9 call sites spanning the
 //! owner-fleet, community, identity-crypto, and app tiers — lifted out of
 //! `harmony-app`'s `owner_state_persist` into this foundation leaf so every
 //! tier depends on it *downward* instead of reaching sideways into a peer
-//! module. Returns [`std::io::Result`] because I/O is its only failure mode;
-//! callers wanting a richer error convert at the boundary (e.g.
-//! `PersistError: From<std::io::Error>` covers the `?` sites unchanged).
+//! module. Every error it *returns* is an I/O error, so callers wanting a
+//! richer error convert at the boundary (e.g. `PersistError:
+//! From<std::io::Error>` covers the `?` sites unchanged). A `path` with no
+//! parent directory is a caller-precondition panic (see `# Panics`), not a
+//! returned error.
 
 #[cfg(unix)]
 use std::fs::File;
@@ -24,6 +26,10 @@ use std::path::Path;
 /// already atomic for in-volume renames on NTFS, and NTFS journals
 /// the directory update along with the file rename, so dropping the
 /// dir fsync on Windows preserves the same crash semantics.
+///
+/// # Panics
+/// Panics if `path` has no parent directory (e.g. a bare root). Every caller
+/// passes a file path under a data dir, so this is unreachable in practice.
 pub fn save_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().expect("save_atomically: path has no parent");
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;

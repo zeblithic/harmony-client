@@ -10,7 +10,7 @@
 //!   (ZEB-790).
 //! - [`wall_clock_ms`] — the wall-clock source (ms since the Unix epoch).
 //! - [`persist::save_atomically`] — durable atomic file replacement, shared by
-//!   11+ call sites across the owner-fleet, community, identity-crypto, and app
+//!   9 call sites across the owner-fleet, community, identity-crypto, and app
 //!   tiers (ZEB-548 Stage 1).
 //! - [`profile`] — process-global named-profile selection (ZEB-446).
 //!

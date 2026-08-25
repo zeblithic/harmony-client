@@ -10,7 +10,7 @@ use std::path::Path;
 // ZEB-548 Stage 1: the durable atomic-write primitive moved to
 // harmony-foundation (a broadly-shared leaf beneath every tier). Re-exported
 // here so the existing crate::owner_state_persist::save_atomically call path —
-// used by ~11 modules across the app — resolves unchanged. Foundation's variant
+// used by 9 modules across the app — resolves unchanged. Foundation's variant
 // returns std::io::Result; callers convert at the boundary (PersistError:
 // From<io::Error> covers the `?` sites).
 pub use harmony_foundation::save_atomically;

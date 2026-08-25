@@ -112,7 +112,7 @@ graph TD
 
 Notes on the DAG:
 - Arrows are "depends on." The layering (L0 bottom → L4 top) is the topological order; the migration extracts bottom-up. The diagram is the **target after the §4 surgeries** — see the caveat below.
-- **`harmony-foundation`** (added 2026-08-25 per the §6 Stage-1 correction; **broadened in PR #2** to also home `save_atomically` + `profile`) is a leaf with no `harmony-*` deps (`chrono`/`tracing`/`tempfile`; not even `core-types`) — and, like `core-types`, is depended on broadly across the mid-layer (`clock_trust`/`hlc_adopt_floor` have ~24/~23 dependents each; `save_atomically` has 11 callers spanning owner-fleet, community, identity-crypto, and app). Only representative edges are drawn to avoid clutter.
+- **`harmony-foundation`** (added 2026-08-25 per the §6 Stage-1 correction; **broadened in PR #2** to also home `save_atomically` + `profile`) is a leaf with no `harmony-*` deps (`chrono`/`tracing`/`tempfile`; not even `core-types`) — and, like `core-types`, is depended on broadly across the mid-layer (`clock_trust`/`hlc_adopt_floor` have ~24/~23 dependents each; `save_atomically` has 9 callers spanning owner-fleet, community, identity-crypto, and app). Only representative edges are drawn to avoid clutter.
 - `harmony-app-core` (L3) is where `NodeState`, `start_node_inner`, `event_loop.rs`, and the `*_commands.rs` glue live. The thin `#[tauri::command]` wrappers + `generate_handler!` stay in the **binary** crate `harmony-app` (L4) because they need the live `tauri::Wry` runtime; their `_impl` bodies migrate down into the feature crates.
 - **`social_graph` and `voice` end up *above* `community`** (both depend on it one-way) once their shared primitives are promoted out: cycle E's `KeyedSlidingWindow` and cycle G's AEAD helpers move to shared modules, and cycle F's friend-acceptor logic relocates into `social_graph`.
 - **Caveat — the mid-layer edges are the design target, not a guarantee.** The exact residual direction of a few edges (and two file relocations: `file_sharing` → dm in Stage 2, `iroh_friend_acceptor` → social_graph in Stage 3) is finalized as each surgery lands; the layering above is the intended acyclic result.
@@ -211,14 +211,15 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 >   **universal primitives the §2 inventory mis-assigned to it**, so they move
 >   *down* into `harmony-foundation` rather than into the tier:
 >   - `owner_state_persist::save_atomically` — a generic atomic-write helper with
->     **11 callers** spanning owner-fleet (`fleet_key_epoch`, `fleet_dataset_file`,
+>     **9 callers** spanning owner-fleet (`fleet_key_epoch`, `fleet_dataset_file`,
 >     `fleet_peer_seed_persist`), community (`community_channel_log`),
 >     identity-crypto (`device_dataset_file`, `avatar_blob_store`), and app
 >     (`friend_nicknames`, `emoji_names`, `backup_state`). Homing it in
 >     identity-crypto would **invert the layering** (owner-fleet/community depending
 >     *up* into identity-crypto for a filesystem write); foundation is the only
->     home below all of them. Return type narrows `PersistError → io::Result` (its
->     sole failure mode is I/O; `PersistError: From<io::Error>` keeps every `?` site
+>     home below all of them. Return type narrows `PersistError → io::Result` (every
+>     error it *returns* is an I/O error — a parentless `path` is a caller-precondition
+>     panic, not a returned error; `PersistError: From<io::Error>` keeps every `?` site
 >     source-compatible), so foundation gains one durable-write primitive but no
 >     owner-state coupling. Re-exported from `owner_state_persist`, so the
 >     `crate::owner_state_persist::save_atomically` call path is unchanged. This

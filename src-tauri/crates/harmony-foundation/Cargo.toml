@@ -4,7 +4,7 @@
 #   - clock_trust (ZEB-831)        — bounded-time trust policy
 #   - hlc_adopt_floor (ZEB-790)    — causal HLC adoption floor
 #   - wall_clock_ms                — the wall-clock source
-#   - persist::save_atomically     — durable atomic file replacement (11+ callers)
+#   - persist::save_atomically     — durable atomic file replacement (9 callers)
 #   - profile (ZEB-446)            — process-global named-profile selection
 # No Tauri, no harmony-* deps, no back-reference to harmony-app. The durable-write
 # primitive means this is not strictly I/O-free, but it stays a pure leaf at the
