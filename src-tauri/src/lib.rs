@@ -226,12 +226,7 @@ pub mod iroh_tunnel_dm_transport;
 pub mod latched_join_reattempt;
 pub mod library_directory;
 pub mod liveness_heartbeat;
-pub mod mail;
-pub mod mail_sync;
 pub mod mint;
-pub mod mint_sync;
-pub mod mint_sync_persist;
-pub mod mint_sync_types;
 pub mod node_event_sink;
 pub mod notes_commands;
 pub mod notes_crdt;
@@ -275,6 +270,17 @@ pub use harmony_foundation::{clock_trust, hlc_adopt_floor, profile};
 pub use harmony_identity_crypto::{
     avatar_blob_store, content_store, device_dataset_file, identity, recoverable_load,
 };
+// ZEB-548 Stage 1 (PR #6): mail store + mail-sync engine extracted to
+// harmony-mail (a Tauri-free leaf over foundation/idc/runtime-ipc/mailbox).
+// Re-exported so crate::mail::* / crate::mail_sync::* call sites resolve unchanged.
+pub use harmony_mail::{mail, mail_sync};
+// ZEB-548 Stage 1 (PR #6): the Mint pure ledger logic + owner-scoped sync engine
+// moved to harmony-mint. The `mint` module here is the surviving Tauri command
+// shim (12 #[tauri::command] wrappers over crate::mint_db_handle) which
+// re-exports the pure API; the sync engine + its types/persist are re-exported so
+// crate::mint_sync::* / crate::mint_sync_types::* / crate::mint_sync_persist::*
+// call sites resolve unchanged.
+pub use harmony_mint::{mint_sync, mint_sync_persist, mint_sync_types};
 // The four wire types owner_state_types used to register on other modules'
 // behalf (friend_graph::{FriendGraph, FriendEntry}, friend_token::FriendTokenPayload,
 // owner_state_crdt::OwnerState) now register here, next to their harmony-app

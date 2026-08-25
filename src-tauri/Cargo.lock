@@ -2843,11 +2843,14 @@ dependencies = [
  "harmony-identity",
  "harmony-identity-crypto",
  "harmony-iroh",
+ "harmony-mail",
  "harmony-mailbox",
+ "harmony-mint",
  "harmony-owner",
  "harmony-pkarr",
  "harmony-reachability",
  "harmony-runtime",
+ "harmony-runtime-ipc",
  "harmony-telemetry",
  "harmony-tunnel",
  "harmony-tunnel-iroh",
@@ -3100,6 +3103,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-mail"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "harmony-foundation",
+ "harmony-identity-crypto",
+ "harmony-mailbox",
+ "harmony-runtime-ipc",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harmony-mailbox"
 version = "0.1.0"
 source = "git+https://github.com/zeblithic/harmony.git?rev=777a5c007c076d96840c9a3b012a028ea3d17a3e#777a5c007c076d96840c9a3b012a028ea3d17a3e"
@@ -3122,6 +3143,29 @@ dependencies = [
  "postcard",
  "rand_core 0.6.4",
  "serde",
+]
+
+[[package]]
+name = "harmony-mint"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "chrono",
+ "ciborium",
+ "csv",
+ "harmony-core-types",
+ "harmony-foundation",
+ "harmony-identity-crypto",
+ "rusqlite",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3227,6 +3271,13 @@ dependencies = [
  "rand_core 0.6.4",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "harmony-runtime-ipc"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

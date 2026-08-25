@@ -276,9 +276,26 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 >   under idc's own `cfg(test)` — no cross-crate dev-dep needed for idc's tests (the
 >   monolith's remaining `test_cipher` callers are already covered by the PR #4 idc
 >   `test-fixtures` dev-dep). Only new idc dep: `serde_json` (dev, test-only).
-> - **PR #6 — `harmony-mail` + `harmony-mint`.** Relocate the two residual type
->   leaks (`event_loop::FetchRequest`, a shared struct; `fleet_sync::RepublishDirty`,
->   a 4-line trait mint implements) to shared homes, then extract both leaves.
+> - **PR #6 — `harmony-mail` + `harmony-mint`** *(this PR — bundled per Jake)*.
+>   A pre-extraction rescan corrected two more design-doc assumptions:
+>   - **`FetchRequest` is one of a family.** It is not a lone leak — it is one of
+>     the four command-thread → event-loop request contracts (`FetchRequest`,
+>     `PublishRequest`, `IngestRequest`, `ContentVerbRequest`). All four move
+>     together into a **new `harmony-runtime-ipc` leaf crate** (pure message
+>     types, `tokio`-`sync` only); `event_loop` re-exports them so the
+>     `crate::event_loop::*` sites resolve unchanged. `RepublishDirty` (the 4-line
+>     seam trait) moves to `harmony-foundation` (`republish`), re-exported from
+>     `fleet_sync`.
+>   - **`mint` is not a clean leaf.** `mint.rs` mixes the pure ledger logic
+>     (`&Connection` → `Result`, no Tauri) with **12 `#[tauri::command]`
+>     handlers** that need `AppHandle`/`NodeState`/`mint_db_handle`. The extraction
+>     is therefore a *command-layer surgery*: the pure logic + `mint_sync` (+ its
+>     `mint_sync_types`/`mint_sync_persist`) move to `harmony-mint`; the 12
+>     command wrappers + `notify_mint_dirty` stay in the binary as `src/mint.rs`,
+>     which glob-re-exports the pure API (`pub use harmony_mint::mint::*`) so the
+>     `generate_handler!` registration and every `crate::mint::*` site (including
+>     `mint_db_handle`'s `mint::open_database`) resolve unchanged. `mail` is the
+>     clean move it was expected to be (0 Tauri).
 > - **owner-fleet + the transport/dm spine** move to Stage 2 per the bottom-up rule.
 >
 > The bottom-up strategy and the §7 mechanics are unchanged; only the cluster

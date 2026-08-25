@@ -1,0 +1,18 @@
+# harmony-runtime-ipc — ZEB-548 Stage 1 (PR #6).
+# The command-thread → event-loop request contracts, lifted out of harmony-app's
+# `event_loop` so feature crates (harmony-mail, and future extractions) can send
+# runtime requests without depending on the whole binary. Pure message types —
+# only tokio's `sync` channels, no runtime, no macros; no `harmony-*` deps.
+# harmony-app re-exports them from `event_loop` so its `crate::event_loop::{...}`
+# call sites resolve unchanged.
+[package]
+name = "harmony-runtime-ipc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+
+[lib]
+name = "harmony_runtime_ipc"
+
+[dependencies]
+tokio = { version = "1", features = ["sync"] }

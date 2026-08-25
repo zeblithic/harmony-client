@@ -33,6 +33,10 @@ harmony-reachability = { git = "https://github.com/zeblithic/harmony.git", rev =
 # `hash::truncated_hash` in the other clusters — so its rev lives here for
 # lockstep. Consumers add the `password-envelope` feature.
 harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
+# ZEB-548 Stage 1 (PR #6): harmony-mailbox is now shared — harmony-mail uses its
+# message wire types (HarmonyMessage/RecipientType) and harmony-app still uses it
+# in the DM/butler clusters — so its rev lives here for lockstep.
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -166,9 +170,22 @@ harmony-foundation = { path = "crates/harmony-foundation" }
 # the crate::identity::* / crate::content_store::* / crate::device_dataset_file::*
 # / crate::avatar_blob_store::* call sites resolve unchanged.
 harmony-identity-crypto = { path = "crates/harmony-identity-crypto" }
+# ZEB-548 Stage 1 (PR #6): command-thread → event-loop request contracts
+# (FetchRequest/PublishRequest/IngestRequest/ContentVerbRequest). event_loop.rs
+# re-exports them so crate::event_loop::* call sites resolve unchanged.
+harmony-runtime-ipc = { path = "crates/harmony-runtime-ipc" }
+# ZEB-548 Stage 1 (PR #6): mail store + mail-sync engine leaf. harmony-app
+# re-exports its modules (lib.rs) so crate::mail::* / crate::mail_sync::* resolve
+# unchanged.
+harmony-mail = { path = "crates/harmony-mail" }
+# ZEB-548 Stage 1 (PR #6): Mint pure ledger + sync engine leaf. The Tauri command
+# shim stays in src/mint.rs; harmony-app re-exports the pure/sync modules so
+# crate::mint::* / crate::mint_sync::* resolve unchanged.
+harmony-mint = { path = "crates/harmony-mint" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
-harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
+# ZEB-548 Stage 1 (PR #6): rev now in [workspace.dependencies] (shared with harmony-mail).
+harmony-mailbox = { workspace = true }
 harmony-owner = { workspace = true, features = ["recovery"] }
 # ZEB-716: direct dep for `hash::truncated_hash` — the primitive behind
 # harmony-identity's device address_hash — so the community-invite wire

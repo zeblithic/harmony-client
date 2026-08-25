@@ -1,0 +1,55 @@
+# harmony-mint — ZEB-548 Stage 1 (PR #6).
+# The Mint personal-finance backend: the pure SQLite/ledger logic (`mint`) plus
+# the owner-scoped sync engine (`mint_sync` + its `mint_sync_types` /
+# `mint_sync_persist`). Extracted from harmony-app; the 12 Tauri command
+# wrappers stay in the binary (they need AppHandle / NodeState / mint_db_handle)
+# and call into this crate. Depends only downward: harmony-core-types
+# (owner_state_crypto / owner_state_types), harmony-foundation (clock_trust /
+# hlc_adopt_floor / node_event_sink / republish), harmony-identity-crypto
+# (content_store / device_dataset_file), plus third-party primitives. No Tauri,
+# no back-reference to harmony-app; harmony-app re-exports these modules so the
+# crate::mint::* / crate::mint_sync::* call paths resolve unchanged.
+[package]
+name = "harmony-mint"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+
+[lib]
+name = "harmony_mint"
+
+[features]
+# Mirrors the sibling leaves: forwards to the fixtures the mint_sync tests use
+# (device_dataset_file::test_cipher). The dev-dependencies cover the default
+# `cargo test -p harmony-mint` path; this feature covers `--features test-fixtures`.
+test-fixtures = [
+    "harmony-foundation/test-fixtures",
+    "harmony-identity-crypto/test-fixtures",
+]
+
+[dependencies]
+harmony-core-types = { path = "../harmony-core-types" }
+harmony-foundation = { path = "../harmony-foundation" }
+harmony-identity-crypto = { path = "../harmony-identity-crypto" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = "0.4"
+async-trait = "0.1"
+thiserror = "1"
+blake3 = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+# mint.rs export_csv writes atomically (tempfile) in CSV form (csv); validators
+# parse monetary amounts with rust_decimal.
+tempfile = "3"
+csv = "1"
+rust_decimal = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+harmony-foundation = { path = "../harmony-foundation", features = ["test-fixtures"] }
+harmony-identity-crypto = { path = "../harmony-identity-crypto", features = ["test-fixtures"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
