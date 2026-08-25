@@ -568,11 +568,16 @@ impl MailManager {
         let Some(state) = self.index.folders.get(folder) else {
             return Vec::new();
         };
-        let start = page * per_page;
+        // Saturating arithmetic: `page`/`per_page` are caller-supplied (the
+        // list_mail IPC command). A huge product would otherwise panic in debug
+        // or wrap in release into an unintended slice / invalid range; saturating
+        // to usize::MAX makes an out-of-range page fall through to the empty
+        // return below.
+        let start = page.saturating_mul(per_page);
         if start >= state.entries.len() {
             return Vec::new();
         }
-        let end = (start + per_page).min(state.entries.len());
+        let end = start.saturating_add(per_page).min(state.entries.len());
         state.entries[start..end].to_vec()
     }
 
@@ -902,6 +907,22 @@ impl MailManager {
             match Self::peek_sealed(&path) {
                 Some(true) | None => continue, // already sealed, or empty/unreadable
                 Some(false) => {}              // legacy plaintext: migrate below
+            }
+            // Cap the read at the same 256 MiB metadata ceiling the sealed path
+            // enforces (device_dataset_file::check_size_cap): a corrupt or
+            // oversized legacy blob must not allocate unbounded during the
+            // synchronous startup migration. Skip (leave in place) rather than
+            // read it, so a large mailbox can't turn boot into a memory-pressure
+            // denial of service.
+            if crate::device_dataset_file::check_size_cap(&path, &Self::blob_label(cid_hex))
+                .is_err()
+            {
+                skipped += 1;
+                tracing::warn!(
+                    cid = %cid_hex,
+                    "mail blob migration: legacy blob exceeds the device-file size cap; leaving in place"
+                );
+                continue;
             }
             // Legacy plaintext blob: verify hash==cid, then re-seal in place.
             let raw = match std::fs::read(&path) {
@@ -1278,6 +1299,15 @@ mod tests {
         assert_eq!(mgr.list_folder("drafts", 0, 50).len(), 0);
         // Unknown folder
         assert_eq!(mgr.list_folder("nonexistent", 0, 50).len(), 0);
+
+        // ZEB-989/CA1: caller-supplied page/per_page must not overflow usize
+        // arithmetic (debug panic / release wrap). A huge product saturates and
+        // falls through to the empty return; a valid page 0 with an enormous
+        // per_page clamps to the folder size instead of overflowing start+per_page.
+        assert_eq!(mgr.list_folder("inbox", usize::MAX, 2).len(), 0);
+        assert_eq!(mgr.list_folder("inbox", 2, usize::MAX).len(), 0);
+        assert_eq!(mgr.list_folder("inbox", usize::MAX, usize::MAX).len(), 0);
+        assert_eq!(mgr.list_folder("inbox", 0, usize::MAX).len(), 5);
     }
 
     #[test]
@@ -1750,6 +1780,66 @@ mod tests {
             "legacy plaintext blob migrated to sealed on load"
         );
         assert_eq!(mgr.get_message(&cid).unwrap().body, "Hello, world!");
+    }
+
+    #[test]
+    fn legacy_migration_skips_oversized_blob_without_reading_it() {
+        // ZEB-989/CA2: the legacy-blob migration must not `fs::read` a blob that
+        // exceeds the device-file size cap — an oversized legacy file would
+        // otherwise allocate hundreds of MB during synchronous startup. The blob
+        // here is a SPARSE file (no real disk cost) whose CID equals blake3 of its
+        // zero content, so absent the cap the migration WOULD read + reseal it;
+        // with the cap it is left plaintext, untouched.
+        use crate::device_dataset_file::{MAX_DEVICE_FILE_BYTES, SEALED_DEVICE_SCHEMA_V3};
+        use std::io::Read;
+
+        fn first_byte(p: &std::path::Path) -> Option<u8> {
+            let mut f = std::fs::File::open(p).ok()?;
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).ok()?;
+            Some(b[0])
+        }
+
+        let len = MAX_DEVICE_FILE_BYTES + 1;
+        // CID = blake3 of `len` zero bytes, hashed incrementally (no big alloc).
+        let mut hasher = blake3::Hasher::new();
+        let chunk = vec![0u8; 1 << 20]; // 1 MiB of zeros
+        let mut remaining = len;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len() as u64) as usize;
+            hasher.update(&chunk[..n]);
+            remaining -= n as u64;
+        }
+        let cid = hex::encode(hasher.finalize().as_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        // First load stands up the blobs dir + sealed index.
+        drop(MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]));
+
+        // Drop a sparse, oversized, plaintext blob straight onto disk.
+        let blob_path = dir.path().join("blobs").join(format!("{cid}.bin"));
+        let f = std::fs::File::create(&blob_path).unwrap();
+        f.set_len(len).unwrap();
+        drop(f);
+        assert_ne!(
+            first_byte(&blob_path),
+            Some(SEALED_DEVICE_SCHEMA_V3),
+            "precondition: sparse blob is plaintext (first byte 0)"
+        );
+
+        // Reload → migration runs. The oversized blob must be SKIPPED (left
+        // plaintext), never read + resealed.
+        drop(MailManager::load(Some(&tc()), dir.path(), [0xBB; 16]));
+        assert_ne!(
+            first_byte(&blob_path),
+            Some(SEALED_DEVICE_SCHEMA_V3),
+            "oversized legacy blob must be left in place, not resealed"
+        );
+        assert_eq!(
+            std::fs::metadata(&blob_path).unwrap().len(),
+            len,
+            "oversized blob must be untouched on disk"
+        );
     }
 
     #[test]

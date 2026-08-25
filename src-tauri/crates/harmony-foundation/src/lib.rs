@@ -30,6 +30,7 @@ pub mod hlc_adopt_floor;
 pub mod node_event_sink;
 pub mod persist;
 pub mod profile;
+pub mod republish;
 
 pub use persist::save_atomically;
 

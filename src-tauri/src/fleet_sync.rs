@@ -511,11 +511,12 @@ impl<S: Send + 'static> Drop for FleetSyncEngine<S> {
 /// datasets); owner-state's `owner_state_sync::SyncEngine` WRAPPER carries its
 /// own delegating impl (the generic one cannot reach its private inner
 /// engine), and the distinct `MintSyncEngine` likewise in `mint_sync.rs`.
-pub trait RepublishDirty: Send + Sync {
-    /// Schedule a debounced re-publish of the current dataset root.
-    /// Non-blocking; coalesces with any pending dirty state.
-    fn republish_dirty(&self);
-}
+// ZEB-548 Stage 1 (PR #6): the trait itself moved to harmony-foundation (a leaf
+// crate) so the extracted feature engines (harmony-mint's MintSyncEngine) can
+// implement it without a back-dependency on harmony-app. Re-exported here so the
+// crate::fleet_sync::RepublishDirty call sites (owner_state_sync, event_loop,
+// lib) resolve unchanged.
+pub use harmony_foundation::republish::RepublishDirty;
 
 impl<S> FleetSyncEngine<S>
 where
