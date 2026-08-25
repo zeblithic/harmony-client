@@ -3077,6 +3077,7 @@ dependencies = [
  "rand 0.8.6",
  "secrecy 0.10.3",
  "serde",
+ "serde_json",
  "serial_test",
  "subtle",
  "tempfile",
