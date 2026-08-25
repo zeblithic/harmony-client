@@ -120,7 +120,6 @@ pub mod butler_deposit;
 pub mod channel_backfill;
 pub mod channel_chunk_index;
 pub mod channel_rbsr;
-pub mod clock_trust;
 pub mod community_address_book;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
@@ -214,7 +213,6 @@ pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
 pub mod friend_token;
-pub mod hlc_adopt_floor;
 pub mod identity;
 pub mod identity_commands;
 pub mod inflight_handshake_gate;
@@ -262,6 +260,11 @@ pub mod pairing;
 // `crate::owner_state_types::*` / `crate::owner_state_crypto::*` call sites keep
 // resolving unchanged.
 pub use harmony_core_types::{owner_state_crypto, owner_state_types};
+// ZEB-548 Stage 1: time/causality leaf primitives extracted to harmony-foundation.
+// Re-exported so existing crate::clock_trust::* / crate::hlc_adopt_floor::* /
+// crate::wall_clock_ms() call sites resolve unchanged.
+pub(crate) use harmony_foundation::wall_clock_ms;
+pub use harmony_foundation::{clock_trust, hlc_adopt_floor};
 // The four wire types owner_state_types used to register on other modules'
 // behalf (friend_graph::{FriendGraph, FriendEntry}, friend_token::FriendTokenPayload,
 // owner_state_crdt::OwnerState) now register here, next to their harmony-app
@@ -2545,17 +2548,6 @@ const ANNOUNCE_PREFIX: &str = "harmony/announce/";
 /// ZEB-669 S2: signed storage-buddy records live under
 /// `harmony/storage/{owner}/{pledges|backup-set|hosting}`.
 pub(crate) const STORAGE_RECORD_PREFIX: &str = "harmony/storage/";
-
-/// Wall-clock milliseconds since the Unix epoch. Used where a timestamp
-/// must be comparable across the event loop AND the IPC layer (e.g.
-/// hosting-report receipt stamps vs. displayed report age) — the loop's
-/// `start.elapsed()` clock is invisible outside `run()`.
-pub(crate) fn wall_clock_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 // ZEB-801: shown when an owner-derived handle is absent because the node has
 // not finished starting (`!node_is_running()`) — the common case.

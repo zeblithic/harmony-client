@@ -146,6 +146,9 @@ harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "777
 harmony-identity = { workspace = true }
 harmony-content = { workspace = true }
 harmony-core-types = { path = "crates/harmony-core-types" }
+# ZEB-548 Stage 1: time/causality leaf primitives (clock_trust, hlc_adopt_floor,
+# wall_clock_ms) — pure leaf, no harmony-* deps.
+harmony-foundation = { path = "crates/harmony-foundation" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }

@@ -7599,6 +7599,33 @@ mod plan_admin_proposal_tests {
 mod tests {
     use super::*;
 
+    /// ZEB-548 Stage 1: cross-invariant pins relocated here from
+    /// harmony-foundation's `clock_trust` / `hlc_adopt_floor` tests — that crate
+    /// is a pure leaf and cannot see the community cluster, but this side can see
+    /// both. Governance's forward-skew budget must stay at or above the control
+    /// tier (today `ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` aliases
+    /// `clock_trust::MAX_FORWARD_SKEW_MS`; the pin catches a future decoupling),
+    /// and the HLC adoption cap must stay far below that budget (ZEB-790 §6.2's
+    /// blast-radius conclusion — 60x headroom).
+    #[test]
+    fn forward_skew_budgets_stay_ordered_against_foundation() {
+        // Compile-visible pins (const-evaluated): a violation fails the build,
+        // not just the test run — matching the intent of the originals.
+        const {
+            assert!(
+                crate::clock_trust::MAX_FORWARD_SKEW_MS <= ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS,
+                "control tier must not exceed governance's ingest budget"
+            );
+        }
+        const {
+            assert!(
+                crate::hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS * 60
+                    <= ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS,
+                "HLC adopt cap must stay far below the governance skew budget (ZEB-790 §6.2)"
+            );
+        }
+    }
+
     #[test]
     fn channel_kind_defaults_to_text_and_reports_is_text() {
         assert_eq!(ChannelKind::default(), ChannelKind::Text);

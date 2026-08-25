@@ -53,6 +53,8 @@ The ticket text describes **runtime decomposition** — separate modules coordin
 | social_graph | 11 | 7.7k | `friend_*`, `contacts_*`, `follows` |
 | voice | 6 | 4.7k | `voice*` |
 
+> **Inventory caveat (2026-08-25):** this table groups by filename prefix, which mis-bucketed a **foundation tier** into `app_infra` — `device_dataset_file` (ZEB-982), `clock_trust` (ZEB-831), `hlc_adopt_floor` (ZEB-790), and the `wall_clock_ms` source are near-leaf primitives depended on across every cluster, not app-infra glue. They belong at L0 (see the §3 DAG and the §6 Stage-1 correction). Treat cluster membership below as topical, not as crate boundaries — the per-file production-dependency scan is the authority.
+
 ---
 
 ## 3. Phase 1 target architecture: the crate DAG
@@ -86,8 +88,9 @@ graph TD
     subgraph L1["Foundation"]
         OWNER["harmony-owner-fleet"]
     end
-    subgraph L0["Core vocabulary"]
+    subgraph L0["Core vocabulary + foundation"]
         CORE["harmony-core-types<br/>owner_state_types + owner_state_crypto"]
+        FOUND["harmony-foundation<br/>clock_trust · hlc_adopt_floor · wall_clock_ms"]
     end
     EXT["external harmony_* crates<br/>crdt_sync · owner · identity · pkarr · content"]
 
@@ -102,12 +105,14 @@ graph TD
     TRANSPORT --> OWNER & DM & CORE
     DM --> OWNER & IDC
     IDC --> OWNER
-    OWNER --> CORE
+    OWNER --> CORE & FOUND
+    COMM --> FOUND
     CORE --> EXT
 ```
 
 Notes on the DAG:
 - Arrows are "depends on." The layering (L0 bottom → L4 top) is the topological order; the migration extracts bottom-up. The diagram is the **target after the §4 surgeries** — see the caveat below.
+- **`harmony-foundation`** (added 2026-08-25 per the §6 Stage-1 correction) is a pure leaf — `chrono`/`tracing` only, not even `core-types` — and, like `core-types`, is depended on broadly across the mid-layer (`clock_trust`/`hlc_adopt_floor` have ~24/~23 dependents each). Only representative edges are drawn to avoid clutter.
 - `harmony-app-core` (L3) is where `NodeState`, `start_node_inner`, `event_loop.rs`, and the `*_commands.rs` glue live. The thin `#[tauri::command]` wrappers + `generate_handler!` stay in the **binary** crate `harmony-app` (L4) because they need the live `tauri::Wry` runtime; their `_impl` bodies migrate down into the feature crates.
 - **`social_graph` and `voice` end up *above* `community`** (both depend on it one-way) once their shared primitives are promoted out: cycle E's `KeyedSlidingWindow` and cycle G's AEAD helpers move to shared modules, and cycle F's friend-acceptor logic relocates into `social_graph`.
 - **Caveat — the mid-layer edges are the design target, not a guarantee.** The exact residual direction of a few edges (and two file relocations: `file_sharing` → dm in Stage 2, `iroh_friend_acceptor` → social_graph in Stage 3) is finalized as each surgery lands; the layering above is the intended acyclic result.
@@ -170,6 +175,47 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 > **Sequencing rule:** a cluster can be extracted into a crate only once *everything it depends on* is already a crate (otherwise it would depend on monolith code — a cycle with the binary). So extraction runs **bottom-up** in the DAG, and each cycle's surgery must land **before** the crate on the depending side is extracted.
 
 ### Stage 1 — Foundation + true leaves
+
+> **Ground-truth correction (2026-08-25, ZEB-989).** A per-file production-dependency
+> scan of `main` (test regions stripped) falsified this stage's original premise
+> that surgeries A+D alone make `owner-fleet` a clean `core-types`-only leaf. Two
+> facts drove a re-scope (decided with Jake — *foundation-first*):
+>
+> 1. **There is an unlisted foundation tier.** The §2 inventory grouped clusters
+>    by filename prefix and swept `device_dataset_file` (ZEB-982 at-rest sealing),
+>    `clock_trust` (ZEB-831), `hlc_adopt_floor` (ZEB-790), and the `wall_clock_ms`
+>    source into "app_infra". These are near-leaves yet universally depended-on
+>    (`device_dataset_file` alone: owner-fleet 54, mint 11, mail 8).
+> 2. **owner-fleet is not a clean leaf after A+D.** Surgery A is confirmed (it
+>    erases ~13 `community_*`/`voice_*`/`event_loop` edges — `address_book_sync`
+>    is the most cross-coupled file in the cluster), but the core state/fleet files
+>    still carry unlisted production couplings: `network_health` (17, transport),
+>    `friend_graph` (8, *inside* the owner-state CRDT), `content_store` (7),
+>    `dm_signing` (7), `butler_deposit` (6), `reachability_record` (8), `identity`
+>    (18), plus command-glue back-edges (`owner_quorum_commands` 9, `owner_commands`
+>    3) and an undocumented `owner_state ↔ identity` cycle. The "true leaves"
+>    (mail/mint/idc) likewise couple to orchestrator bits (`node_event_sink`,
+>    `event_loop`, `recoverable_load`), so they are not cleanly extractable right
+>    after owner-fleet either.
+>
+> **Revised Stage-1 sequence:**
+> - **PR #1 — `harmony-foundation`** = `clock_trust` + `hlc_adopt_floor` +
+>   `wall_clock_ms`. Pure leaves (deps: `chrono` + `tracing`; not even core-types).
+>   Zero surgery — git mv + re-export from `lib.rs`, exactly the Stage-0 pattern.
+>   Two cross-invariant test pins move into `community_membership` (compile-visible
+>   `const` asserts) since the leaf crate cannot see the community cluster.
+> - **PR #2 — `harmony-identity-crypto`+sealing** = `identity` + `device_dataset_file`
+>   + `content_store` + `avatar_blob_store`. Keeping `device_dataset_file` *with*
+>   `identity` makes its `identity::read_seed_from_disk` call intra-crate — no
+>   global seed-reader hook needed. `save_atomically` pulls down to foundation here.
+> - **PR #3+ — `harmony-owner-fleet`** (re-planned from the corrected coupling map:
+>   surgery A + cutting the network/social/dm couplings above) and the remaining
+>   leaves (`mail`, `mint`) once their orchestrator couplings are resolved.
+>
+> The bottom-up strategy and the §7 mechanics are unchanged; only the cluster
+> assignments and the intra-stage PR sequence are corrected.
+
+*(Original plan, retained for context — superseded by the correction above.)*
 - Surgeries **A** (relocate `owner_loaded`/`address_book_sync`) and **D** (`build_vine_relay_set` → vine) first — both are prerequisites that make `owner-fleet` depend only on `core-types`.
 - Extract `harmony-owner-fleet`, then the true leaves that depend only on owner-fleet/core: `harmony-mail`, `harmony-mint`, `harmony-identity-crypto` (minus `file_sharing.rs`). (Note: `voice` is **not** a leaf — it depends on `community`, so it lands in Stage 3.)
 - Move each cluster's inline tests **with** the cluster (tests only reduce build time once they leave the `harmony-app` crate).
