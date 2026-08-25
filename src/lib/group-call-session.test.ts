@@ -307,7 +307,7 @@ describe('GroupCallSession participant name ladder (ZEB-958)', () => {
       { owner: ALICE, device: ALICE_DEVICE, muted: false },
     ]);
     const alice = get(s.state).participants.find((p) => p.ownerHex === ALICE);
-    expect(alice?.displayName).toBe('Ziggy');
+    expect(alice?.displayName).toEqual({ label: 'Ziggy', source: 'petname' });
   });
 
   it('resolves a ringing (non-live) member name through the ladder too', async () => {
@@ -323,7 +323,7 @@ describe('GroupCallSession participant name ladder (ZEB-958)', () => {
     ]);
     const bob = get(s.state).participants.find((p) => p.ownerHex === BOB);
     expect(bob?.state).toBe('ringing');
-    expect(bob?.displayName).toBe('BobNick');
+    expect(bob?.displayName).toEqual({ label: 'BobNick', source: 'petname' });
   });
 
   it('leaves displayName undefined when the published card name is whitespace (leaf hex applies)', async () => {
@@ -367,7 +367,7 @@ describe('GroupCallSession reactive name refresh (ZEB-959)', () => {
     s.refreshNames();
     const bob = get(s.state).participants.find((p) => p.ownerHex === BOB);
     expect(bob?.state).toBe('ringing');
-    expect(bob?.displayName).toBe('BobCard');
+    expect(bob?.displayName).toEqual({ label: 'BobCard', source: 'card' });
   });
 
   it('does not emit a store update when there is no active call (idle)', () => {

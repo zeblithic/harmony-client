@@ -1,12 +1,25 @@
 <script lang="ts">
   import { fly } from 'svelte/transition';
+  import type { ResolvedName } from '../display-label';
+  import PeerName from './PeerName.svelte';
 
   let {
     incomingCall,
     onAccept,
     onDecline,
   }: {
-    incomingCall: { callId: string; callerName: string; callerAvatarUrl?: string } | null;
+    // ZEB-980: `callerName` carries provenance so the toast renders it through
+    // PeerName (petname badge preserved). `callerOwner` arms ZEB-979 collision
+    // detection on this surface — the one the ticket flags for impersonation
+    // pressure. `groupName`, when present, is the group-DM suffix (replaces the
+    // old `caller · group` string concat the caller model used to do).
+    incomingCall: {
+      callId: string;
+      callerName: ResolvedName;
+      callerOwner?: string;
+      groupName?: string;
+      callerAvatarUrl?: string;
+    } | null;
     onAccept: (callId: string) => void;
     onDecline: (callId: string) => void;
   } = $props();
@@ -20,7 +33,10 @@
       <div class="avatar avatar-fallback" aria-hidden="true"></div>
     {/if}
     <div class="call-info">
-      <span class="caller-name">{incomingCall.callerName}</span>
+      <span class="caller-name"><PeerName
+          name={incomingCall.callerName}
+          ownerIdHex={incomingCall.callerOwner}
+        />{#if incomingCall.groupName} · {incomingCall.groupName}{/if}</span>
       <span class="call-label">Incoming call</span>
     </div>
     <div class="call-actions">

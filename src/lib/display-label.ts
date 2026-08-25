@@ -75,3 +75,34 @@ export function resolveMemberName(
   if (card !== undefined) return { label: card, source: 'card' };
   return undefined;
 }
+
+/**
+ * Wrap a pre-formatted identity-prefix string as a `hex`-source {@link ResolvedName}
+ * so it renders through `PeerName.svelte` on the same path as resolved names
+ * (muted-mono, no badge) instead of a separate bare-string branch. Each call/voice
+ * leaf keeps its own hex FORMAT (bars: `hex.slice(0, 6) + '…'`; toasts:
+ * `hex.slice(0, 8)`) and passes the formatted label in — see `resolveMemberName`,
+ * which deliberately omits a hex rung for exactly this reason.
+ */
+export function hexName(label: string): ResolvedName {
+  return { label, source: 'hex' };
+}
+
+/**
+ * Structural equality for a `ResolvedName` field, null/undefined-aware.
+ *
+ * The call/voice session controllers store a resolved name on their roster/state
+ * objects and only patch the store when the view actually changed (ZEB-959).
+ * Those change checks compared plain name strings with `!==`; now that the field
+ * holds a freshly-built object each refresh, a reference `!==` would ALWAYS differ
+ * and churn the store ~10×/s on the voice drain tick. Compare by value instead.
+ * Two absent names (either `null` or `undefined`) count as equal.
+ */
+export function resolvedNameEqual(
+  a: ResolvedName | null | undefined,
+  b: ResolvedName | null | undefined,
+): boolean {
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
+  return a.label === b.label && a.source === b.source;
+}

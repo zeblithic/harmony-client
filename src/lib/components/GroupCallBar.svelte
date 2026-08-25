@@ -7,6 +7,8 @@
   // with power/modMuted), so the tiles are inlined here against `Participant`.
   import { onMount } from 'svelte';
   import type { GroupCallSession } from '../group-call-session';
+  import { hexName, type ResolvedName } from '../display-label';
+  import PeerName from './PeerName.svelte';
 
   let { session, groupName }: {
     session: GroupCallSession | null;
@@ -35,8 +37,8 @@
     return `${mm}:${ss}`;
   }
 
-  function tileLabel(p: { displayName?: string; ownerHex: string }): string {
-    return p.displayName ?? `${p.ownerHex.slice(0, 6)}…`;
+  function tileName(p: { displayName?: ResolvedName; ownerHex: string }): ResolvedName {
+    return p.displayName ?? hexName(`${p.ownerHex.slice(0, 6)}…`);
   }
 
   function stateLabel(s: 'in-call' | 'ringing' | 'declined'): string {
@@ -91,7 +93,7 @@
             {:else}
               <div class="avatar avatar-fallback" aria-hidden="true"></div>
             {/if}
-            <span class="name">{tileLabel(p)}</span>
+            <span class="name"><PeerName name={tileName(p)} ownerIdHex={p.ownerHex} /></span>
             {#if p.state === 'in-call'}
               {#if p.muted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
             {:else}

@@ -10,7 +10,7 @@ import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
 import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
-import { resolveMemberName } from './display-label';
+import { resolveMemberName, resolvedNameEqual, type ResolvedName } from './display-label';
 
 export type SessionPhase = 'idle' | 'joining' | 'connected' | 'leaving';
 
@@ -28,7 +28,7 @@ export interface RosterMember {
   deviceHex: string;
   muted: boolean;
   speaking: boolean;    // derived (Task 5)
-  displayName?: string; // resolved from member card (Task 5)
+  displayName?: ResolvedName; // resolved name + provenance, rendered via PeerName (ZEB-980)
   avatarUrl?: string;   // resolved from member card (Task 5)
   modMuted: boolean;    // server-muted by a moderator (distinct from self-mute `muted`)
   power: number;        // moderation power level (for FE control gating)
@@ -131,7 +131,7 @@ function rostersEqual(a: RosterMember[], b: RosterMember[]): boolean {
     if (
       x.ownerHex !== y.ownerHex || x.deviceHex !== y.deviceHex ||
       x.muted !== y.muted || x.speaking !== y.speaking ||
-      x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl ||
+      !resolvedNameEqual(x.displayName, y.displayName) || x.avatarUrl !== y.avatarUrl ||
       x.modMuted !== y.modMuted || x.power !== y.power ||
       x.handRaisedAt !== y.handRaisedAt ||
       x.handFirstObservedMs !== y.handFirstObservedMs || x.invited !== y.invited
@@ -689,7 +689,7 @@ export class VoiceSession {
           ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
           : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
         const card = this.deps.resolveCard?.(r.ownerHex);
-        const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName)?.label;
+        const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName);
         return {
           ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking,
           modMuted: this.modMutedOwners.has(r.ownerHex),

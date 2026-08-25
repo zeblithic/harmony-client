@@ -4,6 +4,8 @@
   // roster layout — an avatar-tile stage grid for ≤12 participants, collapsing
   // to a compact list beyond.
   import type { VoiceSession, RosterMember } from '../voice-session';
+  import { hexName, type ResolvedName } from '../display-label';
+  import PeerName from './PeerName.svelte';
 
   let { session, channelName, communityId, channelId, onBeforeJoin }: {
     session: VoiceSession;
@@ -113,8 +115,8 @@
   // Losing focus (alt-tab) must drop the hold so the mic can't stick open.
   const onWindowBlur = () => session.setPttHeld(false);
 
-  function label(m: Pick<RosterMember, 'displayName' | 'ownerHex'>): string {
-    return m.displayName ?? `${m.ownerHex.slice(0, 6)}…`;
+  function label(m: Pick<RosterMember, 'displayName' | 'ownerHex'>): ResolvedName {
+    return m.displayName ?? hexName(`${m.ownerHex.slice(0, 6)}…`);
   }
 </script>
 
@@ -169,7 +171,7 @@
               {:else}
                 <div class="avatar avatar-fallback" aria-hidden="true"></div>
               {/if}
-              <span class="name">{label(m)}</span>
+              <span class="name"><PeerName name={label(m)} ownerIdHex={m.ownerHex} /></span>
               {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
                 <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡</span>
@@ -202,7 +204,7 @@
               data-testid="voice-list-row"
             >
               <span class="dot" class:on={m.speaking} aria-hidden="true"></span>
-              <span class="name">{label(m)}</span>
+              <span class="name"><PeerName name={label(m)} ownerIdHex={m.ownerHex} /></span>
               {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
                 <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡</span>

@@ -111,12 +111,32 @@ describe('CallInProgressBar', () => {
   it('renders the resolved peer name when peerDisplayName is set', () => {
     const session = fakeSession({
       phase: 'active', startedAt: Date.now(),
-      peerOwnerHex: 'abcdef'.repeat(5) + 'ab', peerDisplayName: 'Ziggy',
+      peerOwnerHex: 'abcdef'.repeat(5) + 'ab', peerDisplayName: { label: 'Ziggy', source: 'card' },
     });
     render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
     expect(screen.getByText('Ziggy')).toBeInTheDocument();
     // The hex short-id must NOT also show once a name resolved.
     expect(screen.queryByText(/abcdef…/)).toBeNull();
+  });
+
+  // ZEB-980 — the bar renders through PeerName, so a petname-sourced peer keeps
+  // its provenance badge; a card-sourced peer (same label) does NOT get one.
+  it('shows the petname badge for a petname-sourced peer, not a card-sourced one', () => {
+    const petSession = fakeSession({
+      phase: 'active', startedAt: Date.now(),
+      peerOwnerHex: 'abcdef'.repeat(5) + 'ab', peerDisplayName: { label: 'Ziggy', source: 'petname' },
+    });
+    const { container, unmount } = render(CallInProgressBar, { props: { session: petSession as never, onEnd: vi.fn() } });
+    expect(screen.getByText('Ziggy')).toBeInTheDocument();
+    expect(container.querySelector('.petname-badge')).not.toBeNull();
+    unmount();
+
+    const cardSession = fakeSession({
+      phase: 'active', startedAt: Date.now(),
+      peerOwnerHex: 'abcdef'.repeat(5) + 'ab', peerDisplayName: { label: 'Ziggy', source: 'card' },
+    });
+    const { container: cardContainer } = render(CallInProgressBar, { props: { session: cardSession as never, onEnd: vi.fn() } });
+    expect(cardContainer.querySelector('.petname-badge')).toBeNull();
   });
 
   it('falls back to the hex short-id when peerDisplayName is absent', () => {
