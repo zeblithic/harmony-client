@@ -3034,6 +3034,7 @@ name = "harmony-foundation"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "tempfile",
  "tracing",
 ]
 

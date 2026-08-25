@@ -161,73 +161,12 @@ mod tests {
         std::env::remove_var("HARMONY_PROFILE");
     }
 
-    /// The pure join used by lib.rs's resolve_app_data_dir (defined there;
-    /// exercised here so the profile module's test suite pins the layout).
-    #[test]
-    fn app_data_dir_in_maps_default_and_named() {
-        use std::path::Path;
-        let base = Path::new("base");
-        assert_eq!(
-            crate::app_data_dir_in(base, None),
-            base.join("net.zeblith.harmony")
-        );
-        assert_eq!(
-            crate::app_data_dir_in(base, Some("coord")),
-            base.join("net.zeblith.harmony")
-                .join("profiles")
-                .join("coord")
-        );
-    }
-
-    /// ZEB-465: the `HARMONY_DATA_DIR` base override wins over the platform
-    /// base; without either, the same error `serve` printed on Windows when
-    /// `dirs::data_dir()` returned None (which ignores the APPDATA override).
-    #[test]
-    fn resolve_app_data_dir_override_wins_else_platform_else_errors() {
-        use std::path::PathBuf;
-        // Override present: used as the base, with profile nesting applied.
-        assert_eq!(
-            crate::resolve_app_data_dir_from(
-                Some(PathBuf::from("/run/tmp")),
-                Some(PathBuf::from("/real/appdata")),
-                Some("alice"),
-            )
-            .unwrap(),
-            PathBuf::from("/run/tmp")
-                .join("net.zeblith.harmony")
-                .join("profiles")
-                .join("alice"),
-        );
-        // No override: falls back to the platform base (production path).
-        assert_eq!(
-            crate::resolve_app_data_dir_from(None, Some(PathBuf::from("/real/appdata")), None)
-                .unwrap(),
-            PathBuf::from("/real/appdata").join("net.zeblith.harmony"),
-        );
-        // A set-but-BLANK override (empty or whitespace-only) is treated as
-        // unset and falls back to the platform base — NOT a relative "" base
-        // under CWD (Qodo + CodeAnt, PR #264).
-        for blank in ["", "   "] {
-            assert_eq!(
-                crate::resolve_app_data_dir_from(
-                    Some(PathBuf::from(blank)),
-                    Some(PathBuf::from("/real/appdata")),
-                    None,
-                )
-                .unwrap(),
-                PathBuf::from("/real/appdata").join("net.zeblith.harmony"),
-                "blank override {blank:?} must fall back to the platform base",
-            );
-        }
-        // A blank override with no platform base still errors (not a "" base).
-        assert_eq!(
-            crate::resolve_app_data_dir_from(Some(PathBuf::from("")), None, None).unwrap_err(),
-            "cannot resolve platform data dir",
-        );
-        // Neither resolvable: the exact error `serve` aborted with on Windows.
-        assert_eq!(
-            crate::resolve_app_data_dir_from(None, None, None).unwrap_err(),
-            "cannot resolve platform data dir",
-        );
-    }
+    // NOTE (ZEB-548 Stage 1): two tests once lived here —
+    // `app_data_dir_in_maps_default_and_named` and
+    // `resolve_app_data_dir_override_wins_else_platform_else_errors`. They
+    // exercised `crate::app_data_dir_in` / `crate::resolve_app_data_dir_from`,
+    // which live in `harmony-app` (lib.rs), not in this leaf crate. When
+    // `profile` was extracted into harmony-foundation they moved to
+    // harmony-app's `mod tests`, still pinning the profile-scoped path layout
+    // from the crate that actually owns those functions.
 }

@@ -284,9 +284,11 @@ regex = "1"
 # ZEB-626: direct dev-dep so the guard test can assert the vendored patch
 # is active (resolved to vendor/netdev by the [patch.crates-io] entry).
 netdev = "0.45.0"
-# tempfile is declared in [dependencies] (used by save_atomically); cargo
-# already makes it available to tests, so a [dev-dependencies] entry would
-# be redundant and would misleadingly suggest test-only usage.
+# tempfile is declared in [dependencies] (production code uses NamedTempFile
+# for atomic writes — connectivity_settings, mint, file_stream_crypto, …; the
+# save_atomically primitive itself moved to harmony-foundation in ZEB-548
+# Stage 1). cargo already makes it available to tests, so a [dev-dependencies]
+# entry would be redundant and would misleadingly suggest test-only usage.
 tauri = { version = "2", features = ["test"] }
 # ZEB-445: "io-util" gives the api/mod.rs unit tests AsyncRead/WriteExt for
 # their raw-TcpStream HTTP client (no HTTP-client dev-dep needed).
