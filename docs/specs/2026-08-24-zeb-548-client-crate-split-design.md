@@ -207,7 +207,11 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 > - **PR #2 — `harmony-identity-crypto`+sealing** = `identity` + `device_dataset_file`
 >   + `content_store` + `avatar_blob_store`. Keeping `device_dataset_file` *with*
 >   `identity` makes its `identity::read_seed_from_disk` call intra-crate — no
->   global seed-reader hook needed. `save_atomically` pulls down to foundation here.
+>   global seed-reader hook needed. The generic atomic-write helper
+>   `owner_state_persist::save_atomically` (file I/O) moves **into
+>   `harmony-identity-crypto`** alongside `device_dataset_file`, its sub-foundation
+>   consumer — *not* into `harmony-foundation`, which stays no-I/O. `owner-fleet`
+>   (PR #3, above this tier) then calls it downward from there.
 > - **PR #3+ — `harmony-owner-fleet`** (re-planned from the corrected coupling map:
 >   surgery A + cutting the network/social/dm couplings above) and the remaining
 >   leaves (`mail`, `mint`) once their orchestrator couplings are resolved.
