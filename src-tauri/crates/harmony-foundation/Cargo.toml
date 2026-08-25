@@ -1,9 +1,14 @@
 # harmony-foundation — ZEB-548 Stage 1 (foundation-first).
-# Broadly-depended-on, rarely-changing primitives extracted from harmony-app:
-# the bounded-time trust policy (clock_trust, ZEB-831), the causal HLC adoption
-# floor (hlc_adopt_floor, ZEB-790), and the wall-clock source. Pure leaves —
-# no I/O, no Tauri, no harmony-* deps, no back-reference to harmony-app. Sits
-# alongside harmony-core-types at the bottom of the crate DAG.
+# Broadly-depended-on, rarely-changing primitives extracted from harmony-app so
+# every higher tier depends on them downward instead of reaching sideways:
+#   - clock_trust (ZEB-831)        — bounded-time trust policy
+#   - hlc_adopt_floor (ZEB-790)    — causal HLC adoption floor
+#   - wall_clock_ms                — the wall-clock source
+#   - persist::save_atomically     — durable atomic file replacement (9 callers)
+#   - profile (ZEB-446)            — process-global named-profile selection
+# No Tauri, no harmony-* deps, no back-reference to harmony-app. The durable-write
+# primitive means this is not strictly I/O-free, but it stays a pure leaf at the
+# bottom of the crate DAG, alongside harmony-core-types.
 [package]
 name = "harmony-foundation"
 version = "0.1.0"
@@ -15,4 +20,5 @@ name = "harmony_foundation"
 
 [dependencies]
 chrono = "0.4"
+tempfile = "3"
 tracing = "0.1"

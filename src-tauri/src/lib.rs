@@ -260,11 +260,13 @@ pub mod pairing;
 // `crate::owner_state_types::*` / `crate::owner_state_crypto::*` call sites keep
 // resolving unchanged.
 pub use harmony_core_types::{owner_state_crypto, owner_state_types};
-// ZEB-548 Stage 1: time/causality leaf primitives extracted to harmony-foundation.
+// ZEB-548 Stage 1: broadly-shared leaf primitives extracted to harmony-foundation.
 // Re-exported so existing crate::clock_trust::* / crate::hlc_adopt_floor::* /
-// crate::wall_clock_ms() call sites resolve unchanged.
+// crate::wall_clock_ms() / crate::profile::* call sites resolve unchanged.
+// (save_atomically is re-exported from owner_state_persist so its existing
+// crate::owner_state_persist::save_atomically call path is preserved too.)
 pub(crate) use harmony_foundation::wall_clock_ms;
-pub use harmony_foundation::{clock_trust, hlc_adopt_floor};
+pub use harmony_foundation::{clock_trust, hlc_adopt_floor, profile};
 // The four wire types owner_state_types used to register on other modules'
 // behalf (friend_graph::{FriendGraph, FriendEntry}, friend_token::FriendTokenPayload,
 // owner_state_crdt::OwnerState) now register here, next to their harmony-app
@@ -280,7 +282,6 @@ pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
 pub mod pkarr_vines;
 pub mod pkarr_vines_publisher;
-pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
@@ -76682,6 +76683,79 @@ pub const LOCAL_IPC_URL: &str = "http://tauri.localhost";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ZEB-548 Stage 1: these two tests moved here from `profile`'s inline test
+    // module when `profile` was extracted into the harmony-foundation leaf
+    // crate. They pin the profile-scoped path layout of `app_data_dir_in` /
+    // `resolve_app_data_dir_from`, which live here in harmony-app (a leaf crate
+    // cannot see them), so their home is the crate that owns those functions.
+    #[test]
+    fn app_data_dir_in_maps_default_and_named() {
+        use std::path::Path;
+        let base = Path::new("base");
+        assert_eq!(
+            crate::app_data_dir_in(base, None),
+            base.join("net.zeblith.harmony")
+        );
+        assert_eq!(
+            crate::app_data_dir_in(base, Some("coord")),
+            base.join("net.zeblith.harmony")
+                .join("profiles")
+                .join("coord")
+        );
+    }
+
+    /// ZEB-465: the `HARMONY_DATA_DIR` base override wins over the platform
+    /// base; without either, the same error `serve` printed on Windows when
+    /// `dirs::data_dir()` returned None (which ignores the APPDATA override).
+    #[test]
+    fn resolve_app_data_dir_override_wins_else_platform_else_errors() {
+        use std::path::PathBuf;
+        // Override present: used as the base, with profile nesting applied.
+        assert_eq!(
+            crate::resolve_app_data_dir_from(
+                Some(PathBuf::from("/run/tmp")),
+                Some(PathBuf::from("/real/appdata")),
+                Some("alice"),
+            )
+            .unwrap(),
+            PathBuf::from("/run/tmp")
+                .join("net.zeblith.harmony")
+                .join("profiles")
+                .join("alice"),
+        );
+        // No override: falls back to the platform base (production path).
+        assert_eq!(
+            crate::resolve_app_data_dir_from(None, Some(PathBuf::from("/real/appdata")), None)
+                .unwrap(),
+            PathBuf::from("/real/appdata").join("net.zeblith.harmony"),
+        );
+        // A set-but-BLANK override (empty or whitespace-only) is treated as
+        // unset and falls back to the platform base — NOT a relative "" base
+        // under CWD (Qodo + CodeAnt, PR #264).
+        for blank in ["", "   "] {
+            assert_eq!(
+                crate::resolve_app_data_dir_from(
+                    Some(PathBuf::from(blank)),
+                    Some(PathBuf::from("/real/appdata")),
+                    None,
+                )
+                .unwrap(),
+                PathBuf::from("/real/appdata").join("net.zeblith.harmony"),
+                "blank override {blank:?} must fall back to the platform base",
+            );
+        }
+        // A blank override with no platform base still errors (not a "" base).
+        assert_eq!(
+            crate::resolve_app_data_dir_from(Some(PathBuf::from("")), None, None).unwrap_err(),
+            "cannot resolve platform data dir",
+        );
+        // Neither resolvable: the exact error `serve` aborted with on Windows.
+        assert_eq!(
+            crate::resolve_app_data_dir_from(None, None, None).unwrap_err(),
+            "cannot resolve platform data dir",
+        );
+    }
 
     fn make_payload(status: u8) -> Vec<u8> {
         let mut p = vec![0xAA; 32];
