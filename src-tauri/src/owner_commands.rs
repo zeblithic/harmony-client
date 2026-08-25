@@ -1222,7 +1222,7 @@ pub(crate) async fn revoke_device_inner(
                 let (new_doc, new_kt) = plan_fleet_epoch_bump(
                     &trust_now,
                     &carrier_snapshot,
-                    keys.newest().epoch,
+                    keys.newest().epoch(),
                     seed,
                     now_ms,
                 )?;
@@ -3768,7 +3768,7 @@ mod revoke_tests {
             plan_fleet_epoch_bump(&state, &carrier, 0, &seed, now_ms).expect("bump");
 
         assert_eq!(doc.epoch, 1);
-        assert_eq!(new_kt.epoch, 1);
+        assert_eq!(new_kt.epoch(), 1);
         assert_eq!(doc.bump_wall_ms, now_ms);
         // Survivors = A (seed-holder) + B; revoked C absent.
         let a_id_hex = hex::encode(
@@ -3795,7 +3795,7 @@ mod revoke_tests {
             crate::fleet_key_epoch::unseal_own_material(&doc, &b_id_hex, &b_sk).expect("unseal");
         assert_eq!(opened.epoch, 1);
         let back = crate::owner_state_crypto::KeyTree::from_fleet_material(&opened).unwrap();
-        assert_eq!(back.epoch, new_kt.epoch);
+        assert_eq!(back.epoch(), new_kt.epoch());
 
         // Chained bump: next epoch is max+1 even if data epoch lags.
         let (doc2, _) = plan_fleet_epoch_bump(&state, &doc, 0, &seed, now_ms + 1).expect("bump2");
@@ -4080,7 +4080,11 @@ mod revoke_tests {
             "revoked device gets no blob"
         );
         assert_eq!(doc.sealed.len(), 1, "only the seed-holder survives");
-        assert_eq!(keys.newest().epoch, 1, "key set publishes on the new epoch");
+        assert_eq!(
+            keys.newest().epoch(),
+            1,
+            "key set publishes on the new epoch"
+        );
 
         let _ = carrier_engine.shutdown().await;
         let _ = trust_engine.shutdown().await;

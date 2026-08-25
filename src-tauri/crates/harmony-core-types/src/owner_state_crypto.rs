@@ -131,9 +131,10 @@ const INFO_FRIEND_AEAD: &[u8] = b"friend-secret-aead-key";
 pub struct KeyTree {
     /// Fleet KeyTree epoch this tree was derived at (ZEB-668 S5). Not key
     /// material — plain copy, no zeroize. Distinct from transport/tunnel/
-    /// community epochs. ZEB-548 Stage 0: `pub` (was `pub(crate)`) so harmony-app
-    /// call sites reading `.epoch` reach it across the crate boundary.
-    pub epoch: u32,
+    /// community epochs. Read-only outside the crate via [`KeyTree::epoch`] — a
+    /// mutable `pub` field would let a caller relabel a derived tree's epoch
+    /// without re-deriving its keys (CodeRabbit, PR #734).
+    pub(crate) epoch: u32,
     entry_aead: Zeroizing<[u8; 32]>,
     root_aead: Zeroizing<[u8; 32]>,
     lookup: Zeroizing<[u8; 32]>,
@@ -142,6 +143,13 @@ pub struct KeyTree {
 }
 
 impl KeyTree {
+    /// The fleet KeyTree epoch this tree was derived at (ZEB-668 S5). Read-only
+    /// accessor: the epoch is bound to the derived key material and must never be
+    /// relabeled independently of it.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     /// Derive all keys at epoch 0 — the pre-rotation tree every fleet starts
     /// on. Byte-identical to the pre-S5 derivation (golden-pinned).
     pub fn derive(master_seed: &[u8; 32]) -> Result<Self, CryptoError> {
