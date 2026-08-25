@@ -230,15 +230,45 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 >     preserved by re-export. Two of its inline tests exercised harmony-app path
 >     helpers (`app_data_dir_in` / `resolve_app_data_dir_from`) and relocated to
 >     harmony-app's `mod tests`.
-> - **PR #3 — `harmony-identity-crypto`+sealing** = `identity` + `device_dataset_file`
->   + `content_store` + `avatar_blob_store`. Now a genuine `core-types`+`foundation`
->   leaf: keeping `device_dataset_file` *with* `identity` makes its
->   `identity::read_seed_from_disk` call intra-crate, and PR #2 already put
+> - **PR #3 — `harmony-identity-crypto`+sealing** ✅ *shipped (#737)* = `identity`
+>   + `device_dataset_file` + `content_store` + `avatar_blob_store`. A genuine
+>   `core-types`+`foundation` leaf: keeping `device_dataset_file` *with* `identity`
+>   makes its `identity::read_seed_from_disk` call intra-crate, and PR #2 already put
 >   `save_atomically`/`profile` beneath it. (`fetch_avatar` / `fleet_dataset_file`
 >   references in this tier are doc-comment intra-links, not code deps.)
-> - **PR #4+ — `harmony-owner-fleet`** (re-planned from the corrected coupling map:
->   surgery A + cutting the network/social/dm couplings above) and the remaining
->   leaves (`mail`, `mint`) once their orchestrator couplings are resolved.
+>
+> **Ground-truth correction #2 (2026-08-25, post-#737).** A re-scan of `main`
+> after the identity-crypto extraction falsified the original assumption that
+> `owner-fleet` is the next Stage-1 leaf. Its *downward* deps are now all
+> satisfied (idc/core/foundation), but its *core* state/fleet files (not the
+> surgery-A glue) still couple **upward** into six sibling clusters still in the
+> monolith — transport (`network_health` 17, `reachability_record` 8…), dm
+> (`dm_signing` 9, `butler_deposit` 8), social (`friend_graph` 8, inside the
+> owner-state CRDT), vine (`pkarr_vines` 5), voice, and the orchestrator. Surgery
+> A alone barely dents this (re-scanned with `owner_loaded`+`address_book_sync`
+> excluded). **`owner-fleet` is therefore not a Stage-1 leaf — it extracts
+> naturally in/after Stage 2**, once the transport/dm spine is a crate and those
+> edges point downward. The genuinely-clean remaining Stage-1 leaves are `mail`
+> and `mint`, whose only couplings above idc/core/foundation are two mis-tiered
+> shared primitives plus one small type-leak each:
+>
+> - **PR #4 — `node_event_sink` → `harmony-foundation`** *(this PR)*. The
+>   mode-agnostic emission trait (`NodeEventSink` + `emit_ser` + `FanoutSink`,
+>   ZEB-445) is a universal primitive (owner-fleet references it 12×, plus mail/
+>   mint and every future feature crate). The trait + helpers move down; the two
+>   sinks that need the live runtime stay in the binary — `AppHandleSink` (an
+>   orphan-rule newtype over `AppHandle`) and the `ApiEventSink` impl (moved to
+>   the bare type). The `RecordingSink` test recorder moves *with* the trait
+>   (its `impl` is on `Arc<RecordingSink>`, legal only where the trait is local),
+>   exposed under `test-fixtures`.
+> - **PR #5 — `recoverable_load` → `harmony-identity-crypto`.** The ZEB-986
+>   recovery read-path is idc-tier, not orchestrator glue: its real code deps are
+>   `device_dataset_file::{DeviceCipher, read_image, reseal_if_legacy}`. Moving it
+>   into idc makes those intra-crate and puts it beneath mail (4 callers).
+> - **PR #6 — `harmony-mail` + `harmony-mint`.** Relocate the two residual type
+>   leaks (`event_loop::FetchRequest`, a shared struct; `fleet_sync::RepublishDirty`,
+>   a 4-line trait mint implements) to shared homes, then extract both leaves.
+> - **owner-fleet + the transport/dm spine** move to Stage 2 per the bottom-up rule.
 >
 > The bottom-up strategy and the §7 mechanics are unchanged; only the cluster
 > assignments and the intra-stage PR sequence are corrected.

@@ -55,7 +55,11 @@ tauri-build = { version = "2", features = [] }
 # harmony-identity-crypto/test-fixtures propagates the same gate to the extracted
 # identity tier (ZEB-548 PR #3), so its `identity::test_only::*_for_test` seams
 # stay reachable from harmony-app's wire-format integration tests.
-test-fixtures = ["tauri/test", "harmony-identity-crypto/test-fixtures"]
+test-fixtures = [
+    "tauri/test",
+    "harmony-identity-crypto/test-fixtures",
+    "harmony-foundation/test-fixtures",
+]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }

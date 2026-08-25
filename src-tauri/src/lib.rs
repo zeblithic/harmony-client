@@ -3755,7 +3755,7 @@ async fn start_node(
     // ZEB-445: the GUI wraps its AppHandle as the event sink; serve mode
     // will pass a WS-broadcast sink with `wry_handle: None`.
     let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-        std::sync::Arc::new(app.clone());
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app.clone()));
     start_node_inner(endpoint, sink, Some(app), state.inner(), None).await
 }
 
@@ -16321,7 +16321,8 @@ pub async fn start_node_inner(
 /// Stop the harmony node and clean up.
 #[tauri::command]
 fn stop_node(app: AppHandle, state: tauri::State<'_, Mutex<NodeState>>) -> Result<(), String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     stop_node_impl(state.inner(), sink)
 }
 
@@ -21870,7 +21871,12 @@ async fn set_buddy_pledge(
     owner_address: String,
     bytes: u64,
 ) -> Result<(), String> {
-    set_buddy_pledge_impl(state.inner(), &app, owner_address, bytes)
+    set_buddy_pledge_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        owner_address,
+        bytes,
+    )
 }
 
 #[tauri::command]
@@ -21879,7 +21885,11 @@ async fn remove_storage_buddy(
     state: tauri::State<'_, Mutex<NodeState>>,
     owner_address: String,
 ) -> Result<(), String> {
-    remove_storage_buddy_impl(state.inner(), &app, owner_address)
+    remove_storage_buddy_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        owner_address,
+    )
 }
 
 #[tauri::command]
@@ -21888,7 +21898,11 @@ async fn set_shared_budget(
     state: tauri::State<'_, Mutex<NodeState>>,
     bytes: u64,
 ) -> Result<(), String> {
-    set_shared_budget_impl(state.inner(), &app, bytes)
+    set_shared_budget_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        bytes,
+    )
 }
 
 #[tauri::command]
@@ -21945,7 +21959,12 @@ async fn set_backup_flag(
     sidecar_id: String,
     backup: bool,
 ) -> Result<(), String> {
-    set_backup_flag_impl(state.inner(), &app, sidecar_id, backup)
+    set_backup_flag_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        sidecar_id,
+        backup,
+    )
 }
 
 #[cfg(test)]
@@ -24871,7 +24890,13 @@ async fn grant_read(
     cid: String,
     grantee_address: String,
 ) -> Result<(), String> {
-    grant_read_impl(state.inner(), &app, cid, grantee_address).await
+    grant_read_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        cid,
+        grantee_address,
+    )
+    .await
 }
 
 /// ZEB-674 Task 6: lazily revoke a grantee from a file's ShareList.
@@ -24882,7 +24907,13 @@ async fn revoke_read(
     cid: String,
     grantee_address: String,
 ) -> Result<(), String> {
-    revoke_read_impl(state.inner(), &app, cid, grantee_address).await
+    revoke_read_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        cid,
+        grantee_address,
+    )
+    .await
 }
 
 /// ZEB-727: grantee-local dismiss of a "Shared with me" entry (converges across
@@ -24893,7 +24924,12 @@ async fn dismiss_received_grant(
     state: tauri::State<'_, Mutex<NodeState>>,
     cid: String,
 ) -> Result<(), String> {
-    dismiss_received_grant_impl(state.inner(), &app, cid).await
+    dismiss_received_grant_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        cid,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -31486,7 +31522,7 @@ pub fn serve_cli(api_port: Option<u16>, display_name: Option<String>) -> i32 {
         let state = std::sync::Arc::new(Mutex::new(NodeState::default()));
         let events = crate::api::events::ApiEventSink::new();
         let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-            std::sync::Arc::new(events.clone());
+            events.clone();
 
         // serve auto-starts the node — a serve process with a stopped node
         // is a transient state (after stop_node RPC), not the default.
@@ -37783,7 +37819,8 @@ async fn create_community(
     name: String,
     is_invite_only: bool,
 ) -> Result<String, String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     create_community_impl(state_lock.inner(), sink, name, is_invite_only).await
 }
 
@@ -43567,7 +43604,8 @@ async fn redeem_invite(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     url: String,
 ) -> Result<RedeemInviteResultDto, RedeemInviteError> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     redeem_invite_impl(state_lock.inner(), sink, url).await
 }
 
@@ -43911,7 +43949,8 @@ async fn join_open_community(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<RedeemInviteResultDto, String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     join_open_community_impl(state_lock.inner(), sink, community_id).await
 }
 
@@ -48486,7 +48525,8 @@ async fn leave_community(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<(), String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     leave_community_impl(state_lock.inner(), sink, community_id).await
 }
 
@@ -59679,7 +59719,8 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
     min_power: Option<u32>,
 ) -> Result<String, String> {
     // ZEB-720: thin Tauri wrapper → shared _impl (also called by the RPC layer).
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     voting_create_tier2_proposal_impl(
         state_lock.inner(),
         sink,
@@ -59914,7 +59955,8 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
     support: bool,
 ) -> Result<(), String> {
     // ZEB-720: thin Tauri wrapper → shared _impl (also called by the RPC layer).
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     voting_signal_tier2_impl(state_lock.inner(), sink, proposal_id, support).await
 }
 
@@ -64044,7 +64086,8 @@ async fn connectivity_redeem_invite_iroh(
     // and delegate. The GUI path is unchanged — the same
     // `connectivity-invite-resolution-progress` and `nav-updated` events
     // fan out through the AppHandle sink.
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     connectivity_redeem_invite_iroh_impl(state.inner(), sink, invite_url).await
 }
 
@@ -64334,7 +64377,8 @@ async fn connectivity_open_join_iroh(
     state: tauri::State<'_, Mutex<NodeState>>,
     invite_url: String,
 ) -> Result<RedeemInviteResultDto, String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     connectivity_open_join_iroh_impl(state.inner(), sink, invite_url).await
 }
 
@@ -68975,7 +69019,8 @@ async fn redeem_friend_token(
     state: tauri::State<'_, Mutex<NodeState>>,
     url: String,
 ) -> Result<FriendLinkResultDto, String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     redeem_friend_token_impl(state.inner(), sink, url).await
 }
 
@@ -70499,7 +70544,8 @@ async fn accept_friend_request(
     state: tauri::State<'_, Mutex<NodeState>>,
     owner_id_hex: String,
 ) -> Result<(), String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     accept_friend_request_impl(state.inner(), sink, owner_id_hex).await
 }
 
@@ -70757,7 +70803,8 @@ async fn decline_friend_request(
     state: tauri::State<'_, Mutex<NodeState>>,
     owner_id_hex: String,
 ) -> Result<(), String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     decline_friend_request_impl(state.inner(), sink, owner_id_hex).await
 }
 
@@ -70899,7 +70946,8 @@ async fn accept_dm_invite(
     state: tauri::State<'_, Mutex<NodeState>>,
     space_id: String,
 ) -> Result<(), String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     accept_dm_invite_impl(state.inner(), sink, space_id).await
 }
 
@@ -71062,7 +71110,8 @@ async fn decline_dm_invite(
     state: tauri::State<'_, Mutex<NodeState>>,
     space_id: String,
 ) -> Result<(), String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     decline_dm_invite_impl(state.inner(), sink, space_id).await
 }
 
@@ -72163,7 +72212,8 @@ async fn add_friend_by_key(
     state: tauri::State<'_, Mutex<NodeState>>,
     identity_pub_hex: String,
 ) -> Result<AddFriendOutcome, String> {
-    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app));
     add_friend_by_key_impl(state.inner(), sink, identity_pub_hex).await
 }
 
@@ -75498,7 +75548,7 @@ async fn set_device_petname(
 ) -> Result<(), String> {
     set_device_petname_impl(
         state.inner(),
-        std::sync::Arc::new(app),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
         device_vk_hex,
         petname,
     )
@@ -75640,7 +75690,11 @@ async fn bump_fleet_epoch(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<u32, String> {
-    bump_fleet_epoch_impl(state.inner(), std::sync::Arc::new(app)).await
+    bump_fleet_epoch_impl(
+        state.inner(),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
+    )
+    .await
 }
 
 /// ZEB-489: NodeState-level core of the headless `get_butler_pin` RPC.
@@ -87365,8 +87419,7 @@ mod zeb_687_revoked_feed_boot_tests {
         //     doesn't pay it under the assertion budget (ZEB-347).
         crate::iroh_endpoint::warm_up_iroh_global_init().await;
         let events = crate::api::events::ApiEventSink::new();
-        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-            std::sync::Arc::new(events.clone());
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = events.clone();
         start_node_inner(None, sink, None, &state, None)
             .await
             .expect("node must boot with the minted owner identity loaded");
@@ -87593,8 +87646,7 @@ mod zeb_898_headless_card_flow_tests {
         //     under the assertion.
         crate::iroh_endpoint::warm_up_iroh_global_init().await;
         let events = crate::api::events::ApiEventSink::new();
-        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-            std::sync::Arc::new(events.clone());
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = events.clone();
         let state_for_restart = std::sync::Arc::clone(&state);
         let sink_for_restart = std::sync::Arc::clone(&sink);
         crate::owner_commands::mint_owner_identity_inner_for_test(&state, move || async move {
@@ -87727,8 +87779,7 @@ mod zeb904_seedless_local_only_boot_tests {
         // (c) Boot 1 — the local-only boot under test.
         crate::iroh_endpoint::warm_up_iroh_global_init().await;
         let events = crate::api::events::ApiEventSink::new();
-        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-            std::sync::Arc::new(events.clone());
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = events.clone();
         let resp = start_node_inner(None, sink.clone(), None, &state, None)
             .await
             .expect("seedless no-material boot must SUCCEED (local-only), not brick");

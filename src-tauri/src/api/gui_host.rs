@@ -3,7 +3,7 @@
 // When HARMONY_API_PORT is set, the GUI process hosts the same localhost
 // API server `harmony-app serve` already runs: same bearer auth, same profile
 // lock, same discovery files. Event parity is implemented at the sink:
-// `impl NodeEventSink for AppHandle` (node_event_sink.rs) mirrors every
+// `AppHandleSink`'s `NodeEventSink` impl (node_event_sink.rs) mirrors every
 // emission onto `ApiHost.events`, so the webview and the WS firehose see
 // one vocabulary with no per-wrapper fan-out plumbing.
 
@@ -121,7 +121,8 @@ fn start_gui_api_at<R: tauri::Runtime>(
     // SAME sink the Tauri wrappers use — so API-triggered events reach the
     // webview AND (via the mirror in node_event_sink.rs) the WS stream.
     // Passing `events` directly here would skip the webview.
-    let sink: Arc<dyn crate::node_event_sink::NodeEventSink> = Arc::new(app.clone());
+    let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+        Arc::new(crate::node_event_sink::AppHandleSink(app.clone()));
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (handle, server_task) = match tauri::async_runtime::block_on(super::start_server(
         &data_dir,
@@ -213,7 +214,11 @@ mod tests {
         });
         let handle = app.handle().clone();
 
-        NodeEventSink::emit(&handle, "mirror-test", serde_json::json!({"k": 1}));
+        NodeEventSink::emit(
+            &crate::node_event_sink::AppHandleSink(handle.clone()),
+            "mirror-test",
+            serde_json::json!({"k": 1}),
+        );
 
         let frame = rx
             .try_recv()
@@ -261,9 +266,17 @@ mod tests {
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
         // No ApiHost managed at all:
-        NodeEventSink::emit(&handle, "no-host", serde_json::json!(null));
+        NodeEventSink::emit(
+            &crate::node_event_sink::AppHandleSink(handle.clone()),
+            "no-host",
+            serde_json::json!(null),
+        );
         // Disabled host:
         app.manage(ApiHost::disabled());
-        NodeEventSink::emit(&handle, "disabled-host", serde_json::json!(null));
+        NodeEventSink::emit(
+            &crate::node_event_sink::AppHandleSink(handle.clone()),
+            "disabled-host",
+            serde_json::json!(null),
+        );
     }
 }

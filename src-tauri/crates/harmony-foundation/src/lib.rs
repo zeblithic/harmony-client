@@ -13,16 +13,21 @@
 //!   9 call sites across the owner-fleet, community, identity-crypto, and app
 //!   tiers (ZEB-548 Stage 1).
 //! - [`profile`] — process-global named-profile selection (ZEB-446).
+//! - [`node_event_sink`] — the mode-agnostic event-emission trait
+//!   (`NodeEventSink`), its serialize-then-emit helper, and the fan-out
+//!   combinator (ZEB-445). The concrete Tauri/API sinks stay in `harmony-app`.
 //!
 //! No Tauri, no `harmony-*` deps, no back-reference to `harmony-app`. The
 //! durable-write primitive makes this not strictly I/O-free, but it stays a
 //! pure leaf at the bottom of the crate DAG, alongside `harmony-core-types`.
 //! `harmony-app` re-exports these items so existing `crate::clock_trust::*` /
 //! `crate::wall_clock_ms()` / `crate::profile::*` /
-//! `crate::owner_state_persist::save_atomically` call sites resolve unchanged.
+//! `crate::owner_state_persist::save_atomically` /
+//! `crate::node_event_sink::*` call sites resolve unchanged.
 
 pub mod clock_trust;
 pub mod hlc_adopt_floor;
+pub mod node_event_sink;
 pub mod persist;
 pub mod profile;
 
