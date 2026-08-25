@@ -1,0 +1,50 @@
+# harmony-identity-crypto — ZEB-548 Stage 1 (PR #3).
+# The identity/vault crypto + at-rest sealing + content-addressing leaf tier,
+# extracted from harmony-app. Depends only downward: harmony-core-types (owner
+# wire types) + harmony-foundation (save_atomically / wall_clock_ms / profile),
+# plus the harmony-* crypto/content crates and third-party primitives. No Tauri,
+# no back-reference to harmony-app; harmony-app re-exports these modules so the
+# crate::identity / crate::content_store / crate::device_dataset_file /
+# crate::avatar_blob_store call paths across the binary resolve unchanged.
+[package]
+name = "harmony-identity-crypto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+
+[lib]
+name = "harmony_identity_crypto"
+
+[features]
+# Mirrors harmony-app's `test-fixtures`: exposes the deterministic-nonce
+# identity fixture seams (`identity::test_only::encrypt_with_params_for_test`
+# etc.) to harmony-app's integration tests, which compile against this crate's
+# public API and cannot see `#[cfg(test)]`-only items. NEVER enable in a
+# production build — the deterministic-nonce variants would reuse nonces.
+test-fixtures = []
+
+[dependencies]
+harmony-core-types = { path = "../harmony-core-types" }
+harmony-foundation = { path = "../harmony-foundation" }
+harmony-identity = { workspace = true }
+harmony-content = { workspace = true }
+harmony-crypto = { workspace = true, features = ["password-envelope"] }
+
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
+hex = "0.4"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+tracing = "0.1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+secrecy = "0.10"
+subtle = "2"
+async-trait = "0.1"
+thiserror = "1"
+tempfile = "3"
+fd-lock = "4"
+
+[dev-dependencies]
+serial_test = "3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

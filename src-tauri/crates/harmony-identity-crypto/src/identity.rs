@@ -130,7 +130,7 @@ fn blob_to_seed(buf: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
 /// `TmpGuard` removes the `.tmp` file if anything panics or returns Err
 /// before the rename completes. After successful rename, the guard is
 /// `mem::forget`ed so the renamed file isn't unlinked.
-pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
@@ -391,7 +391,7 @@ const VAULT_VERSION: u8 = 1;
 /// comparisons (migration read-back verification) compare fields explicitly.
 #[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-pub(crate) struct SecretVault {
+pub struct SecretVault {
     /// Structure version — see [`VAULT_VERSION`].
     version: u8,
     /// Node/Reticulum identity master seed (recovery root); sub-keys derive from
@@ -1588,7 +1588,7 @@ fn decrypt_v2_plaintext(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec
 ///
 /// Live as of ZEB-492 Task 4 via the `owner_state::save_fleet_keytree`
 /// encrypted-file fallback, which the pairing install path now calls.
-pub(crate) fn encrypt_vault_bytes(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
+pub fn encrypt_vault_bytes(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
     encrypt_vault(passphrase, plaintext)
 }
 
@@ -1605,10 +1605,7 @@ pub(crate) fn encrypt_vault_bytes(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8
 /// (out-of-bounds) instead of returning an Err, crashing boot. Mirrors
 /// [`decrypt_vault`]'s guards exactly (same `MIN_LEN`/`ENC_MAGIC` constants and
 /// indistinguishable error messages).
-pub(crate) fn decrypt_vault_bytes(
-    passphrase: &[u8],
-    bytes: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, String> {
+pub fn decrypt_vault_bytes(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     const MIN_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + TAG_LEN;
     if bytes.len() < MIN_LEN {
         return Err(format!(
@@ -1667,7 +1664,7 @@ pub enum VaultSlot {
 /// Returns `(key, freshly_created)`. `freshly_created` is `true` ONLY when a
 /// brand-new key was generated — never when an existing key was loaded (those
 /// are the *same* identity, so the iroh `EndpointId` is preserved).
-pub(crate) fn app_key_or_create_with_fallback<F>(
+pub fn app_key_or_create_with_fallback<F>(
     slot: VaultSlot,
     legacy: &keyring::Entry,
     make_fallback: F,
@@ -2143,7 +2140,7 @@ fn vault_clear_fleet_keytree_with_store(store: &KeychainStore) -> Result<(), Str
 /// `save_vault` are the primary surface; the seed-level `load` / `save` are
 /// convenience wrappers over them (read/write only the `seed` field) used by the
 /// existing seed-resolution machinery, which is otherwise unchanged.
-pub(crate) trait KeyStore {
+pub trait KeyStore {
     /// Load the full secret vault. Returns `Ok(None)` if no entry exists.
     fn load_vault(&self) -> Result<Option<SecretVault>, String>;
     /// Save the full secret vault (overwriting any existing item).
@@ -2283,7 +2280,7 @@ impl KeychainStore {
         // on one machine would read/clobber EACH OTHER'S vault (the
         // ZEB-428 class, in production). Named profiles use the
         // encrypted-file vault under their own identity dir instead.
-        if let Some(p) = crate::profile::active_profile() {
+        if let Some(p) = harmony_foundation::profile::active_profile() {
             return Err(format!(
                 "OS keychain refused for named profile {p:?} (ZEB-446): keychain names are \
                  machine-global; this profile uses the encrypted-file vault — set \
@@ -2536,7 +2533,7 @@ fn quarantine_relic_between(
 /// Returned errors are *unprefixed* — callers add their own context (e.g.,
 /// "HARMONY_PASSPHRASE_FILE=<path> ..." or "--new-passphrase-file=<path> ...")
 /// because the same parser is invoked from both env-var and CLI paths.
-pub(crate) fn parse_passphrase_file(path: &Path) -> Result<String, String> {
+pub fn parse_passphrase_file(path: &Path) -> Result<String, String> {
     let raw = std::fs::read(path).map_err(|e| format!("could not be read: {e}"))?;
 
     #[cfg(unix)]
@@ -2595,7 +2592,7 @@ use secrecy::{ExposeSecret, SecretString};
 // `SecretBox<str>([REDACTED])`. If new secret-bearing fields are added they
 // must use a `secrecy` wrapper, or this derive must become a manual impl.
 #[derive(Debug)]
-pub(crate) struct EncryptedFileStore {
+pub struct EncryptedFileStore {
     path: PathBuf,
     passphrase: SecretString,
 }
@@ -2615,7 +2612,7 @@ impl EncryptedFileStore {
     ///
     /// Used by the CLI rotate handler to detect a no-op rotation (old == new) so
     /// it can emit a warning without aborting.
-    pub(crate) fn passphrase_eq(&self, candidate: &SecretString) -> bool {
+    pub fn passphrase_eq(&self, candidate: &SecretString) -> bool {
         use secrecy::ExposeSecret;
         bool::from(subtle::ConstantTimeEq::ct_eq(
             self.passphrase.expose_secret().as_bytes(),
@@ -2626,7 +2623,7 @@ impl EncryptedFileStore {
     /// Construct from the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`
     /// environment variables — see [`resolve_passphrase_env`] for the
     /// resolution rules.
-    pub(crate) fn from_env(path: PathBuf) -> Result<Option<Self>, String> {
+    pub fn from_env(path: PathBuf) -> Result<Option<Self>, String> {
         Ok(resolve_passphrase_env()?.map(|passphrase| Self::new(path, passphrase)))
     }
 }
@@ -2653,7 +2650,7 @@ impl EncryptedFileStore {
 /// `pub(crate)` so the owner-state variable-length fleet-KeyTree fallback
 /// (ZEB-492) resolves the passphrase through the SAME logic the
 /// `EncryptedFileStore` 32-byte fallback uses — the two must never diverge.
-pub(crate) fn resolve_passphrase_env() -> Result<Option<SecretString>, String> {
+pub fn resolve_passphrase_env() -> Result<Option<SecretString>, String> {
     let direct = std::env::var("HARMONY_PASSPHRASE").ok();
     let file_path = std::env::var("HARMONY_PASSPHRASE_FILE").ok();
 
@@ -2734,7 +2731,7 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
         })?;
     Ok(identity_path_in(
         Path::new(&home),
-        crate::profile::active_profile(),
+        harmony_foundation::profile::active_profile(),
     ))
 }
 
@@ -3145,7 +3142,7 @@ pub fn write_seed_to_disk(
 /// non-reentrant `Mutex` is never re-acquired on one thread. Recover from
 /// poisoning so a panic in one writer doesn't brick future ones (mirrors
 /// `OWNER_STATE_WRITE_LOCK`).
-pub(crate) static IDENTITY_FILE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static IDENTITY_FILE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire both identity-write guards and run `critical_section` while they are
 /// held, releasing them on return. This is the single acquisition point shared
@@ -3254,7 +3251,7 @@ fn with_identity_write_guards<T>(
 /// guards the mixed-process case: the reset serializes against identity writers
 /// and, if one is mid-write, fails fast with the standard "another harmony-app
 /// process is writing the identity store" message instead of racing it.
-pub(crate) fn with_identity_dir_write_guard<T>(
+pub fn with_identity_dir_write_guard<T>(
     identity_dir: &Path,
     critical_section: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
@@ -3430,7 +3427,7 @@ fn write_seed_probe_and_write(
 ///
 /// Caller-side concerns (keychain check, env var resolution, CLI wiring) live
 /// in `main.rs` — this function is the pure key-rotation primitive.
-pub(crate) fn rotate_passphrase(
+pub fn rotate_passphrase(
     old: &EncryptedFileStore,
     new_passphrase: SecretString,
 ) -> Result<(), String> {
@@ -3614,7 +3611,7 @@ mod tests {
     /// process-per-test, so the OnceLock set here cannot leak.
     #[test]
     fn keychain_constructor_refuses_on_named_profile() {
-        crate::profile::set_active_profile(Some("gatetest")).expect("activate");
+        harmony_foundation::profile::set_active_profile(Some("gatetest")).expect("activate");
         let err = match KeychainStore::new() {
             Err(e) => e,
             Ok(_) => panic!("named profile must refuse the OS keychain"),

@@ -6,7 +6,7 @@
 //! at boot rendered by name with a blank avatar. This module is the durable
 //! *payload* behind that durable *pointer*: a small
 //! `{app_data_dir}/avatars/{cid}.bin` blob cache, written through when
-//! [`crate::fetch_avatar`] fetches over the network and read back first on
+//! `fetch_avatar` fetches over the network and read back first on
 //! subsequent fetches. Because a CID is an immutable content-address, a disk
 //! hit is always exactly the requested content — so reads are offline-capable
 //! and have no staleness window.
@@ -124,7 +124,7 @@ impl AvatarBlobStore {
     /// Write `bytes` for `cid_hex` (best-effort), then prune to the byte budget.
     ///
     /// Rejects a malformed CID, bytes over `max_blob_bytes`, or bytes that fail
-    /// `hash == cid`. The caller ([`crate::fetch_avatar`]) already returns
+    /// `hash == cid`. The caller (`fetch_avatar`) already returns
     /// size-capped, verified bytes, but re-checking keeps the store's on-disk
     /// invariant local and total — a `get` can then trust any file it finds. A
     /// rejection or write error is logged and swallowed.
@@ -150,8 +150,7 @@ impl AvatarBlobStore {
         // fsyncs the file and the parent directory (so a committed blob survives
         // a power loss) and uses a uniquely-named temp so concurrent same-CID
         // writes never collide (`tempfile::NamedTempFile`).
-        if let Err(e) = crate::owner_state_persist::save_atomically(&self.blob_path(cid_hex), bytes)
-        {
+        if let Err(e) = harmony_foundation::save_atomically(&self.blob_path(cid_hex), bytes) {
             tracing::warn!(cid = %cid_hex, error = %e, "avatar cache: write failed");
             return;
         }

@@ -2841,6 +2841,7 @@ dependencies = [
  "harmony-crypto",
  "harmony-foundation",
  "harmony-identity",
+ "harmony-identity-crypto",
  "harmony-iroh",
  "harmony-mailbox",
  "harmony-owner",
@@ -3054,6 +3055,32 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "harmony-identity-crypto"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ciborium",
+ "fd-lock",
+ "harmony-content",
+ "harmony-core-types",
+ "harmony-crypto",
+ "harmony-foundation",
+ "harmony-identity",
+ "hex",
+ "keyring",
+ "rand 0.8.6",
+ "secrecy 0.10.3",
+ "serde",
+ "serial_test",
+ "subtle",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
  "zeroize",
 ]
 

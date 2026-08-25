@@ -10,8 +10,8 @@
 //! semantics for unit tests; the new `RuntimeContentStore` (Task 4) wires
 //! through the new `cas_op` mpsc channel into `event_loop::run`.
 
-use crate::owner_state_types::ContentId;
 use async_trait::async_trait;
+use harmony_core_types::owner_state_types::ContentId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -55,12 +55,12 @@ impl CommunityServeAllowlist {
     /// skipping the insert (best-effort, never a panic) rather than by
     /// promising later recovery.
     pub fn allow(&self, cid: ContentId) {
-        self.allow_at(cid, crate::wall_clock_ms());
+        self.allow_at(cid, harmony_foundation::wall_clock_ms());
     }
 
     /// Insert-or-refresh with a caller-supplied clock (test seam for
     /// [`Self::allow`]; stamps are process-local and never persisted, so the
-    /// one clock every stamping module shares — `crate::wall_clock_ms` — is
+    /// one clock every stamping module shares — `harmony_foundation::wall_clock_ms` — is
     /// the production source).
     pub fn allow_at(&self, cid: ContentId, now_ms: u64) {
         if let Ok(mut g) = self.0.write() {
@@ -81,7 +81,7 @@ impl CommunityServeAllowlist {
     /// serve is demonstrated demand, but demand alone must never CREATE
     /// serving intent, so this never inserts.
     pub fn touch(&self, cid: &ContentId) {
-        self.touch_at(cid, crate::wall_clock_ms());
+        self.touch_at(cid, harmony_foundation::wall_clock_ms());
     }
 
     /// Test-seam core of [`Self::touch`]. Returns whether a lease was
@@ -575,7 +575,7 @@ impl InMemoryStub {
         self.inner.lock().unwrap().len()
     }
 
-    pub async fn debug_all_cids(&self) -> Vec<crate::owner_state_types::ContentId> {
+    pub async fn debug_all_cids(&self) -> Vec<harmony_core_types::owner_state_types::ContentId> {
         self.inner.lock().unwrap().keys().copied().collect()
     }
 }

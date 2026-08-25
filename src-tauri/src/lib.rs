@@ -114,7 +114,6 @@ mod app_tracing;
 // ZEB-901: re-export the shared default log filter so the binary crate
 // (`main.rs::init_tracing`) can reuse it without the private module being public.
 pub use app_tracing::DEFAULT_ENV_FILTER;
-pub mod avatar_blob_store;
 pub mod backup_state;
 pub mod butler_deposit;
 pub mod channel_backfill;
@@ -177,8 +176,6 @@ pub mod contacts_commands;
 pub mod contacts_crdt;
 pub mod contacts_persist;
 pub mod content_index;
-pub mod content_store;
-pub mod device_dataset_file;
 pub mod dm_crypto;
 pub mod dm_envelope;
 pub mod dm_inbox_crdt;
@@ -213,7 +210,6 @@ pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
 pub mod friend_token;
-pub mod identity;
 pub mod identity_commands;
 pub mod inflight_handshake_gate;
 pub mod invite_mint;
@@ -267,6 +263,16 @@ pub use harmony_core_types::{owner_state_crypto, owner_state_types};
 // crate::owner_state_persist::save_atomically call path is preserved too.)
 pub(crate) use harmony_foundation::wall_clock_ms;
 pub use harmony_foundation::{clock_trust, hlc_adopt_floor, profile};
+// ZEB-548 Stage 1 (PR #3): identity/vault crypto + at-rest sealing +
+// content-addressing leaf tier extracted to harmony-identity-crypto. Re-exported
+// so existing crate::identity::* / crate::device_dataset_file::* /
+// crate::content_store::* / crate::avatar_blob_store::* call sites resolve
+// unchanged. Among the workspace's split crates it depends only downward on
+// harmony-core-types + harmony-foundation (plus the harmony-* crypto/content
+// crates and third-party primitives) — never sideways into harmony-app.
+pub use harmony_identity_crypto::{
+    avatar_blob_store, content_store, device_dataset_file, identity,
+};
 // The four wire types owner_state_types used to register on other modules'
 // behalf (friend_graph::{FriendGraph, FriendEntry}, friend_token::FriendTokenPayload,
 // owner_state_crdt::OwnerState) now register here, next to their harmony-app
