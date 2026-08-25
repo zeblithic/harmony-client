@@ -112,7 +112,7 @@ graph TD
 
 Notes on the DAG:
 - Arrows are "depends on." The layering (L0 bottom → L4 top) is the topological order; the migration extracts bottom-up. The diagram is the **target after the §4 surgeries** — see the caveat below.
-- **`harmony-foundation`** (added 2026-08-25 per the §6 Stage-1 correction; **broadened in PR #2** to also home `save_atomically` + `profile`) is a leaf with no `harmony-*` deps (`chrono`/`tracing`/`tempfile`; not even `core-types`) — and, like `core-types`, is depended on broadly across the mid-layer (`clock_trust`/`hlc_adopt_floor` have ~24/~23 dependents each; `save_atomically` has 9 callers spanning owner-fleet, community, identity-crypto, and app). Only representative edges are drawn to avoid clutter.
+- **`harmony-foundation`** (added 2026-08-25 per the §6 Stage-1 correction; **broadened in PR #2** to also home `save_atomically` + `profile`, and in **PR #4** to home the `node_event_sink` emission trait) is a leaf with no `harmony-*` deps (`chrono`/`serde`/`serde_json`/`tempfile`/`tracing`; not even `core-types`) — and, like `core-types`, is depended on broadly across the mid-layer (`clock_trust`/`hlc_adopt_floor` have ~24/~23 dependents each; `save_atomically` has 9 callers spanning owner-fleet, community, identity-crypto, and app). Only representative edges are drawn to avoid clutter.
 - `harmony-app-core` (L3) is where `NodeState`, `start_node_inner`, `event_loop.rs`, and the `*_commands.rs` glue live. The thin `#[tauri::command]` wrappers + `generate_handler!` stay in the **binary** crate `harmony-app` (L4) because they need the live `tauri::Wry` runtime; their `_impl` bodies migrate down into the feature crates.
 - **`social_graph` and `voice` end up *above* `community`** (both depend on it one-way) once their shared primitives are promoted out: cycle E's `KeyedSlidingWindow` and cycle G's AEAD helpers move to shared modules, and cycle F's friend-acceptor logic relocates into `social_graph`.
 - **Caveat — the mid-layer edges are the design target, not a guarantee.** The exact residual direction of a few edges (and two file relocations: `file_sharing` → dm in Stage 2, `iroh_friend_acceptor` → social_graph in Stage 3) is finalized as each surgery lands; the layering above is the intended acyclic result.
@@ -200,8 +200,10 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 >
 > **Revised Stage-1 sequence:**
 > - **PR #1 — `harmony-foundation`** ✅ *shipped (#735)* = `clock_trust` +
->   `hlc_adopt_floor` + `wall_clock_ms`. Pure leaves (deps: `chrono` + `tracing`;
->   not even core-types). Zero surgery — git mv + re-export from `lib.rs`, exactly
+>   `hlc_adopt_floor` + `wall_clock_ms`. Pure leaves (deps *at PR #1*: `chrono` +
+>   `tracing`; not even core-types — later broadened to `tempfile` in PR #2 and
+>   `serde`/`serde_json` in PR #4; see §3 for the current inventory). Zero surgery
+>   — git mv + re-export from `lib.rs`, exactly
 >   the Stage-0 pattern. Two cross-invariant test pins moved into
 >   `community_membership` (compile-visible `const` asserts) since the leaf crate
 >   cannot see the community cluster.
