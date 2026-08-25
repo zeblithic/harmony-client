@@ -28,6 +28,11 @@ harmony-crdt-sync = { git = "https://github.com/zeblithic/harmony.git", rev = "7
 # crates pin the same rev from here. harmony-app adds the `recovery` feature.
 harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 harmony-reachability = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
+# ZEB-548 Stage 1 (PR #3): harmony-crypto is now shared — harmony-identity-crypto
+# uses `password_envelope` (identity vault sealing) and harmony-app still uses
+# `hash::truncated_hash` in the other clusters — so its rev lives here for
+# lockstep. Consumers add the `password-envelope` feature.
+harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -47,7 +52,10 @@ tauri-build = { version = "2", features = [] }
 # (e.g. `mock_context_with_full_acl`) compile with just `--features
 # test-fixtures`, not only under `--all-targets` (where the dev-dependency
 # would otherwise pull `tauri/test` in via feature unification).
-test-fixtures = ["tauri/test"]
+# harmony-identity-crypto/test-fixtures propagates the same gate to the extracted
+# identity tier (ZEB-548 PR #3), so its `identity::test_only::*_for_test` seams
+# stay reachable from harmony-app's wire-format integration tests.
+test-fixtures = ["tauri/test", "harmony-identity-crypto/test-fixtures"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -149,6 +157,11 @@ harmony-core-types = { path = "crates/harmony-core-types" }
 # ZEB-548 Stage 1: time/causality leaf primitives (clock_trust, hlc_adopt_floor,
 # wall_clock_ms) — pure leaf, no harmony-* deps.
 harmony-foundation = { path = "crates/harmony-foundation" }
+# ZEB-548 Stage 1 (PR #3): identity/vault crypto + at-rest sealing +
+# content-addressing leaf tier. harmony-app re-exports its modules (lib.rs) so
+# the crate::identity::* / crate::content_store::* / crate::device_dataset_file::*
+# / crate::avatar_blob_store::* call sites resolve unchanged.
+harmony-identity-crypto = { path = "crates/harmony-identity-crypto" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
@@ -157,7 +170,9 @@ harmony-owner = { workspace = true, features = ["recovery"] }
 # harmony-identity's device address_hash — so the community-invite wire
 # commitment delegates to it instead of open-coding SHA256[..16]. Already in
 # the lock transitively; the ml-dsa/ml-kem pins below exist for its benefit.
-harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e", features = ["password-envelope"] }
+# ZEB-548 Stage 1 (PR #3): rev moved to [workspace.dependencies] (now shared with
+# harmony-identity-crypto). The `password-envelope` feature stays app-side too.
+harmony-crypto = { workspace = true, features = ["password-envelope"] }
 # ZEB-737 (ZEB-571 item 3): harmony-crdt-sync is the reusable backfill/backoff
 # latch primitive that `channel_backfill.rs` now delegates to (the drivers +
 # the `Hlc` watermark binding stay client-side). ZEB-548 Stage 0: shared with

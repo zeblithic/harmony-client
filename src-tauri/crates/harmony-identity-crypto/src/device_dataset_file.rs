@@ -1,5 +1,5 @@
 //! ZEB-982: device-sealed at-rest envelope for the owner-state family and
-//! keyless-boot peripherals — the files that [`crate::fleet_dataset_file`]
+//! keyless-boot peripherals — the files that `fleet_dataset_file`
 //! (ZEB-981) structurally cannot cover because they are written on boots
 //! where no fleet KeyTree exists (ZEB-905 local-only mode, pre-mint, the
 //! recovery CLI).
@@ -13,7 +13,7 @@
 //!
 //! where the AEAD plaintext is the complete former on-disk image. Key: a
 //! device-local key derived from the node identity master seed
-//! ([`crate::owner_state_crypto::derive_device_dataset_key`]) — available on
+//! ([`harmony_core_types::owner_state_crypto::derive_device_dataset_key`]) — available on
 //! every boot mode, so there is no plaintext fallback mode. AAD binds the
 //! canonical filename, so ciphertext moved between files fails the tag.
 //!
@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use zeroize::Zeroizing;
 
-use crate::owner_state_crypto::{
+use harmony_core_types::owner_state_crypto::{
     derive_device_dataset_key, open_device_file, seal_device_file, CryptoError,
 };
 
@@ -49,7 +49,7 @@ pub const SEALED_DEVICE_SCHEMA_V3: u8 = 3;
 /// Coarse plausibility cap checked against file METADATA before the bytes
 /// are read — same rationale and value as
 /// `fleet_dataset_file::MAX_DATASET_FILE_BYTES` (PR #727 review).
-pub(crate) const MAX_DEVICE_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_DEVICE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Sealing context for device-sealed files: the seed-derived at-rest key.
 /// Cheap to clone; the key bytes are shared and zeroized on final drop.
@@ -336,7 +336,7 @@ pub fn write_image(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::owner_state_persist::save_atomically(path, &bytes)
+    harmony_foundation::save_atomically(path, &bytes)
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
