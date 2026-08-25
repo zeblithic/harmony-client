@@ -3,9 +3,9 @@
 //! Generalizes two recovery disciplines already proven elsewhere in the tree, for
 //! plaintext `serde_json` / `ciborium` app-data stores:
 //!
-//! * **Io-vs-content freeze discrimination** ([`persistent_card_store`]): a transient
-//!   *read* error must not lead to overwriting the (possibly still-good) on-disk bytes
-//!   with an empty in-memory default. Such a load *freezes* writes.
+//! * **Io-vs-content freeze discrimination** (`persistent_card_store`, in `harmony-app`):
+//!   a transient *read* error must not lead to overwriting the (possibly still-good)
+//!   on-disk bytes with an empty in-memory default. Such a load *freezes* writes.
 //! * **Quarantine-aside on content corruption** (`fleet_dataset_file::load_or_recover`,
 //!   `friend_requests`): genuinely corrupt bytes are renamed aside so the store can
 //!   heal on the next write — unless the rename fails, in which case we freeze rather
@@ -16,8 +16,6 @@
 //! [`crate::device_dataset_file::read_image`] so the transient-vs-content split comes from
 //! the envelope layer, and it *freezes* (never quarantines) a sealed image that will not
 //! decrypt — a wrong/rotated key must not wipe the store.
-//!
-//! [`persistent_card_store`]: crate::persistent_card_store
 
 use std::path::Path;
 

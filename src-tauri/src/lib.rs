@@ -263,15 +263,17 @@ pub use harmony_core_types::{owner_state_crypto, owner_state_types};
 // crate::owner_state_persist::save_atomically call path is preserved too.)
 pub(crate) use harmony_foundation::wall_clock_ms;
 pub use harmony_foundation::{clock_trust, hlc_adopt_floor, profile};
-// ZEB-548 Stage 1 (PR #3): identity/vault crypto + at-rest sealing +
-// content-addressing leaf tier extracted to harmony-identity-crypto. Re-exported
-// so existing crate::identity::* / crate::device_dataset_file::* /
-// crate::content_store::* / crate::avatar_blob_store::* call sites resolve
-// unchanged. Among the workspace's split crates it depends only downward on
-// harmony-core-types + harmony-foundation (plus the harmony-* crypto/content
-// crates and third-party primitives) — never sideways into harmony-app.
+// ZEB-548 Stage 1: identity/vault crypto + at-rest sealing + content-addressing
+// leaf tier extracted to harmony-identity-crypto (PR #3), joined by the ZEB-986
+// recoverable_load primitives (PR #5) — the sealed load-or-recover variant reads
+// through device_dataset_file, so it lives next to the envelope. Re-exported so
+// existing crate::identity::* / crate::device_dataset_file::* /
+// crate::content_store::* / crate::avatar_blob_store::* / crate::recoverable_load::*
+// call sites resolve unchanged. Among the workspace's split crates it depends only
+// downward on harmony-core-types + harmony-foundation (plus the harmony-* crypto/
+// content crates and third-party primitives) — never sideways into harmony-app.
 pub use harmony_identity_crypto::{
-    avatar_blob_store, content_store, device_dataset_file, identity,
+    avatar_blob_store, content_store, device_dataset_file, identity, recoverable_load,
 };
 // The four wire types owner_state_types used to register on other modules'
 // behalf (friend_graph::{FriendGraph, FriendEntry}, friend_token::FriendTokenPayload,
@@ -292,7 +294,6 @@ pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
 pub mod protocol_versioning;
-pub mod recoverable_load;
 pub mod referral_catalog;
 pub mod relay_acceptor_watchdog;
 pub mod relay_hold_persist;

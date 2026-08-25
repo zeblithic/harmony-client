@@ -254,7 +254,7 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 > and `mint`, whose only couplings above idc/core/foundation are two mis-tiered
 > shared primitives plus one small type-leak each:
 >
-> - **PR #4 — `node_event_sink` → `harmony-foundation`** *(this PR)*. The
+> - **PR #4 — `node_event_sink` → `harmony-foundation`** *(#738, merged)*. The
 >   mode-agnostic emission trait (`NodeEventSink` + `emit_ser` + `FanoutSink`,
 >   ZEB-445) is a universal primitive (owner-fleet references it 12×, plus mail/
 >   mint and every future feature crate). The trait + helpers move down; the two
@@ -263,10 +263,19 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 >   the bare type). The `RecordingSink` test recorder moves *with* the trait
 >   (its `impl` is on `Arc<RecordingSink>`, legal only where the trait is local),
 >   exposed under `test-fixtures`.
-> - **PR #5 — `recoverable_load` → `harmony-identity-crypto`.** The ZEB-986
->   recovery read-path is idc-tier, not orchestrator glue: its real code deps are
->   `device_dataset_file::{DeviceCipher, read_image, reseal_if_legacy}`. Moving it
->   into idc makes those intra-crate and puts it beneath mail (4 callers).
+> - **PR #5 — `recoverable_load` → `harmony-identity-crypto`** *(this PR)*. The
+>   ZEB-986 recovery read-path is idc-tier, not orchestrator glue: its only
+>   production code deps are `device_dataset_file::{DeviceCipher, read_image,
+>   reseal_if_legacy, ImageError}`. Moving the whole module (plaintext
+>   `load_or_recover` + sealed `load_sealed_or_recover` + `sweep_corrupt_sidecars`)
+>   into idc makes those refs intra-crate and puts the primitive beneath its callers
+>   (`mail`, `follows`, `vine_*`, `content_index`). `harmony-app` re-exports it
+>   (`pub use harmony_identity_crypto::recoverable_load`) so all `crate::recoverable_load::*`
+>   sites resolve unchanged. Its inline tests move with it; because they share idc
+>   with `device_dataset_file`, the `test_cipher`/`write_image` fixtures resolve
+>   under idc's own `cfg(test)` — no cross-crate dev-dep needed for idc's tests (the
+>   monolith's remaining `test_cipher` callers are already covered by the PR #4 idc
+>   `test-fixtures` dev-dep). Only new idc dep: `serde_json` (dev, test-only).
 > - **PR #6 — `harmony-mail` + `harmony-mint`.** Relocate the two residual type
 >   leaks (`event_loop::FetchRequest`, a shared struct; `fleet_sync::RepublishDirty`,
 >   a 4-line trait mint implements) to shared homes, then extract both leaves.

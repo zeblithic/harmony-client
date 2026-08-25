@@ -9,6 +9,9 @@
 //!   (sentinel 0x03), keyed off `identity::read_seed_from_disk`.
 //! - [`content_store`] — content-addressed (CID) blob store + state-root fetch.
 //! - [`avatar_blob_store`] — the on-disk avatar blob cache (CID-verified).
+//! - [`recoverable_load`] — the ZEB-986 load-or-recover primitives; the sealed
+//!   variant reads through [`device_dataset_file::read_image`], so it lives
+//!   next to the envelope it recovers.
 //!
 //! Depends only downward: `harmony-core-types` (owner wire types) +
 //! `harmony-foundation` (`save_atomically` / `wall_clock_ms` / `profile`), plus
@@ -22,3 +25,4 @@ pub mod avatar_blob_store;
 pub mod content_store;
 pub mod device_dataset_file;
 pub mod identity;
+pub mod recoverable_load;
