@@ -1411,7 +1411,7 @@ pub async fn revoke_device(
 ) -> Result<(), String> {
     revoke_device_impl(
         state.inner(),
-        std::sync::Arc::new(app),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
         device_vk_hex,
         reason,
     )
@@ -1426,7 +1426,7 @@ pub async fn mint_owner_identity(
     // ZEB-445: wrap the AppHandle as the event sink (same shape as the
     // `start_node` command wrapper) and delegate to the shared IPC/RPC seam.
     let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
-        std::sync::Arc::new(app.clone());
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app.clone()));
     mint_owner_identity_impl(state.inner(), sink, Some(app), None).await
 }
 

@@ -55,7 +55,11 @@ tauri-build = { version = "2", features = [] }
 # harmony-identity-crypto/test-fixtures propagates the same gate to the extracted
 # identity tier (ZEB-548 PR #3), so its `identity::test_only::*_for_test` seams
 # stay reachable from harmony-app's wire-format integration tests.
-test-fixtures = ["tauri/test", "harmony-identity-crypto/test-fixtures"]
+test-fixtures = [
+    "tauri/test",
+    "harmony-identity-crypto/test-fixtures",
+    "harmony-foundation/test-fixtures",
+]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -293,6 +297,25 @@ futures-util = "0.3"
 
 [dev-dependencies]
 serial_test = "3"
+# ZEB-548 Stage 1 (PR #4): activate harmony-foundation's `test-fixtures` for
+# harmony-app's own dev/test builds, so `node_event_sink::RecordingSink` is
+# reachable from the ~60 in-crate `#[cfg(test)]` unit-test sites under a bare
+# `cargo test --lib` (no `--features` flag). The recorder's `#[cfg(test)]` in
+# its own crate is NOT propagated to the dependency copy of harmony-foundation
+# built for harmony-app's tests, so without this the default unit-test target
+# fails to compile (regression vs. the pre-split local recorder). The
+# `test-fixtures` feature entry above still covers `--features test-fixtures`
+# lib/all-targets builds; this dev-dep covers the default-feature test path.
+# Same pattern as harmony-pkarr below; the recorder stays out of release
+# binaries (gated behind test-fixtures, and dev-deps never link into release).
+harmony-foundation = { path = "crates/harmony-foundation", features = ["test-fixtures"] }
+# ZEB-548 Stage 1 (PR #4): same rationale for identity-crypto — harmony-app's
+# in-crate `#[cfg(test)]` unit tests reach its `test-fixtures`-gated seams
+# (`device_dataset_file::test_cipher`, `identity::test_only::*`). Extracted in
+# PR #3 (#737) without this dev-dep, which silently broke the default (no
+# `--features`) `cargo test --lib` unit-test compile; propagating the feature
+# for dev/test builds restores it. Kept out of release binaries (dev-dep).
+harmony-identity-crypto = { path = "crates/harmony-identity-crypto", features = ["test-fixtures"] }
 # ZEB-329: regex used in network_health redaction-leak test to assert
 # no 32+ char hex run leaks into the redacted export markdown.
 regex = "1"

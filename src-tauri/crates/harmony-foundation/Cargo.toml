@@ -6,6 +6,7 @@
 #   - wall_clock_ms                — the wall-clock source
 #   - persist::save_atomically     — durable atomic file replacement (9 callers)
 #   - profile (ZEB-446)            — process-global named-profile selection
+#   - node_event_sink (ZEB-445)    — mode-agnostic event-emission trait + helpers
 # No Tauri, no harmony-* deps, no back-reference to harmony-app. The durable-write
 # primitive means this is not strictly I/O-free, but it stays a pure leaf at the
 # bottom of the crate DAG, alongside harmony-core-types.
@@ -18,7 +19,15 @@ rust-version = "1.91"
 [lib]
 name = "harmony_foundation"
 
+[features]
+# Exposes the `node_event_sink::RecordingSink` test recorder to downstream
+# crates (harmony-app + its integration tests) that compile against the public
+# API and cannot see `#[cfg(test)]`-only items.
+test-fixtures = []
+
 [dependencies]
 chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tempfile = "3"
 tracing = "0.1"

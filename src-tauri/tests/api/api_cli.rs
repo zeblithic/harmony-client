@@ -27,7 +27,7 @@ async fn cli_client_drives_rpc_and_event_stream_against_live_server() {
     // ── Phase 2: live server, ephemeral port, default NodeState ─────────
     let state = Arc::new(Mutex::new(harmony_app::NodeState::default()));
     let events = harmony_app::api::events::ApiEventSink::new();
-    let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(events.clone());
+    let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = events.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (handle, server_task) = harmony_app::api::start_server(
         &data_dir,

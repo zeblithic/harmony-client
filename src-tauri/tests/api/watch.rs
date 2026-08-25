@@ -59,7 +59,7 @@ async fn watch_backfill_emits_then_dedupes() {
     // ── Boot the serve core in-process (mirrors serve_cli / api_server.rs) ─
     let state = Arc::new(Mutex::new(harmony_app::NodeState::default()));
     let events = harmony_app::api::events::ApiEventSink::new();
-    let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(events.clone());
+    let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = events.clone();
     harmony_app::start_node_inner(None, sink.clone(), None, &state, Some(Arc::clone(&state)))
         .await
         .expect("headless node boots without Tauri");

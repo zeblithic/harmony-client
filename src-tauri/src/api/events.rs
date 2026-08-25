@@ -46,7 +46,11 @@ impl ApiEventSink {
     }
 }
 
-impl NodeEventSink for std::sync::Arc<ApiEventSink> {
+// Impl on the bare type (not `Arc<ApiEventSink>`): `NodeEventSink` now lives in
+// `harmony-foundation`, and a foreign trait cannot be impl'd for the
+// non-fundamental `Arc<local>` (orphan rule). `Arc<ApiEventSink>` still coerces
+// straight to `Arc<dyn NodeEventSink>` because the pointee impls the trait.
+impl NodeEventSink for ApiEventSink {
     fn emit(&self, event: &str, payload: serde_json::Value) {
         // seq assignment and the broadcast send happen under one lock:
         // with an atomic counter alone, two concurrent emitters could send

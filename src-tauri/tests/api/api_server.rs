@@ -89,7 +89,7 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
     // the only NodeEventSink, no Tauri handle.
     let state = Arc::new(Mutex::new(harmony_app::NodeState::default()));
     let events = harmony_app::api::events::ApiEventSink::new();
-    let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = Arc::new(events.clone());
+    let sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> = events.clone();
     // ZEB-719: pass the owned NodeState handle exactly as `serve_cli` does, so this
     // headless harness faithfully mirrors the real serve wiring (Tier-2 auto-exec
     // dispatches rather than stubs). Inert here — no Tier-2 poll is finalized.

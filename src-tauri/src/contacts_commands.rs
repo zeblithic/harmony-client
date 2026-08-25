@@ -324,7 +324,13 @@ pub async fn set_contact_petname(
     owner_id_hex: String,
     petname: Option<String>,
 ) -> Result<Option<ContactView>, String> {
-    set_contact_petname_impl(state.inner(), &app, owner_id_hex, petname).await
+    set_contact_petname_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        owner_id_hex,
+        petname,
+    )
+    .await
 }
 
 /// Set or clear the local-only private notes for any identity (`None`/blank
@@ -337,7 +343,13 @@ pub async fn set_contact_notes(
     owner_id_hex: String,
     notes: Option<String>,
 ) -> Result<Option<ContactView>, String> {
-    set_contact_notes_impl(state.inner(), &app, owner_id_hex, notes).await
+    set_contact_notes_impl(
+        state.inner(),
+        &crate::node_event_sink::AppHandleSink(app.clone()),
+        owner_id_hex,
+        notes,
+    )
+    .await
 }
 
 #[cfg(test)]

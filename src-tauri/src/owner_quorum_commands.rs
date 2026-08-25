@@ -947,7 +947,7 @@ pub async fn request_quorum_revocation(
 ) -> Result<String, String> {
     request_quorum_revocation_impl(
         state.inner(),
-        std::sync::Arc::new(app),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
         device_vk_hex,
         reason,
     )
@@ -960,7 +960,12 @@ pub async fn cosign_quorum_request(
     request_id: String,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
-    cosign_quorum_request_impl(state.inner(), std::sync::Arc::new(app), request_id).await
+    cosign_quorum_request_impl(
+        state.inner(),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
+        request_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -969,7 +974,12 @@ pub async fn decline_quorum_request(
     request_id: String,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
-    decline_quorum_request_impl(state.inner(), std::sync::Arc::new(app), request_id).await
+    decline_quorum_request_impl(
+        state.inner(),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
+        request_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -977,7 +987,11 @@ pub async fn arm_quorum_enrollment(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<u64, String> {
-    arm_quorum_enrollment_impl(state.inner(), std::sync::Arc::new(app)).await
+    arm_quorum_enrollment_impl(
+        state.inner(),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -985,7 +999,11 @@ pub async fn disarm_quorum_enrollment(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
-    disarm_quorum_enrollment_impl(state.inner(), std::sync::Arc::new(app)).await
+    disarm_quorum_enrollment_impl(
+        state.inner(),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -993,7 +1011,11 @@ pub async fn request_quorum_epoch_bump(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<String, String> {
-    request_quorum_epoch_bump_impl(state.inner(), std::sync::Arc::new(app)).await
+    request_quorum_epoch_bump_impl(
+        state.inner(),
+        std::sync::Arc::new(crate::node_event_sink::AppHandleSink(app)),
+    )
+    .await
 }
 
 #[cfg(test)]
