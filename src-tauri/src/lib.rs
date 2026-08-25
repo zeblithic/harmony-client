@@ -253,12 +253,20 @@ pub mod owner_quorum_enroll;
 pub mod owner_quorum_sync;
 pub mod owner_state;
 pub mod owner_state_crdt;
-pub mod owner_state_crypto;
 pub mod owner_state_persist;
 pub mod owner_state_sync;
-pub mod owner_state_types;
 pub mod owner_trust_sync;
 pub mod pairing;
+// ZEB-548 Stage 0: owner_state_types + owner_state_crypto were extracted into
+// the harmony-core-types crate. Re-exported here so the ~hundreds of existing
+// `crate::owner_state_types::*` / `crate::owner_state_crypto::*` call sites keep
+// resolving unchanged.
+pub use harmony_core_types::{owner_state_crypto, owner_state_types};
+// The four wire types owner_state_types used to register on other modules'
+// behalf (friend_graph, friend_token, owner_state_crdt::OwnerState) now
+// register here, next to their harmony-app definitions, since the sealed
+// CanonicalPayload trait crossed the crate boundary.
+mod canonical_impls;
 pub mod pairing_commands;
 pub mod pending_dm_invites;
 pub mod persistent_card_store;

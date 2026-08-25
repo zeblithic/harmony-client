@@ -16,10 +16,7 @@ use harmony_crdt_sync::HlcTick;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Helper: serialize byte array as CBOR bstr, not as array.
-pub(crate) fn serialize_bytes_as_bstr<const N: usize, S>(
-    b: &[u8; N],
-    s: S,
-) -> Result<S::Ok, S::Error>
+pub fn serialize_bytes_as_bstr<const N: usize, S>(b: &[u8; N], s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -36,7 +33,7 @@ where
 /// header byte plus the raw bytes, vs. array-of-u8's two bytes per
 /// byte once values exceed 0x17 — load-bearing for ciphertext-bearing
 /// fields where overhead dominates packet size.
-pub(crate) fn serialize_vec_as_bstr<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
+pub fn serialize_vec_as_bstr<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -49,7 +46,7 @@ where
 /// Crate-public alongside its serialize partner so DM wire types
 /// (`dm_envelope::MessagePayload.body`) and future Phase 2/3b modules
 /// can reuse the same bstr decoding contract.
-pub(crate) fn deserialize_vec_from_bstr<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+pub fn deserialize_vec_from_bstr<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -93,7 +90,7 @@ where
 /// far more compact than the default `Vec<u8>` Serialize (which would emit an
 /// array-of-u8, two bytes per byte once values exceed 0x17). Mirrors the
 /// single-`Vec<u8>` `serialize_vec_as_bstr` one nesting level up.
-pub(crate) fn serialize_vec_of_vec_as_bstr<S>(v: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error>
+pub fn serialize_vec_of_vec_as_bstr<S>(v: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -119,7 +116,7 @@ where
 /// Helper: deserialize a CBOR array of byte-strings into a `Vec<Vec<u8>>`.
 /// Pairs with `serialize_vec_of_vec_as_bstr`. Each element must be a CBOR
 /// bstr (major type 2); the inner `deserialize_vec_from_bstr` enforces that.
-pub(crate) fn deserialize_vec_of_vec_from_bstr<'de, D>(d: D) -> Result<Vec<Vec<u8>>, D::Error>
+pub fn deserialize_vec_of_vec_from_bstr<'de, D>(d: D) -> Result<Vec<Vec<u8>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -167,7 +164,7 @@ where
 }
 
 /// Helper: deserialize CBOR bstr into byte array.
-pub(crate) fn deserialize_bytes_from_bstr<'de, const N: usize, D>(d: D) -> Result<[u8; N], D::Error>
+pub fn deserialize_bytes_from_bstr<'de, const N: usize, D>(d: D) -> Result<[u8; N], D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -221,7 +218,7 @@ where
 /// `library_signature` fields to `LibraryDirectoryEntry`. Phase 1
 /// entries (no wrapping sig) must serialize to byte-identical CBOR
 /// when the new fields are `None` — see spec §4.1.
-pub(crate) fn serialize_optional_bytes_as_bstr<const N: usize, S>(
+pub fn serialize_optional_bytes_as_bstr<const N: usize, S>(
     b: &Option<[u8; N]>,
     s: S,
 ) -> Result<S::Ok, S::Error>
@@ -241,7 +238,7 @@ where
 /// `Some(arr)` on a bstr, `None` on CBOR null OR absent field (the
 /// absent-field case is handled by `#[serde(default)]` on the field).
 /// Pair with `serialize_optional_bytes_as_bstr`.
-pub(crate) fn deserialize_optional_bytes_from_bstr<'de, const N: usize, D>(
+pub fn deserialize_optional_bytes_from_bstr<'de, const N: usize, D>(
     d: D,
 ) -> Result<Option<[u8; N]>, D::Error>
 where
@@ -575,6 +572,21 @@ pub struct DeviceIdentityHash(
     )]
     pub [u8; 16],
 );
+
+/// Derive the 16-byte DM device-address hash from a 64-byte combined identity
+/// pub (`X25519 ‖ Ed25519`) via `harmony_identity::Identity`'s `address_hash`.
+/// `None` when the bytes are not a valid Identity point.
+///
+/// ZEB-548 Stage 0: relocated here from `dm_signing` (which now re-exports it)
+/// so the `OwnerDeviceCache` deserialize defense-in-depth check below — and this
+/// crate's leaf property — hold without depending on harmony-app. This is the
+/// device-ADDRESS hash; it is a distinct notion from the signing `identity_hash`
+/// (`harmony_owner::PubKeyBundle::identity_hash()`), and the two must never be
+/// converged (see reference_device_hash_two_notions).
+pub fn derive_device_hash_from_identity_pub(identity_pub: &[u8; 64]) -> Option<DeviceIdentityHash> {
+    let identity = harmony_identity::Identity::from_public_bytes(identity_pub).ok()?;
+    Some(DeviceIdentityHash(identity.address_hash))
+}
 
 /// Per-OwnerAddr cache of known bound-device identity hashes. Replicated
 /// across the user's bound devices via Flow A (owner-state CRDT sync).
@@ -952,7 +964,9 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                 // `apply_owner_device_update`.
                 for (d, p, _t) in merged.iter() {
                     if let Some(pub_bytes) = p {
-                        match crate::dm_signing::derive_device_hash_from_identity_pub(pub_bytes) {
+                        match crate::owner_state_types::derive_device_hash_from_identity_pub(
+                            pub_bytes,
+                        ) {
                             Some(derived) if derived == *d => {}
                             Some(derived) => {
                                 return Err(A::Error::custom(format!(
@@ -1522,17 +1536,27 @@ impl ReadReceiptPref {
 // `canonical_cbor_encode` / `canonical_cbor_decode`. Adding a new
 // type to this module is incomplete until its impl is added here.
 
-use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
-
+/// Certify a type as [`owner_state_crypto::CanonicalPayload`] (ZEB-220): its
+/// `serde::Serialize` produces deterministic canonical CBOR. `#[macro_export]`ed
+/// from harmony-core-types (ZEB-548 Stage 0) so feature crates certify their own
+/// wire types against the sealed trait defined here —
+/// `harmony_core_types::impl_canonical!(MyWireType, ...)`. This macro is the
+/// ONLY supported way to certify a type; never hand-write the two impls.
+#[macro_export]
 macro_rules! impl_canonical {
     ($($t:ty),* $(,)?) => {
         $(
-            impl CanonicalPayloadSealed for $t {}
-            impl CanonicalPayload for $t {}
+            impl $crate::owner_state_crypto::sealed::CanonicalPayloadSealed for $t {}
+            impl $crate::owner_state_crypto::CanonicalPayload for $t {}
         )*
     };
 }
 
+// The core wire vocabulary defined in this crate. Types that live in other
+// workspace crates (friend_graph::FriendGraph / FriendEntry,
+// friend_token::FriendTokenPayload, owner_state_crdt::OwnerState) register
+// themselves via `impl_canonical!` next to their own definitions in harmony-app
+// (ZEB-548 Stage 0 — the sealed trait crossed the crate boundary).
 impl_canonical!(
     Hlc,
     SpaceId,
@@ -1557,18 +1581,17 @@ impl_canonical!(
     ReadMarker,
     LibraryEntry,
     RootPublishPayload,
-    crate::friend_graph::FriendGraph, // ZEB-370 Phase 1: friend-graph sub-CRDT
-    crate::friend_graph::FriendEntry,
-    crate::friend_token::FriendTokenPayload, // ZEB-370 Phase 1: friend-token URL payload
 );
 
-// OwnerState lives in owner_state_crdt to keep CRDT semantics together;
-// its CanonicalPayload impl is registered here alongside all Phase 2 wire types.
-impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed
-    for crate::owner_state_crdt::OwnerState
-{
-}
-impl crate::owner_state_crypto::CanonicalPayload for crate::owner_state_crdt::OwnerState {}
+// Foreign wire types certified here (ZEB-548 Stage 0). Once the sealed trait
+// crossed the crate boundary, harmony-app could no longer impl it for types it
+// does not define (orphan rule — foreign trait for a foreign type), so these
+// impls moved here to live with the trait. harmony-app previously certified them
+// by hand in owner_trust_sync.rs / reachability_record.rs.
+impl_canonical!(
+    harmony_owner::state::OwnerState,
+    harmony_reachability::ReachabilityAnnouncePayload,
+);
 
 #[cfg(test)]
 mod hlc_tests {

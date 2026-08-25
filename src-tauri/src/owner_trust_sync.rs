@@ -15,7 +15,6 @@
 
 use crate::fleet_sync::{FleetPersist, MergeOutcome, Merger, SyncError};
 use crate::owner_state::{load_owner_state_cbor, save_owner_state_cbor_only};
-use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::Hlc;
 use ciborium::{from_reader, into_writer};
 use harmony_owner::state::OwnerState;
@@ -39,13 +38,10 @@ pub const OWNER_TRUST_REPLAY_FILENAME: &str = "owner_trust_replay.cbor";
 
 const OWNER_TRUST_REPLAY_SCHEMA_V1: u8 = 1;
 
-// ZEB-220 sealed CanonicalPayload registration for the FOREIGN type
-// `harmony_owner::state::OwnerState` — the same two empty impls the
-// `impl_canonical!` macro expands to (see fleet_sync.rs, which does this
-// manually for `FleetRootPublish`). Coherent because both traits are
-// crate-local.
-impl CanonicalPayloadSealed for OwnerState {}
-impl CanonicalPayload for OwnerState {}
+// ZEB-548 Stage 0: the CanonicalPayload registration for the FOREIGN type
+// `harmony_owner::state::OwnerState` moved to harmony-core-types
+// (owner_state_types.rs). Once the sealed trait crossed the crate boundary,
+// impl'ing a foreign trait for a foreign type here violated the orphan rule.
 
 /// Fold a remote trust snapshot into local via the crate's validating
 /// mutators. Fold order is load-bearing: enrollments → revocations →

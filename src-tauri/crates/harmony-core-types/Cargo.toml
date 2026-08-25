@@ -1,0 +1,35 @@
+# harmony-core-types — ZEB-548 Stage 0.
+# The pure-data wire vocabulary (owner_state_types) + canonical-CBOR crypto
+# (owner_state_crypto), extracted from harmony-app as the foundation crate every
+# other cluster depends on. No I/O; no Tauri; no back-reference to harmony-app.
+[package]
+name = "harmony-core-types"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+
+[lib]
+name = "harmony_core_types"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+blake3 = "1"
+hex = "0.4"
+thiserror = "1"
+# harmony-* git deps come from [workspace.dependencies] so their lockstep rev
+# lives in exactly one place (see reference_harmony_dep_lockstep_rev_bump).
+harmony-identity = { workspace = true }
+harmony-content = { workspace = true }
+harmony-crdt-sync = { workspace = true }
+# Needed only to certify their wire types (OwnerState,
+# ReachabilityAnnouncePayload) as CanonicalPayload — the impls must live with the
+# sealed trait, which lives here (orphan rule). See owner_state_types.rs.
+harmony-owner = { workspace = true }
+harmony-reachability = { workspace = true }

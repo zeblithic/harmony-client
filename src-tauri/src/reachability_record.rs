@@ -5,9 +5,7 @@
 use serde::Serialize;
 use std::net::SocketAddr;
 
-use crate::owner_state_crypto::{
-    canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload, CryptoError,
-};
+use crate::owner_state_crypto::{canonical_cbor_encode, CryptoError};
 use crate::owner_state_types::{serialize_bytes_as_bstr, Hlc, OwnerAddr};
 
 /// Signed validity window applied to every reachability pkarr record
@@ -64,8 +62,10 @@ pub fn durable_butler_set(blob: &ReachabilityAnnouncePayload) -> Vec<ButlerSetEn
         .collect()
 }
 
-impl CanonicalPayloadSealed for ReachabilityAnnouncePayload {}
-impl CanonicalPayload for ReachabilityAnnouncePayload {}
+// ZEB-548 Stage 0: the CanonicalPayload registration for the FOREIGN type
+// `harmony_reachability::ReachabilityAnnouncePayload` moved to
+// harmony-core-types (owner_state_types.rs) — orphan rule, once the sealed
+// trait crossed the crate boundary.
 
 /// Convenience: canonical-encode for hashing / signing.
 pub fn canonical_payload_bytes(p: &ReachabilityAnnouncePayload) -> Result<Vec<u8>, CryptoError> {

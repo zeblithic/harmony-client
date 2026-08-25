@@ -27,11 +27,14 @@ pub use crate::owner_state_types::Hlc;
 /// followup since ciborium 0.2 has no canonical writer.
 pub trait CanonicalPayload: sealed::CanonicalPayloadSealed + serde::Serialize {}
 
-pub(crate) mod sealed {
-    /// Sealing trait — only this crate can impl it. `pub(crate)` so
-    /// the macro in `owner_state_types` can reach it; outside-crate
-    /// users still cannot impl `CanonicalPayload` (they'd need to
-    /// impl this trait too, and it's only crate-visible).
+pub mod sealed {
+    /// Sealing supertrait for `CanonicalPayload`. ZEB-548 Stage 0: now
+    /// `pub` (was `pub(crate)`) so the exported `impl_canonical!` macro can
+    /// certify wire types that live in *other* workspace crates. The seal is
+    /// now by convention — certify a type only via `impl_canonical!`, never a
+    /// hand-written impl — rather than by crate visibility. ZEB-220's
+    /// "audit the impls in one place" intent is preserved per-crate: each
+    /// crate's `impl_canonical!` block sits next to the types it certifies.
     pub trait CanonicalPayloadSealed {}
 }
 
@@ -128,8 +131,9 @@ const INFO_FRIEND_AEAD: &[u8] = b"friend-secret-aead-key";
 pub struct KeyTree {
     /// Fleet KeyTree epoch this tree was derived at (ZEB-668 S5). Not key
     /// material — plain copy, no zeroize. Distinct from transport/tunnel/
-    /// community epochs.
-    pub(crate) epoch: u32,
+    /// community epochs. ZEB-548 Stage 0: `pub` (was `pub(crate)`) so harmony-app
+    /// call sites reading `.epoch` reach it across the crate boundary.
+    pub epoch: u32,
     entry_aead: Zeroizing<[u8; 32]>,
     root_aead: Zeroizing<[u8; 32]>,
     lookup: Zeroizing<[u8; 32]>,
@@ -1434,11 +1438,9 @@ mod tests {
         assert_canonical::<InboxKey>();
         assert_canonical::<InboxEntry>();
         assert_canonical::<ReadMarker>();
-        // dm_envelope wire types (ZEB-216 Sub-B Phase 1)
-        assert_canonical::<crate::dm_envelope::MessagePayload>();
-        assert_canonical::<crate::dm_envelope::DmInviteSigned>();
-        assert_canonical::<crate::dm_envelope::DmCidNotifySigned>();
-        assert_canonical::<crate::dm_envelope::DmAckSigned>();
+        // dm_envelope wire types (ZEB-216 Sub-B Phase 1) live in harmony-app;
+        // their compile-time CanonicalPayload assertion moved there with the
+        // crate split (ZEB-548 Stage 0) — see harmony-app's canonical_impls.rs.
     }
 
     #[test]
