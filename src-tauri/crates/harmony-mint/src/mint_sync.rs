@@ -272,25 +272,33 @@ fn upsert_transaction_lww(
     ) {
         return Ok(());
     }
-    // ZEB-989/CA4: defense-in-depth. The local command path validates every
-    // field via create_transaction/update_transaction, but a peer snapshot
-    // bypasses it — a malformed remote row would otherwise persist an invalid
-    // date/amount/currency/description/metadata that list/export then surface.
-    // Validate with the same rules and DROP just this row (not the whole
-    // snapshot) if it fails, so unrelated valid rows still apply.
-    if let Err(e) = crate::mint::validate_transaction_fields(
-        &r.transaction_date,
-        &r.amount,
-        &r.currency,
-        &r.description,
-        r.metadata.as_deref(),
-    ) {
-        tracing::warn!(
-            id = %r.id,
-            error = %e,
-            "mint sync: dropping remote transaction with invalid fields"
-        );
-        return Ok(());
+    // ZEB-989/CA4: defense-in-depth for LIVE rows only. The local command path
+    // validates every field via create_transaction/update_transaction, but a
+    // peer snapshot bypasses it — a malformed live remote row would otherwise
+    // persist an invalid date/amount/currency/description/metadata that
+    // list/export then surface. Validate with the same rules and DROP just this
+    // row (not the whole snapshot) if it fails.
+    //
+    // A TOMBSTONE (deleted_at set) is exempt and always applied: its payload
+    // columns are never surfaced (reads filter `deleted_at IS NULL`), and a
+    // deletion must converge regardless of a malformed or legacy peer's retained
+    // fields — validating it could drop a newer tombstone and leave an older
+    // local row live, breaking LWW deletion convergence (Qodo #1).
+    if r.deleted_at.is_none() {
+        if let Err(e) = crate::mint::validate_transaction_fields(
+            &r.transaction_date,
+            &r.amount,
+            &r.currency,
+            &r.description,
+            r.metadata.as_deref(),
+        ) {
+            tracing::warn!(
+                id = %r.id,
+                error = %e,
+                "mint sync: dropping remote LIVE transaction with invalid fields"
+            );
+            return Ok(());
+        }
     }
     let local_updated_at: Option<String> = tx
         .query_row(
@@ -2008,6 +2016,63 @@ mod tests {
             .unwrap();
         assert_eq!(good, 1, "valid row must persist");
         assert_eq!(bad, 0, "malformed row must be dropped, apply not aborted");
+    }
+
+    #[test]
+    fn apply_tombstone_with_invalid_payload_still_deletes_local() {
+        // ZEB-989 / Qodo#1: the CA4 validation must apply to LIVE rows only. A
+        // newer remote TOMBSTONE with malformed payload (retained fields a legacy
+        // peer never re-validated) must still suppress an older local live row —
+        // otherwise deletion convergence breaks and the row can be republished.
+        let mut local = fresh_db();
+        seed_account(&mut local, "a1", "Chase", "2026-05-01T00:00:00Z");
+        local
+            .execute(
+                "INSERT INTO transactions \
+                 (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+                 VALUES ('t1', '2026-05-01', '-1.00', 'USD', 'a1', 'x', \
+                 '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![AccountRow {
+                id: "a1".into(),
+                name: "Chase".into(),
+                created_at: "2026-05-01T00:00:00Z".into(),
+                updated_at: "2026-05-01T00:00:00Z".into(),
+            }],
+            transactions: vec![TransactionRow {
+                id: "t1".into(),
+                transaction_date: "2026-05-01".into(),
+                amount: "not-a-number".into(), // malformed retained payload
+                currency: "USD".into(),
+                account_id: "a1".into(),
+                description: "x".into(),
+                metadata: None,
+                created_at: "2026-05-01T00:00:00Z".into(),
+                updated_at: "2026-05-02T00:00:00Z".into(), // NEWER than local
+                deleted_at: Some("2026-05-02T00:00:00Z".into()), // TOMBSTONE
+            }],
+            settings: vec![],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        apply_remote_snapshot(&mut local, &remote, &HashMap::new(), None).unwrap();
+
+        let deleted_at: Option<String> = local
+            .query_row(
+                "SELECT deleted_at FROM transactions WHERE id = 't1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            deleted_at.is_some(),
+            "a newer malformed tombstone must still delete the local live row"
+        );
     }
 
     #[test]

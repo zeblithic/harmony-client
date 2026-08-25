@@ -20,8 +20,11 @@ name = "harmony_mint"
 
 [features]
 # Mirrors the sibling leaves: forwards to the fixtures the mint_sync tests use
-# (device_dataset_file::test_cipher). The dev-dependencies cover the default
-# `cargo test -p harmony-mint` path; this feature covers `--features test-fixtures`.
+# (device_dataset_file::test_cipher). The dev-dependencies make those fixtures
+# available on the default-feature build (no `--features test-fixtures`); this
+# feature covers builds that enable it. Both are needed so the tests compile
+# under the full `--workspace --all-targets --features test-fixtures` gate and a
+# bare `--lib` inner-loop run alike.
 test-fixtures = [
     "harmony-foundation/test-fixtures",
     "harmony-identity-crypto/test-fixtures",

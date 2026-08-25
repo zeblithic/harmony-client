@@ -18,8 +18,11 @@ name = "harmony_mail"
 [features]
 # Mirrors the sibling leaves: forwards to the crypto/emission fixtures the mail
 # tests use (device_dataset_file::test_cipher, node_event_sink::RecordingSink).
-# The dev-dependencies below cover the default `cargo test -p harmony-mail` path;
-# this feature covers `--features test-fixtures` (workspace clippy / --all-targets).
+# The dev-dependencies below make those fixtures available on the default-feature
+# build (no `--features test-fixtures`); this feature covers builds that enable
+# it. Both are needed so the tests compile under the full
+# `--workspace --all-targets --features test-fixtures` gate and a bare `--lib`
+# inner-loop run alike.
 test-fixtures = [
     "harmony-foundation/test-fixtures",
     "harmony-identity-crypto/test-fixtures",
