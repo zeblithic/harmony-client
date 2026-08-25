@@ -162,9 +162,9 @@ mod tests {
         // holds — a 5s adopt advance is negligible against a 5min governance
         // skew gate. Widening CAP still trips this pin.
         assert!(HLC_ADOPT_FORWARD_CAP_MS * 12 <= 60_000);
-        assert!(
-            HLC_ADOPT_FORWARD_CAP_MS * 60
-                <= crate::community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
-        );
+        // NOTE (ZEB-548 Stage 1): the second pin
+        //   HLC_ADOPT_FORWARD_CAP_MS * 60 <= community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
+        // now lives in harmony-app (community_membership tests) — this crate is a
+        // pure leaf and cannot see the community cluster.
     }
 }

@@ -1,0 +1,18 @@
+# harmony-foundation — ZEB-548 Stage 1 (foundation-first).
+# Broadly-depended-on, rarely-changing primitives extracted from harmony-app:
+# the bounded-time trust policy (clock_trust, ZEB-831), the causal HLC adoption
+# floor (hlc_adopt_floor, ZEB-790), and the wall-clock source. Pure leaves —
+# no I/O, no Tauri, no harmony-* deps, no back-reference to harmony-app. Sits
+# alongside harmony-core-types at the bottom of the crate DAG.
+[package]
+name = "harmony-foundation"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+
+[lib]
+name = "harmony_foundation"
+
+[dependencies]
+chrono = "0.4"
+tracing = "0.1"

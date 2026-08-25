@@ -2839,6 +2839,7 @@ dependencies = [
  "harmony-core-types",
  "harmony-crdt-sync",
  "harmony-crypto",
+ "harmony-foundation",
  "harmony-identity",
  "harmony-iroh",
  "harmony-mailbox",
@@ -3026,6 +3027,14 @@ dependencies = [
  "hashbrown 0.15.5",
  "postcard",
  "serde",
+]
+
+[[package]]
+name = "harmony-foundation"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "tracing",
 ]
 
 [[package]]

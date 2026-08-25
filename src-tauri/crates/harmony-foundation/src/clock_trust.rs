@@ -617,10 +617,9 @@ mod tests {
         // The adoption floor's local nudge (5 s) is far below the control window
         // it must never widen past.
         assert!(crate::hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS < MAX_FORWARD_SKEW_MS);
-        // The control tier is at or below governance's current ingest budget
-        // (T-GOV may later tighten governance ordering TO this constant).
-        assert!(
-            MAX_FORWARD_SKEW_MS <= crate::community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
-        );
+        // NOTE (ZEB-548 Stage 1): the cross-invariant pin
+        //   MAX_FORWARD_SKEW_MS <= community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
+        // now lives in harmony-app (community_membership tests) — this crate is a
+        // pure leaf and cannot see the community cluster.
     }
 }
