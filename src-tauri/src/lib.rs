@@ -253,12 +253,20 @@ pub mod owner_quorum_enroll;
 pub mod owner_quorum_sync;
 pub mod owner_state;
 pub mod owner_state_crdt;
-pub mod owner_state_crypto;
 pub mod owner_state_persist;
 pub mod owner_state_sync;
-pub mod owner_state_types;
 pub mod owner_trust_sync;
 pub mod pairing;
+// ZEB-548 Stage 0: owner_state_types + owner_state_crypto were extracted into
+// the harmony-core-types crate. Re-exported here so the ~hundreds of existing
+// `crate::owner_state_types::*` / `crate::owner_state_crypto::*` call sites keep
+// resolving unchanged.
+pub use harmony_core_types::{owner_state_crypto, owner_state_types};
+// The four wire types owner_state_types used to register on other modules'
+// behalf (friend_graph::{FriendGraph, FriendEntry}, friend_token::FriendTokenPayload,
+// owner_state_crdt::OwnerState) now register here, next to their harmony-app
+// definitions, since the sealed CanonicalPayload trait crossed the crate boundary.
+mod canonical_impls;
 pub mod pairing_commands;
 pub mod pending_dm_invites;
 pub mod persistent_card_store;
@@ -5933,7 +5941,7 @@ pub async fn start_node_inner(
                             // epoch-0 material is never pruned).
                             let kt0 = trees
                                 .iter()
-                                .min_by_key(|k| k.epoch)
+                                .min_by_key(|k| k.epoch())
                                 .map(std::sync::Arc::clone);
                             match kt0 {
                                 Some(kt0) => {
@@ -5947,10 +5955,10 @@ pub async fn start_node_inner(
                                     // stragglers mid-window degrade to CRDT
                                     // catch-up once they install N+1.)
                                     let max_epoch =
-                                        trees.iter().map(|k| k.epoch).max().unwrap_or(0);
+                                        trees.iter().map(|k| k.epoch()).max().unwrap_or(0);
                                     let mut data_trees = trees
                                         .into_iter()
-                                        .filter(|k| k.epoch != 0 || max_epoch == 0);
+                                        .filter(|k| k.epoch() != 0 || max_epoch == 0);
                                     let keys = crate::owner_state_crypto::FleetKeySet::new(
                                         data_trees
                                             .next()
@@ -7909,7 +7917,7 @@ pub async fn start_node_inner(
                             tokio::spawn(async move {
                                 while fkeys_nudge_rx.recv().await.is_some() {
                                     let doc_snapshot = { apply_doc.lock().await.clone() };
-                                    if doc_snapshot.epoch <= apply_keys.newest().epoch {
+                                    if doc_snapshot.epoch <= apply_keys.newest().epoch() {
                                         continue;
                                     }
                                     if !doc_snapshot.verify(&fleet_keys_owner_id) {
@@ -11322,7 +11330,7 @@ pub async fn start_node_inner(
                                             // set that reopens the window at the
                                             // next boot. Seed-holders have no
                                             // vault to persist.
-                                            let newest_epoch = window_keys.newest().epoch;
+                                            let newest_epoch = window_keys.newest().epoch();
                                             let persisted = if window_is_seed_holder {
                                                 true
                                             } else {
@@ -75577,7 +75585,7 @@ pub(crate) async fn bump_fleet_epoch_inner(
     // touches keychain/disk; sealing is CPU crypto).
     let trust_snapshot = { trust_doc_arc.lock().await.clone() };
     let carrier_snapshot = { carrier_doc_arc.lock().await.clone() };
-    let current_data_epoch = keys.newest().epoch;
+    let current_data_epoch = keys.newest().epoch();
     let (new_doc, new_kt) = tokio::task::spawn_blocking(move || {
         let loaded = crate::owner_state::load_owner_state(&identity_dir, keychain())?
             .ok_or_else(|| "no owner identity on this device".to_string())?;

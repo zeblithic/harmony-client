@@ -3138,7 +3138,7 @@ mod tests {
         );
         // The carrier advanced to N+1 and the initiator publishes on the new epoch.
         assert_eq!(cr.carrier.carrier_doc.lock().await.epoch, 5);
-        assert_eq!(cr.carrier.fleet_keys.newest().epoch, 5);
+        assert_eq!(cr.carrier.fleet_keys.newest().epoch(), 5);
     }
 
     #[test]
@@ -3285,7 +3285,7 @@ mod tests {
         assert_eq!(outcome.revocations_applied, 0, "no revocation");
         assert_eq!(outcome.epoch_bumps_installed, 1);
         assert_eq!(cr.carrier.carrier_doc.lock().await.epoch, 5);
-        assert_eq!(cr.carrier.fleet_keys.newest().epoch, 5);
+        assert_eq!(cr.carrier.fleet_keys.newest().epoch(), 5);
         assert!(rig.quorum_doc.lock().await.requests.is_empty());
     }
 

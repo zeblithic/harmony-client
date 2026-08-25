@@ -2836,6 +2836,7 @@ dependencies = [
  "futures-util",
  "harmony-compute",
  "harmony-content",
+ "harmony-core-types",
  "harmony-crdt-sync",
  "harmony-crypto",
  "harmony-identity",
@@ -2948,6 +2949,28 @@ dependencies = [
  "postcard",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "harmony-core-types"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20poly1305",
+ "ciborium",
+ "harmony-content",
+ "harmony-crdt-sync",
+ "harmony-identity",
+ "harmony-owner",
+ "harmony-reachability",
+ "hex",
+ "hkdf",
+ "hmac",
+ "rand 0.8.6",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]

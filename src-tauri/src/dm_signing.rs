@@ -206,26 +206,19 @@ pub fn compute_dm_destination_hash(identity_address_hash: [u8; 16]) -> [u8; 16] 
 /// public-bytes value (`X25519_pub(32) || Ed25519_pub(32)`, the canonical
 /// `harmony_identity::Identity::to_public_bytes()` layout).
 ///
+/// ZEB-548 Stage 0: relocated into `harmony_core_types::owner_state_types`
+/// (where `DeviceIdentityHash` lives, so the OwnerDeviceCache deserialize
+/// check can call it without depending on harmony-app). Re-exported here so
+/// the existing `crate::dm_signing::derive_device_hash_from_identity_pub` call
+/// sites are unchanged.
+///
 /// Single source of truth: delegates to
 /// `harmony_identity::Identity::from_public_bytes(identity_pub).address_hash`.
-/// Never re-derive the hash formula here — if harmony changes its scheme,
-/// we want to follow automatically rather than silently diverge.
-///
-/// Returns `None` if the bytes are malformed (invalid X25519 or Ed25519
-/// point encoding). Caller treats `None` as a verification-failure case.
-///
-/// Infallible twin for wire-commitment checks over untrusted bytes:
-/// `crate::community_invite::device_hash_from_identity_pub` — same
-/// `SHA256(X25519 ‖ Ed25519)[..16]` bytes via
-/// `harmony_crypto::hash::truncated_hash`, but no point validation, because
-/// the invite/open-join decode defenses must hash arbitrary wire bytes before
-/// signature verification (ZEB-716). Distinct notion from
+/// Returns `None` if the bytes are malformed. Distinct notion from
 /// `harmony_owner::PubKeyBundle::identity_hash()` (signing-only material);
-/// the two must never be converged.
-pub fn derive_device_hash_from_identity_pub(identity_pub: &[u8; 64]) -> Option<DeviceIdentityHash> {
-    let identity = harmony_identity::Identity::from_public_bytes(identity_pub).ok()?;
-    Some(DeviceIdentityHash(identity.address_hash))
-}
+/// the two must never be converged. Infallible untrusted-bytes twin:
+/// `crate::community_invite::device_hash_from_identity_pub`.
+pub use harmony_core_types::owner_state_types::derive_device_hash_from_identity_pub;
 
 /// ZEB-580 S1: build the 64-byte DM combined pub (`X25519_pub(32) ‖
 /// Ed25519_pub(32)`) for an enrolled device (#2) from its EnrollmentCert's

@@ -52,7 +52,7 @@ pub(crate) async fn start_inviter_pairing_with_keychain(
     // (live datasets). The resident key set knows the current epoch.
     let fleet_current_epoch = {
         let guard = state.lock().unwrap_or_else(|p| p.into_inner());
-        guard.fleet_keys.as_ref().map_or(0, |k| k.newest().epoch)
+        guard.fleet_keys.as_ref().map_or(0, |k| k.newest().epoch())
     };
     // ZEB-510 step 2: snapshot this device's iroh dialing coordinates so the
     // outgoing CONFIRM carries them, seeding the joiner's dial route to us.

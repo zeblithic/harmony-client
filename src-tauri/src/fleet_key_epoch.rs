@@ -476,7 +476,7 @@ pub fn persist_vault_material_set(
     let mut materials: Vec<crate::owner_state_crypto::FleetKeyMaterial> = keys
         .accept_set()
         .iter()
-        .filter(|k| k.epoch >= min_epoch)
+        .filter(|k| k.epoch() >= min_epoch)
         .map(|k| k.to_fleet_material())
         .collect();
     if !materials.iter().any(|m| m.epoch == 0) {

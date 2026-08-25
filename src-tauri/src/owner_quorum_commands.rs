@@ -621,7 +621,7 @@ pub(crate) async fn request_quorum_revocation_inner(
         (g.fleet_key_epoch_doc.clone(), g.fleet_keys.clone())
     };
     let current_fleet_epoch: Option<u32> = match (&carrier_doc_opt, &fleet_keys_opt) {
-        (Some(carrier), Some(keys)) => Some(carrier.lock().await.epoch.max(keys.newest().epoch)),
+        (Some(carrier), Some(keys)) => Some(carrier.lock().await.epoch.max(keys.newest().epoch())),
         _ => None,
     };
     let loaded = load_keys(dir, keychain).await?;
@@ -702,7 +702,7 @@ pub(crate) async fn request_quorum_epoch_bump_inner(
         (g.fleet_key_epoch_doc.clone(), g.fleet_keys.clone())
     };
     let current_fleet_epoch = match (&carrier_doc_opt, &fleet_keys_opt) {
-        (Some(carrier), Some(keys)) => carrier.lock().await.epoch.max(keys.newest().epoch),
+        (Some(carrier), Some(keys)) => carrier.lock().await.epoch.max(keys.newest().epoch()),
         _ => {
             return Err(
                 "noFleetKeys: this node is not carrying fleet keys; nothing to rotate".to_string(),
