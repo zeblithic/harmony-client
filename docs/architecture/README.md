@@ -342,6 +342,24 @@ flowchart TB
   public vine-relay, ping). Inbound admission is layered cheapest-first —
   per-source rate shields, per-source concurrency caps, global semaphores,
   boot-window queues — each with RAII permits held for the session's life.
+- **A zenoh face is transport, not trust (ZEB-996).** Any peer that
+  negotiates `harmony/zenoh/v1` gets a zenoh face — deliberately. The
+  authorization boundary is the payload layer, per plane: owner datasets ride
+  owner-key envelopes, community voting is epoch-encrypted to the membership,
+  channel/state ingest verifies signatures and membership *at the event's own
+  HLC*, DMs are end-to-end encrypted, and profile cards are public by intent.
+  Gating faces on identity would island new members during the join window
+  (they learn our reachability record before our CRDT ingest produces
+  theirs — the same anti-islanding reason the admission oracle fails *open*
+  on unknown node ids and so cannot serve as an inbound gate). What IS
+  bounded is availability: resolver-known peers pass untouched, while
+  resolver-unknown ("stranger") endpoints occupy a small bounded pool behind
+  a global admission-rate window (`zenoh_inbound_admission.rs`) — endpoint
+  ids are free to mint, so without the bound a Sybil could stack unbounded
+  faces and amplify linkstate flood (super-linear in edges; ZEB-912 measured
+  router collapse near N50). Shed strangers retry via their reconnect
+  ladder, which also self-heals the boot window where the resolver has not
+  yet replayed and known peers briefly classify as strangers.
 - **Dialing has exactly one enforcement point.** Every trigger (resolver
   learn/change, drop-watchers, boot seeding, presence sweeps) just *kicks*
   the reconnect supervisor; its dispatch pass applies the admission-oracle
