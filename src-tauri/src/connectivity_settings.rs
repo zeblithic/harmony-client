@@ -187,7 +187,7 @@ fn validate_single_relay(trimmed: &str) -> Result<String, String> {
         "https" => {}
         "http" => {
             let host = parsed.host_str().unwrap_or("");
-            if !is_local_host(host) {
+            if !crate::network_health::is_local_host(host) {
                 return Err(format!(
                     "http:// is only allowed for localhost relays: {trimmed}"
                 ));
@@ -278,36 +278,6 @@ pub fn effective_iroh_relays(settings: &ConnectivitySettings) -> Option<Vec<Stri
         None
     } else {
         Some(sanitized)
-    }
-}
-
-/// True for loopback / private / link-local hosts where a plaintext `http://`
-/// relay is acceptable (a local pkarr relay on :6881).
-///
-/// IPv6 coverage: loopback (`::1`), ULA (`fc00::/7`), link-local (`fe80::/10`).
-/// The `is_unique_local` / `is_unicast_link_local` methods are unstable, so we
-/// use stable bit-mask checks on the first 16-bit segment instead.
-///
-/// Note: `url::Url::host_str()` returns IPv6 addresses bracketed as `[::1]`
-/// per the URL spec; we strip the brackets before parsing.
-pub(crate) fn is_local_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // `url::Url::host_str()` wraps IPv6 in `[…]` brackets per URL spec — strip
-    // them so `str::parse::<IpAddr>()` can handle the address.
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
-    match bare.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        Ok(std::net::IpAddr::V6(v6)) => {
-            let seg0 = v6.segments()[0];
-            // loopback ::1, ULA fc00::/7, link-local fe80::/10
-            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
-        }
-        Err(_) => false,
     }
 }
 

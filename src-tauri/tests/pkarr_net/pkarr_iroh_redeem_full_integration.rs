@@ -221,8 +221,8 @@ pub(crate) fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
 // The helper builds Alice's acceptor with `Some(invite_pub)` (the case-A
 // `PkarrInvitePublisher`, shared via `Arc`), so the ZEB-367 unregister-on-
 // consume wiring (`handle_unicast` → `unregister_invite` on `Inserted`) is
-// live for BOTH tests. Each test calls `invite_pub.register_invite(&payload)`
-// with its own payload after constructing the invite.
+// live for BOTH tests. Each test calls `invite_pub.register_invite(sig)` with
+// its own payload's `invite_token.sig` after constructing the invite.
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Everything the two roundtrip tests need after the shared two-party setup.
@@ -508,7 +508,7 @@ pub(crate) async fn setup_two_party_iroh_handshake_with_config(
     // (`handle_unicast` → `unregister_invite` once Bob's PendingJoin lands
     // as `Inserted`). The publisher object only depends on alice_sk /
     // alice_pub / the routing-blob builder — all available here. Each test
-    // calls `register_invite(&its_own_payload)` after constructing the
+    // calls `register_invite(its_own_payload's token sig)` after constructing the
     // invite; the publisher is shared via `Arc` because both the acceptor
     // and the test body hold it and `register/unregister_invite` take `&self`.
     let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
@@ -853,7 +853,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // Publish Alice's case-A pkarr record for this invite and wait for
         // the mock relay to make it visible. The IPC resolves it end-to-end
         // (pkarr → iroh) with no test-specific short-circuit.
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         // ── 7. Drive Bob's IPC. ─────────────────────────────────────────
@@ -1186,7 +1188,9 @@ async fn targeted_invite_only_generate_then_redeem_roundtrip() {
         let invite_url =
             community_invite::encode_invite_url(&invite_payload).expect("encode targeted invite");
 
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
@@ -1353,7 +1357,9 @@ async fn targeted_invite_only_multi_device_redeem_opens_correct_envelope() {
         let invite_url = community_invite::encode_invite_url(&invite_payload)
             .expect("encode multi-device invite");
 
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
@@ -1531,7 +1537,9 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
 
         // Publish Alice's case-A pkarr record (keyed on the minted token sig)
         // and wait for visibility before driving Bob's IPC.
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         // ── 7. Drive Bob's IPC. ─────────────────────────────────────────
@@ -1784,7 +1792,9 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
         let invite_url =
             community_invite::encode_invite_url(&invite_payload).expect("encode invite");
 
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         // ── Bob's owner-state SyncEngine over a temp identity dir. ──────
@@ -2018,7 +2028,9 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
         let invite_url =
             community_invite::encode_invite_url(&invite_payload).expect("encode invite");
 
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
         let invite_handle = format!("invite:{}", hex::encode(token_sig));
         assert!(
@@ -2224,7 +2236,9 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
         let cache_key = invite_payload
             .redemption_mint_cache_key()
             .expect("payload cache key");
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         // Real wall-clock now — production reads the cache with SystemTime::now()
@@ -2362,7 +2376,9 @@ async fn zeb899_latch_commit_failure_degrades_to_unreachable() {
         let cache_key = invite_payload
             .redemption_mint_cache_key()
             .expect("payload cache key");
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
@@ -2475,7 +2491,9 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             .expect("payload cache key");
 
         // Register the case-A invite so active_handles carries it (burn target).
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
         let invite_handle = format!("invite:{}", hex::encode(token_sig));
         assert!(
@@ -2722,7 +2740,9 @@ async fn zeb903_reattempt_driver_converges_latched_join_on_epoch_bump() {
             .redemption_mint_cache_key()
             .expect("payload cache key");
 
-        s.invite_pub.register_invite(&invite_payload).await;
+        s.invite_pub
+            .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
+            .await;
         let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
         let invite_handle = format!("invite:{}", hex::encode(token_sig));
 

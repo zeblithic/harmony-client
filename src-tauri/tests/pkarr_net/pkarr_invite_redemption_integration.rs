@@ -118,7 +118,9 @@ async fn case_a_publish_then_resolve_round_trip() {
         let invite = fixture_invite_payload(alice_owner_addr);
 
         // --- Case A: Alice registers the invite publication ---
-        inv_pub.register_invite(&invite).await;
+        inv_pub
+            .register_invite(invite.invite_token.as_ref().map(|t| t.sig))
+            .await;
 
         // --- Bob's side: derive the same key ---
         let token_sig: [u8; 64] = [0xAAu8; 64];
