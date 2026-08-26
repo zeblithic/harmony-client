@@ -667,6 +667,20 @@ pub fn load_owner_state(
     }))
 }
 
+/// Note: this lock does NOT cover the encrypted-file writers `rotate_passphrase`
+/// / `write_seed_to_disk_with_keychain`, which write `identity.enc` but not
+/// `owner_state.cbor`. Those are serialized by the sibling
+/// `identity::IDENTITY_FILE_WRITE_LOCK` (ZEB-201). `save_owner_state_atomic`
+/// acquires BOTH — this lock (held by its callers) as the OUTER and
+/// `IDENTITY_FILE_WRITE_LOCK` as the INNER; the acquisition order never inverts,
+/// so the two locks are deadlock-free together.
+///
+/// ZEB-548 Stage 2: lives here (beside the [`save_owner_state_atomic`] path it
+/// guards) rather than in `owner_commands`, which re-exports it back
+/// (downward), so the spine trust-sync path no longer reaches up for it.
+pub(crate) static OWNER_STATE_WRITE_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Atomically persist a freshly-minted owner identity.
 ///
 /// Order: keychain entries first, `.cbor` last. The `.cbor` file's
@@ -1989,7 +2003,7 @@ mod persistence_tests {
         // (which takes IDENTITY inner) — the real mint/pairing caller ordering.
         std::thread::spawn(move || {
             let a_seed = *a.recovery_artifact.as_bytes();
-            let _owner_guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
+            let _owner_guard = crate::owner_state::OWNER_STATE_WRITE_LOCK
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let r = save_owner_state_atomic(

@@ -1485,11 +1485,11 @@ mod tests {
         GRANT_DEPOSIT_MARKER, GRANT_REVOKE_DEPOSIT_MARKER, MAX_DEPOSIT_GRANT_BYTES,
         MAX_DEPOSIT_GRANT_REVOKE_BYTES, MAX_DEPOSIT_INVITE_BYTES, REVOCATION_DEPOSIT_MARKER,
     };
-    use crate::community_membership::{mint_test_owner, TestOwner};
     use crate::dm_envelope::{build_signed_cidnotify, encode_packet, DmCidNotifySigned};
     use crate::dm_signing::{
         derive_device_hash_from_identity_pub, ed25519_pub_to_x25519, seal_to_owner_with_info,
     };
+    use crate::enrollment_verify::quorum_fixtures::{mint_test_owner, TestOwner};
     use crate::owner_state_types::{OwnerAddr, SpaceId};
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;

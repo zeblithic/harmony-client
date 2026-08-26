@@ -277,7 +277,7 @@ mod tests {
         // `PubKeyBundle::classical_only(master_ed25519).identity_hash()`, so a
         // friend learned from such a cert satisfies the key invariant by
         // construction.
-        let owner = crate::community_membership::mint_test_owner(0x5a);
+        let owner = crate::enrollment_verify::quorum_fixtures::mint_test_owner(0x5a);
         let master_ed25519 =
             if let harmony_owner::certs::EnrollmentIssuer::Master { master_pubkey } =
                 &owner.cert.issuer

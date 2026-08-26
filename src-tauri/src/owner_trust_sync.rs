@@ -262,7 +262,7 @@ impl FleetPersist<OwnerState> for TrustPersist {
         // here could race pairing/mint writers and clobber a newer
         // enrollment (Qodo PR #451). Sync lock in a sync context; held
         // across both file writes so doc + replay stay a consistent pair.
-        let _guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
+        let _guard = crate::owner_state::OWNER_STATE_WRITE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Load-merge-save: the engine snapshot can be STALER than disk —
@@ -323,7 +323,7 @@ pub async fn mutate_trust_state<R>(
             // owner_state.cbor writer (mint / pairing / get_owner_state) —
             // same lock they hold. No `.await` occurs inside the guard
             // scope, so holding a std guard here is safe in async context.
-            let _guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
+            let _guard = crate::owner_state::OWNER_STATE_WRITE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut state = load_owner_state_cbor(&identity_dir)?;

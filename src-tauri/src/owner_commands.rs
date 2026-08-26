@@ -17,7 +17,7 @@ use harmony_owner::recovery::RecoveryMetadata;
 use harmony_owner::trust;
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -37,14 +37,11 @@ use zeroize::Zeroizing;
 /// in one handler doesn't brick future writes (mirrors PR-61's
 /// preview_cache_lock policy).
 ///
-/// Note: this lock does NOT cover the encrypted-file writers `rotate_passphrase`
-/// / `write_seed_to_disk_with_keychain`, which write `identity.enc` but not
-/// `owner_state.cbor`. Those are serialized by the sibling
-/// `identity::IDENTITY_FILE_WRITE_LOCK` (ZEB-201). `save_owner_state_atomic`
-/// acquires BOTH — this lock (held by its callers) as the OUTER and
-/// `IDENTITY_FILE_WRITE_LOCK` as the INNER; the acquisition order never inverts,
-/// so the two locks are deadlock-free together.
-pub(crate) static OWNER_STATE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+// ZEB-548 Stage 2: `OWNER_STATE_WRITE_LOCK` moved down beside the
+// `save_owner_state_atomic` path it guards (`owner_state`); re-imported so
+// this module's guard sites and downstream `crate::owner_commands::`
+// importers resolve unchanged.
+pub(crate) use crate::owner_state::OWNER_STATE_WRITE_LOCK;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,18 +76,11 @@ fn now_unix_checked() -> Option<u64> {
         .ok()
 }
 
-/// Wire → crate reason mapping (ZEB-668 S2 spec §3: three UI reasons; `Other`
-/// unused by the UI).
-pub(crate) fn parse_revoke_reason(reason: &str) -> Result<RevocationReason, String> {
-    match reason {
-        "decommissioned" => Ok(RevocationReason::Decommissioned),
-        "lost" => Ok(RevocationReason::Lost),
-        "compromised" => Ok(RevocationReason::Compromised),
-        other => Err(format!(
-            "invalidReason: expected decommissioned|lost|compromised, got {other:?}"
-        )),
-    }
-}
+// ZEB-548 Stage 2: `parse_revoke_reason` moved down beside the revocation
+// issuer policy (`enrollment_verify`, core-types); re-imported so this
+// module's call sites and downstream `crate::owner_commands::` importers
+// resolve unchanged.
+pub(crate) use crate::enrollment_verify::parse_revoke_reason;
 
 /// Crate → wire label (for `DeviceView.revoked_reason`).
 pub(crate) fn revoke_reason_label(reason: &RevocationReason) -> String {
@@ -253,85 +243,14 @@ pub(crate) fn plan_fleet_epoch_bump(
     Ok((doc, new_kt))
 }
 
-/// Seal `material_cbor` to every surviving device's enrollment x25519 →
-/// `device_id_hex → blob`. Survivors = enrolled minus revoked (deliberately
-/// NOT `active_devices`: a temporarily-offline, non-revoked device must still
-/// get a blob or it is orphaned at window close). `exclude` additionally drops
-/// one device — the quorum-revocation target, which may not yet be revoked in
-/// this trust snapshot (ZEB-677 S5).
-fn seal_material_to_survivors(
-    trust: &harmony_owner::state::OwnerState,
-    material_cbor: &[u8],
-    exclude: Option<[u8; 16]>,
-) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
-    let mut sealed = std::collections::BTreeMap::new();
-    for (device_id, cert) in trust.enrollments.iter() {
-        if trust.is_revoked(*device_id) || exclude == Some(*device_id) {
-            continue;
-        }
-        let id_hex = hex::encode(device_id);
-        let mut x_pub = cert.device_pubkeys.classical.x25519_pub;
-        if x_pub == [0u8; 32] {
-            // `classical_only` zero-fills the x25519 slot when the ed25519
-            // bytes don't map — retry the birational map explicitly so the
-            // error names the device instead of sealing to a dead key.
-            x_pub = crate::dm_signing::ed25519_pub_to_x25519(
-                &cert.device_pubkeys.classical.ed25519_verify,
-            )
-            .map_err(|e| format!("sealFailed:{id_hex}: no usable x25519 ({e})"))?;
-        }
-        let blob = crate::dm_signing::seal_to_owner_with_info(
-            &x_pub,
-            material_cbor,
-            crate::fleet_key_epoch::FLEET_EPOCH_SEAL_INFO,
-        )
-        .map_err(|e| format!("sealFailed:{id_hex}: {e}"))?;
-        sealed.insert(id_hex, blob);
-    }
-    Ok(sealed)
-}
+// ZEB-548 Stage 2: `seal_material_to_survivors` moved down with
+// `plan_fleet_epoch_bump_quorum` (`fleet_key_epoch`), the sealing domain both
+// callers share.
+use crate::fleet_key_epoch::seal_material_to_survivors;
 
-/// ZEB-677 S5 — build the UNSIGNED next-epoch carrier doc for a master-less
-/// (quorum) fleet bump. Generates a FRESH RANDOM `KeyTree` (no master seed to
-/// derive from) and seals it to survivors minus `exclude_target`. The returned
-/// doc carries no signature — the co-sign ceremony collects K=2 quorum parts
-/// over its `signing_bytes` and calls `assemble_quorum`. The returned `KeyTree`
-/// is discarded by the request planner (A recovers it by unsealing its own
-/// blob at assembly time, like any survivor).
-pub(crate) fn plan_fleet_epoch_bump_quorum(
-    trust: &harmony_owner::state::OwnerState,
-    current_data_epoch: u32,
-    now_ms: u64,
-    exclude_target: Option<[u8; 16]>,
-) -> Result<
-    (
-        crate::fleet_key_epoch::FleetKeyEpochDoc,
-        crate::owner_state_crypto::KeyTree,
-    ),
-    String,
-> {
-    let new_epoch = current_data_epoch
-        .checked_add(1)
-        .ok_or_else(|| "fleet epoch counter overflow".to_string())?;
-    let new_kt = crate::owner_state_crypto::KeyTree::generate_at_epoch(new_epoch);
-    let material_cbor = {
-        let mut buf = Zeroizing::new(Vec::new());
-        ciborium::into_writer(&new_kt.to_fleet_material(), &mut *buf)
-            .map_err(|e| format!("encode new material: {e}"))?;
-        buf
-    };
-    let sealed = seal_material_to_survivors(trust, &material_cbor, exclude_target)?;
-    let doc = crate::fleet_key_epoch::FleetKeyEpochDoc {
-        epoch: new_epoch,
-        bump_wall_ms: now_ms,
-        sealed,
-        master_pubkey: None,
-        master_sig: Vec::new(),
-        quorum_sig: None,
-        signer_certs: Vec::new(),
-    };
-    Ok((doc, new_kt))
-}
+// ZEB-548 Stage 2: `plan_fleet_epoch_bump_quorum` moved down beside the
+// `FleetKeyEpochDoc` it builds (`fleet_key_epoch`); its remaining callers (the
+// quorum planners, now in `owner_quorum_sync`) import it from there.
 
 /// ZEB-668 S5: pure window-close decision for the dual-epoch read window.
 /// `survivor_seen_ms` carries each surviving device's fleet-net

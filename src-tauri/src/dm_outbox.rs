@@ -3889,7 +3889,7 @@ mod tests {
         // the helper stays deterministic. The cert's owner_id does NOT match
         // self_owner (the assert in `DmOutbox::new` is bypassed via
         // `DmOutbox::new_synthetic`; production callers must use `new()`).
-        let test_owner = crate::community_membership::mint_test_owner(0xAB);
+        let test_owner = crate::enrollment_verify::quorum_fixtures::mint_test_owner(0xAB);
         let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
             &test_owner.device_key.to_bytes(),
         ));
@@ -4126,7 +4126,8 @@ mod tests {
         // binding, not the community cert binding. Use new_synthetic to bypass
         // the cert.owner_id assert (self_owner here is Reticulum-derived,
         // not from a harmony-owner master key).
-        let test_owner_for_countersign = crate::community_membership::mint_test_owner(0xCC);
+        let test_owner_for_countersign =
+            crate::enrollment_verify::quorum_fixtures::mint_test_owner(0xCC);
         let community_signing_key_for_countersign =
             std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
                 &test_owner_for_countersign.device_key.to_bytes(),
@@ -4297,7 +4298,7 @@ mod tests {
     #[cfg(any(test, feature = "test-fixtures"))]
     #[test]
     fn dm_outbox_community_signing_key_and_enrollment_cert() {
-        use crate::community_membership::mint_test_owner;
+        use crate::enrollment_verify::quorum_fixtures::mint_test_owner;
 
         let test_owner = mint_test_owner(0x77);
 
@@ -10003,7 +10004,7 @@ mod outhold_write_tests {
         let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
         let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
         let private_identity = std::sync::Arc::new(private_identity);
-        let test_owner = crate::community_membership::mint_test_owner(0xAB);
+        let test_owner = crate::enrollment_verify::quorum_fixtures::mint_test_owner(0xAB);
         let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
             &test_owner.device_key.to_bytes(),
         ));

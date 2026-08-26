@@ -3320,7 +3320,7 @@ mod integration_tests {
     /// clamped `now + 5min` still exceeds an honest `revoked_at` at `now`.
     #[test]
     fn future_dated_grant_reshare_cannot_undo_an_honest_revoke() {
-        use crate::file_sharing::{record_grant, revoke_grant_inner};
+        use crate::owner_state_crdt::{record_grant, revoke_grant_inner};
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3363,7 +3363,7 @@ mod integration_tests {
     /// must still reactivate the grant — the guard isn't over-rejecting.
     #[test]
     fn in_window_grant_reshare_still_reactivates_after_a_revoke() {
-        use crate::file_sharing::{record_grant, revoke_grant_inner};
+        use crate::owner_state_crdt::{record_grant, revoke_grant_inner};
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3406,7 +3406,7 @@ mod integration_tests {
     /// whole record before the max-join, so the poison never lands.
     #[test]
     fn future_dated_revoke_reshare_cannot_grief_lock_an_active_grant() {
-        use crate::file_sharing::{record_grant, revoke_grant_inner};
+        use crate::owner_state_crdt::{record_grant, revoke_grant_inner};
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3457,7 +3457,7 @@ mod integration_tests {
     /// deactivate it — the guard isn't over-rejecting.
     #[test]
     fn in_window_revoke_reshare_still_deactivates_a_grant() {
-        use crate::file_sharing::{record_grant, revoke_grant_inner};
+        use crate::owner_state_crdt::{record_grant, revoke_grant_inner};
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3903,7 +3903,7 @@ mod integration_tests {
         // Re-share on the converged state (granted@300 > revoked@200) reactivates,
         // and merging it back likewise converges to active.
         let mut regrant = a.clone();
-        crate::file_sharing::record_grant(&mut regrant, cid, x, 300);
+        crate::owner_state_crdt::record_grant(&mut regrant, cid, x, 300);
         assert!(active(&regrant), "re-share past revoked_at reactivates");
         let mut merged_back = b.clone();
         super::merge_remote_into_local(&mut merged_back, regrant.clone());
@@ -3995,7 +3995,7 @@ mod integration_tests {
         // Device A dismissed the grant (entry gone, tombstone at 200).
         let mut a = OwnerState::default();
         a.received_file_grants.insert(cid, grant.clone());
-        crate::file_sharing::dismiss_received_grant_inner(&mut a, cid, 200);
+        crate::owner_state_crdt::dismiss_received_grant_inner(&mut a, cid, 200);
 
         // Device B is a stale sibling: still holds the grant, no dismissal.
         let mut b = OwnerState::default();

@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use ed25519_dalek::Signer;
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 use harmony_owner::pubkey_bundle::PubKeyBundle;
+use zeroize::Zeroizing;
 
 use crate::owner_state_crypto::{canonical_cbor_encode, sealed::CanonicalPayloadSealed};
 
@@ -525,6 +526,89 @@ pub fn unseal_own_material(
         ));
     }
     Ok(material)
+}
+
+/// Seal `material_cbor` to every surviving device's enrollment x25519 →
+/// `device_id_hex → blob`. Survivors = enrolled minus revoked (deliberately
+/// NOT `active_devices`: a temporarily-offline, non-revoked device must still
+/// get a blob or it is orphaned at window close). `exclude` additionally drops
+/// one device — the quorum-revocation target, which may not yet be revoked in
+/// this trust snapshot (ZEB-677 S5).
+pub(crate) fn seal_material_to_survivors(
+    trust: &harmony_owner::state::OwnerState,
+    material_cbor: &[u8],
+    exclude: Option<[u8; 16]>,
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    let mut sealed = std::collections::BTreeMap::new();
+    for (device_id, cert) in trust.enrollments.iter() {
+        if trust.is_revoked(*device_id) || exclude == Some(*device_id) {
+            continue;
+        }
+        let id_hex = hex::encode(device_id);
+        let mut x_pub = cert.device_pubkeys.classical.x25519_pub;
+        if x_pub == [0u8; 32] {
+            // `classical_only` zero-fills the x25519 slot when the ed25519
+            // bytes don't map — retry the birational map explicitly so the
+            // error names the device instead of sealing to a dead key.
+            x_pub = crate::dm_signing::ed25519_pub_to_x25519(
+                &cert.device_pubkeys.classical.ed25519_verify,
+            )
+            .map_err(|e| format!("sealFailed:{id_hex}: no usable x25519 ({e})"))?;
+        }
+        let blob = crate::dm_signing::seal_to_owner_with_info(
+            &x_pub,
+            material_cbor,
+            crate::fleet_key_epoch::FLEET_EPOCH_SEAL_INFO,
+        )
+        .map_err(|e| format!("sealFailed:{id_hex}: {e}"))?;
+        sealed.insert(id_hex, blob);
+    }
+    Ok(sealed)
+}
+
+// ZEB-548 Stage 2: lives here (beside the `FleetKeyEpochDoc` it builds) rather
+// than in `owner_commands`, which re-exports it back (downward), so the spine
+// quorum planners no longer reach up for it.
+/// ZEB-677 S5 — build the UNSIGNED next-epoch carrier doc for a master-less
+/// (quorum) fleet bump. Generates a FRESH RANDOM `KeyTree` (no master seed to
+/// derive from) and seals it to survivors minus `exclude_target`. The returned
+/// doc carries no signature — the co-sign ceremony collects K=2 quorum parts
+/// over its `signing_bytes` and calls `assemble_quorum`. The returned `KeyTree`
+/// is discarded by the request planner (A recovers it by unsealing its own
+/// blob at assembly time, like any survivor).
+pub(crate) fn plan_fleet_epoch_bump_quorum(
+    trust: &harmony_owner::state::OwnerState,
+    current_data_epoch: u32,
+    now_ms: u64,
+    exclude_target: Option<[u8; 16]>,
+) -> Result<
+    (
+        crate::fleet_key_epoch::FleetKeyEpochDoc,
+        crate::owner_state_crypto::KeyTree,
+    ),
+    String,
+> {
+    let new_epoch = current_data_epoch
+        .checked_add(1)
+        .ok_or_else(|| "fleet epoch counter overflow".to_string())?;
+    let new_kt = crate::owner_state_crypto::KeyTree::generate_at_epoch(new_epoch);
+    let material_cbor = {
+        let mut buf = Zeroizing::new(Vec::new());
+        ciborium::into_writer(&new_kt.to_fleet_material(), &mut *buf)
+            .map_err(|e| format!("encode new material: {e}"))?;
+        buf
+    };
+    let sealed = seal_material_to_survivors(trust, &material_cbor, exclude_target)?;
+    let doc = crate::fleet_key_epoch::FleetKeyEpochDoc {
+        epoch: new_epoch,
+        bump_wall_ms: now_ms,
+        sealed,
+        master_pubkey: None,
+        master_sig: Vec::new(),
+        quorum_sig: None,
+        signer_certs: Vec::new(),
+    };
+    Ok((doc, new_kt))
 }
 
 #[cfg(test)]

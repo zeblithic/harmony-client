@@ -46,7 +46,7 @@ use iroh::endpoint::Connection;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::friend_intro::KeyedSlidingWindow;
-use crate::iroh_invite_acceptor::IrohHandshakeDispatcher;
+use crate::iroh_endpoint::IrohHandshakeDispatcher;
 use crate::tunnel_manager::{InboundDm, TunnelManager};
 
 /// ZEB-757: strict cap on the number of concurrently-live INBOUND PQ tunnel

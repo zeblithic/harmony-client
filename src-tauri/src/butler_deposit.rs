@@ -1273,76 +1273,11 @@ mod tests {
         );
     }
 
-    /// ZEB-674 Task 3: the butler/relay carrying `grant_push` cannot open the
-    /// per-device sealed grant blobs inside it — each blob is sealed
-    /// end-to-end to a SPECIFIC grantee device's X25519 key
-    /// (`file_sharing::seal_grant_for_devices`), so an unrelated private key
-    /// (standing in for the butler, which never holds a grantee device's
-    /// key) fails to open it.
-    #[test]
-    fn butler_cannot_open_grant_push() {
-        use crate::file_sharing::{seal_grant_for_devices, FileGrantInner, FILE_GRANT_SEAL_INFO};
-
-        let (grantee_priv, grantee_pub) = make_x25519_keypair(0x03);
-        let (unrelated_priv, _unrelated_pub) = make_x25519_keypair(0x04);
-
-        let inner = FileGrantInner {
-            cid: [0x07; 32],
-            file_name: "report.pdf".into(),
-            file_size: 4096,
-            mime: "application/pdf".into(),
-            dek: [0x08; 32],
-        };
-        let sealed_blobs =
-            seal_grant_for_devices(&inner, &[grantee_pub]).expect("seal grant for devices");
-
-        // Build the realistic `grant_push` wire value: CBOR of
-        // `Vec<serde_bytes Vec<u8>>` (each element a byte-string, not a
-        // nested array of integers). `ByteBuf` is `serde_bytes`'s owned
-        // byte-string newtype — encoding via `ciborium` directly (this local
-        // `Vec<ByteBuf>` can't satisfy the module-private `CanonicalPayload`
-        // sealed trait that `canonical_cbor_encode` requires; mirrors the
-        // `LegacyDepositPayload` pattern above).
-        let grant_push_list: Vec<serde_bytes::ByteBuf> = sealed_blobs
-            .iter()
-            .cloned()
-            .map(serde_bytes::ByteBuf::from)
-            .collect();
-        let mut grant_push_bytes = Vec::new();
-        ciborium::into_writer(&grant_push_list, &mut grant_push_bytes).expect("encode gp list");
-
-        let payload = DepositPayload {
-            cidnotify_packet: None,
-            storage_blob: Vec::new(),
-            invite_packet: None,
-            revocation_push: None,
-            grant_push: Some(grant_push_bytes.clone()),
-            grant_revoke: None,
-        };
-        let wire = encode_deposit_payload(&payload).expect("encode payload with grant_push");
-        let decoded = decode_deposit_payload(&wire).expect("decode payload with grant_push");
-        let gp = decoded.grant_push.expect("grant_push present");
-
-        // Decode the outer Vec<Vec<u8>> back out and attempt to open the
-        // single per-device seal with an UNRELATED X25519 private key — the
-        // butler/relay never holds a grantee device's private key.
-        let blobs: Vec<serde_bytes::ByteBuf> =
-            ciborium::from_reader(gp.as_slice()).expect("decode gp list");
-        assert_eq!(blobs.len(), 1);
-        let err = open_from_owner_with_info(&unrelated_priv, &blobs[0], FILE_GRANT_SEAL_INFO)
-            .expect_err("unrelated key must not open the sealed grant");
-        assert!(
-            matches!(err, crate::dm_signing::DmSignError::DecryptionFailed),
-            "expected DecryptionFailed, got {err:?}"
-        );
-
-        // Sanity: the intended grantee CAN open it (proves the fixture is
-        // realistic, not a vacuously-failing seal).
-        let opened = open_from_owner_with_info(&grantee_priv, &blobs[0], FILE_GRANT_SEAL_INFO)
-            .expect("grantee must open its own sealed grant");
-        let back: FileGrantInner = canonical_cbor_decode(&opened).expect("decode inner");
-        assert_eq!(back, inner);
-    }
+    // ZEB-548 Stage 2: `butler_cannot_open_grant_push` (the ZEB-674 Task-3
+    // butler-cannot-open seam test) relocated to
+    // `tests/dm/grant_ingest_seam_integration.rs` — it needs the
+    // orchestration-tier `file_sharing` sealing, which this spine module's
+    // tests may no longer name.
 
     /// The sealed envelope round-trips under the butler info string, and is
     /// domain-separated from ZEB-249: the same ciphertext MUST NOT open

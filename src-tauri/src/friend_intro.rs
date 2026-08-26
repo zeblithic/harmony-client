@@ -1014,7 +1014,7 @@ impl Default for FriendRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::community_membership::mint_test_owner;
+    use crate::enrollment_verify::quorum_fixtures::mint_test_owner;
     use crate::owner_state_types::OwnerAddr;
 
     /// ZEB-680: an empty revoked-device projection for verifier call sites that

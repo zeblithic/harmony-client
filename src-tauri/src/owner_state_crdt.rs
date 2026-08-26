@@ -1365,6 +1365,111 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
     }
 }
 
+// ZEB-548 Stage 2: the three file-grant ledger mutations live here, beside the
+// `file_grants` / `received_file_grants` / `dismissed_received_grants` CRDT
+// fields whose merge semantics they must stay coherent with (ZEB-725/727/847).
+// `file_sharing` re-exports them back (downward) for its command bodies and
+// app-tier callers; the spine sync tests import them from here.
+
+/// Record an owner-local grant (C2). UPSERT semantics: a re-share to the same
+/// grantee refreshes the single row's `granted_at` rather than appending a
+/// duplicate, so the ShareList shows exactly one row per grantee.
+///
+/// The CALLER MUST `notify_dirty()` + persist after a mutation — a `file_grants`
+/// change without it is NEVER persisted NOR replicated (ack-outruns-payload =
+/// permanent loss, ZEB-709).
+pub fn record_grant(
+    state: &mut OwnerState,
+    cid: [u8; 32],
+    grantee_owner: OwnerAddr,
+    granted_at: u64,
+) {
+    let entries = state.file_grants.entry(cid).or_default();
+    // Upsert: bump `granted_at` forward on an existing entry — PRESERVING any
+    // `revoked_at`, so a re-share after a revoke REACTIVATES the grant via
+    // `granted_at > revoked_at` (ZEB-725 LWW-element-set). Otherwise append a
+    // fresh, never-revoked entry.
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|g| g.grantee_owner == grantee_owner)
+    {
+        existing.granted_at = granted_at;
+    } else {
+        entries.push(GrantEntry {
+            grantee_owner,
+            granted_at,
+            revoked_at: 0,
+        });
+    }
+}
+
+/// LAZY revoke (design "Revocation semantics — lazy"), ZEB-725 convergent form:
+/// TOMBSTONE the grantee's `GrantEntry` for `cid` by stamping `revoked_at`
+/// forward past `granted_at` (so `granted_at > revoked_at` is now false and the
+/// grant is inactive). The entry is KEPT, not removed — a removed record would
+/// be re-added by a plain grow-only union with a stale sibling, resurrecting the
+/// revoked grantee; a tombstone that merges by `max` instead CONVERGES the
+/// revoke across the owner's devices. Returns whether an ACTIVE grant was
+/// revoked (idempotent no-op — `false` — when already inactive or absent).
+///
+/// Does NOT touch the DEK or the serve allowlist — an already-granted grantee
+/// keeps the DEK and the CID stays served (constraint 3: access to this CID
+/// version cannot be withdrawn without rotation). This only drops the grantee
+/// from the owner's ShareList and stops future re-delivery. The CALLER MUST
+/// `notify_dirty()` + persist on a `true` return (ZEB-709).
+pub fn revoke_grant_inner(
+    state: &mut OwnerState,
+    cid: [u8; 32],
+    grantee_owner: OwnerAddr,
+    now_ms: u64,
+) -> bool {
+    let Some(grants) = state.file_grants.get_mut(&cid) else {
+        return false;
+    };
+    let Some(entry) = grants.iter_mut().find(|g| g.grantee_owner == grantee_owner) else {
+        return false;
+    };
+    // Already inactive ⇒ idempotent no-op (no state change, no re-emit).
+    if entry.granted_at <= entry.revoked_at {
+        return false;
+    }
+    // Stamp revoked_at forward PAST granted_at so the grant is inactive even
+    // under clock skew (revoked_at >= granted_at ⇒ `granted_at > revoked_at`
+    // is false), while remaining a `max`-mergeable LWW timestamp.
+    entry.revoked_at = now_ms.max(entry.granted_at);
+    true
+}
+
+/// ZEB-727: grantee-local "dismiss this shared-with-me entry". Removes the
+/// `received_file_grants` entry AND records an LWW tombstone
+/// (`dismissed_received_grants[cid] = max(existing, now_ms)`) so the removal
+/// CONVERGES across the grantee's own bound devices — a plain `remove` would be
+/// resurrected by the add-wins union merge (`merge_remote_into_local`). Returns
+/// `true` iff state changed (the entry was present, or the tombstone advanced);
+/// the caller uses this to gate `notify_dirty` + the `shared-with-me-updated`
+/// event.
+///
+/// Recording the tombstone even when the local entry is already gone is
+/// intentional: a sibling device may still hold the grant, and the tombstone is
+/// what suppresses it there on the next merge. Dismiss is REVERSIBLE — a later
+/// owner re-share ingests with a fresh `received_at > dismissed_at` (the shared
+/// file's root CID is stable) and reappears, so the tombstone is timestamped,
+/// not permanent. Pure; unit-testable without a live node.
+pub fn dismiss_received_grant_inner(state: &mut OwnerState, cid: [u8; 32], now_ms: u64) -> bool {
+    let removed = state.received_file_grants.remove(&cid).is_some();
+    // Advance the LWW tombstone. Check presence explicitly rather than treating
+    // `0` as an "absent" sentinel (a real `dismissed_at` could be 0), so the
+    // returned change-signal is correct even at timestamp zero.
+    let advanced = match state.dismissed_received_grants.get(&cid) {
+        Some(&prev) if now_ms <= prev => false,
+        _ => {
+            state.dismissed_received_grants.insert(cid, now_ms);
+            true
+        }
+    };
+    removed || advanced
+}
+
 #[cfg(test)]
 mod apply_space_tests {
     use super::*;

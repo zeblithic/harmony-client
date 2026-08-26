@@ -941,7 +941,7 @@ impl IrohFriendPexAcceptor {
 }
 
 #[async_trait::async_trait]
-impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for IrohFriendPexAcceptor {
+impl crate::iroh_endpoint::IrohHandshakeDispatcher for IrohFriendPexAcceptor {
     async fn handle_connection(&self, conn: Connection) {
         match self.serve(&conn).await {
             // ZEB-804: stamp the FULL-id served-traffic registry once per
@@ -983,7 +983,7 @@ fn wall_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::community_membership::mint_test_owner;
+    use crate::enrollment_verify::quorum_fixtures::mint_test_owner;
     use crate::friend_graph::{FriendEntry, FriendOrigin};
 
     /// ZEB-680: an empty revoked-device projection for verifier call sites that
