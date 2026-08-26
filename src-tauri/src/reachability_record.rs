@@ -2,11 +2,13 @@
 //!
 //! See `docs/specs/2026-05-22-zeb-321-cross-wan-connectivity-design.md` §5.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use crate::owner_state_crypto::{canonical_cbor_encode, CryptoError};
-use crate::owner_state_types::{serialize_bytes_as_bstr, Hlc, OwnerAddr};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
+};
 
 /// ZEB-321 RCH4: maximum allowed skew (ms) between a ReachabilityAnnounce
 /// payload's `announced_at_ms` and the event's HLC `wall_ms`. ±30 minutes —
@@ -30,6 +32,30 @@ pub(crate) const REACHABILITY_RECORD_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 // inner-signature scheme, butler-set accessors, and freshness policy, operating
 // on the core-owned record through its public fields.
 pub use harmony_reachability::{DelegateEndpoint as ButlerSetEntry, ReachabilityAnnouncePayload};
+
+/// Max relay-set entries a vines record may carry (bounds fan-out, mirrors
+/// `COMMUNITY_RELAY_ADVERTISERS_MAX`).
+///
+/// ZEB-548 Stage 2: lives here (beside its butler-set analogue) rather than in
+/// `pkarr_vines`; the vines codec re-exports it back (downward), so the spine
+/// relay-set builder (`fleet_net`) no longer reaches up for it.
+pub const VINE_RELAY_SET_MAX: usize = 4;
+
+/// One relay device's dialing coordinates, as advertised by a vine creator.
+///
+/// The vines analogue of [`ButlerSetEntry`] (ZEB-548 Stage 2: homed beside it;
+/// `pkarr_vines` re-exports this and [`VINE_RELAY_SET_MAX`] back downward).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VineRelayEntry {
+    #[serde(
+        rename = "ep",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub iroh_endpoint_id: [u8; 32],
+    #[serde(rename = "hr")]
+    pub home_relay: String,
+}
 
 /// Reader-side accessor for the butler set (ZEB-418 SP2 P1): returns the
 /// advertised entries iff the `bs_at` stamp is present and within

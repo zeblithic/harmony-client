@@ -20,11 +20,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr};
-
-/// Max relay-set entries a vines record may carry (bounds fan-out, mirrors
-/// `COMMUNITY_RELAY_ADVERTISERS_MAX`).
-pub const VINE_RELAY_SET_MAX: usize = 4;
+// ZEB-548 Stage 2: `VineRelayEntry` + `VINE_RELAY_SET_MAX` are authored by the
+// spine relay-set builder (`fleet_net::build_vine_relay_set`) and homed beside
+// their butler-set analogue in `reachability_record`; re-exported here so
+// vine-tier call sites keep their original paths.
+pub use crate::reachability_record::{VineRelayEntry, VINE_RELAY_SET_MAX};
 
 /// Headroom under pkarr's 1104-byte `SignedPacket` budget. A record that
 /// exceeds the budget doesn't fail loudly — it fails as an eternal silent
@@ -32,19 +32,6 @@ pub const VINE_RELAY_SET_MAX: usize = 4;
 /// and retries forever). Rejecting oversize payloads at build time turns
 /// that into an immediate, attributable error.
 const VINES_RECORD_BLOB_MAX_BYTES: usize = 700;
-
-/// One relay device's dialing coordinates, as advertised by a vine creator.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VineRelayEntry {
-    #[serde(
-        rename = "ep",
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub iroh_endpoint_id: [u8; 32],
-    #[serde(rename = "hr")]
-    pub home_relay: String,
-}
 
 /// The vines pkarr record's routing-blob payload (Task 2 §Design note: no
 /// inner signature field — authenticity comes from the pkarr envelope).
