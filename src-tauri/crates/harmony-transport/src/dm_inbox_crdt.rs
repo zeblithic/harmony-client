@@ -194,12 +194,30 @@ impl DmInboxDoc {
     /// - Q-1: a stamp GREATER than `now_ms` (a backward local clock step left a
     ///   future stamp in the sidecar) is rebased down to `now_ms`, so it cannot
     ///   delay TTL expiry beyond `now_ms + TTL`. Self-heals on each boot.
+    /// - Q-3 (ZEB-998): an entry present in `entries` but MISSING from the
+    ///   sidecar — the mirror image of Q-2's torn multi-file write (the doc
+    ///   rename landed, the first-observed rename did not; also a quarantined
+    ///   or pre-ZEB-862 sidecar) — inherits its own `deposited_at.wall_ms` as
+    ///   the observation floor instead of being lazily re-stamped `now` by the
+    ///   next sweep. A crash between the sidecar renames must not extend an
+    ///   entry's TTL past its original observation floor; the deposit stamp
+    ///   travels in the same file as the entry, so it survives any torn write.
+    ///   It is butler-minted (untrusted), so it is clamped to `now_ms` like
+    ///   Q-1 — a backdated deposit can only shorten a crash-window entry's
+    ///   retention (the safe side: sibling outholds redeliver), never extend
+    ///   it. Runtime arrivals (fleet merge while running) still lazy-stamp
+    ///   `now` in `gc_expired` — that is a genuine local first observation,
+    ///   not a lost one.
     ///
     /// Callers MUST load `entries` before calling this (the boot path does).
     pub fn restore_first_observed(&mut self, mut map: BTreeMap<String, u64>, now_ms: u64) {
         map.retain(|k, _| self.entries.contains_key(k));
         for v in map.values_mut() {
             *v = (*v).min(now_ms);
+        }
+        for (k, e) in &self.entries {
+            map.entry(k.clone())
+                .or_insert_with(|| e.deposited_at.wall_ms.min(now_ms));
         }
         self.first_observed_ms = map;
     }
@@ -449,7 +467,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_first_observed_survives_first_sweep_after_restart() {
+    fn runtime_arrival_without_restore_lazy_stamps_at_now() {
+        // An entry that appears WHILE RUNNING (fleet merge) with no restore in
+        // between is genuinely first-observed at the next sweep: lazy-stamp
+        // `now`, survives. The boot path is different — see the ZEB-998 Q-3
+        // tests below: restore inherits the deposit floor for missing stamps.
         let mut doc = DmInboxDoc::default();
         let k = key();
         doc.entries
@@ -457,7 +479,7 @@ mod tests {
         let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
         assert!(
             !doc.gc_expired(now, &BTreeSet::new()),
-            "empty clock re-stamps at now → survives"
+            "runtime lazy stamp at now → survives"
         );
         assert_eq!(doc.entries.len(), 1);
     }
@@ -527,6 +549,78 @@ mod tests {
         assert!(
             !doc.first_observed_ms().contains_key(&orphan),
             "orphan stamp pruned"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // ZEB-998 Q-3: restore reconciles doc entries missing sidecar stamps
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn restore_missing_stamp_inherits_deposit_floor() {
+        // Torn multi-file write: the doc rename landed, the first-observed
+        // sidecar rename did not. The entry must inherit its own deposit stamp
+        // as the observation floor — NOT be lazily re-stamped `now` by the
+        // next sweep, which would restart its TTL from the boot time.
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries
+            .insert(k.clone(), entry(hlc(1_000, "a"), "butler", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        doc.restore_first_observed(BTreeMap::new(), now);
+        assert_eq!(
+            doc.first_observed_ms()[&k],
+            1_000,
+            "missing stamp inherits the entry's deposit floor"
+        );
+        assert!(
+            doc.gc_expired(now, &BTreeSet::new()),
+            "inherited old floor → entry ages out instead of restarting TTL"
+        );
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn restore_missing_stamp_clamps_future_deposit_to_now() {
+        // The deposit stamp is butler-minted (untrusted): a future-dated
+        // deposit must not delay expiry past now + TTL (mirrors Q-1).
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        let now = 1_000_000u64;
+        doc.entries
+            .insert(k.clone(), entry(hlc(now + 5_000_000, "a"), "butler", &[]));
+        doc.restore_first_observed(BTreeMap::new(), now);
+        assert_eq!(
+            doc.first_observed_ms()[&k],
+            now,
+            "future deposit floor clamped to now"
+        );
+        assert!(doc.gc_expired(
+            now + crate::butler_deposit::INBOX_TTL_MS + 1,
+            &BTreeSet::new()
+        ));
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn restore_torn_write_only_missing_entries_inherit() {
+        // Mixed-generation shape: the sidecar covers the older entry (its
+        // stamp survives verbatim); only the entry the crash orphaned inherits
+        // its deposit floor.
+        let mut doc = DmInboxDoc::default();
+        let k1 = DmInboxDoc::key(&[1u8; 16], &[2u8; 32]);
+        let k2 = DmInboxDoc::key(&[3u8; 16], &[4u8; 32]);
+        doc.entries
+            .insert(k1.clone(), entry(hlc(1, "a"), "butler", &[]));
+        doc.entries
+            .insert(k2.clone(), entry(hlc(7_777, "a"), "butler", &[]));
+        let m: BTreeMap<String, u64> = [(k1.clone(), 5u64)].into_iter().collect();
+        doc.restore_first_observed(m, 1_000_000);
+        assert_eq!(doc.first_observed_ms()[&k1], 5, "sidecar stamp kept");
+        assert_eq!(
+            doc.first_observed_ms()[&k2],
+            7_777,
+            "orphaned entry inherits its deposit floor"
         );
     }
 
