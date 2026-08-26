@@ -448,14 +448,18 @@ impl IrohZenohLinkManager {
                     false
                 }
             };
+            // ZEB-996: release this conn's stranger slot UNCONDITIONALLY —
+            // `release` frees the slot only for the conn that owns it, so a
+            // watcher whose conn was superseded by a same-peer re-admission
+            // no-ops (ownership transferred under the admission lock), while
+            // a stranger face replaced by an outbound/known connection (which
+            // never takes admission ownership, so the registry guard below
+            // would say "not evicted") still frees its slot here instead of
+            // leaking it for the replacement's lifetime (PR #752 review).
+            stranger_admission.release(peer_id.as_bytes(), conn_id);
             // Kick only on a guard-passing eviction: a superseded watcher must
             // not re-arm a peer whose live connection replaced this one.
             if evicted {
-                // ZEB-996: free the peer's stranger slot (no-op for
-                // resolver-known peers). Guarded by the same eviction
-                // identity check, so a superseded stranger conn's watcher
-                // cannot free the slot its own replacement still occupies.
-                stranger_admission.release(peer_id.as_bytes());
                 if let Some(handle) = reconnect.get() {
                     handle.kick(*peer_id.as_bytes(), ReconnectTrigger::Dropped);
                 }
@@ -683,6 +687,7 @@ impl IrohZenohLinkManager {
                         // BEFORE the registry swap for the same reason as the
                         // denylist above: a shed peer must never reach
                         // mark_supervisor_connected.
+                        let conn_id = conn.stable_id();
                         if mgr
                             .resolver
                             .resolve_by_node_id(peer_id.as_bytes())
@@ -690,7 +695,7 @@ impl IrohZenohLinkManager {
                         {
                             match mgr
                                 .stranger_admission
-                                .try_admit_stranger(peer_id.as_bytes())
+                                .try_admit_stranger(peer_id.as_bytes(), conn_id)
                             {
                                 StrangerVerdict::Admit => {}
                                 StrangerVerdict::ShedOccupancy => {
@@ -703,7 +708,6 @@ impl IrohZenohLinkManager {
                                 }
                             }
                         }
-                        let conn_id = conn.stable_id();
                         if let Some(old) = mgr.swap_zenoh_conn(peer_id, conn.clone()) {
                             tracing::debug!(
                                 peer = %peer_id,

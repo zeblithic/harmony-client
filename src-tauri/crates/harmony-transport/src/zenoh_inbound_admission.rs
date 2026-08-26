@@ -54,7 +54,7 @@
 //! Like the ZEB-711/757 shields, the rate window runs on this limiter's OWN
 //! monotonic clock (never wall time), and unit tests drive `now_ms` logically.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -102,11 +102,17 @@ struct ShedCounters {
 /// [`IrohZenohLinkManager`]: crate::zenoh_iroh_transport::IrohZenohLinkManager
 pub(crate) struct ZenohInboundAdmission {
     cap: usize,
-    /// Endpoint ids of live stranger-admitted faces. Insert is idempotent
-    /// (same-zid reconnect keeps its slot); removal happens in the accept
-    /// path's identity-guarded drop-watcher eviction, unconditionally for
-    /// every evicted peer (a no-op for resolver-known peers).
-    strangers: Mutex<HashSet<[u8; 32]>>,
+    /// Live stranger-admitted faces: endpoint id → `stable_id` of the
+    /// connection that currently OWNS the slot. Conn-id ownership (PR #752
+    /// review, CodeRabbit + CodeAnt) closes two same-peer supersession holes
+    /// a bare peer-set had: a same-zid re-admission racing the old conn's
+    /// drop-watcher could have its slot freed out from under the live face
+    /// (repeatable → cap overshoot), and a stranger superseded by an
+    /// outbound/known connection leaked its slot for the replacement's
+    /// lifetime. Re-admission transfers ownership to the new conn under the
+    /// lock; `release` frees the slot only for the conn that owns it, so
+    /// every drop-watcher releases unconditionally and stale watchers no-op.
+    strangers: Mutex<HashMap<[u8; 32], usize>>,
     /// Global new-admission rate window (single unit key; see module docs).
     rate: Mutex<KeyedSlidingWindow<()>>,
     /// Monotonic base for the production `now_ms`.
@@ -133,7 +139,7 @@ impl ZenohInboundAdmission {
     fn with_caps(cap: usize, rate_max: usize, rate_window_ms: u64) -> Self {
         Self {
             cap,
-            strangers: Mutex::new(HashSet::new()),
+            strangers: Mutex::new(HashMap::new()),
             rate: Mutex::new(KeyedSlidingWindow::new(rate_max, rate_window_ms)),
             started: Instant::now(),
             warn: Mutex::new(ShedCounters {
@@ -150,16 +156,27 @@ impl ZenohInboundAdmission {
 
     /// Admission check for a resolver-unknown inbound zenoh connection.
     /// Callers classify first: resolver-known peers must NOT be routed here.
-    pub(crate) fn try_admit_stranger(&self, peer: &[u8; 32]) -> StrangerVerdict {
-        self.try_admit_stranger_at(peer, self.now_ms())
+    /// `conn_id` is the connection's `stable_id`; on admit it becomes (or
+    /// takes over) the slot's owner.
+    pub(crate) fn try_admit_stranger(&self, peer: &[u8; 32], conn_id: usize) -> StrangerVerdict {
+        self.try_admit_stranger_at(peer, conn_id, self.now_ms())
     }
 
     /// Logical-time core (unit-testable without wall-clock waits).
-    fn try_admit_stranger_at(&self, peer: &[u8; 32], now_ms: u64) -> StrangerVerdict {
+    fn try_admit_stranger_at(
+        &self,
+        peer: &[u8; 32],
+        conn_id: usize,
+        now_ms: u64,
+    ) -> StrangerVerdict {
         let mut strangers = self.strangers.lock().expect("strangers poisoned");
         // A peer already holding a slot is replacing its own face (same-zid
-        // reconnect): admit without a rate token, occupancy unchanged.
-        if strangers.contains(peer) {
+        // reconnect): admit without a rate token, occupancy unchanged — and
+        // TRANSFER slot ownership to the new connection under this lock, so
+        // the superseded conn's drop-watcher release no-ops instead of
+        // freeing the slot out from under the live face.
+        if let Some(owner) = strangers.get_mut(peer) {
+            *owner = conn_id;
             return StrangerVerdict::Admit;
         }
         if strangers.len() >= self.cap {
@@ -176,18 +193,22 @@ impl ZenohInboundAdmission {
             self.note_shed(StrangerVerdict::ShedRate, now_ms);
             return StrangerVerdict::ShedRate;
         }
-        strangers.insert(*peer);
+        strangers.insert(*peer, conn_id);
         StrangerVerdict::Admit
     }
 
-    /// Release `peer`'s stranger slot. Called from the drop-watcher's
-    /// identity-guarded eviction for EVERY evicted peer — a no-op when the
-    /// peer never held a slot (resolver-known peers).
-    pub(crate) fn release(&self, peer: &[u8; 32]) {
-        self.strangers
-            .lock()
-            .expect("strangers poisoned")
-            .remove(peer);
+    /// Release `peer`'s stranger slot, but only if `conn_id` still OWNS it.
+    /// Called unconditionally from every zenoh drop-watcher (regardless of
+    /// the registry-eviction verdict): a no-op for resolver-known peers
+    /// (never tracked), for stale watchers whose conn was superseded by a
+    /// same-peer re-admission (ownership transferred), and it correctly
+    /// frees the slot when a stranger's face is replaced by an
+    /// outbound/known connection that never took admission ownership.
+    pub(crate) fn release(&self, peer: &[u8; 32], conn_id: usize) {
+        let mut strangers = self.strangers.lock().expect("strangers poisoned");
+        if strangers.get(peer) == Some(&conn_id) {
+            strangers.remove(peer);
+        }
     }
 
     /// Throttled shed accounting: at most one warn per
@@ -232,10 +253,16 @@ mod tests {
     #[test]
     fn admits_up_to_cap_then_sheds_occupancy() {
         let a = ZenohInboundAdmission::with_caps(2, 100, 60_000);
-        assert_eq!(a.try_admit_stranger_at(&peer(1), 0), StrangerVerdict::Admit);
-        assert_eq!(a.try_admit_stranger_at(&peer(2), 1), StrangerVerdict::Admit);
         assert_eq!(
-            a.try_admit_stranger_at(&peer(3), 2),
+            a.try_admit_stranger_at(&peer(1), 10, 0),
+            StrangerVerdict::Admit
+        );
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(2), 20, 1),
+            StrangerVerdict::Admit
+        );
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(3), 30, 2),
             StrangerVerdict::ShedOccupancy
         );
     }
@@ -243,37 +270,49 @@ mod tests {
     #[test]
     fn release_frees_the_slot() {
         let a = ZenohInboundAdmission::with_caps(1, 100, 60_000);
-        assert_eq!(a.try_admit_stranger_at(&peer(1), 0), StrangerVerdict::Admit);
         assert_eq!(
-            a.try_admit_stranger_at(&peer(2), 1),
+            a.try_admit_stranger_at(&peer(1), 10, 0),
+            StrangerVerdict::Admit
+        );
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(2), 20, 1),
             StrangerVerdict::ShedOccupancy
         );
-        a.release(&peer(1));
-        assert_eq!(a.try_admit_stranger_at(&peer(2), 2), StrangerVerdict::Admit);
+        a.release(&peer(1), 10);
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(2), 20, 2),
+            StrangerVerdict::Admit
+        );
     }
 
     #[test]
     fn tracked_peer_readmits_at_full_pool_without_rate_token() {
         // cap 1, rate 1: peer 1 takes both the slot and the sole rate token.
         let a = ZenohInboundAdmission::with_caps(1, 1, 60_000);
-        assert_eq!(a.try_admit_stranger_at(&peer(1), 0), StrangerVerdict::Admit);
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(1), 10, 0),
+            StrangerVerdict::Admit
+        );
         // Same-zid reconnect: pool full with ITS OWN entry and the rate window
         // exhausted — still admitted, and no second token is recorded.
-        assert_eq!(a.try_admit_stranger_at(&peer(1), 1), StrangerVerdict::Admit);
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(1), 11, 1),
+            StrangerVerdict::Admit
+        );
         // A different stranger at the same instant sheds on occupancy.
         assert_eq!(
-            a.try_admit_stranger_at(&peer(2), 2),
+            a.try_admit_stranger_at(&peer(2), 20, 2),
             StrangerVerdict::ShedOccupancy
         );
         // Even after peer 1 leaves, the exhausted rate window (1/60s, token
         // recorded at t=0) sheds newcomers until it slides past.
-        a.release(&peer(1));
+        a.release(&peer(1), 11);
         assert_eq!(
-            a.try_admit_stranger_at(&peer(2), 3),
+            a.try_admit_stranger_at(&peer(2), 20, 3),
             StrangerVerdict::ShedRate
         );
         assert_eq!(
-            a.try_admit_stranger_at(&peer(2), 60_001),
+            a.try_admit_stranger_at(&peer(2), 20, 60_001),
             StrangerVerdict::Admit
         );
     }
@@ -282,21 +321,23 @@ mod tests {
     fn occupancy_shed_does_not_drain_rate_budget() {
         // cap 1, rate 1. Peer 1 occupies; peers 2..5 shed on OCCUPANCY, which
         // must not consume rate tokens (peek-then-commit ordering): after
-        // peer 1 releases, a newcomer still finds... the single token was
-        // spent by peer 1 at t=0, so advance past the window and verify the
-        // occupancy sheds recorded no tokens (admission succeeds immediately
-        // rather than needing 4 more windows).
+        // peer 1 releases, advance past the single t=0 token's window and
+        // verify a newcomer admits immediately (occupancy sheds recorded no
+        // tokens; otherwise it would take 4 more windows).
         let a = ZenohInboundAdmission::with_caps(1, 1, 60_000);
-        assert_eq!(a.try_admit_stranger_at(&peer(1), 0), StrangerVerdict::Admit);
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(1), 10, 0),
+            StrangerVerdict::Admit
+        );
         for (i, b) in (2u8..=5).enumerate() {
             assert_eq!(
-                a.try_admit_stranger_at(&peer(b), 1 + i as u64),
+                a.try_admit_stranger_at(&peer(b), u64::from(b) as usize, 1 + i as u64),
                 StrangerVerdict::ShedOccupancy
             );
         }
-        a.release(&peer(1));
+        a.release(&peer(1), 10);
         assert_eq!(
-            a.try_admit_stranger_at(&peer(6), 60_001),
+            a.try_admit_stranger_at(&peer(6), 60, 60_001),
             StrangerVerdict::Admit
         );
     }
@@ -305,14 +346,20 @@ mod tests {
     fn rate_window_sheds_fast_churn_and_recovers() {
         // Roomy pool, tight rate: 2 admissions per window.
         let a = ZenohInboundAdmission::with_caps(100, 2, 1_000);
-        assert_eq!(a.try_admit_stranger_at(&peer(1), 0), StrangerVerdict::Admit);
-        assert_eq!(a.try_admit_stranger_at(&peer(2), 1), StrangerVerdict::Admit);
         assert_eq!(
-            a.try_admit_stranger_at(&peer(3), 2),
+            a.try_admit_stranger_at(&peer(1), 10, 0),
+            StrangerVerdict::Admit
+        );
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(2), 20, 1),
+            StrangerVerdict::Admit
+        );
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(3), 30, 2),
             StrangerVerdict::ShedRate
         );
         assert_eq!(
-            a.try_admit_stranger_at(&peer(3), 1_001),
+            a.try_admit_stranger_at(&peer(3), 30, 1_001),
             StrangerVerdict::Admit
         );
     }
@@ -320,7 +367,41 @@ mod tests {
     #[test]
     fn release_of_untracked_peer_is_noop() {
         let a = ZenohInboundAdmission::with_caps(1, 100, 60_000);
-        a.release(&peer(9));
-        assert_eq!(a.try_admit_stranger_at(&peer(1), 0), StrangerVerdict::Admit);
+        a.release(&peer(9), 90);
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(1), 10, 0),
+            StrangerVerdict::Admit
+        );
+    }
+
+    /// PR #752 review regression (CodeRabbit Major / CodeAnt Major): a
+    /// same-peer re-admission transfers slot ownership to the new conn, so
+    /// the superseded conn's (possibly delayed) drop-watcher release must
+    /// NOT free the live face's slot — while the owning conn's release must.
+    #[test]
+    fn readmission_transfers_ownership_and_stale_release_is_noop() {
+        let a = ZenohInboundAdmission::with_caps(1, 100, 60_000);
+        // conn 10 admits; conn 11 (same peer) re-admits and takes ownership.
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(1), 10, 0),
+            StrangerVerdict::Admit
+        );
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(1), 11, 1),
+            StrangerVerdict::Admit
+        );
+        // The old conn's watcher fires late: must be a no-op.
+        a.release(&peer(1), 10);
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(2), 20, 2),
+            StrangerVerdict::ShedOccupancy,
+            "stale release must not free the live face's slot"
+        );
+        // The owning conn's release frees it.
+        a.release(&peer(1), 11);
+        assert_eq!(
+            a.try_admit_stranger_at(&peer(2), 20, 3),
+            StrangerVerdict::Admit
+        );
     }
 }

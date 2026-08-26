@@ -342,8 +342,11 @@ flowchart TB
   public vine-relay, ping). Inbound admission is layered cheapest-first —
   per-source rate shields, per-source concurrency caps, global semaphores,
   boot-window queues — each with RAII permits held for the session's life.
-- **A zenoh face is transport, not trust (ZEB-996).** Any peer that
-  negotiates `harmony/zenoh/v1` gets a zenoh face — deliberately. The
+- **A zenoh face is transport, not trust (ZEB-996).** Face admission is
+  deliberately unauthenticated — no membership or identity check gates
+  `harmony/zenoh/v1` — but it is not unconditional: resolver-unknown peers
+  get a face only while stranger capacity and the admission-rate window
+  permit, and a shed endpoint is closed before it reaches the registry. The
   authorization boundary is the payload layer, per plane: owner datasets ride
   owner-key envelopes, community voting is epoch-encrypted to the membership,
   channel/state ingest verifies signatures and membership *at the event's own
