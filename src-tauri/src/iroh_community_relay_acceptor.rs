@@ -875,6 +875,20 @@ impl IrohCommunityRelayDepositAcceptor {
     }
 }
 
+/// ZEB-548 Stage 2: lets the transport spine hold this acceptor as a
+/// generic `Arc<dyn IrohHandshakeDispatcher>` (see
+/// `IrohZenohLinkManager::install_community_relay_deposit_acceptor`)
+/// instead of naming the concrete type — severing the
+/// spine→iroh_community_relay_acceptor compile edge. Delegates to the
+/// inherent `handle_connection`; inherent-method resolution wins in
+/// receiver syntax, so this does not recurse.
+#[async_trait]
+impl crate::iroh_endpoint::IrohHandshakeDispatcher for IrohCommunityRelayDepositAcceptor {
+    async fn handle_connection(&self, conn: Connection) {
+        self.handle_connection(conn).await
+    }
+}
+
 // ---------------------------------------------------------------------
 // Pull shell
 // ---------------------------------------------------------------------
@@ -1100,6 +1114,19 @@ impl IrohCommunityRelayPullAcceptor {
         send.finish()
             .map_err(|e| RelayPullConnError::Finish(e.to_string()))?;
         Ok(())
+    }
+}
+
+/// ZEB-548 Stage 2: lets the transport spine hold this acceptor as a
+/// generic `Arc<dyn IrohHandshakeDispatcher>` (see
+/// `IrohZenohLinkManager::install_community_relay_pull_acceptor`) instead
+/// of naming the concrete type. Delegates to the inherent
+/// `handle_connection`; inherent-method resolution wins in receiver
+/// syntax, so this does not recurse.
+#[async_trait]
+impl crate::iroh_endpoint::IrohHandshakeDispatcher for IrohCommunityRelayPullAcceptor {
+    async fn handle_connection(&self, conn: Connection) {
+        self.handle_connection(conn).await
     }
 }
 

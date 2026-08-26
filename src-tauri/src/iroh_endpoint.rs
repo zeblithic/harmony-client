@@ -27,8 +27,33 @@
 //!   [`all_client_alpns`] is the single source the production + hermetic
 //!   constructors advertise.
 
+use async_trait::async_trait;
 pub use harmony_iroh::endpoint::IrohEndpoint;
+use iroh::endpoint::Connection;
 use iroh::{RelayUrl, SecretKey};
+
+/// Pluggable dispatcher invoked by `IrohZenohLinkManager`'s accept
+/// loop when an inbound connection negotiates an ALPN other than
+/// `harmony/zenoh/v1`. The link manager passes the accepted
+/// `Connection` directly — implementations are responsible for opening
+/// any bi-streams and consuming the connection.
+///
+/// ZEB-548 Stage 2: this contract lives in `iroh_endpoint` (spine
+/// transport core) so the accept loop dispatches inbound connections
+/// through a trait object and stays decoupled from the higher-tier
+/// acceptor modules that implement it (invite/friend/pex, community
+/// relay, vine relay, tunnel). Those modules `impl` this trait and
+/// register via the link manager's `install_*_acceptor` methods; the
+/// spine never names their concrete types. Re-exported from
+/// `iroh_invite_acceptor` for byte-stable call sites.
+#[async_trait]
+pub trait IrohHandshakeDispatcher: Send + Sync + 'static {
+    /// Called once per inbound connection that survives the ALPN
+    /// filter. Implementations may run synchronously or spawn a task;
+    /// the accept loop awaits this call. Errors are not propagated —
+    /// implementations should log and return.
+    async fn handle_connection(&self, conn: Connection);
+}
 
 /// ALPN registry for harmony-on-iroh sub-protocols. Constants are
 /// referenced by both the endpoint binder (server-side `accept`) and
