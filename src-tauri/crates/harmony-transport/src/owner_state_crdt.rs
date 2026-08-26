@@ -50,8 +50,11 @@ pub struct OwnerState {
     /// deliberate-re-create gesture is the spec's "user manually clears the
     /// tombstone" without needing a separate clear API. Entries are retained
     /// after a successful re-create (the newer row keeps passing; the old
-    /// row's copies keep dying). Merge: per-key HLC max union, then a sweep
-    /// of dominated live rows (`owner_state_sync::merge_remote_into_local`).
+    /// row's copies keep dying). Merge: per-key HLC max union — with the
+    /// ZEB-847 receiver-clock reject on future-dated stamps, since a
+    /// forward-skewed deletion would suppress re-creation until real time
+    /// caught up — then a sweep of dominated live rows
+    /// (`owner_state_sync::merge_remote_into_local`).
     ///
     /// `DedupeKey::None` (folders) is never recorded. Growth is bounded by
     /// explicit user deletions — same class as `tombstones`. Absent on the

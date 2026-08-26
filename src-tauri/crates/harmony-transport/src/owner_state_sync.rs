@@ -377,10 +377,28 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // deletion HLC is a resurrection (or a concurrent re-create losing the
     // deletion tie) and must die on every replica. Runs AFTER the spaces
     // loop above so a racing snapshot carrying both a live row and its
-    // dedupe-key tombstone converges to deleted — the same
-    // tombstone-always-applies discipline as the id loop. A live row that IS
+    // dedupe-key tombstone converges to deleted. A live row that IS
     // strictly newer (a deliberate post-deletion re-create) survives.
     for (dk, remote_hlc) in dedupe_tombstones {
+        // ZEB-847-shape guard (CodeRabbit + CodeAnt on this PR): a
+        // future-dated deletion stamp would win the per-key max, sweep valid
+        // live rows, and suppress every re-creation of that identity until
+        // real time passes it — the same unbounded forward impact as a
+        // future friend-graph `learned_at`, so it gets the same
+        // receiver-clock reject. (This deliberately differs from the
+        // unconditional `outbox_tombstones` loop: an outbox tombstone only
+        // ever kills its own never-reused ULID, while this key gates future
+        // creations.) The id-tombstone loop above is untouched, so the
+        // deleted row itself still dies everywhere immediately; only the
+        // dedupe-key re-creation block is deferred, and periodic snapshot
+        // re-merges accept the stamp once it falls within the skew budget.
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            remote_hlc.wall_ms,
+            receiver_now,
+            "owner_state.dedupe_tombstone.deleted_at",
+        ) {
+            continue;
+        }
         local.record_dedupe_tombstone(dk, remote_hlc);
     }
     let dedupe_dominated: Vec<crate::owner_state_types::SpaceId> = local
@@ -2738,6 +2756,80 @@ mod integration_tests {
             !local.spaces.contains_key(&stale_id),
             "stale row must not survive a snapshot that also carries its dedupe-key tombstone"
         );
+    }
+
+    /// ZEB-1000 forward-skew guard (CodeRabbit + CodeAnt): a future-dated
+    /// remote dedupe tombstone must be rejected at merge — otherwise it
+    /// sweeps valid live Spaces and suppresses every re-creation of that
+    /// dedupe identity until real time catches up with the poisoned stamp.
+    #[test]
+    fn future_dated_dedupe_tombstone_cannot_sweep_or_block() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut local = OwnerState::default();
+        let live = dm(0x55, vec![1, 2], now_ms);
+        let dk = live.dedupe_key();
+        local.spaces.insert(live.id, live);
+
+        // Sibling snapshot carries a deletion stamped 400 days ahead.
+        let mut remote = OwnerState::default();
+        remote.dedupe_tombstones.insert(
+            dk.clone(),
+            Hlc {
+                wall_ms: now_ms + 400 * 24 * 60 * 60 * 1000,
+                logical: 0,
+                device_id: "skewed".into(),
+            },
+        );
+
+        super::merge_remote_into_local(&mut local, remote);
+
+        assert!(
+            local.spaces.contains_key(&SpaceId([0x55; 16])),
+            "live Space must survive a future-dated deletion stamp"
+        );
+        assert!(
+            !local.dedupe_tombstones.contains_key(&dk),
+            "the poisoned stamp must not enter the map (it would block \
+             every re-creation until real time passes it)"
+        );
+    }
+
+    /// Companion: an in-window deletion stamp (well inside the forward-skew
+    /// tolerance) must still union and sweep normally — the guard must not
+    /// over-reject legitimate deletions.
+    #[test]
+    fn in_window_dedupe_tombstone_still_sweeps() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut local = OwnerState::default();
+        let stale = dm(0x66, vec![1, 2], now_ms - 10_000);
+        let dk = stale.dedupe_key();
+        local.spaces.insert(stale.id, stale);
+
+        let mut remote = OwnerState::default();
+        remote.dedupe_tombstones.insert(
+            dk.clone(),
+            Hlc {
+                wall_ms: now_ms + 1_000,
+                logical: 0,
+                device_id: "deleter".into(),
+            },
+        );
+
+        super::merge_remote_into_local(&mut local, remote);
+
+        assert!(
+            !local.spaces.contains_key(&SpaceId([0x66; 16])),
+            "an in-window deletion must still sweep the dominated row"
+        );
+        assert!(local.dedupe_tombstones.contains_key(&dk));
     }
 
     /// ZEB-243: a remote tombstone with HLC strictly newer than the
