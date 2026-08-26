@@ -49654,7 +49654,7 @@ pub(crate) async fn remove_space_impl(
     let space_id = decode_space_id_16(&space_id)?;
     let id_hex = hex::encode(space_id.0);
 
-    let (self_owner, community_registry, crdt_state, sync_engine, snapshot_generation) = {
+    let (self_owner, community_registry, crdt_state, sync_engine, snapshot_generation, device_id) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -49666,6 +49666,10 @@ pub(crate) async fn remove_space_impl(
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.sync_engine.clone(),
             g.generation,
+            // ZEB-1000: HLC tie-break identity for the dedupe-key tombstone
+            // stamp. Empty when no DM device id is provisioned — the stamp
+            // still orders correctly on (wall_ms, logical).
+            g.dm_device_id.clone().unwrap_or_default(),
         )
     };
 
@@ -49752,7 +49756,7 @@ pub(crate) async fn remove_space_impl(
             check_generation()?;
             {
                 let mut g = crdt_state.lock().await;
-                g.tombstone_space(space_id);
+                g.remove_space_permanent(space_id, crate::file_sharing::now_epoch_ms(), &device_id);
             }
             // Delete the on-disk data ONLY once the tombstone is durably flushed
             // (Qodo) AND the node generation still matches (Cursor) — otherwise
@@ -49772,7 +49776,7 @@ pub(crate) async fn remove_space_impl(
             check_generation()?;
             {
                 let mut g = crdt_state.lock().await;
-                g.tombstone_space(space_id);
+                g.remove_space_permanent(space_id, crate::file_sharing::now_epoch_ms(), &device_id);
             }
             // No on-disk dir to delete; the tombstone flush is best-effort (same
             // durability model as leave_community).
