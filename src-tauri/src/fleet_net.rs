@@ -440,7 +440,7 @@ pub fn build_butler_set(
 }
 
 /// Aggregate the creator's active devices into a vine relay set (max
-/// [`crate::pkarr_vines::VINE_RELAY_SET_MAX`]). The vines analogue of
+/// [`crate::reachability_record::VINE_RELAY_SET_MAX`]). The vines analogue of
 /// [`build_butler_set`], minus the `vk_lookup` layer: a `VineRelayEntry`
 /// carries only `iroh_endpoint_id` + `home_relay`, both present directly in
 /// `FleetNetRow`, so no per-device verify-key resolution is needed.
@@ -468,10 +468,10 @@ pub fn build_butler_set(
 pub fn build_vine_relay_set(
     doc: &FleetNetDoc,
     self_device_id: &str,
-    self_entry: crate::pkarr_vines::VineRelayEntry,
+    self_entry: crate::reachability_record::VineRelayEntry,
     now_ms: u64,
-) -> Vec<crate::pkarr_vines::VineRelayEntry> {
-    use crate::pkarr_vines::{VineRelayEntry, VINE_RELAY_SET_MAX};
+) -> Vec<crate::reachability_record::VineRelayEntry> {
+    use crate::reachability_record::{VineRelayEntry, VINE_RELAY_SET_MAX};
 
     let stale_before_ms = now_ms.saturating_sub(crate::butler_deposit::BUTLER_SET_FRESHNESS_MS);
     let self_is_pinned = doc.pinned.as_deref() == Some(self_device_id);
@@ -553,7 +553,7 @@ pub fn vine_selection_view(
 ) -> Vec<(String, [u8; 32], String, bool)> {
     butler_set_order(doc, stale_before_ms)
         .into_iter()
-        .take(crate::pkarr_vines::VINE_RELAY_SET_MAX)
+        .take(crate::reachability_record::VINE_RELAY_SET_MAX)
         .map(|(id, row)| {
             let pinned = doc.pinned.as_deref() == Some(id.as_str());
             (id, row.iroh_endpoint_id, row.home_relay, pinned)
@@ -2045,7 +2045,7 @@ mod vine_relay_set_tests {
     use super::*;
     use crate::butler_deposit::BUTLER_SET_FRESHNESS_MS;
     use crate::owner_state_types::Hlc;
-    use crate::pkarr_vines::{VineRelayEntry, VINE_RELAY_SET_MAX};
+    use crate::reachability_record::{VineRelayEntry, VINE_RELAY_SET_MAX};
 
     const SELF_ID: &str = "self-device";
     const SELF_EP: [u8; 32] = [0xEE; 32];
