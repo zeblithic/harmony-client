@@ -407,7 +407,7 @@ mod tests {
     }
 
     impl StubCtx {
-        fn new(entries: impl IntoIterator<Item = (String, Option<DeliveryStatus>)>) -> Self {
+        pub fn new(entries: impl IntoIterator<Item = (String, Option<DeliveryStatus>)>) -> Self {
             Self {
                 status_map: StdMutex::new(entries.into_iter().collect()),
                 cas_fail: false,

@@ -534,7 +534,7 @@ pub fn unseal_own_material(
 /// get a blob or it is orphaned at window close). `exclude` additionally drops
 /// one device — the quorum-revocation target, which may not yet be revoked in
 /// this trust snapshot (ZEB-677 S5).
-pub(crate) fn seal_material_to_survivors(
+pub fn seal_material_to_survivors(
     trust: &harmony_owner::state::OwnerState,
     material_cbor: &[u8],
     exclude: Option<[u8; 16]>,

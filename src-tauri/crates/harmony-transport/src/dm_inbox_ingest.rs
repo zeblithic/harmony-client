@@ -524,7 +524,7 @@ pub async fn run_dm_inbox_ingest_sweeper(
 /// The friend handshake (ZEB-473) is what populates each friend's
 /// owner → devices → `DeviceTunnelContact`, so a real friend's invite binds; a
 /// device we have never handshaked (no contact cached) is unbindable.
-pub(crate) fn resolve_owner_for_peer(
+pub fn resolve_owner_for_peer(
     state: &crate::owner_state_crdt::OwnerState,
     peer_node_id: [u8; 32],
 ) -> Option<crate::owner_state_types::OwnerAddr> {
@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     impl ProbeCtx {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 // Self + one sibling so a single-device ingest does NOT
                 // complete coverage (tests that want coverage-GC shrink

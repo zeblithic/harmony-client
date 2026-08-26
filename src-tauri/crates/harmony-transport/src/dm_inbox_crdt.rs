@@ -246,7 +246,7 @@ impl DmInboxDoc {
     /// outlive `INBOX_TOMBSTONE_RETENTION_MS`. Pruning at the merge boundary
     /// keeps the CRDT itself time-free while making the merge that would be
     /// wrongly suppressed the one that re-admits.
-    pub(crate) fn prune_tombstones(&mut self, now_ms: u64) {
+    pub fn prune_tombstones(&mut self, now_ms: u64) {
         self.expired_at_ms.retain(|_, t| {
             now_ms.saturating_sub(*t) < crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS
         });

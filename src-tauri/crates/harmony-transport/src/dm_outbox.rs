@@ -473,7 +473,7 @@ pub(crate) fn resolve_sender_devices(
 /// / `inviter_identity_pub` (the cert's #2 combined pub) so the invite is
 /// self-consistent. On the #3 fallback path the caller passes `None` here and
 /// the legacy #3 pub, preserving pre-migration wire bytes exactly.
-pub(crate) fn build_invite_packet_from_space(
+pub fn build_invite_packet_from_space(
     state: &OwnerState,
     space_id: &SpaceId,
     signing_key: &ed25519_dalek::SigningKey,
@@ -541,7 +541,7 @@ pub const STUCK_THRESHOLD_MS: u64 = 60_000; // 60s
 /// outstanding means pathological wedging — the tick then skips its Phase C
 /// with a WARN rather than spawning unfenced. The shutdown barrier
 /// `acquire_many`s this many to await drain-path quiescence.
-pub(crate) const DRAIN_PHASE_C_FENCE_CAPACITY: usize = 64;
+pub const DRAIN_PHASE_C_FENCE_CAPACITY: usize = 64;
 
 /// ZEB-710: process-lived counters for the ZEB-703 fence's two documented
 /// degraded modes, which were previously WARN-log-only:
@@ -558,7 +558,7 @@ pub(crate) const DRAIN_PHASE_C_FENCE_CAPACITY: usize = 64;
 /// the previous stop's skip in the next boot's network-health snapshot.
 /// Registered with `NetworkHealthService` at boot via
 /// `set_dm_fence_source`.
-pub(crate) struct DmFenceStats {
+pub struct DmFenceStats {
     phase_c_saturated_skips: std::sync::atomic::AtomicU64,
     stop_fence_skipped_contended: std::sync::atomic::AtomicU64,
 }
@@ -595,7 +595,7 @@ impl DmFenceStats {
 /// ZEB-710: the process-global instance (see [`DmFenceStats`] for why it is
 /// not outbox-lived). `Arc` so the network-health registry can hold the
 /// same allocation via its additive `set_*_source` pattern.
-pub(crate) static DM_FENCE_STATS: std::sync::LazyLock<Arc<DmFenceStats>> =
+pub static DM_FENCE_STATS: std::sync::LazyLock<Arc<DmFenceStats>> =
     std::sync::LazyLock::new(|| {
         Arc::new(DmFenceStats {
             phase_c_saturated_skips: std::sync::atomic::AtomicU64::new(0),
@@ -687,8 +687,8 @@ pub enum DeleteDmError {
 /// acquired its lock. This `DmOutbox` owns only ephemeral per-process state
 /// (in-flight set, backoff timestamps); CRDT state lives in `OwnerState`.
 pub struct DmOutbox {
-    pub(crate) device_id: String,
-    pub(crate) self_owner: OwnerAddr,
+    pub device_id: String,
+    pub self_owner: OwnerAddr,
     /// Phase 3b: our device-Identity hash, used as the
     /// `signing_device_hash` on outbound DM packets (drain's CidNotify
     /// builds; legacy #3 DM signing per `dm_signing_material`). Mirrors
@@ -700,7 +700,7 @@ pub struct DmOutbox {
     /// outbound DM packets built by the drain path. Held via `Arc` so the
     /// outbox can outlive any single owning context —
     /// `RuntimeUnicastTransport` holds it the same way.
-    pub(crate) signing_key: Arc<ed25519_dalek::SigningKey>,
+    pub signing_key: Arc<ed25519_dalek::SigningKey>,
     /// Phase 4 (ZEB-262): full `PrivateIdentity` snapshot, parallel to
     /// `signing_key`. The receive-side counter-sign path
     /// (`community_invite::handle_unicast` →
@@ -714,15 +714,15 @@ pub struct DmOutbox {
     /// they produce identical signatures for the same message, and
     /// `redeem_invite_inner` snapshots both fields under the outbox
     /// lock to feed `build_signed_invite_packet`.
-    pub(crate) private_identity: Arc<harmony_identity::PrivateIdentity>,
+    pub private_identity: Arc<harmony_identity::PrivateIdentity>,
     /// ZEB-339: the harmony-owner ENROLLED device signing key (#2). Distinct
     /// from `signing_key` (the Reticulum/transport key, #3). Community
     /// membership events sign with this; DM/transport keep `signing_key`.
-    pub(crate) community_signing_key: Arc<ed25519_dalek::SigningKey>,
+    pub community_signing_key: Arc<ed25519_dalek::SigningKey>,
     /// ZEB-339: this device's own Master EnrollmentCert (owner_id -> device #2),
     /// attached to outbound identity-introducing events (bootstrap/redeem Join,
     /// PendingJoin).
-    pub(crate) enrollment_cert: harmony_owner::certs::EnrollmentCert,
+    pub enrollment_cert: harmony_owner::certs::EnrollmentCert,
     /// ZEB-580 S1: this device's #2 DM hash, computed from `enrollment_cert`.
     /// `None` when the cert has no usable X25519 (synthetic/test certs) — then
     /// DM body signing degrades to the legacy #3 (`signing_key` /
@@ -832,7 +832,7 @@ impl DmOutbox {
     /// `acquire_many(DRAIN_PHASE_C_FENCE_CAPACITY)` on the semaphore to
     /// await every in-flight detached Phase C task before snapshotting
     /// owner-state.
-    pub(crate) fn shutdown_fence_handles(
+    pub fn shutdown_fence_handles(
         &self,
     ) -> (
         Arc<std::sync::atomic::AtomicBool>,
@@ -850,7 +850,7 @@ impl DmOutbox {
     /// its brief Phase A window — degrade to no-fence with a WARN rather than
     /// spinning. ZEB-710: the degraded mode also increments
     /// [`DM_FENCE_STATS`] so wedge visibility is not log-only.
-    pub(crate) fn snapshot_shutdown_fence_at_stop(
+    pub fn snapshot_shutdown_fence_at_stop(
         outbox: &Arc<tokio::sync::Mutex<DmOutbox>>,
     ) -> Option<(
         Arc<std::sync::atomic::AtomicBool>,
@@ -1751,7 +1751,7 @@ impl DmOutbox {
     /// no enrolled identity is usable — preserving pre-migration wire bytes
     /// exactly (the #3 pub is `private_identity`'s combined pub, bit-identical to
     /// `start_node`'s captured `identity_pub_64`).
-    pub(crate) fn dm_invite_material(
+    pub fn dm_invite_material(
         &self,
     ) -> (
         &Arc<ed25519_dalek::SigningKey>,
@@ -2225,7 +2225,7 @@ impl DmOutbox {
 // directly, which an unboxed payload keeps ergonomic.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub(crate) enum ApplyInviteOutcome {
+pub enum ApplyInviteOutcome {
     /// The inviter was an active friend; the DM Space (and, when entitled, the
     /// OwnerDeviceCache) was written via `run_invite_accept_tail`.
     Accepted,
@@ -2342,7 +2342,7 @@ pub fn handle_revocation_push(
 // learned-at clock + the F1 inviter-bind hint; threading them through a struct
 // would not improve clarity at this single shared call boundary.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_invite(
+pub fn apply_invite(
     state: &mut OwnerState,
     self_owner: OwnerAddr,
     device_id: &str,
@@ -2505,7 +2505,7 @@ pub(crate) fn apply_invite(
 /// extracted so the deferred user-accept path (`accept_dm_invite_impl`) and
 /// the friend-tier auto-accept run the same code. Callers guarantee `signed`
 /// already passed `apply_invite`'s gates + signature verification.
-pub(crate) fn run_invite_accept_tail(
+pub fn run_invite_accept_tail(
     state: &mut OwnerState,
     device_id: &str,
     signed: crate::dm_envelope::DmInviteSigned,
@@ -2657,7 +2657,7 @@ pub(crate) fn run_invite_accept_tail(
 /// forged, non-DM, or mismatched invite is rejected before it touches any state.
 /// Size-bounded; fail-closed.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_deposited_invite(
+pub fn apply_deposited_invite(
     state: &mut OwnerState,
     self_owner: OwnerAddr,
     device_id: &str,
@@ -3214,7 +3214,7 @@ fn derive_recipients(members: &[OwnerAddr], self_addr: &OwnerAddr) -> Vec<OwnerA
 // (IPC wiring) will pass the SyncEngine's tracker entry as `prev` to
 // keep production HLCs monotone with state-root publishes. (A future
 // cleanup could promote this to a shared module — out of Phase 2 scope.)
-pub(crate) fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
+pub fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
     // Same tick rule as `fleet_sync::compute_next_hlc` — this was a verbatim
     // second copy of it. Both now delegate to the core kernel (ZEB-759), so
     // the saturating-monotonicity rule has exactly one implementation.
@@ -3369,7 +3369,7 @@ pub(crate) fn resolve_signed_origin_owner(
 /// (not just Ed25519) so `verify_dm_packet_signature` can re-derive the
 /// `signing_device_hash` and confirm the cached pub actually maps to the
 /// hash the body claims (key-substitution defense).
-pub(crate) fn lookup_pubkey_for_device(
+pub fn lookup_pubkey_for_device(
     cache: &OwnerDeviceCache,
     signing_device_hash: DeviceIdentityHash,
 ) -> Option<[u8; 64]> {
@@ -3446,7 +3446,7 @@ pub(crate) fn verify_cidnotify_admission(
 /// legitimate offline-DM path the sender is an existing friend whose devices are
 /// already cached, so this resolves without help from the invite; the invite is
 /// then only permitted to bootstrap the missing Space, never device trust.
-pub(crate) fn verify_cidnotify_sender_binding(
+pub fn verify_cidnotify_sender_binding(
     state: &OwnerState,
     signed: &crate::dm_envelope::DmCidNotifySigned,
     signature: &[u8; 64],
@@ -3482,7 +3482,7 @@ pub(crate) fn verify_cidnotify_sender_binding(
 /// already-resolved sender is a member. Split out so the deposit-recover path
 /// can bootstrap the Space from a deposited invite BETWEEN sender-binding and
 /// this check (ZEB-483) without re-reading the cache.
-pub(crate) fn verify_cidnotify_space(
+pub fn verify_cidnotify_space(
     state: &OwnerState,
     signed: &crate::dm_envelope::DmCidNotifySigned,
     resolved_owner: OwnerAddr,
@@ -3564,7 +3564,7 @@ pub(crate) fn verify_read_receipt_admission(
 ///   decrypts.
 /// * The decrypted payload's `sender` must equal `resolved_owner`
 ///   (`SenderImpersonation` defense).
-pub(crate) fn decrypt_and_bind_dm_blob(
+pub fn decrypt_and_bind_dm_blob(
     space: &crate::owner_state_types::Space,
     blob: &[u8],
     resolved_owner: OwnerAddr,
@@ -3585,13 +3585,13 @@ pub(crate) fn decrypt_and_bind_dm_blob(
 /// The `dm-received` UI event name, shared by the normal receive path and
 /// butler dm-inbox ingestion (ZEB-418 P1 Task 6) so both deliver through
 /// one event the frontend already listens for.
-pub(crate) const DM_RECEIVED_EVENT: &str = "dm-received";
+pub const DM_RECEIVED_EVENT: &str = "dm-received";
 
 /// Builds the `dm-received` event payload — the single source of truth for
 /// its shape, shared by every receive path (`dm_inbox_ingest`, relay
 /// recover) so the frontend cannot observe which path delivered a
 /// message.
-pub(crate) fn dm_received_event_payload(
+pub fn dm_received_event_payload(
     rm: &crate::owner_state_types::ReceivedMessage,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -9043,7 +9043,7 @@ mod tests {
     }
 
     impl MockRelay {
-        fn new(acked: bool) -> Arc<Self> {
+        pub fn new(acked: bool) -> Arc<Self> {
             Arc::new(Self {
                 acked,
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),

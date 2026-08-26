@@ -471,7 +471,7 @@ pub enum PeerStaleness {
 /// `pub(crate)`: ZEB-910's gateway coverage numerator
 /// (`GATEWAY_PROVEN_TRAFFIC_MS`) deliberately shares this bar — "proven
 /// member" and "fresh peer" must mean the same thing.
-pub(crate) const STALENESS_QUIET_MS: u64 = 300_000;
+pub const STALENESS_QUIET_MS: u64 = 300_000;
 
 /// ZEB-804 (spec §6): traffic-evidence age beyond which a peer reads `dark`
 /// (30 min). Derived from the community-relay pull cadence
@@ -1199,7 +1199,7 @@ impl CommunityRelayServingTelemetry {
     /// The process-wide last-served-pull time, `0 → None` (the "never served"
     /// sentinel), without allocating the full peer summary. Used by the ZEB-803
     /// watchdog sensor.
-    pub(crate) fn last_served_ms(&self) -> Option<u64> {
+    pub fn last_served_ms(&self) -> Option<u64> {
         match self.last_served_ms.load(Ordering::Relaxed) {
             0 => None,
             ms => Some(ms),
@@ -1208,7 +1208,7 @@ impl CommunityRelayServingTelemetry {
 
     /// ZEB-971: the most recent inbound pull attempt of ANY outcome, `0 →
     /// None` (never attempted in this telemetry lifetime).
-    pub(crate) fn last_pull_attempt_ms(&self) -> Option<u64> {
+    pub fn last_pull_attempt_ms(&self) -> Option<u64> {
         match self.last_pull_attempt_ms.load(Ordering::Relaxed) {
             0 => None,
             ms => Some(ms),
@@ -2037,7 +2037,7 @@ impl NetworkHealthSnapshot {
 /// file-local wall-ms helper inject THIS clock into
 /// [`PeerTrafficRegistry`] — the same clock `snapshot` compares the stamps
 /// against.
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2052,7 +2052,7 @@ pub(crate) fn now_ms() -> u64 {
 /// service snapshot and the `empty()` (service-absent) snapshot, so the single
 /// caller covers the disabled case (no `NetworkHealthService`) and any future
 /// degraded-but-running case. Overwrites whatever the constructor defaulted.
-pub(crate) fn stamp_transport_status(
+pub fn stamp_transport_status(
     mut snap: NetworkHealthSnapshot,
     reason: Option<String>,
 ) -> NetworkHealthSnapshot {
@@ -2763,17 +2763,14 @@ impl NetworkHealthService {
     /// when unset, `snapshot`'s `dm_fence` stays `None`. `pub(crate)`
     /// because `DmFenceStats` is crate-private (a `pub fn` would leak it —
     /// same `private_interfaces` rationale as `root_serve_tx`).
-    pub(crate) fn set_dm_fence_source(
-        &mut self,
-        src: std::sync::Arc<crate::dm_outbox::DmFenceStats>,
-    ) {
+    pub fn set_dm_fence_source(&mut self, src: std::sync::Arc<crate::dm_outbox::DmFenceStats>) {
         self.dm_fence = Some(src);
     }
 
     /// ZEB-803: install the community-relay ACCEPTOR telemetry source (the same
     /// `Arc` the pull shell writes). Additive — when unset,
     /// `snapshot().community_relay` reports `None` for a node with no acceptor.
-    pub(crate) fn set_community_relay_serving_source(
+    pub fn set_community_relay_serving_source(
         &mut self,
         src: std::sync::Arc<CommunityRelayServingTelemetry>,
     ) {
@@ -2781,7 +2778,7 @@ impl NetworkHealthService {
     }
 
     /// ZEB-803: install the community-relay PULL-DRIVER telemetry source.
-    pub(crate) fn set_community_relay_pull_source(
+    pub fn set_community_relay_pull_source(
         &mut self,
         src: std::sync::Arc<CommunityRelayPullTelemetry>,
     ) {
@@ -2792,7 +2789,7 @@ impl NetworkHealthService {
     /// source (the same `Arc` the acceptor shell writes). Additive — when
     /// unset, `snapshot().vine_relay` reports `None` for a node with no
     /// vine-relay acceptor.
-    pub(crate) fn set_vine_relay_serving_source(
+    pub fn set_vine_relay_serving_source(
         &mut self,
         src: std::sync::Arc<VineRelayServingTelemetry>,
     ) {
@@ -2801,41 +2798,35 @@ impl NetworkHealthService {
 
     /// ZEB-811 Task 8: install the vine PULL-DRIVER (follower) telemetry
     /// source.
-    pub(crate) fn set_vine_pull_source(&mut self, src: std::sync::Arc<VinePullTelemetry>) {
+    pub fn set_vine_pull_source(&mut self, src: std::sync::Arc<VinePullTelemetry>) {
         self.vine_pull = Some(src);
     }
 
     /// ZEB-824: install the gateway-dial DRIVER telemetry source (the same
     /// `Arc` the driver loop writes). Additive — when unset,
     /// `snapshot().gateway_bootstrap` reports `None`.
-    pub(crate) fn set_gateway_bootstrap_source(
-        &mut self,
-        src: std::sync::Arc<GatewayBootstrapTelemetry>,
-    ) {
+    pub fn set_gateway_bootstrap_source(&mut self, src: std::sync::Arc<GatewayBootstrapTelemetry>) {
         self.gateway_bootstrap = Some(src);
     }
 
     /// ZEB-804: install the per-peer served-traffic registry (the same `Arc`
     /// every iroh acceptor stamps). Additive — when unset, the snapshot's
     /// traffic merge is inert.
-    pub(crate) fn set_peer_traffic_source(&mut self, src: std::sync::Arc<PeerTrafficRegistry>) {
+    pub fn set_peer_traffic_source(&mut self, src: std::sync::Arc<PeerTrafficRegistry>) {
         self.peer_traffic = Some(src);
     }
 
     /// ZEB-805: wire the community engine registry as the per-community sync
     /// counter source. Until this is called the `community_sync` rows are
     /// empty, which renders as "no engines" rather than as a fault.
-    pub(crate) fn set_community_sync_source(
-        &mut self,
-        src: std::sync::Arc<dyn CommunitySyncSource>,
-    ) {
+    pub fn set_community_sync_source(&mut self, src: std::sync::Arc<dyn CommunitySyncSource>) {
         self.community_sync = Some(src);
     }
 
     /// ZEB-877: wire the fleet engine registry as the per-fleet-engine sync
     /// counter source. Until this is called the `fleet_sync` rows are empty,
     /// which renders as "no engines" rather than as a fault.
-    pub(crate) fn set_fleet_sync_source(&mut self, src: std::sync::Arc<dyn FleetSyncSource>) {
+    pub fn set_fleet_sync_source(&mut self, src: std::sync::Arc<dyn FleetSyncSource>) {
         self.fleet_sync = Some(src);
     }
 
@@ -3242,7 +3233,7 @@ impl NetworkHealthService {
 ///
 /// Network-tier predicate: used by the export redaction below and by
 /// `connectivity_settings` relay-URL validation.
-pub(crate) fn is_local_host(host: &str) -> bool {
+pub fn is_local_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }

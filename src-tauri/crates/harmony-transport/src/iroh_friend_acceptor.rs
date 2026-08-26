@@ -1247,6 +1247,22 @@ impl FriendEventEmit for () {
     fn emit_friend_request_received(&self) {}
 }
 
+/// ZEB-445: sink-trait adapter so `Arc<dyn NodeEventSink>` satisfies the
+/// `FriendEventEmit` bound — the production emitter in BOTH node modes (the
+/// GUI wraps its `AppHandle` in a sink; serve mode passes the API sink).
+/// Tauri serializes `()` as JSON `null`, so `Value::Null` is wire-identical
+/// to the pre-split AppHandle impl.
+// ZEB-548 Stage 2 (PR #10): moved from harmony-app's lib.rs — the sealed
+// orphan rule wants this impl beside its (now-foreign-to-the-app) trait.
+impl FriendEventEmit for std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> {
+    fn emit_friend_list_changed(&self) {
+        self.emit("friend-list-changed", serde_json::Value::Null);
+    }
+    fn emit_friend_request_received(&self) {
+        self.emit("friend-request-received", serde_json::Value::Null);
+    }
+}
+
 /// Default per-await IO deadline for the inbound friend handshake. Mirrors
 /// `iroh_invite_acceptor::DEFAULT_ACCEPTOR_IO_DEADLINE_MS`.
 pub const DEFAULT_FRIEND_IO_DEADLINE_MS: u64 = 30_000;
@@ -1254,7 +1270,7 @@ pub const DEFAULT_FRIEND_IO_DEADLINE_MS: u64 = 30_000;
 /// Wall-clock now in epoch-milliseconds — the same one-syscall pattern used
 /// throughout `lib.rs` (`generate_invite`/HLC reservation) and `next_hlc`.
 /// Saturates to `0` if the clock is before the epoch.
-pub(crate) fn wall_now_ms() -> u64 {
+pub fn wall_now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1265,7 +1281,7 @@ pub(crate) fn wall_now_ms() -> u64 {
 /// Wall-clock now in epoch-SECONDS. `EnrollmentCert` timestamps (`issued_at` /
 /// `expires_at`) are Unix seconds, so cert-expiry checks must pass seconds — NOT
 /// the millisecond [`wall_now_ms`]. (ZEB-378)
-pub(crate) fn wall_now_secs() -> u64 {
+pub fn wall_now_secs() -> u64 {
     wall_now_ms() / 1000
 }
 

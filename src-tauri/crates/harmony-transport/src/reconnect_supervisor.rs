@@ -500,7 +500,7 @@ impl SupervisorHandle {
     /// `cfg(test)`: only in-crate unit tests (the transport drop-watcher tests,
     /// ZEB-620 Task 3) observe raised kicks through it, since a `kick` writes
     /// `dirty` (not `states`) and there is no production reader of `dirty`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn pending_trigger(&self, peer: [u8; 32]) -> Option<ReconnectTrigger> {
         self.inner
             .dirty
@@ -515,7 +515,7 @@ impl SupervisorHandle {
     /// driver's ZEB-910 tests need a `Dormant`/`Retrying` slot to exist so the
     /// targeted-revival pass has something to observe via `states_snapshot`;
     /// production states are only ever loop-materialized.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn set_peer_state_for_test(&self, peer: [u8; 32], state: PeerState) {
         let mut states = self.inner.states.lock().expect("states lock");
         states.insert(
@@ -540,7 +540,7 @@ impl SupervisorHandle {
     /// `cfg(test)`: only in-crate unit tests (the presence-edge wiring test,
     /// ZEB-620 Task 5) observe a raised sweep through it, since `kick_sweep`
     /// writes `sweep_requested` and there is no production reader of it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn sweep_pending(&self) -> bool {
         self.inner.sweep_requested.load(Ordering::Acquire)
     }
@@ -549,7 +549,7 @@ impl SupervisorHandle {
     /// instant, or `None` if the peer has no slot or was never marked. Lets the
     /// gateway driver's action-4 test observe that a coverage-repair bridge was
     /// marked (parallels [`Self::pending_trigger`] observing the kick). Read-only.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn repair_exempt_since(&self, peer: [u8; 32]) -> Option<Instant> {
         self.inner
             .states
@@ -1339,7 +1339,7 @@ mod tests {
     }
 
     impl RecordingDialer {
-        fn new(behavior: DialBehavior) -> Arc<Self> {
+        pub fn new(behavior: DialBehavior) -> Arc<Self> {
             Arc::new(Self {
                 behavior,
                 calls: Mutex::new(Vec::new()),

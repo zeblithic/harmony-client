@@ -607,7 +607,7 @@ pub fn sibling_rows(doc: &FleetNetDoc, self_device_id: &str) -> Vec<(String, Fle
 /// entry matters (the butler set advertises our own fleet). The publishing
 /// device itself is always inserted (`self_device_id_hex` → `self_vk`), so
 /// self resolves even on a cold cache.
-pub(crate) fn vk_map_from_device_cache(
+pub fn vk_map_from_device_cache(
     cache: &crate::owner_state_types::OwnerDeviceCache,
     self_owner: &crate::owner_state_types::OwnerAddr,
     self_device_id_hex: &str,
@@ -643,7 +643,7 @@ pub(crate) fn vk_map_from_device_cache(
 /// a re-pair or a genuine later self-announcement supersedes this with the
 /// identical identity pub (no conflict). Returns `true` iff the cache was
 /// updated (the caller then persists + republishes the advert).
-pub(crate) fn seed_sibling_device_cache(
+pub fn seed_sibling_device_cache(
     state: &mut crate::owner_state_crdt::OwnerState,
     self_owner: crate::owner_state_types::OwnerAddr,
     sibling_ed25519_verify: [u8; 32],

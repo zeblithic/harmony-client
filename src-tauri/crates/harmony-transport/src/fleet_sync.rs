@@ -94,7 +94,7 @@ pub const MAX_DEVICES_PER_OWNER: usize = 32;
 /// a peer's GET reply into a `Vec<u8>` before the engine validates it, so reject
 /// anything wildly larger up front to bound an oversized attacker-controlled
 /// reply (CodeRabbit). Generous vs. the real size.
-pub(crate) const MAX_ROOT_WIRE_BYTES: usize = 256 * 1024;
+pub const MAX_ROOT_WIRE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MergeOutcome {
@@ -140,7 +140,7 @@ pub enum SyncError {
 /// the health registry. All `Relaxed`: a reader (`fleet_sync_raw`) tolerating a
 /// momentarily-torn view is fine for telemetry — the next snapshot corrects it.
 #[derive(Debug, Default)]
-pub(crate) struct FleetSyncStats {
+pub struct FleetSyncStats {
     /// ZEB-705 observability: retries scheduled / retry frames processed /
     /// retries dropped because the in-flight cap was saturated / retries that
     /// exhausted their attempt budget (the publish was permanently lost —
@@ -233,22 +233,18 @@ fn classify_fleet_publish_error(err: &SyncError) -> crate::network_health::Publi
 /// (`into_inner`) rather than panic — telemetry degrades, it never takes down
 /// the snapshot.
 #[derive(Default)]
-pub(crate) struct FleetSyncRegistry {
+pub struct FleetSyncRegistry {
     engines: std::sync::Mutex<BTreeMap<crate::network_health::FleetDoc, Arc<FleetSyncStats>>>,
 }
 
 impl FleetSyncRegistry {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Register a live engine's stats handle. Called once per engine at boot;
     /// re-registering a `FleetDoc` replaces the prior handle (last wins).
-    pub(crate) fn register(
-        &self,
-        doc: crate::network_health::FleetDoc,
-        stats: Arc<FleetSyncStats>,
-    ) {
+    pub fn register(&self, doc: crate::network_health::FleetDoc, stats: Arc<FleetSyncStats>) {
         // Recover from a poisoned lock rather than panicking: the map is always
         // internally consistent (trivial insert/read critical sections), and
         // telemetry must degrade, never take down the caller. `snapshot()` reads
@@ -336,7 +332,7 @@ pub trait FleetPersist<S>: Send + Sync {
 /// zenoh adapter sends one of these per inbound root query and awaits the
 /// oneshot, then `query.reply()`s the frame — so a receiver that missed the
 /// live push can PULL the root instead of waiting for the next push.
-pub(crate) type RootServeReq = tokio::sync::oneshot::Sender<Result<Vec<u8>, SyncError>>;
+pub type RootServeReq = tokio::sync::oneshot::Sender<Result<Vec<u8>, SyncError>>;
 
 pub struct FleetSyncConfig<S> {
     /// Installed fleet KeyTrees (ZEB-668 S5). Publishes use the newest
@@ -609,7 +605,7 @@ where
     /// delegate to it. `pub(crate)`: all callers are in-crate, and returning the
     /// `pub(crate)` `FleetSyncStats` from a `pub` fn would leak a crate-private
     /// type (`private_interfaces`), same as `root_serve_tx`.
-    pub(crate) fn sync_stats(&self) -> Arc<FleetSyncStats> {
+    pub fn sync_stats(&self) -> Arc<FleetSyncStats> {
         Arc::clone(&self.sync_stats)
     }
 
@@ -621,7 +617,7 @@ where
     /// `pub(crate)`: callers are all in-crate (the wrapper + the event-loop
     /// adapter), and returning the `pub(crate)` `RootServeReq` from a `pub` fn
     /// would leak a crate-private type (CodeRabbit; `private_interfaces`).
-    pub(crate) fn root_serve_tx(&self) -> mpsc::Sender<RootServeReq> {
+    pub fn root_serve_tx(&self) -> mpsc::Sender<RootServeReq> {
         self.root_serve_tx.clone()
     }
 

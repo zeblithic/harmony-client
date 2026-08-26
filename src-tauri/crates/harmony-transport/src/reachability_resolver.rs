@@ -27,7 +27,7 @@ use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 /// (24h) is considered stale enough that the dial route may be pinned to a
 /// long-dead address — [`ReachabilityResolver::maybe_refresh_stale`] then kicks
 /// off an async pkarr re-resolve to heal it.
-pub(crate) const STALE_RECORD_REFRESH_MS: u64 = 24 * 60 * 60 * 1000;
+pub const STALE_RECORD_REFRESH_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// ZEB-621: minimum spacing between async pkarr re-resolves for the same owner.
 /// A stale record that the supervisor re-observes on every dispatch must not
@@ -49,7 +49,7 @@ pub(crate) const FUTURE_SKEW_TOLERANCE_MS: u64 = crate::clock_trust::MAX_FORWARD
 /// across the whole resolver (see [`ReachabilityResolver::maybe_refresh_stale`]).
 /// Bounds instantaneous fan-out when a reconnect sweep finds many stale peers due
 /// at once; per-owner cooldowns separately bound the per-owner rate.
-pub(crate) const PKARR_REFRESH_MAX_CONCURRENT: usize = 4;
+pub const PKARR_REFRESH_MAX_CONCURRENT: usize = 4;
 
 /// Default wall clock for [`ReachabilityResolver`]: milliseconds since the Unix
 /// epoch. Injectable via `set_clock` in tests so the future-skew clamp
@@ -351,8 +351,8 @@ impl ReachabilityResolver {
     /// clamp so paused-time tests can drive a controllable "now". Shared across
     /// clones via the same `Arc<RwLock<..>>`, so an injection on any clone is
     /// visible to all.
-    #[cfg(test)]
-    pub(crate) fn set_clock(&self, f: Arc<dyn Fn() -> u64 + Send + Sync>) {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn set_clock(&self, f: Arc<dyn Fn() -> u64 + Send + Sync>) {
         *self.clock.write().expect("resolver clock lock") = f;
     }
 
@@ -693,7 +693,7 @@ impl ReachabilityResolver {
     /// "forced" refresh is still rate-bounded, because repair passes repeat on a
     /// ladder and an ungated refresh would hammer pkarr for members that are
     /// simply asleep.
-    pub(crate) fn refresh_if_older_than(
+    pub fn refresh_if_older_than(
         &self,
         owner: OwnerAddr,
         node_id: [u8; 32],
@@ -966,7 +966,7 @@ impl ReachabilityResolver {
     /// permit — it exists for callers that need the payloads inline). The
     /// cooldown map is shared with the refresh path deliberately: both are
     /// "one pkarr fetch per owner per window" decisions.
-    pub(crate) fn discover_record_less(&self, owner: OwnerAddr) {
+    pub fn discover_record_less(&self, owner: OwnerAddr) {
         {
             let map = self.inner.read().expect("resolver read lock");
             if map.range_owner(&owner).next().is_some() {

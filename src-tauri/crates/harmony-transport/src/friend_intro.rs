@@ -553,7 +553,7 @@ pub(crate) fn introduction_reachability_hlc() -> crate::owner_state_types::Hlc {
 /// acceptable for a first-contact dial target. The HLC is deliberately NOT a
 /// parameter: signing with any other clock would make X reject every
 /// introduction, so it must not be caller-overridable.
-pub(crate) fn build_self_reachability_announce(
+pub fn build_self_reachability_announce(
     iroh_node_id: [u8; 32],
     home_relay_url: String,
     direct_addresses: Vec<std::net::SocketAddr>,
@@ -615,14 +615,14 @@ const MAX_WINDOW_KEYS: usize = 8192;
 /// `open_join_admit` reuse this same bounded-eviction primitive rather than
 /// re-implementing a per-source window — a keyed limiter MUST be memory-bounded
 /// against rotating-key floods, and that discipline lives here.
-pub(crate) struct KeyedSlidingWindow<K> {
+pub struct KeyedSlidingWindow<K> {
     max: usize,
     window_ms: u64,
     windows: HashMap<K, VecDeque<u64>>,
 }
 
 impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
-    pub(crate) fn new(max: usize, window_ms: u64) -> Self {
+    pub fn new(max: usize, window_ms: u64) -> Self {
         Self {
             max,
             window_ms,
@@ -631,7 +631,7 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
     }
 
     /// `true` if admitted (recorded), `false` if the key is at its in-window cap.
-    pub(crate) fn admit(&mut self, key: K, now_ms: u64) -> bool {
+    pub fn admit(&mut self, key: K, now_ms: u64) -> bool {
         if self.max == 0 {
             return false; // a zero cap admits nothing; avoid inserting an unbounded empty entry
         }
@@ -656,7 +656,7 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
     /// if the first sheds (ZEB-865's aggregate ceiling peeks before the
     /// per-source window records). Counts only in-window (non-stale) entries; a
     /// zero cap never admits.
-    pub(crate) fn would_admit(&self, key: K, now_ms: u64) -> bool {
+    pub fn would_admit(&self, key: K, now_ms: u64) -> bool {
         if self.max == 0 {
             return false;
         }

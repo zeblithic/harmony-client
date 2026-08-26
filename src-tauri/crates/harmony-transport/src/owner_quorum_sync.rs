@@ -448,12 +448,7 @@ pub fn prune_settled_requests(
 /// so disarm/consume write an already-expired cell that wins LWW and is
 /// reaped later by `prune_settled_requests`. The `(wall_ms, logical)` bump
 /// guarantees strict newness even for two writes in the same millisecond.
-pub(crate) fn stamp_arm_cell(
-    doc: &mut QuorumReqDoc,
-    self_id: [u8; 16],
-    armed_until_ms: u64,
-    now_ms: u64,
-) {
+pub fn stamp_arm_cell(doc: &mut QuorumReqDoc, self_id: [u8; 16], armed_until_ms: u64, now_ms: u64) {
     let self_hex = hex::encode(self_id);
     let (wall_ms, logical) = match doc.enroll_arms.get(&self_hex).map(|a| &a.set_at) {
         Some(prev) if prev.wall_ms >= now_ms => {
@@ -483,7 +478,7 @@ pub(crate) fn stamp_arm_cell(
 }
 
 /// Decode a 16-byte device-id hex string.
-pub(crate) fn parse_device_id_hex(hex_str: &str) -> Result<[u8; 16], String> {
+pub fn parse_device_id_hex(hex_str: &str) -> Result<[u8; 16], String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("bad device id hex: {e}"))?;
     bytes
         .try_into()
@@ -1760,7 +1755,7 @@ pub(crate) fn eligible_cosigners(
 /// locks. `request_id` is caller-supplied (16 random bytes) so the planner
 /// stays deterministic under test.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn plan_quorum_revocation_request(
+pub fn plan_quorum_revocation_request(
     trust: &OwnerState,
     device_signing_key: &ed25519_dalek::SigningKey,
     master_seed_present: bool,
@@ -1890,7 +1885,7 @@ pub(crate) fn plan_quorum_revocation_request(
 /// hash per eligible co-signer so B can authenticate the request before adding
 /// its own part into `primary_sig_hex`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn plan_quorum_epoch_bump_request(
+pub fn plan_quorum_epoch_bump_request(
     trust: &OwnerState,
     device_signing_key: &ed25519_dalek::SigningKey,
     master_seed_present: bool,
@@ -1972,7 +1967,7 @@ pub(crate) fn plan_quorum_epoch_bump_request(
 /// `Ok(true)` when a signature was added, `Ok(false)` when this device had
 /// already signed (idempotent re-approve). NodeState-free for the
 /// two-engine integration tests.
-pub(crate) fn cosign_request_core(
+pub fn cosign_request_core(
     doc: &mut QuorumReqDoc,
     trust: &OwnerState,
     device_signing_key: &ed25519_dalek::SigningKey,
@@ -2211,7 +2206,7 @@ pub(crate) fn cosign_request_core(
 /// count — see `owner_quorum_sync::verified_decliners`). Returns
 /// `Ok(true)` when the tombstone was added, `Ok(false)` when already
 /// declined (idempotent).
-pub(crate) fn decline_request_core(
+pub fn decline_request_core(
     doc: &mut QuorumReqDoc,
     trust: &OwnerState,
     device_signing_key: &ed25519_dalek::SigningKey,

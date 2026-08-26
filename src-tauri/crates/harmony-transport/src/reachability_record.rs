@@ -25,7 +25,7 @@ pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: u64 = 30 * 60 * 1000;
 /// ~3.5-day republish gap with margin and never outlives the per-epoch
 /// ephemeral key. The resolver (`harmony_pkarr::verify_freshness`) honors a
 /// record while `now <= announced_at + this`.
-pub(crate) const REACHABILITY_RECORD_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const REACHABILITY_RECORD_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 // The record shape + delegate type + canonical CBOR now live in the core crate
 // (harmony-reachability, ZEB-744 PR 1). This module keeps only the client-side

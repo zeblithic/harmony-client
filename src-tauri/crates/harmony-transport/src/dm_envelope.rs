@@ -486,7 +486,7 @@ struct RevocationPushBody {
 
 /// ZEB-685: construct a `RevocationPush` packet (no outer signature). Called by
 /// the send-side friend-push hook (`owner_commands::push_revocation_to_friends`).
-pub(crate) fn build_revocation_push_packet(
+pub fn build_revocation_push_packet(
     revocation: harmony_owner::certs::RevocationCert,
     enrollment: harmony_owner::certs::EnrollmentCert,
 ) -> DmPacket {
@@ -921,7 +921,7 @@ impl CanonicalPayload for RevocationPushBody {}
 /// so downstream stores (`pending_dm_invites`) and later tasks share one
 /// self-consistent invite. Plain `#[cfg(test)]`: every consumer is an
 /// in-crate unit test (no integration test needs it — see Task 1 brief).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures {
     use super::DmInviteSigned;
     use crate::owner_state_types::{

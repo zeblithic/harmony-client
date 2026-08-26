@@ -7,12 +7,12 @@
 // friend-graph / friend-token sub-CRDTs (ZEB-370 Phase 1) and the top-level
 // OwnerState CRDT. Certified via the exported macro — the only supported path
 // (never hand-write the sealed-trait impls).
-harmony_core_types::impl_canonical!(
-    crate::friend_graph::FriendGraph,
-    crate::friend_graph::FriendEntry,
-    crate::friend_token::FriendTokenPayload,
-    crate::owner_state_crdt::OwnerState,
-);
+// ZEB-548 Stage 2 (PR #10): friend_graph::{FriendGraph, FriendEntry} and
+// owner_state_crdt::OwnerState moved to harmony-transport, and the orphan rule
+// moved their registrations with them (harmony-transport's canonical_impls).
+// friend_token stays app-side, so its registration stays here. The compile-time
+// asserts below still cover ALL the types (the re-export paths resolve).
+harmony_core_types::impl_canonical!(crate::friend_token::FriendTokenPayload);
 
 #[cfg(test)]
 mod tests {

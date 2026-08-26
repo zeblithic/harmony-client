@@ -108,14 +108,14 @@ mod zeb398_content_policy_tests {
 }
 
 pub mod address_book_sync;
-pub mod admission_oracle;
+pub use harmony_transport::admission_oracle;
 pub mod api;
 mod app_tracing;
 // ZEB-901: re-export the shared default log filter so the binary crate
 // (`main.rs::init_tracing`) can reuse it without the private module being public.
 pub use app_tracing::DEFAULT_ENV_FILTER;
 pub mod backup_state;
-pub mod butler_deposit;
+pub use harmony_transport::butler_deposit;
 pub mod channel_backfill;
 pub mod channel_chunk_index;
 pub mod channel_rbsr;
@@ -158,7 +158,7 @@ pub mod community_state_persist;
 // ZEB-814: segmented community-state root (manifest + immutable CAS segments).
 pub mod community_state_segments;
 pub mod community_state_sync;
-pub mod community_topology;
+pub use harmony_transport::community_topology;
 pub mod community_voting_approval;
 pub mod community_voting_conviction;
 pub mod community_voting_core;
@@ -176,18 +176,18 @@ pub mod contacts_commands;
 pub mod contacts_crdt;
 pub mod contacts_persist;
 pub mod content_index;
-pub mod dm_crypto;
-pub mod dm_envelope;
-pub mod dm_inbox_crdt;
-pub mod dm_inbox_ingest;
-pub mod dm_inbox_persist;
-pub mod dm_outbox;
-pub mod dm_outhold;
-pub mod dm_outhold_apply;
-pub mod dm_outhold_persist;
-pub mod dm_read_receipt;
-pub mod dm_signing;
-pub mod dm_tunnel_contact;
+pub use harmony_transport::dm_crypto;
+pub use harmony_transport::dm_envelope;
+pub use harmony_transport::dm_inbox_crdt;
+pub use harmony_transport::dm_inbox_ingest;
+pub use harmony_transport::dm_inbox_persist;
+pub use harmony_transport::dm_outbox;
+pub use harmony_transport::dm_outhold;
+pub use harmony_transport::dm_outhold_apply;
+pub use harmony_transport::dm_outhold_persist;
+pub use harmony_transport::dm_read_receipt;
+pub use harmony_transport::dm_signing;
+pub use harmony_transport::dm_tunnel_contact;
 pub mod emoji_names;
 // enrollment_verify moved to harmony-core-types (ZEB-548 Stage 2 PR #1);
 // re-exported below via `pub use harmony_core_types::{… enrollment_verify …}`.
@@ -195,35 +195,35 @@ pub mod event_loop;
 pub mod feed_authority;
 pub mod file_sharing;
 pub mod file_stream_crypto;
-pub mod fleet_dataset_file;
-pub mod fleet_key_epoch;
-pub mod fleet_net;
-pub mod fleet_net_persist;
-pub mod fleet_peer_seed;
-pub mod fleet_peer_seed_persist;
-pub mod fleet_sync;
+pub use harmony_transport::fleet_dataset_file;
+pub use harmony_transport::fleet_key_epoch;
+pub use harmony_transport::fleet_net;
+pub use harmony_transport::fleet_net_persist;
+pub use harmony_transport::fleet_peer_seed;
+pub use harmony_transport::fleet_peer_seed_persist;
+pub use harmony_transport::fleet_sync;
 pub mod folder_ingest;
 pub mod folders;
 mod follows;
-pub mod friend_graph;
-pub mod friend_intro;
+pub use harmony_transport::friend_graph;
+pub use harmony_transport::friend_intro;
 pub mod friend_nicknames;
-pub mod friend_rendezvous;
-pub mod friend_requests;
+pub use harmony_transport::friend_rendezvous;
+pub use harmony_transport::friend_requests;
 pub mod friend_token;
 pub mod identity_commands;
-pub mod inflight_handshake_gate;
+pub use harmony_transport::inflight_handshake_gate;
 pub mod invite_mint;
-pub mod iroh_butler_acceptor;
+pub use harmony_transport::iroh_butler_acceptor;
 pub mod iroh_community_relay_acceptor;
-pub mod iroh_endpoint;
-pub mod iroh_framing;
-pub mod iroh_friend_acceptor;
+pub use harmony_transport::iroh_endpoint;
+pub use harmony_transport::iroh_framing;
+pub use harmony_transport::iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
-pub mod iroh_pex_acceptor;
-pub mod iroh_transport_lifecycle;
-pub mod iroh_tunnel_acceptor;
-pub mod iroh_tunnel_dm_transport;
+pub use harmony_transport::iroh_pex_acceptor;
+pub use harmony_transport::iroh_transport_lifecycle;
+pub use harmony_transport::iroh_tunnel_acceptor;
+pub use harmony_transport::iroh_tunnel_dm_transport;
 pub mod latched_join_reattempt;
 pub mod library_directory;
 pub mod liveness_heartbeat;
@@ -239,13 +239,13 @@ pub mod open_join_dial;
 pub mod owner_commands;
 pub mod owner_loaded;
 pub mod owner_quorum_commands;
-pub mod owner_quorum_enroll;
-pub mod owner_quorum_sync;
-pub mod owner_state;
-pub mod owner_state_crdt;
-pub mod owner_state_persist;
-pub mod owner_state_sync;
-pub mod owner_trust_sync;
+pub use harmony_transport::owner_quorum_enroll;
+pub use harmony_transport::owner_quorum_sync;
+pub use harmony_transport::owner_state;
+pub use harmony_transport::owner_state_crdt;
+pub use harmony_transport::owner_state_persist;
+pub use harmony_transport::owner_state_sync;
+pub use harmony_transport::owner_trust_sync;
 pub mod pairing;
 // ZEB-548 Stage 0: owner_state_types + owner_state_crypto were extracted into
 // the harmony-core-types crate. Re-exported here so the ~hundreds of existing
@@ -293,29 +293,29 @@ pub use harmony_mint::{mint_sync, mint_sync_persist, mint_sync_types};
 // definitions, since the sealed CanonicalPayload trait crossed the crate boundary.
 mod canonical_impls;
 pub mod pairing_commands;
-pub mod pending_dm_invites;
+pub use harmony_transport::pending_dm_invites;
 pub mod persistent_card_store;
 pub mod pkarr_community_publisher;
-pub mod pkarr_friend_publisher;
+pub use harmony_transport::pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
-pub mod pkarr_invite_publisher;
+pub use harmony_transport::pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
 pub mod pkarr_vines;
 pub mod pkarr_vines_publisher;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
 pub mod profile_page_doc;
-pub mod protocol_versioning;
-pub mod referral_catalog;
-pub mod relay_acceptor_watchdog;
+pub use harmony_transport::protocol_versioning;
+pub use harmony_transport::referral_catalog;
+pub use harmony_transport::relay_acceptor_watchdog;
 pub mod relay_hold_persist;
 pub mod relay_optin_persist;
-pub mod reply_spill;
+pub use harmony_transport::reply_spill;
 pub mod voting_rbsr;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
-pub mod network_health;
+pub use harmony_transport::network_health;
 // revoked_device_projection moved to harmony-core-types (ZEB-548 Stage 2 PR #1);
 // re-exported above via `pub use harmony_core_types::{… revoked_device_projection}`.
 // ZEB-391: filters stale/virtual addresses out of the advertised iroh direct
@@ -326,8 +326,8 @@ pub mod direct_addr_filter;
 pub mod addr_change_fanout;
 pub mod reachability_bound;
 pub mod reachability_publisher;
-pub mod reachability_record;
-pub mod reachability_resolver;
+pub use harmony_transport::reachability_record;
+pub use harmony_transport::reachability_resolver;
 pub mod recovery_cli;
 pub mod recovery_policy;
 pub mod resume_detector;
@@ -344,8 +344,8 @@ pub mod storage_signing;
 // ZEB-473 (DM-over-iroh, Move 1a): the per-peer PQ tunnel session map
 // (TunnelManager) + per-connection async driver (tunnel_task: responder
 // acceptor + initiator dialer over the persistent iroh endpoint).
-pub mod tunnel_manager;
-pub mod tunnel_task;
+pub use harmony_transport::tunnel_manager;
+pub use harmony_transport::tunnel_task;
 pub mod vine_feed_cache;
 pub mod vine_follow_graph;
 pub mod vine_pull_driver;
@@ -361,14 +361,14 @@ pub mod voice_reconnect;
 pub mod voice_signal;
 // ZEB-321 Phase 1 Task 5: zenoh-link::LinkUnicastTrait impl over an
 // iroh QUIC bidi stream pair. Consumed by Task 6's IrohZenohLinkManager.
-pub mod zenoh_iroh_link;
+pub use harmony_transport::zenoh_iroh_link;
 // ZEB-321 Phase 1 Task 6: zenoh-link::LinkManagerUnicastTrait impl —
 // resolves outbound locators via ReachabilityResolver and opens iroh
 // QUIC bidi streams wrapped in IrohZenohLink.
-pub mod zenoh_iroh_transport;
+pub use harmony_transport::zenoh_iroh_transport;
 // ZEB-368: registers harmony's IrohZenohLinkManager with the vendored
 // zenoh-link factory and forwards accepted inbound links into Zenoh.
-pub mod iroh_zenoh_registration;
+pub use harmony_transport::iroh_zenoh_registration;
 // ZEB-695: durable panic capture — records the causal first panic (with a
 // forced backtrace) before zenoh's poisoned-lock Drop-path re-panic aborts the
 // process and erases it. Auto-installed at zenoh session open; debug/CI-gated.
@@ -376,11 +376,11 @@ pub mod panic_capture;
 // ZEB-373/ZEB-620: iroh dial primitives — the `PeerDialer` trait,
 // `RuntimePeerDialer` (over a live zenoh Runtime), and `deterministic_zid_hex`.
 // The dial-once `run_dial_driver` was retired for the reconnect supervisor.
-pub mod iroh_dial_driver;
+pub use harmony_transport::iroh_dial_driver;
 // ZEB-620: reconnect supervisor — per-peer retry state machine, jittered
 // exponential ladder, coalescing dirty-set kicks, lower-NodeId dial-role gate,
 // bounded dial concurrency. Pure logic; producers are wired in later tasks.
-pub mod reconnect_supervisor;
+pub use harmony_transport::reconnect_supervisor;
 // ZEB-917 (R6c): SimNet — deterministic single-process simulation harness.
 // Test-only; compiled only under `cfg(test)`, never in a release binary.
 #[cfg(test)]
@@ -394,7 +394,7 @@ mod moderator_invite_tests;
 // ZEB-622: peer liveness — passive per-peer transport state machine fusing
 // registry connect/drop edges, iroh path events, and zenoh transport events
 // into Connected/Degraded/Disconnected. Pure logic; producers wired in later tasks.
-pub mod peer_liveness;
+pub use harmony_transport::peer_liveness;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
@@ -414,19 +414,10 @@ impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHan
     }
 }
 
-/// ZEB-370: production impl of `iroh_friend_acceptor::FriendEventEmit` on
-/// `tauri::AppHandle<R>`. Lets the friend handshake acceptor signal the UI a
-/// friend was added without depending on `tauri` directly (the trait + unit-
-/// type stub live in `iroh_friend_acceptor.rs` so tests compile without a
-/// Tauri runtime).
-impl<R: tauri::Runtime> crate::iroh_friend_acceptor::FriendEventEmit for tauri::AppHandle<R> {
-    fn emit_friend_list_changed(&self) {
-        let _ = self.emit("friend-list-changed", ());
-    }
-    fn emit_friend_request_received(&self) {
-        let _ = self.emit("friend-request-received", ());
-    }
-}
+// ZEB-548 Stage 2 (PR #10): the `FriendEventEmit` production impls moved to
+// harmony-transport's `iroh_friend_acceptor` (the trait's crate — the orphan
+// rule forbids foreign-trait-on-foreign-type impls here). Both node modes hand
+// the acceptor an `Arc<dyn NodeEventSink>`, so no Tauri-side impl remains.
 
 /// ZEB-445: Tauri-free equivalent of `app.path().app_data_dir()`. Tauri
 /// resolves the app-data dir as `dirs::data_dir()/<identifier>` with
@@ -498,20 +489,6 @@ impl crate::community_invite::AppHandleEmit
                 "reason": reason_tag,
             }),
         );
-    }
-}
-
-/// ZEB-445: sink-trait adapter so `Arc<dyn NodeEventSink>` satisfies the
-/// `FriendEventEmit` bound. Tauri serializes `()` as JSON `null`, so
-/// `Value::Null` is wire-identical to the AppHandle impl above.
-impl crate::iroh_friend_acceptor::FriendEventEmit
-    for std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>
-{
-    fn emit_friend_list_changed(&self) {
-        self.emit("friend-list-changed", serde_json::Value::Null);
-    }
-    fn emit_friend_request_received(&self) {
-        self.emit("friend-request-received", serde_json::Value::Null);
     }
 }
 

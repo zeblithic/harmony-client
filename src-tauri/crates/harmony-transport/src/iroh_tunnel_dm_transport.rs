@@ -120,7 +120,7 @@ pub(crate) fn resolve_owner_tunnel_targets(
 /// [`IrohTunnelDmTransport::resolve_tunnel_targets`] — so a DM-space-creation
 /// fan-out can't stall unrelated CRDT reads/writes (Qodo). Devices with no
 /// tunnel contact are skipped (durability is the deposit rung's job — ZEB-483).
-pub(crate) async fn send_packet_to_owner_tunnels(
+pub async fn send_packet_to_owner_tunnels(
     crdt_state: &Arc<tokio::sync::Mutex<OwnerState>>,
     mgr: &Arc<TunnelManager>,
     recipient: OwnerAddr,
