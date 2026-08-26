@@ -109,6 +109,23 @@ impl Default for WatchdogMemory {
     }
 }
 
+/// Process-global watchdog escalation state (see the module docs above).
+/// Deliberately NOT a `NodeState` field: a Tier-2 remediation re-runs
+/// `start_node_inner`, which re-spawns the watchdog fresh. If the counters lived
+/// in `NodeState` they would reset to zero every restart, the max-restart cap
+/// would never trip, and the watchdog would restart forever. A `static` survives
+/// the in-process restart.
+// ZEB-548 Stage 2: moved here from the crate root, beside the `WatchdogMemory`
+// state it wraps, so the transport tier carries its own process-global.
+static WATCHDOG_MEMORY: std::sync::OnceLock<Arc<Mutex<WatchdogMemory>>> =
+    std::sync::OnceLock::new();
+
+pub fn watchdog_memory() -> Arc<Mutex<WatchdogMemory>> {
+    WATCHDOG_MEMORY
+        .get_or_init(|| Arc::new(Mutex::new(WatchdogMemory::default())))
+        .clone()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
     Hold,

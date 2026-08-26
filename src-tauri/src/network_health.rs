@@ -3176,7 +3176,7 @@ impl NetworkHealthService {
             // `community_relay`). `phase`/counters come from the process-global
             // watchdog memory; `staleness_ms`/`connected_peers` are live.
             relay_acceptor_watchdog: self.community_relay_serving.as_ref().map(|tel| {
-                let mem = *crate::watchdog_memory()
+                let mem = *crate::relay_acceptor_watchdog::watchdog_memory()
                     .lock()
                     .expect("watchdog memory poisoned");
                 let staleness_ms = tel.last_served_ms().map(|ms| now_ms().saturating_sub(ms));

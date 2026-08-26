@@ -728,6 +728,43 @@ pub struct SelfHandshakeReachability {
     pub pq_kem_pubkey: Vec<u8>,
 }
 
+/// ZEB-461 Task 6: build this node's [`SelfHandshakeReachability`] from the
+/// NodeState-snapshotted self material + the live iroh endpoint, for advertising
+/// in an outbound friend handshake.
+///
+/// Returns `None` (→ ship the EMPTY bundle) unless ALL of the inputs are present:
+/// the 64-byte identity pub, BOTH PQ pubkeys, and the iroh endpoint. A partial
+/// advertisement (e.g. real device bundle but a zero iroh id) would be worse than
+/// none — a friend would cache an unreachable hint — so we fall back to empty.
+/// `node_id()` / `home_relay()` are synchronous, so this never blocks. An empty
+/// `home_relay()` string is normalized to `None`.
+// ZEB-376 Task 10 / ZEB-548 Stage 2: `pub` so both the friend-PEX acceptor and
+// the app tier's request/redeem paths can rebuild X's own
+// dialer `SelfHandshakeReachability` fresh per introduction dial (same per-dial
+// fresh-relay read the request/redeem paths use).
+pub fn build_self_handshake_reachability(
+    self_identity_pub_64: Option<[u8; 64]>,
+    self_dsa_pubkey: Option<Vec<u8>>,
+    self_kem_pubkey: Option<Vec<u8>>,
+    iroh_endpoint: Option<&std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+) -> Option<crate::iroh_friend_acceptor::SelfHandshakeReachability> {
+    let identity_pub_64 = self_identity_pub_64?;
+    let pq_dsa_pubkey = self_dsa_pubkey?;
+    let pq_kem_pubkey = self_kem_pubkey?;
+    let ep = iroh_endpoint?;
+    let home_relay_url = ep
+        .home_relay()
+        .map(|r| r.to_string())
+        .filter(|s| !s.is_empty());
+    Some(crate::iroh_friend_acceptor::SelfHandshakeReachability {
+        identity_pub_64,
+        iroh_node_id: *ep.node_id().as_bytes(),
+        home_relay_url,
+        pq_dsa_pubkey,
+        pq_kem_pubkey,
+    })
+}
+
 /// ZEB-621 (ZEB-521 completion): the IMMUTABLE self-handshake material the friend
 /// acceptor advertises in every signed accept — this node's identity pub, iroh
 /// node id, and PQ keys. Captured once at `start_node` and constant for the
@@ -1181,6 +1218,7 @@ fn resolve_consent_consuming_approval(
 // =====================================================================
 
 use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+use crate::iroh_endpoint::HandshakeDialConfig;
 use crate::owner_state_crdt::{ApplyOutcome, OwnerState};
 use crate::owner_state_types::Hlc;
 use async_trait::async_trait;
@@ -2664,6 +2702,568 @@ impl crate::iroh_endpoint::IrohHandshakeDispatcher for MultiplexHandshakeDispatc
             .handle_connection(conn)
             .await;
     }
+}
+
+// ── ZEB-548 Stage 2: the friend-link DIAL driver, moved down from the crate
+// root so this module carries the whole friend-handshake protocol (accept +
+// dial sides). Bodies unchanged; `pub` because the app tier's request/redeem
+// paths still drive these. ──
+
+/// Synthesize an iroh `EndpointAddr` from a verified reachability routing
+/// record: iroh node id (required) + home relay url (skipped if malformed) +
+/// direct addresses. Shared by the redeem and add-friend dial paths.
+pub fn endpoint_addr_from_routing(
+    routing: &crate::reachability_record::ReachabilityAnnouncePayload,
+) -> Result<iroh::EndpointAddr, String> {
+    let id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode iroh_node_id: {e}"))?;
+    let mut addr = iroh::EndpointAddr::new(id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => addr = addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        addr = addr.with_ip_addr(*da);
+    }
+    Ok(addr)
+}
+
+/// Apply a freshly-handshaked friend + their advertised device bundle to owner
+/// state under ONE lock. Shared by BOTH dialer paths (token-redeem
+/// `connectivity_link_friend_iroh_inner` and add-by-key
+/// `connectivity_add_friend_by_key_inner`) so the ZEB-461 device-cache
+/// population cannot drift between them — it did: Greptile flagged (P1, #269)
+/// that the add-by-key path verified the accept's bundle digest but never wrote
+/// the devices, reproducing the exact DM-routing gap ZEB-461 closes.
+///
+/// `learned_at` is this node's local HLC (anti-forgery: never the peer's claimed
+/// time). An empty derived bundle is skipped so a peer that advertised nothing
+/// never LWW-clobbers a previously-known-good cache entry.
+///
+/// ZEB-580 S1: the cached DM identity is the peer's **#2** identity derived from
+/// the already-verified `enrollment` cert (combined pub keyed by the #2 DM hash),
+/// NOT the self-asserted wire #3 bundle. Deriving it HERE (the single write point
+/// both dialer paths share) keeps them from drifting — the same reason the helper
+/// exists. The wire `sender_devices` / `device_identity_pubs` are retained only as
+/// the degrade fallback for a cert with no usable X25519 (synthetic / pre-ZEB-372
+/// zeroed cert).
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_handshaked_friend(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    addr: crate::owner_state_types::OwnerAddr,
+    entry: crate::friend_graph::FriendEntry,
+    // ZEB-580 S1: the peer's EnrollmentCert, ALREADY verified by the caller
+    // (`verify_enrolled_device`). Authoritative source of the peer's #2 DM
+    // identity; the wire bundle below is only the degrade fallback.
+    enrollment: &harmony_owner::certs::EnrollmentCert,
+    // Degrade-only: the self-asserted wire #3 bundle, used solely when the cert
+    // has no usable X25519.
+    sender_devices: Vec<crate::owner_state_types::DeviceIdentityHash>,
+    device_identity_pubs: Vec<Option<[u8; 64]>>,
+    // ZEB-473 Task 5: the peer's per-device tunnel reachability/PQ contacts,
+    // parallel-indexed to the cached device (built from the SIGNED accept fields
+    // by the caller). `apply_owner_device_update` re-aligns these to the sorted
+    // device list. `None` elements are skip-on-empty (never clobber a known
+    // contact).
+    device_tunnel_contacts: Vec<Option<crate::owner_state_types::DeviceTunnelContact>>,
+    learned_at: crate::owner_state_types::Hlc,
+) -> Result<(), String> {
+    let mut state = crdt_state.lock().await;
+    match state.apply_friend_update(addr, entry) {
+        crate::owner_state_crdt::ApplyOutcome::Inserted
+        | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {}
+        crate::owner_state_crdt::ApplyOutcome::Rejected(reason) => {
+            return Err(format!("friend-graph apply rejected: {reason:?}"));
+        }
+    }
+    // ZEB-580 S1: prefer the cert-attested #2 identity; degrade to the wire #3
+    // bundle only when the cert carries no usable X25519, then to empty.
+    //
+    // The tunnel contacts are parallel-indexed to the WIRE device bundle. When
+    // we collapse to the single cert-derived #2 hash we can only carry a wire
+    // contact if it unambiguously belongs to #2 — i.e. the peer advertised a
+    // single device, so wire[0] IS the #2 device. With a MULTI-device wire
+    // bundle there is no reliable map from #2's cert-derived hash back to a wire
+    // index (the wire bundle is #3-native), so `apply_owner_device_update`'s
+    // truncate-to-parity would pair #2 with wire[0]'s contact — potentially
+    // another device's reachability. Drop the contact to `None` in that case:
+    // skip-on-empty never clobbers a known contact, and #2's real contact is
+    // re-learned from a later signed device update / the deposit rung.
+    let (devices, pubs, contacts) = match crate::dm_signing::device2_signing_hash(enrollment) {
+        Some(h2) => {
+            let contact = if sender_devices.len() <= 1 {
+                device_tunnel_contacts
+            } else {
+                Vec::new()
+            };
+            (
+                vec![h2],
+                vec![Some(crate::dm_signing::device2_combined_pub(enrollment))],
+                contact,
+            )
+        }
+        None if !sender_devices.is_empty() => {
+            (sender_devices, device_identity_pubs, device_tunnel_contacts)
+        }
+        None => (
+            Vec::new(),
+            Vec::new(),
+            Vec::<Option<crate::owner_state_types::DeviceTunnelContact>>::new(),
+        ),
+    };
+    if !devices.is_empty() {
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) =
+            state.apply_owner_device_update(addr, devices, pubs, contacts, learned_at)
+        {
+            return Err(format!("device-cache apply rejected: {reason:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// ZEB-680 §2: build this node's own-fleet revocation attestations to carry on an
+/// outbound friend-link request, read FRESH from the live owner trust doc at
+/// request-build time (the set is NOT folded into the request signature — each
+/// attestation is independently self-authenticating). `None` handle (tests /
+/// pre-identity) carries none. Shared by both friend-link dialers so the build
+/// step can't diverge between them.
+pub async fn build_self_revocations(
+    self_trust_doc: &Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+) -> Vec<crate::iroh_friend_acceptor::RevocationAttestation> {
+    match self_trust_doc {
+        Some(doc) => crate::iroh_friend_acceptor::build_revocation_attestations(&*doc.lock().await),
+        None => Vec::new(),
+    }
+}
+
+/// ZEB-680 §2 (Task 6): apply a just-linked peer's carried own-fleet revocations
+/// to the DM revoked-device store + live projection, AFTER the friendship is
+/// established (friend entry written). Phase-1 `verify_carried_revocations` at the
+/// call site already proved every pair valid + bound to `peer_owner`;
+/// `apply_carried_revocations` re-verifies per-pair inside `handle_revocation_push`.
+/// Takes the `crdt_state` lock only for the sync apply, then drops it. This holds
+/// no owner-state engine handle by design — the friend write shares the SAME
+/// OwnerState CRDT and the caller arms `notify_dirty` on the established path, so
+/// any genuine insert is flushed by that publish. Emits the learn-at-link audit
+/// log on a genuine insert. Shared by both friend-link dialers so the apply step
+/// (and its ordering/lock discipline) can't diverge between them.
+pub async fn apply_accepted_revocations(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    peer_owner: crate::owner_state_types::OwnerAddr,
+    revocations: &[crate::iroh_friend_acceptor::RevocationAttestation],
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+) {
+    if revocations.is_empty() {
+        return;
+    }
+    let inserted = {
+        let mut state = crdt_state.lock().await;
+        crate::iroh_friend_acceptor::apply_carried_revocations(
+            &mut state,
+            peer_owner,
+            revocations,
+            revoked,
+        )
+    };
+    if inserted {
+        tracing::info!(
+            friend = %hex::encode(peer_owner.0),
+            "ZEB-680: learned new device revocation(s) from a peer at friend-link time"
+        );
+    }
+}
+
+/// Outcome of a Path-A `add_friend_by_key` initiate.
+///
+/// `rename_all` camelCases the variant tags (`linked`/`pending`/`unreachable`);
+/// `rename_all_fields` camelCases the struct-variant fields (`ownerIdHex`) — the
+/// plain `rename_all` does NOT cascade to a variant's fields.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum AddFriendOutcome {
+    /// The target auto-accepted (known + auto-accept ON, or pre-approved): a
+    /// mutual `Active`/`MutualKey` friend was written. Carries the target's
+    /// master `owner_id` (hex) + the display they advertised.
+    Linked {
+        owner_id_hex: String,
+        display: Option<String>,
+    },
+    /// The target recorded our request and is awaiting their user's accept. NO
+    /// friend was written (the target's master owner_id is unknown until they
+    /// accept + send their cert). The user re-invokes `add_friend_by_key` later
+    /// to retry; once the target accepts, the retry's response is `Accepted`.
+    Pending,
+    /// The target is not currently discoverable (no Case-B pkarr record).
+    Unreachable,
+}
+
+/// Pure classifier for the Path-A `FriendLinkResponse` branch the inner takes on
+/// a `Pending` reply. Factored out so the "Pending → no friend written" decision
+/// is unit-testable without a live two-node handshake. (The `Accepted` branch
+/// does cryptographic verification + a CRDT write, so it can't be reduced to a
+/// pure value — it's covered by the inner + the shared dial/secret machinery the
+/// token roundtrip integration test exercises.)
+pub fn classify_pending_outcome() -> AddFriendOutcome {
+    AddFriendOutcome::Pending
+}
+
+/// ZEB-376: reusable Path-A friend-link tail. Given an already-connected iroh
+/// `conn` on the friend ALPN, opens a bi-stream, sends a token-less
+/// `FriendLinkRequest`, reads the `FriendLinkResponse`, verifies the accept
+/// cert+signature, derives the rendezvous secret, and applies the peer as a
+/// friend with `established_via = origin`. `expected_peer` (when `Some`) pins
+/// the owner the accept must come from (Path C introductions); `None` lets the
+/// caller learn the owner from the accept (Case-B `MutualKey`). `peer_label` is
+/// a hex label used only in log lines.
+#[allow(clippy::too_many_arguments)]
+pub async fn link_over_connection(
+    conn: iroh::endpoint::Connection,
+    dial_config: HandshakeDialConfig,
+    origin: crate::friend_graph::FriendOrigin,
+    expected_peer: Option<crate::owner_state_types::OwnerAddr>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
+    >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    device_id: String,
+    peer_label: String,
+    // ZEB-680 §1: the live revoked-device projection, consulted by the
+    // Accepted-response `verify_enrolled_device` below. Owned (cheap Arc-backed
+    // clone) so it survives the spawned introduction path; callers pass the real
+    // NodeState handle, tests pass `RevokedDeviceProjection::new()`.
+    revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    // ZEB-680 §2: live handle to this node's owner trust doc, read FRESH at
+    // request-build time (below) to carry our own-fleet revocations on the
+    // token-less FriendLinkRequest. `None` (tests) carries none.
+    self_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+) -> Result<AddFriendOutcome, String> {
+    use crate::iroh_friend_acceptor::{
+        decode_friend_response, encode_friend_request, friend_accept_sig_preimage,
+        friend_request_sig_preimage, verify_carried_revocations, verify_enrolled_device,
+        FriendLinkRequest, FriendLinkResponse, FRIEND_MAX_PACKET_LEN,
+    };
+    use ed25519_dalek::{Signature, Signer, VerifyingKey};
+
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("target_unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "target_unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // 5. Build + device-#2-sign a token-LESS FriendLinkRequest. `token_sig` is
+    //    None end-to-end (Path A); the sig binds our ephemeral X25519 public.
+    let (self_eph_sk, self_eph_pub) = crate::friend_rendezvous::generate_ephemeral();
+    // ZEB-461 Task 6: fill the device bundle + reachability + PQ keys from this
+    // node's self-values when present; ship the EMPTY bundle when `None`. The
+    // digest is computed from the SAME contact material placed on the wire so the
+    // request signature stays consistent — and ZEB-473 §6.3 folds reachability +
+    // PQ keys into `contact_digest`, so the signature BINDS devices, pubs,
+    // reachability, AND PQ keys (downgrade / tamper protection).
+    let req_bundle = crate::dm_tunnel_contact::self_request_bundle(self_reachability.as_ref());
+    let req_devices_digest = crate::iroh_friend_acceptor::contact_digest(
+        &req_bundle.sender_devices,
+        &req_bundle.device_identity_pubs,
+        &req_bundle.iroh_node_id,
+        req_bundle.home_relay_url.as_deref(),
+        &req_bundle.pq_dsa_pubkey,
+        &req_bundle.pq_kem_pubkey,
+    );
+    let req_sig = self_device2_signing_key
+        .sign(&friend_request_sig_preimage(
+            self_owner,
+            None,
+            &self_eph_pub,
+            &req_devices_digest,
+        ))
+        .to_bytes();
+    // ZEB-680 §2: carry our own-fleet revocations, built FRESH from the live
+    // trust doc at request-build time (see the token-path build for rationale).
+    let self_revocations = build_self_revocations(&self_trust_doc).await;
+    let request = FriendLinkRequest {
+        from_addr: self_owner,
+        display: self_display,
+        token_sig: None,
+        eph_x25519_pub: self_eph_pub,
+        enrollment: self_enrollment,
+        // ZEB-677: see the token-path build — threading lands with S4.
+        signer_certs: Vec::new(),
+        sig: req_sig,
+        sender_devices: req_bundle.sender_devices,
+        device_identity_pubs: req_bundle.device_identity_pubs,
+        iroh_node_id: req_bundle.iroh_node_id,
+        home_relay_url: req_bundle.home_relay_url,
+        pq_dsa_pubkey: req_bundle.pq_dsa_pubkey,
+        pq_kem_pubkey: req_bundle.pq_kem_pubkey,
+        revocations: self_revocations,
+    };
+    let wire = encode_friend_request(&request).map_err(|e| format!("encode request: {e}"))?;
+    let write_prefix = async {
+        // Caller-bounded packet; no historical write cap, so cap at the wire-
+        // representable max (u32::MAX) — preserves behavior, keeps the prefix
+        // u32-safe, and unifies byte order.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            u32::MAX as usize,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("target_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target_unreachable: request length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write request body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"request-write-failed");
+            return Err(format!("target_unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target_unreachable: request body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("target_unreachable: send.finish failed: {e}"));
+    }
+
+    // 6. Read [u32 LE length-prefix][FriendLinkResponse].
+    let read_response = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read length-prefix: {e}"))?;
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            FRIEND_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    let response_bytes =
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"response-read-failed");
+                return Err(format!("target_unreachable: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"response-read-timeout");
+                return Err("target_unreachable: friend response timeout".to_string());
+            }
+        };
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"friend-handshake-complete");
+    drop(conn);
+
+    // 7. Branch on the response. Unlike the token redeem, `Pending` is a NORMAL
+    //    Path-A outcome (the target recorded our request, awaiting their accept):
+    //    we write NO friend and return `Pending` so the user can retry later.
+    let accepted = match decode_friend_response(&response_bytes)
+        .map_err(|e| format!("decode response: {e}"))?
+    {
+        FriendLinkResponse::Accepted(a) => *a,
+        FriendLinkResponse::Pending => {
+            tracing::info!(
+                target = %peer_label,
+                "ZEB-371 Path A: target recorded request (Pending); no friend written, retry after accept"
+            );
+            return Ok(classify_pending_outcome());
+        }
+    };
+
+    // 8. Authenticate the accept (MUST happen before deriving/storing anything):
+    //    the cert binds the target's claimed owner_id, and the accept sig is over
+    //    the token-LESS accept preimage. A garbage/forged reply errors here —
+    //    never writes a friend.
+    let target_addr_master = accepted.from_addr;
+    let accept_verified =
+        // ZEB-378: fresh clock — this verify runs after pkarr resolution + the iroh
+        // handshake, so the early-captured `now_ms` would be stale at verify time.
+        verify_enrolled_device(
+            &accepted.enrollment,
+            &accepted.signer_certs,
+            target_addr_master,
+            &revoked,
+            crate::iroh_friend_acceptor::wall_now_secs(),
+        )
+        .map_err(|e| format!("verify accept enrollment: {e}"))?;
+    let accept_vk = VerifyingKey::from_bytes(&accept_verified.device_ed25519)
+        .map_err(|_| "accept device key invalid")?;
+    // ZEB-461/473: bind the accepter's contact digest (device bundle +
+    // reachability + PQ keys) into the verified preimage.
+    let accept_devices_digest = crate::iroh_friend_acceptor::contact_digest(
+        &accepted.sender_devices,
+        &accepted.device_identity_pubs,
+        &accepted.iroh_node_id,
+        accepted.home_relay_url.as_deref(),
+        &accepted.pq_dsa_pubkey,
+        &accepted.pq_kem_pubkey,
+    );
+    accept_vk
+        .verify_strict(
+            &friend_accept_sig_preimage(
+                target_addr_master,
+                None,
+                &accepted.eph_x25519_pub,
+                &accept_devices_digest,
+            ),
+            &Signature::from_bytes(&accepted.sig),
+        )
+        .map_err(|_| "friend accept signature invalid".to_string())?;
+
+    // ZEB-680 §2 (Task 5): fail-closed phase-1 verify of the target's carried
+    // own-fleet revocation attestations, bound to the target's authenticated
+    // owner. A present-but-invalid attestation rejects the link; an empty/absent
+    // list is the back-compat no-op. Errors format to String here (the site's
+    // convention) — the variant's Display text keeps it distinguishable.
+    verify_carried_revocations(target_addr_master, &accepted.revocations)
+        .map_err(|e| format!("verify accept revocations: {e}"))?;
+
+    // ZEB-376: when the caller pinned an expected owner (Path C introductions),
+    // the authenticated accept MUST come from that owner — otherwise the peer we
+    // reached is not the subject the introducer vouched for. Case-B passes `None`
+    // (it learns the owner from the accept).
+    if let Some(exp) = expected_peer {
+        if accepted.from_addr != exp {
+            return Err("link: accept came from an unexpected owner".into());
+        }
+    }
+
+    // 9. The target's master key came from the chokepoint verification in
+    //    step 8; apply them as an Active/MutualKey friend (keyed on their
+    //    authenticated master owner_id).
+    let master_ed25519 = accept_verified.master_ed25519;
+    let display = accepted.display.clone();
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let learned_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    // Derive the shared rendezvous secret (our ephemeral secret + the target's
+    // ephemeral public from the accept), KeyTree-seal it AAD-bound to the
+    // target's owner_id.
+    let secret = crate::friend_rendezvous::derive_friendship_secret(
+        self_eph_sk,
+        &accepted.eph_x25519_pub,
+        self_owner,
+        target_addr_master,
+    );
+    let sealed =
+        crate::owner_state_crypto::encrypt_friend_secret(&keytree, &target_addr_master.0, &secret)
+            .map_err(|e| format!("friend-secret seal failed: {e}"))?;
+
+    let entry = crate::friend_graph::FriendEntry {
+        master_ed25519,
+        display: display.clone(),
+        status: crate::friend_graph::FriendStatus::Active,
+        established_via: origin,
+        referrable: false,
+        learned_at: learned_at.clone(),
+        sealed_secret: Some(sealed),
+    };
+    // ZEB-461: learn the target's advertised devices (carried in the accept) so
+    // the DM outbox can route to this key-introduced friend even without a shared
+    // community. Shared helper keeps this in lockstep with the token path —
+    // Greptile P1 on #269 found this path previously dropped the device update.
+    // ZEB-473 Task 5: persist the target's SIGNED iroh reachability + PQ keys
+    // (single contact parallel to device 0; `None` if nothing dialable).
+    let target_contacts = vec![crate::dm_tunnel_contact::peer_handshake_contact(
+        accepted.iroh_node_id,
+        accepted.home_relay_url.clone(),
+        accepted.pq_dsa_pubkey.clone(),
+        accepted.pq_kem_pubkey.clone(),
+    )];
+    apply_handshaked_friend(
+        &crdt_state,
+        target_addr_master,
+        entry,
+        &accepted.enrollment,
+        accepted.sender_devices.clone(),
+        accepted.device_identity_pubs.clone(),
+        target_contacts,
+        learned_at,
+    )
+    .await?;
+
+    // ZEB-680 §2 (Task 6): PHASE 2 — the friendship is established (friend entry
+    // written above, AFTER the `expected_peer` owner-pin check — a pin-failed
+    // Path-C peer returned early at the mismatch guard and wrote NOTHING), so
+    // apply the target's carried own-fleet revocations. See
+    // `apply_accepted_revocations` for the phase-1/phase-2 split, lock discipline,
+    // and the notify_dirty rationale (shared with the token-path dialer).
+    apply_accepted_revocations(
+        &crdt_state,
+        target_addr_master,
+        &accepted.revocations,
+        &revoked,
+    )
+    .await;
+
+    tracing::info!(
+        friend = %hex::encode(target_addr_master.0),
+        "ZEB-371 Path A: friend link established (target added as Active/MutualKey friend)"
+    );
+
+    Ok(AddFriendOutcome::Linked {
+        owner_id_hex: hex::encode(target_addr_master.0),
+        display,
+    })
 }
 
 #[cfg(test)]
