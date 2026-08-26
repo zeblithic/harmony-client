@@ -629,7 +629,7 @@ pub fn build_deposit_frame(
 /// Task 4 wires both production deposit rungs to this selector:
 /// [`IrohButlerDepositClient::deposit`] (same module) and
 /// [`crate::community_relay_prod::ReachabilityButlerSetResolve::resolve_targets`].
-pub(crate) fn freshest_butler_set_by_source(
+pub fn freshest_butler_set_by_source(
     tagged: &[(
         ReachabilityAnnouncePayload,
         crate::reachability_resolver::ReachabilitySource,

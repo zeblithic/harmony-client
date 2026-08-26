@@ -98,7 +98,7 @@ pub(crate) fn record_watermark_max(
 /// tunnel. No-op when `prepare_read_receipt` returns `None`. Never writes the
 /// outbox (ephemeral).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn maybe_send_read_receipt(
+pub async fn maybe_send_read_receipt(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     mgr: &std::sync::Arc<crate::tunnel_manager::TunnelManager>,
     signing_key: &std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -154,7 +154,7 @@ pub(crate) fn plan_reconnect_resends(
 /// (a live tunnel to `peer` was just proven by the inbound DM that triggered
 /// this). Never writes the outbox (ephemeral).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn resend_watermarks_to_peer(
+pub async fn resend_watermarks_to_peer(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     mgr: &std::sync::Arc<crate::tunnel_manager::TunnelManager>,
     signing_key: &std::sync::Arc<ed25519_dalek::SigningKey>,

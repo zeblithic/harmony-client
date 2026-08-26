@@ -166,7 +166,7 @@ impl PendingDmInvites {
 /// CALLER CONTRACT: the `crdt_state` async lock guard MUST already be dropped
 /// before calling this — `stage()` takes the store `Mutex` and this fires the
 /// event sink, neither of which may nest inside the held owner-state lock.
-pub(crate) fn stage_and_emit_staged_invite(
+pub fn stage_and_emit_staged_invite(
     pending: Option<&std::sync::Arc<PendingDmInvites>>,
     sink: &dyn crate::node_event_sink::NodeEventSink,
     staged: StagedDmInvite,
@@ -206,7 +206,7 @@ pub(crate) fn stage_and_emit_staged_invite(
 /// CALLER CONTRACT: the `crdt_state` async lock guard MUST already be dropped
 /// before calling this — `take()` takes the store `Mutex` and this fires the
 /// event sink, neither of which may nest inside the held owner-state lock.
-pub(crate) fn purge_stale_staged_on_accept(
+pub fn purge_stale_staged_on_accept(
     pending: Option<&std::sync::Arc<PendingDmInvites>>,
     sink: &dyn crate::node_event_sink::NodeEventSink,
     space_id: &crate::owner_state_types::SpaceId,

@@ -17,6 +17,12 @@ use crate::owner_state_types::{
 };
 use crate::reachability_record::ReachabilityAnnouncePayload;
 use crate::referral_catalog::{decode_catalog_request, decode_strict, ReferralCodecError};
+// ZEB-548 Stage 2: the introduction actions moved here from the crate root;
+// their dial-driver dependencies now live in `iroh_endpoint` / `iroh_friend_acceptor`.
+use crate::iroh_endpoint::HandshakeDialConfig;
+use crate::iroh_friend_acceptor::{
+    endpoint_addr_from_routing, link_over_connection, AddFriendOutcome,
+};
 use harmony_owner::certs::EnrollmentCert;
 
 /// Failure modes when authenticating an [`IntroduceRequest`] (on F) or verifying
@@ -547,7 +553,7 @@ pub(crate) fn introduction_reachability_hlc() -> crate::owner_state_types::Hlc {
 /// acceptable for a first-contact dial target. The HLC is deliberately NOT a
 /// parameter: signing with any other clock would make X reject every
 /// introduction, so it must not be caller-overridable.
-pub(crate) fn build_self_reachability_announce(
+pub fn build_self_reachability_announce(
     iroh_node_id: [u8; 32],
     home_relay_url: String,
     direct_addresses: Vec<std::net::SocketAddr>,
@@ -609,14 +615,14 @@ const MAX_WINDOW_KEYS: usize = 8192;
 /// `open_join_admit` reuse this same bounded-eviction primitive rather than
 /// re-implementing a per-source window — a keyed limiter MUST be memory-bounded
 /// against rotating-key floods, and that discipline lives here.
-pub(crate) struct KeyedSlidingWindow<K> {
+pub struct KeyedSlidingWindow<K> {
     max: usize,
     window_ms: u64,
     windows: HashMap<K, VecDeque<u64>>,
 }
 
 impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
-    pub(crate) fn new(max: usize, window_ms: u64) -> Self {
+    pub fn new(max: usize, window_ms: u64) -> Self {
         Self {
             max,
             window_ms,
@@ -625,7 +631,7 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
     }
 
     /// `true` if admitted (recorded), `false` if the key is at its in-window cap.
-    pub(crate) fn admit(&mut self, key: K, now_ms: u64) -> bool {
+    pub fn admit(&mut self, key: K, now_ms: u64) -> bool {
         if self.max == 0 {
             return false; // a zero cap admits nothing; avoid inserting an unbounded empty entry
         }
@@ -650,7 +656,7 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
     /// if the first sheds (ZEB-865's aggregate ceiling peeks before the
     /// per-source window records). Counts only in-window (non-stale) entries; a
     /// zero cap never admits.
-    pub(crate) fn would_admit(&self, key: K, now_ms: u64) -> bool {
+    pub fn would_admit(&self, key: K, now_ms: u64) -> bool {
         if self.max == 0 {
             return false;
         }
@@ -1009,6 +1015,343 @@ impl Default for FriendRateLimiter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── ZEB-548 Stage 2: the introduction-flow actions (F→X delivery and X's
+// Proceed self-dial), moved down from the crate root beside the
+// `Introduction` envelope they act on. Bodies unchanged; `pub` because the
+// app tier's accept path still drives `complete_introduction`. ──
+
+/// ZEB-376 (Friends Phase 2b, Task 9): F→X active-introduction delivery. Mirrors
+/// `browse_friend_referrals`' Case-D resolve + dial-`HARMONY_FRIEND_PEX_V1`
+/// pattern verbatim, but resolves the TARGET (X) from F's own sealed rendezvous
+/// secret for X (`target_sealed_secret`), writes a tagged
+/// `PexFrame::Introduction`, and reads a small ack (no catalog). The PEX
+/// acceptor's `IntroduceRequest` arm calls this inside a `tokio::spawn` so
+/// `serve()` stays single-shot and non-blocking. `intro` is F's already-signed
+/// vouch aimed at X.
+pub async fn deliver_introduction_to_target(
+    resolver: std::sync::Arc<harmony_pkarr::PkarrResolver>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    iroh_endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    target_owner: crate::owner_state_types::OwnerAddr,
+    target_sealed_secret: Vec<u8>,
+    intro: crate::friend_intro::Introduction,
+) -> Result<(), String> {
+    let target_owner_16 = target_owner.0;
+
+    // Decrypt the per-friendship secret + Case-D resolve X's current reachability
+    // — REUSING the same helpers `browse_friend_referrals` uses.
+    let secret = crate::owner_state_crypto::decrypt_friend_secret(
+        &keytree,
+        &target_owner_16,
+        &target_sealed_secret,
+    )
+    .map_err(|_| "target unreachable".to_string())?;
+
+    let Some(blob) =
+        crate::pkarr_friend_publisher::resolve_friend_case_d(&resolver, &secret, &target_owner_16)
+            .await?
+    else {
+        return Err("target unreachable".to_string());
+    };
+    if blob.is_empty() {
+        // Publisher emits an empty blob when iroh is down (un-dial-able).
+        return Err("target unreachable".to_string());
+    }
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(blob.as_slice())
+            .map_err(|e| format!("decode case-d routing blob: {e}"))?;
+
+    // Synthesize an EndpointAddr from the verified routing record (same inline
+    // synthesis `browse_friend_referrals` does).
+    let target_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode target iroh_node_id: {e}"))?;
+    let mut target_addr = iroh::EndpointAddr::new(target_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => target_addr = target_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        target_addr = target_addr.with_ip_addr(*da);
+    }
+
+    // Dial the friend-PEX ALPN + open a bi-stream, bounded by the same dial config
+    // the browse path uses.
+    let dial_config = HandshakeDialConfig::from_env();
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint.inner().connect(
+            target_addr,
+            crate::iroh_endpoint::alpn::HARMONY_FRIEND_PEX_V1,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("target unreachable: iroh connect failed: {e}")),
+        Err(_elapsed) => {
+            return Err(format!(
+                "target unreachable: iroh connect timeout after {}ms",
+                dial_config.connect_timeout.as_millis()
+            ));
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Err(format!("target unreachable: open_bi failed: {e}"));
+            }
+            Err(_elapsed) => {
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Err(format!(
+                    "target unreachable: open_bi timeout after {}ms",
+                    dial_config.open_bi_timeout.as_millis()
+                ));
+            }
+        };
+
+    // Encode the tagged Introduction frame + write [u32 LE len][body].
+    let wire = crate::friend_intro::encode_pex_frame(&crate::friend_intro::PexFrame::Introduction(
+        Box::new(intro),
+    ))
+    .map_err(|e| format!("encode introduction frame: {e:?}"))?;
+    let write_prefix = async {
+        // Caller-bounded packet; cap at the wire-representable max (u32::MAX) — the
+        // acceptor's inbound read enforces `PEX_MAX_PACKET_LEN`. Mirrors browse.
+        let prefix = crate::iroh_framing::encode_len_prefix(
+            wire.len(),
+            u32::MAX as usize,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("length-prefix out of bounds: {e}"))?;
+        send.write_all(&prefix)
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"intro-write-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target unreachable: introduction length-prefix write timeout".to_string());
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write introduction body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"intro-write-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"write-timeout");
+            return Err("target unreachable: introduction body write timeout".to_string());
+        }
+    }
+    if let Err(e) = send.finish() {
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Err(format!("target unreachable: send.finish failed: {e}"));
+    }
+
+    // Read the small ack [u32 LE length-prefix][body] (no catalog). Content is
+    // ignored — the ack only confirms X received the relayed Introduction.
+    let read_ack = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read ack length-prefix: {e}"))?;
+        let len = crate::iroh_framing::decode_len_prefix(
+            len_buf,
+            crate::referral_catalog::PEX_MAX_PACKET_LEN,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .map_err(|e| format!("ack length out of bounds: len={} max={}", e.len, e.max))?;
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read ack body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    match tokio::time::timeout(dial_config.response_read_timeout, read_ack).await {
+        Ok(Ok(_ack)) => {}
+        Ok(Err(e)) => {
+            conn.close(0u32.into(), b"ack-read-failed");
+            return Err(format!("target unreachable: {e}"));
+        }
+        Err(_elapsed) => {
+            conn.close(0u32.into(), b"ack-read-timeout");
+            return Err("target unreachable: introduction ack timeout".to_string());
+        }
+    }
+
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"introduction-complete");
+    drop(conn);
+    Ok(())
+}
+
+/// ZEB-376 Task 10: X's "dial the introducee and form the mutual link" action,
+/// shared by the friend-PEX `Introduction` arm (auto-`Proceed`) and the AskMe
+/// accept path (Task 11). The relayed `reachability` has ALREADY been verified
+/// self-authenticated + fresh by the caller; here X synthesizes the dial target
+/// from it, connects on the friend ALPN, and links — pinning `Some(subject)` as
+/// `expected_peer` so the authenticated accept MUST come from the introducee (an
+/// impostor squatting that iroh address is rejected inside `link_over_connection`
+/// at the accept-cert check, never written as a friend). Stamps `established_via:
+/// Introduction`.
+///
+/// On a successful `Linked`, mirrors `add_friend_by_key_impl`'s post-`Linked`
+/// block: arms the owner-state `SyncEngine` (`notify_dirty()`), reconciles the
+/// new friend's Case-D slot, and emits `friend-list-changed` — so the introduced
+/// friend is PERSISTED + REPLICATED + SURFACED (a local crdt mutation without
+/// `notify_dirty()` is never flushed on shutdown nor replicated). Each step is
+/// skipped (logged) when its handle is `None` (test path). `Pending`/`Unreachable`
+/// write nothing and emit nothing.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_introduction(
+    subject: crate::owner_state_types::OwnerAddr,
+    reachability: crate::reachability_record::ReachabilityAnnouncePayload,
+    iroh_endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    dial_config: HandshakeDialConfig,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    self_display: Option<String>,
+    self_enrollment: harmony_owner::certs::EnrollmentCert,
+    self_device2_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    self_reachability: Option<crate::iroh_friend_acceptor::SelfHandshakeReachability>,
+    keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
+    >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    device_id: String,
+    // ZEB-376 Task 10 (durability fix): the post-`Linked` handles this shared
+    // action needs so an introduced friend is PERSISTED + REPLICATED + SURFACED —
+    // mirroring `add_friend_by_key_impl`'s post-`Linked` block. A LOCAL crdt
+    // mutation (`link_over_connection` → `apply_handshaked_friend`) without
+    // `notify_dirty()` is NEVER persisted (shutdown flush is dirty-gated) NOR
+    // replicated — the introduced friend would evaporate on restart. All three are
+    // `Option` so the test path (no engine/publisher/sink wired) skips each step
+    // gracefully (logs) rather than panicking. Both callers (Task 10's auto-Proceed
+    // spawn AND Task 11's AskMe-accept path) get durability for free.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    friend_publisher: Option<std::sync::Arc<crate::pkarr_friend_publisher::PkarrFriendPublisher>>,
+    event_sink: Option<std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>>,
+    // ZEB-680 §1: the live revoked-device projection, threaded to
+    // `link_over_connection` so the introducee's Accepted response is
+    // revocation-checked. Owned (Arc-backed clone).
+    revoked: crate::revoked_device_projection::RevokedDeviceProjection,
+    // ZEB-680 §2: live handle to this node's owner trust doc, forwarded to
+    // `link_over_connection` so X's request to the introducee carries X's
+    // own-fleet revocations. `None` (tests) carries none.
+    self_trust_doc: Option<std::sync::Arc<tokio::sync::Mutex<harmony_owner::state::OwnerState>>>,
+) -> Result<AddFriendOutcome, String> {
+    let target_addr = endpoint_addr_from_routing(&reachability)
+        .map_err(|e| format!("synthesize introducee addr: {e}"))?;
+    let conn = tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(target_addr, crate::iroh_endpoint::alpn::HARMONY_FRIEND_V1),
+    )
+    .await
+    .map_err(|_| "introducee unreachable: connect timeout".to_string())?
+    .map_err(|e| format!("introducee unreachable: connect failed: {e}"))?;
+
+    // Clone the reconcile handles BEFORE `link_over_connection` moves the
+    // originals — mirrors `add_friend_by_key_impl`.
+    let crdt_state_for_reconcile = std::sync::Arc::clone(&crdt_state);
+    let keytree_for_reconcile = std::sync::Arc::clone(&keytree);
+
+    let outcome = link_over_connection(
+        conn,
+        dial_config,
+        crate::friend_graph::FriendOrigin::Introduction,
+        Some(subject),
+        self_owner,
+        self_display,
+        self_enrollment,
+        self_device2_signing_key,
+        self_reachability,
+        keytree,
+        crdt_state,
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        hex::encode(subject.0),
+        revoked,
+        self_trust_doc,
+    )
+    .await?;
+
+    // Only a `Linked` outcome mutated owner-state → arm sync + reconcile Case-D +
+    // refresh the UI. `Pending`/`Unreachable` wrote nothing. This block is a
+    // deliberate mirror of `add_friend_by_key_impl`'s post-`Linked` steps (same
+    // functions, same event name) so BOTH friend-add paths behave identically.
+    if matches!(outcome, AddFriendOutcome::Linked { .. }) {
+        // (1) Arm the owner-state SyncEngine: persist-on-shutdown is dirty-gated
+        //     and replication is dirty-driven, so without this the introduced
+        //     friend is neither saved nor pushed to the user's other devices.
+        match sync_engine {
+            Some(engine) => engine.notify_dirty(),
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no owner-state SyncEngine wired \
+                 (test path); skipping notify_dirty — introduced friend will NOT \
+                 persist/replicate"
+            ),
+        }
+        // (2) Case-D reconcile: publish the just-added friend's reachability slot
+        //     now (no wait for the next reachability tick). Snapshot `friends` out
+        //     from under the owner-state lock BEFORE the network `.await`s.
+        match friend_publisher {
+            Some(friend_pub) => {
+                let friends_snapshot = {
+                    let s = crdt_state_for_reconcile.lock().await;
+                    s.friend_graph.friends.clone()
+                };
+                crate::pkarr_friend_publisher::sync_case_d_handles(
+                    &friend_pub,
+                    &friends_snapshot,
+                    &keytree_for_reconcile,
+                )
+                .await;
+            }
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no Case-D friend publisher wired \
+                 (test path); skipping reconcile"
+            ),
+        }
+        // (3) Surface the new friend to the UI.
+        match event_sink {
+            Some(sink) => {
+                crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &())
+            }
+            None => tracing::debug!(
+                "ZEB-376: complete_introduction: no event sink wired (test path); \
+                 skipping friend-list-changed emit"
+            ),
+        }
+    }
+
+    Ok(outcome)
 }
 
 #[cfg(test)]

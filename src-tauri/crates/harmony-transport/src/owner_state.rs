@@ -242,8 +242,8 @@ fn evict_expired(cache: &mut HashMap<Uuid, TokenEntry>) {
 }
 
 #[doc(hidden)]
-#[cfg(test)]
-pub(crate) fn clear_token_cache() {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn clear_token_cache() {
     token_cache_lock().clear();
 }
 
@@ -317,8 +317,8 @@ fn evict_expired_paths(cache: &mut HashMap<Uuid, PathTokenEntry>) {
 }
 
 #[doc(hidden)]
-#[cfg(test)]
-pub(crate) fn clear_path_token_cache() {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn clear_path_token_cache() {
     path_token_cache_lock().clear();
 }
 
@@ -466,11 +466,11 @@ const KEYCHAIN_DEVICE_SK: &str = "device_signing_key";
 const KEYCHAIN_MASTER_SEED: &str = "master_seed";
 // pub(crate) so the reset manifest (`owner_commands::OWNER_RESET_FILES`, ZEB-835)
 // references the canonical name instead of a drift-prone literal.
-pub(crate) const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
+pub const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
 /// Encrypted-file fallback for the distributed fleet KeyTree material on a
 /// cert-only enrolled device (ZEB-492). Variable-length HRMI `v0x02` envelope
 /// (NOT the 32-byte `EncryptedFileStore` format the `*_secret` helpers use).
-pub(crate) const FLEET_KEYTREE_FILENAME: &str = "fleet_keytree.enc";
+pub const FLEET_KEYTREE_FILENAME: &str = "fleet_keytree.enc";
 
 /// Returned by `load_owner_state` when a persisted identity is found.
 pub struct LoadedOwnerState {
@@ -678,7 +678,7 @@ pub fn load_owner_state(
 /// ZEB-548 Stage 2: lives here (beside the [`save_owner_state_atomic`] path it
 /// guards) rather than in `owner_commands`, which re-exports it back
 /// (downward), so the spine trust-sync path no longer reaches up for it.
-pub(crate) static OWNER_STATE_WRITE_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+pub static OWNER_STATE_WRITE_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 /// Atomically persist a freshly-minted owner identity.
@@ -1429,7 +1429,7 @@ fn clear_secret(
 ///
 /// Live as of ZEB-492 Task 4: `pairing::persist::install_joiner_state_inner`
 /// calls this when the inviter sealed fleet material into the ENROLL payload.
-pub(crate) fn save_fleet_keytree(
+pub fn save_fleet_keytree(
     keychain: &Option<KeychainStore>,
     identity_dir: &Path,
     material: &[u8],
@@ -1505,7 +1505,7 @@ pub(crate) fn save_fleet_keytree(
 /// mirrors how `save_owner_state_atomic` clears `master_seed` when `None`.
 /// Best-effort like `clear_secret`: a vault clear failure is captured and
 /// returned AFTER the file is removed, so at least one store ends up clean.
-pub(crate) fn clear_fleet_keytree(
+pub fn clear_fleet_keytree(
     keychain: &Option<KeychainStore>,
     identity_dir: &Path,
 ) -> Result<(), String> {
@@ -1531,7 +1531,7 @@ pub(crate) fn clear_fleet_keytree(
 /// `Ok(None)` on the minting device + pre-ZEB-492 devices (neither the vault nor
 /// the encrypted file carries it). Keychain-vault-preferred, falling back to the
 /// variable-length encrypted file. The returned buffer is `Zeroizing`.
-pub(crate) fn load_fleet_keytree(
+pub fn load_fleet_keytree(
     keychain: &Option<KeychainStore>,
     identity_dir: &Path,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, String> {

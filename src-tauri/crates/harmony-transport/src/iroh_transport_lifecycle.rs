@@ -72,7 +72,7 @@ pub(crate) const RELAY_FLAP_THRESHOLD: usize = 4;
 /// (`wait_all_draining` caps at the transport probe timeout, ~3s; the actor
 /// await has an explicit 100ms cap), and every sibling shutdown in `stop_inner`
 /// likewise awaits fully — so we await it here too.
-pub(crate) async fn close_iroh_endpoint(endpoint: Arc<IrohEndpoint>) {
+pub async fn close_iroh_endpoint(endpoint: Arc<IrohEndpoint>) {
     endpoint.shutdown().await;
 }
 
@@ -85,16 +85,16 @@ pub(crate) async fn close_iroh_endpoint(endpoint: Arc<IrohEndpoint>) {
 /// aborting it — leaving it holding an `Arc<IrohEndpoint>` clone alive past a
 /// failed start (the leaked-task class this ticket addresses). On the success
 /// path the handle is `disarm`ed out and moved into `NodeState`.
-pub(crate) struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+pub struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
 
 impl AbortOnDrop {
-    pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+    pub fn new(handle: tokio::task::JoinHandle<()>) -> Self {
         Self(Some(handle))
     }
 
     /// Take the handle out without aborting — call once ownership transfers to
     /// a longer-lived owner (`NodeState`).
-    pub(crate) fn disarm(mut self) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn disarm(mut self) -> Option<tokio::task::JoinHandle<()>> {
         self.0.take()
     }
 }
@@ -186,7 +186,7 @@ fn evaluate_relay_stability(
 /// Configuration for the start-time relay-health observer. All fields are
 /// `Copy`, so the whole config moves cheaply into the observer task.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RelayObserveConfig {
+pub struct RelayObserveConfig {
     /// Delay between successive relay-status samples.
     pub interval: Duration,
     /// How many samples to take before rendering a verdict.
@@ -254,7 +254,7 @@ async fn observe_relay_stability(
 /// terminates. The caller **must** still store the returned handle and abort it
 /// on node stop (`clear_iroh_handles`), so it can't pin the old endpoint `Arc`
 /// across a restart (the leaked-task class this whole ticket is about).
-pub(crate) fn spawn_relay_health_observer(
+pub fn spawn_relay_health_observer(
     endpoint: Arc<IrohEndpoint>,
     config: RelayObserveConfig,
 ) -> tokio::task::JoinHandle<()> {

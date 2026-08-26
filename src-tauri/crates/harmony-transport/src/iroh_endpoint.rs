@@ -390,6 +390,89 @@ pub fn hermetic_dns_resolver() -> iroh::dns::DnsResolver {
     iroh::dns::DnsResolver::with_nameserver(std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
 }
 
+/// Tunable timeouts for the dialer side of the ZEB-325 Phase 2c invite
+/// handshake. Each `tokio::time::timeout(..)` wrapping a
+/// `connect` / `open_bi` / response-read call uses one of these
+/// durations.
+///
+/// Production wiring (the `connectivity_redeem_invite_iroh` IPC) calls
+/// [`Self::from_env`] so operators can override without recompiling;
+/// integration tests construct directly to keep wall-clock short and
+/// to avoid mutating process env (`std::env::set_var` is unsafe in
+/// multithreaded contexts — see ZEB-325 PR #159 F10).
+#[derive(Debug, Clone, Copy)]
+pub struct HandshakeDialConfig {
+    /// Timeout for the QUIC `connect()` call (initial dial + hole-
+    /// punch). Distinct from the response-read timeout so diagnostics
+    /// can tell "couldn't reach the inviter at all" apart from
+    /// "reached them but they never responded".
+    pub connect_timeout: std::time::Duration,
+    /// Timeout for `Connection::open_bi()` after `connect()` succeeds.
+    /// Usually returns near-immediately on a healthy connection;
+    /// bounded for the pathological case where the peer never opens
+    /// its receive window.
+    pub open_bi_timeout: std::time::Duration,
+    /// Timeout for reading the length-prefixed handshake response
+    /// (acceptor's CBOR-encoded JoinCountersign). Replaces the
+    /// previous direct `std::env::var` read at the call site.
+    pub response_read_timeout: std::time::Duration,
+    /// Timeout for the dialer's request writes (length-prefix +
+    /// packet body) and `send.finish()`. ZEB-325 PR #159 R3-2
+    /// (Cursor MEDIUM): previously unbounded — the dial / open_bi /
+    /// response-read awaits were all wrapped, but the request send
+    /// path wasn't, so a misbehaving acceptor's flow-control freeze
+    /// could pin the dialer indefinitely. Production override:
+    /// `HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS` (defaults to
+    /// 30_000ms; clamped to >= 1ms).
+    pub write_timeout: std::time::Duration,
+}
+
+impl Default for HandshakeDialConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_millis(30_000),
+            open_bi_timeout: std::time::Duration::from_millis(30_000),
+            response_read_timeout: std::time::Duration::from_millis(30_000),
+            write_timeout: std::time::Duration::from_millis(30_000),
+        }
+    }
+}
+
+impl HandshakeDialConfig {
+    /// Production constructor: reads `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS`
+    /// (the historical single-knob env var) and applies it uniformly to
+    /// connect, open_bi, and response read. Unset / unparseable → 30s.
+    /// The write-side timeout uses a dedicated
+    /// `HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS` knob (added in
+    /// ZEB-325 PR #159 R3-2) so operators can tune request-send
+    /// resilience independently from the read budget.
+    ///
+    /// ZEB-325 PR #159 R3: clamp to >= 1ms. A zero from env override
+    /// would otherwise produce instant `tokio::time::timeout(0, …)`
+    /// failures, surfacing `inviter_unreachable` on every redeem +
+    /// (if the caller retries) a tight loop.
+    pub fn from_env() -> Self {
+        let ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000)
+            .max(1);
+        let d = std::time::Duration::from_millis(ms);
+        let write_ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000)
+            .max(1);
+        let write_d = std::time::Duration::from_millis(write_ms);
+        Self {
+            connect_timeout: d,
+            open_bi_timeout: d,
+            response_read_timeout: d,
+            write_timeout: write_d,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

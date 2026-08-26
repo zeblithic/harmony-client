@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 /// REJECTED rather than truncated — matching this codebase's strict-deserialize
 /// culture (cf. `OwnerDeviceEntry`). The serialized shape of valid values is
 /// unchanged. 256 bytes is generous for a human display name.
-pub(crate) const MAX_FRIEND_DISPLAY_LEN: usize = 256;
+pub const MAX_FRIEND_DISPLAY_LEN: usize = 256;
 
 /// Derive the friend's 16-byte master `OwnerAddr` (their `owner_id`) from their
 /// 32-byte master Ed25519 verify key.
@@ -69,7 +69,7 @@ pub fn owner_id_from_master_ed25519(master_ed25519: &[u8; 32]) -> OwnerAddr {
 /// network ingress — an authenticated peer must not be able to push an
 /// oversized `display` through the handshake into a `FriendEntry` that then
 /// fails to deserialize on the owner's other devices during owner-state sync.
-pub(crate) fn deserialize_capped_display<'de, D>(d: D) -> Result<Option<String>, D::Error>
+pub fn deserialize_capped_display<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -200,8 +200,8 @@ impl FriendGraph {
 /// `master_ed25519` is a placeholder — the tier check reads only `status`, and
 /// these tests insert directly into `friends` (bypassing `apply_friend_update`'s
 /// key↔master gate, since their `OwnerAddr`s are not master-derived).
-#[cfg(test)]
-pub(crate) fn active_friend_entry_for_test(learned_wall_ms: u64) -> FriendEntry {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn active_friend_entry_for_test(learned_wall_ms: u64) -> FriendEntry {
     FriendEntry {
         master_ed25519: [0u8; 32],
         display: None,

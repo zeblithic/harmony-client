@@ -195,7 +195,7 @@ struct InboundAdmission {
 }
 
 impl InboundAdmission {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_caps(
             MAX_INBOUND_TUNNEL_SESSIONS,
             PER_SOURCE_INBOUND_TUNNEL_MAX,

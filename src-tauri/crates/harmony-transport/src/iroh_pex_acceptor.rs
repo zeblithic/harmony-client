@@ -119,7 +119,7 @@ pub struct IrohFriendPexAcceptor {
     /// (tests / iroh unbound) → X dials advertising the empty self bundle.
     self_statics: Option<SelfHandshakeStatics>,
     /// ZEB-376 Task 10 (durability fix): the post-`Linked` handles
-    /// [`crate::complete_introduction`] needs so an auto-`Proceed` introduction is
+    /// [`crate::friend_intro::complete_introduction`] needs so an auto-`Proceed` introduction is
     /// PERSISTED + REPLICATED + SURFACED — the SAME handles the friend acceptor /
     /// `add_friend_by_key_impl` thread. All optional (default `None`) so existing
     /// `new`/`with_config` callers keep compiling; a missing handle skips that step
@@ -402,7 +402,7 @@ impl IrohFriendPexAcceptor {
 
     /// ZEB-376 Task 10: X's `Introduction`-arm `Proceed` action — gather the
     /// threaded self-dial handles, rebuild X's own dialer reachability fresh, and
-    /// `tokio::spawn` [`crate::complete_introduction`] so `serve()` stays
+    /// `tokio::spawn` [`crate::friend_intro::complete_introduction`] so `serve()` stays
     /// single-shot (the F-relayed stream's ack does not block on the X→introducee
     /// link). When the dial endpoint/keytree are absent (tests / iroh unbound)
     /// this logs and skips rather than panicking — the same graceful degrade as
@@ -420,7 +420,7 @@ impl IrohFriendPexAcceptor {
         // Rebuild X's own dialer reachability fresh — including a fresh home-relay
         // read from the live endpoint — the SAME per-dial convention the
         // request/redeem paths use via `build_self_handshake_reachability`.
-        let self_reachability = crate::build_self_handshake_reachability(
+        let self_reachability = crate::iroh_friend_acceptor::build_self_handshake_reachability(
             self.self_statics.as_ref().map(|s| s.identity_pub_64),
             self.self_statics.as_ref().map(|s| s.pq_dsa_pubkey.clone()),
             self.self_statics.as_ref().map(|s| s.pq_kem_pubkey.clone()),
@@ -448,11 +448,11 @@ impl IrohFriendPexAcceptor {
         // own-fleet revocations (built fresh from the snapshot in the driver).
         let self_trust_doc = self.self_trust_doc.clone();
         tokio::spawn(async move {
-            match crate::complete_introduction(
+            match crate::friend_intro::complete_introduction(
                 subject,
                 reachability,
                 endpoint,
-                crate::HandshakeDialConfig::from_env(),
+                crate::iroh_endpoint::HandshakeDialConfig::from_env(),
                 self_owner,
                 // self_display: a UX hint only, and not persisted at start_node
                 // (mirrors the friend acceptor's production `None`).
@@ -490,7 +490,7 @@ impl IrohFriendPexAcceptor {
     /// ZEB-376 Task 11 (AskMe): record an introduction-offer in the pending inbox
     /// and emit the existing `friend-request-received` prompt for the user's
     /// explicit accept. On accept, `accept_friend_request` `take_offer`s this and
-    /// runs [`crate::complete_introduction`] — the SAME self-dial action an
+    /// runs [`crate::friend_intro::complete_introduction`] — the SAME self-dial action an
     /// auto-`Proceed` runs.
     ///
     /// The offer is stored AFTER the arm already verified the introduction
@@ -743,7 +743,7 @@ impl IrohFriendPexAcceptor {
                             // the relay's success).
                             let target = ir.target;
                             tokio::spawn(async move {
-                                if let Err(e) = crate::deliver_introduction_to_target(
+                                if let Err(e) = crate::friend_intro::deliver_introduction_to_target(
                                     resolver, keytree, endpoint, target, sealed, intro,
                                 )
                                 .await

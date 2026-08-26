@@ -67,6 +67,9 @@ test-fixtures = [
     # to core-types) to harmony-app's --features test-fixtures lib/all-targets
     # builds; the dev-dep below covers the bare default-feature test path.
     "harmony-core-types/test-fixtures",
+    # ZEB-548 Stage 2 (PR #10): the spine crate's deterministic/test seams
+    # (RecordingSink re-exports, fixture ctors in the moved modules).
+    "harmony-transport/test-fixtures",
 ]
 
 [dependencies]
@@ -186,6 +189,11 @@ harmony-mail = { path = "crates/harmony-mail" }
 # shim stays in src/mint.rs; harmony-app re-exports the pure/sync modules so
 # crate::mint::* / crate::mint_sync::* resolve unchanged.
 harmony-mint = { path = "crates/harmony-mint" }
+# ZEB-548 Stage 2 (ZEB-990): the transport/dm/owner spine — iroh/zenoh
+# transport, tunnels, DM pipeline, friend handshakes, fleet + owner state and
+# their sync engines. harmony-app re-exports every module (lib.rs) so
+# crate::X / harmony_app::X call sites resolve unchanged.
+harmony-transport = { path = "crates/harmony-transport" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "777a5c007c076d96840c9a3b012a028ea3d17a3e" }
 # ZEB-548 Stage 1 (PR #6): rev now in [workspace.dependencies] (shared with harmony-mail).
@@ -346,6 +354,10 @@ harmony-identity-crypto = { path = "crates/harmony-identity-crypto", features = 
 # builds; this covers the default-feature test path. Same pattern as foundation /
 # identity-crypto / harmony-pkarr. Kept out of release binaries (dev-dep).
 harmony-core-types = { path = "crates/harmony-core-types", features = ["test-fixtures"] }
+# ZEB-548 Stage 2 (PR #10): same default-feature test path for the spine crate —
+# harmony-app's #[cfg(test)] mods reach test-fixtures-gated seams in the moved
+# modules under a bare `cargo test --lib`.
+harmony-transport = { path = "crates/harmony-transport", features = ["test-fixtures"] }
 # ZEB-329: regex used in network_health redaction-leak test to assert
 # no 32+ char hex run leaks into the redacted export markdown.
 regex = "1"

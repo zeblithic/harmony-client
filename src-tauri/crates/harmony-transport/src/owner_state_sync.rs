@@ -190,9 +190,7 @@ impl SyncEngine {
     /// query-side zenoh adapter can answer a peer's root PULL (a butler that
     /// missed the live push). The wrapper isn't a `FleetSyncEngine`, so it
     /// delegates like the methods around it. See `FleetSyncEngine::root_serve_tx`.
-    pub(crate) fn root_serve_tx(
-        &self,
-    ) -> tokio::sync::mpsc::Sender<crate::fleet_sync::RootServeReq> {
+    pub fn root_serve_tx(&self) -> tokio::sync::mpsc::Sender<crate::fleet_sync::RootServeReq> {
         self.inner.root_serve_tx()
     }
 
@@ -200,7 +198,7 @@ impl SyncEngine {
     /// fleet health registry can read this owner-state engine's publish-retry +
     /// fetch counters. The wrapper isn't a `FleetSyncEngine`, so it delegates
     /// like the methods around it. See `FleetSyncEngine::sync_stats`.
-    pub(crate) fn sync_stats(&self) -> std::sync::Arc<crate::fleet_sync::FleetSyncStats> {
+    pub fn sync_stats(&self) -> std::sync::Arc<crate::fleet_sync::FleetSyncStats> {
         self.inner.sync_stats()
     }
 
