@@ -1393,7 +1393,17 @@ pub fn record_grant(
         .iter_mut()
         .find(|g| g.grantee_owner == grantee_owner)
     {
-        existing.granted_at = granted_at;
+        // ZEB-999: the caller's stamp is raw wall-clock (`now_epoch_ms`), so a
+        // regressed clock can hand us a value older than the stored row. A bare
+        // assignment would then (a) regress the LWW register the sync merge
+        // `max()`es, and (b) — worst case — stamp `granted_at <= revoked_at`,
+        // turning an explicit RE-SHARE into a silent revoke. Mirror
+        // `revoke_grant_inner`'s forward clamp: never regress, and always land
+        // strictly past `revoked_at` so the documented reactivation contract
+        // holds regardless of clock skew.
+        existing.granted_at = granted_at
+            .max(existing.granted_at)
+            .max(existing.revoked_at.saturating_add(1));
     } else {
         entries.push(GrantEntry {
             grantee_owner,
@@ -1468,6 +1478,59 @@ pub fn dismiss_received_grant_inner(state: &mut OwnerState, cid: [u8; 32], now_m
         }
     };
     removed || advanced
+}
+
+#[cfg(test)]
+mod record_grant_monotonicity_tests {
+    //! ZEB-999: `record_grant`'s upsert must never regress the LWW
+    //! `granted_at` register, and a re-share must reactivate a revoked
+    //! grant even when the caller's wall clock has regressed below the
+    //! stored `revoked_at` stamp.
+
+    use super::*;
+
+    const CID: [u8; 32] = [7; 32];
+    const GRANTEE: OwnerAddr = OwnerAddr([9; 16]);
+
+    fn entry(state: &OwnerState) -> &GrantEntry {
+        &state.file_grants[&CID][0]
+    }
+
+    #[test]
+    fn regressed_stamp_does_not_regress_active_grant() {
+        let mut state = OwnerState::default();
+        record_grant(&mut state, CID, GRANTEE, 5_000);
+        // Re-share with a wall clock that has regressed below the stored stamp.
+        record_grant(&mut state, CID, GRANTEE, 3_000);
+        let g = entry(&state);
+        assert_eq!(g.granted_at, 5_000, "granted_at must never move backward");
+        assert!(g.granted_at > g.revoked_at, "grant stays active");
+    }
+
+    #[test]
+    fn regressed_stamp_reshare_after_revoke_still_reactivates() {
+        let mut state = OwnerState::default();
+        record_grant(&mut state, CID, GRANTEE, 5_000);
+        assert!(revoke_grant_inner(&mut state, CID, GRANTEE, 6_000));
+        assert_eq!(entry(&state).revoked_at, 6_000);
+        // Pre-fix, this wrote granted_at = 3_000 <= revoked_at = 6_000: an
+        // explicit re-share left the grant INACTIVE (silent self-revoke).
+        record_grant(&mut state, CID, GRANTEE, 3_000);
+        let g = entry(&state);
+        assert_eq!(g.granted_at, 6_001, "clamped strictly past revoked_at");
+        assert!(g.granted_at > g.revoked_at, "re-share reactivates under skew");
+    }
+
+    #[test]
+    fn healthy_clock_reshare_is_unchanged_by_the_clamp() {
+        let mut state = OwnerState::default();
+        record_grant(&mut state, CID, GRANTEE, 5_000);
+        assert!(revoke_grant_inner(&mut state, CID, GRANTEE, 6_000));
+        record_grant(&mut state, CID, GRANTEE, 7_000);
+        let g = entry(&state);
+        assert_eq!(g.granted_at, 7_000, "healthy stamps pass through verbatim");
+        assert!(g.granted_at > g.revoked_at);
+    }
 }
 
 #[cfg(test)]
