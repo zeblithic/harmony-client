@@ -54,6 +54,20 @@ impl DmOutholdDoc {
     /// construction, so first-writer-wins is exact. `changed` is true only when
     /// a new key was inserted.
     ///
+    /// # Key ↔ payload binding (ZEB-997)
+    /// A remote row is admitted only if its key equals the key a well-behaved
+    /// writer would mint for its payload: `"{hex(entry.space_id)}:{hex(cid)}"`
+    /// with `cid = ContentId::for_book(storage_blob, {encrypted: true})` —
+    /// the exact construction of the production insert site (`dm_outbox`
+    /// step 5; the flags here must stay in lockstep with it). Without this,
+    /// a corrupt or hostile sibling frame could persist a row the outhold
+    /// sweeper admits into CAS under a false CID and repeatedly attempts to
+    /// deliver — the binding is otherwise only checked much later at
+    /// ingestion. Invalid rows are dropped with telemetry; the rest of the
+    /// snapshot still applies (drop-don't-abort, mirroring the sync-ingest
+    /// convention). This doc has no tombstones (removal does not replicate),
+    /// so validation gates every remote row.
+    ///
     /// # Resurrection invariant
     /// Removal does NOT replicate (state-CRDT). A locally-GC'd row can
     /// resurrect from a stale sibling's publish, which is harmless: the
@@ -64,6 +78,33 @@ impl DmOutholdDoc {
         let mut changed = false;
         for (k, r) in remote.entries {
             if let std::collections::btree_map::Entry::Vacant(slot) = self.entries.entry(k) {
+                // ZEB-997: recompute the writer's canonical key from the
+                // payload itself; one string compare then binds the CID half,
+                // the space prefix, and the key shape simultaneously.
+                let expected = match harmony_content::cid::ContentId::for_book(
+                    &r.storage_blob,
+                    harmony_content::cid::ContentFlags {
+                        encrypted: true,
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(cid) => Self::key(&r.space_id, &cid.to_bytes()),
+                    Err(e) => {
+                        tracing::warn!(
+                            key = %slot.key(),
+                            error = %e,
+                            "ZEB-997 outhold merge: CID uncomputable for remote row — dropped"
+                        );
+                        continue;
+                    }
+                };
+                if slot.key() != &expected {
+                    tracing::warn!(
+                        key = %slot.key(),
+                        "ZEB-997 outhold merge: key does not bind to payload — dropped"
+                    );
+                    continue;
+                }
                 slot.insert(r);
                 changed = true;
             }
@@ -94,21 +135,33 @@ mod tests {
         }
     }
 
-    fn key() -> String {
-        DmOutholdDoc::key(&[0x11u8; 16], &[0x22u8; 32])
+    /// The key a well-behaved writer mints for `e` — same construction as the
+    /// production insert site (`dm_outbox` step 5): CID over the encrypted
+    /// storage blob with `encrypted: true`.
+    fn valid_key(e: &DmOutholdEntry) -> String {
+        let cid = harmony_content::cid::ContentId::for_book(
+            &e.storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("fixture blob under payload cap");
+        DmOutholdDoc::key(&e.space_id, &cid.to_bytes())
     }
 
     #[test]
     fn merge_inserts_new_entry_and_is_idempotent() {
+        let e = entry(vec![0xAA, 0xBB, 0xCC], hlc(1, "B"));
+        let k = valid_key(&e);
         let mut a = DmOutholdDoc::default();
         let mut b = DmOutholdDoc::default();
-        b.entries
-            .insert(key(), entry(vec![0xAA, 0xBB, 0xCC], hlc(1, "B")));
+        b.entries.insert(k.clone(), e);
 
         let out = a.merge_from(b.clone());
         assert!(out.changed, "new entry must flag changed");
         assert_eq!(a.entries.len(), 1);
-        assert_eq!(a.entries[&key()], b.entries[&key()]);
+        assert_eq!(a.entries[&k], b.entries[&k]);
 
         // Re-merge of identical doc must be a no-op.
         let out = a.merge_from(b.clone());
@@ -119,21 +172,23 @@ mod tests {
     #[test]
     fn merge_never_overwrites_existing_entry() {
         // Local entry has blob A; remote same key has blob B.
-        // Invariant: local keeps A; changed = false.
+        // Invariant: local keeps A; changed = false. The present-key skip
+        // happens BEFORE ZEB-997 validation — an existing local row is never
+        // re-judged (it was validated or locally minted when it entered).
+        let local_entry = entry(vec![0xAA], hlc(1, "local"));
+        let k = valid_key(&local_entry);
         let mut local = DmOutholdDoc::default();
-        local
-            .entries
-            .insert(key(), entry(vec![0xAA], hlc(1, "local")));
+        local.entries.insert(k.clone(), local_entry);
 
         let mut remote = DmOutholdDoc::default();
         remote
             .entries
-            .insert(key(), entry(vec![0xBB], hlc(2, "remote")));
+            .insert(k.clone(), entry(vec![0xBB], hlc(2, "remote")));
 
         let out = local.merge_from(remote);
         assert!(!out.changed, "no change when existing key skipped");
         assert_eq!(
-            local.entries[&key()].storage_blob,
+            local.entries[&k].storage_blob,
             vec![0xAA],
             "local blob must not be overwritten"
         );
@@ -142,25 +197,95 @@ mod tests {
     #[test]
     fn merge_unchanged_when_remote_subset() {
         // Local has two entries; remote has only one of them.
-        let k1 = DmOutholdDoc::key(&[0x01u8; 16], &[0x02u8; 32]);
-        let k2 = DmOutholdDoc::key(&[0x03u8; 16], &[0x04u8; 32]);
+        let e1 = entry(vec![1], hlc(1, "d1"));
+        let e2 = entry(vec![2], hlc(2, "d2"));
+        let k1 = valid_key(&e1);
+        let k2 = valid_key(&e2);
 
         let mut local = DmOutholdDoc::default();
-        local
-            .entries
-            .insert(k1.clone(), entry(vec![1], hlc(1, "d1")));
-        local
-            .entries
-            .insert(k2.clone(), entry(vec![2], hlc(2, "d2")));
+        local.entries.insert(k1.clone(), e1.clone());
+        local.entries.insert(k2.clone(), e2);
 
         let mut remote = DmOutholdDoc::default();
-        remote
-            .entries
-            .insert(k1.clone(), entry(vec![1], hlc(1, "d1")));
+        remote.entries.insert(k1, e1);
 
         let out = local.merge_from(remote);
         assert!(!out.changed, "remote is a strict subset — no change");
         assert_eq!(local.entries.len(), 2, "both entries still present");
+    }
+
+    // ── ZEB-997: merge-time key ↔ payload binding validation ─────────────────
+
+    #[test]
+    fn merge_drops_row_whose_key_cid_does_not_match_blob() {
+        // Key claims CID 0x22…22 but the blob hashes to something else — the
+        // exact shape a corrupt/hostile sibling frame would carry. Pre-ZEB-997
+        // this row persisted and the sweeper redelivered it under a false CID.
+        let mut remote = DmOutholdDoc::default();
+        remote.entries.insert(
+            DmOutholdDoc::key(&[0x11u8; 16], &[0x22u8; 32]),
+            entry(vec![0xAA, 0xBB, 0xCC], hlc(1, "evil")),
+        );
+
+        let mut local = DmOutholdDoc::default();
+        let out = local.merge_from(remote);
+        assert!(!out.changed, "invalid row must not flag changed");
+        assert!(local.entries.is_empty(), "invalid row must be dropped");
+    }
+
+    #[test]
+    fn merge_drops_row_whose_space_prefix_does_not_match_entry() {
+        // CID half is honest (matches the blob) but the key's space prefix
+        // disagrees with entry.space_id.
+        let e = entry(vec![0xAA, 0xBB, 0xCC], hlc(1, "evil"));
+        let honest = valid_key(&e);
+        let cid_hex = honest.split(':').nth(1).unwrap().to_string();
+        let forged = format!("{}:{}", hex::encode([0x99u8; 16]), cid_hex);
+
+        let mut remote = DmOutholdDoc::default();
+        remote.entries.insert(forged, e);
+
+        let mut local = DmOutholdDoc::default();
+        let out = local.merge_from(remote);
+        assert!(!out.changed);
+        assert!(local.entries.is_empty(), "space-mismatched row dropped");
+    }
+
+    #[test]
+    fn merge_drops_invalid_rows_without_aborting_snapshot() {
+        // One valid + one invalid row in the same remote doc: the valid row
+        // must still apply (drop-don't-abort).
+        let good = entry(vec![0x01, 0x02], hlc(1, "sib"));
+        let good_key = valid_key(&good);
+
+        let mut remote = DmOutholdDoc::default();
+        remote.entries.insert(good_key.clone(), good.clone());
+        remote.entries.insert(
+            DmOutholdDoc::key(&[0x11u8; 16], &[0x22u8; 32]),
+            entry(vec![0xAA], hlc(2, "evil")),
+        );
+
+        let mut local = DmOutholdDoc::default();
+        let out = local.merge_from(remote);
+        assert!(out.changed, "the valid row still applies");
+        assert_eq!(local.entries.len(), 1);
+        assert_eq!(local.entries[&good_key], good);
+    }
+
+    #[test]
+    fn merge_drops_row_with_oversized_blob() {
+        // Blob past ContentId's payload cap: for_book errors, so the binding
+        // cannot even be computed — the row is dropped, not inserted blind.
+        let big = entry(vec![0u8; 0x10_0000], hlc(1, "evil")); // 1 MiB + 1 > 0xF_FFFF
+        let mut remote = DmOutholdDoc::default();
+        remote
+            .entries
+            .insert(DmOutholdDoc::key(&big.space_id, &[0x22u8; 32]), big);
+
+        let mut local = DmOutholdDoc::default();
+        let out = local.merge_from(remote);
+        assert!(!out.changed);
+        assert!(local.entries.is_empty(), "uncomputable binding → dropped");
     }
 
     /// Pins the dm-outhold-v1 wire format. NEVER regenerate — any change to
