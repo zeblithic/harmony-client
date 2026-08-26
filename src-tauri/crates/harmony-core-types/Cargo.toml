@@ -11,8 +11,23 @@ rust-version = "1.91"
 [lib]
 name = "harmony_core_types"
 
+[features]
+# ZEB-548 Stage 2 (PR #1): gates `enrollment_verify::quorum_fixtures`, the
+# deterministic quorum-cert worlds used by ~13 modules' seam tests in
+# harmony-app. The module is `#[cfg(any(test, feature = "test-fixtures"))]`, so
+# this feature exposes it to out-of-crate test builds; harmony-app forwards it
+# (and carries a dev-dep enabling it) so both `--features test-fixtures` and a
+# bare `cargo test -p harmony-app --lib` see the fixtures. Mirrors the
+# foundation/identity-crypto pattern. See reference_crate_split_test_fixtures_devdep.
+test-fixtures = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# ZEB-548 Stage 2 (PR #1): `enrollment_verify` names ed25519_dalek directly (the
+# SelfDevice-revocation verify-key path + the quorum_fixtures signers). Bare "2"
+# — the module uses only `from_bytes`/verify, not key generation, so no
+# `rand_core`; unifies to the same locked 2.2.0 harmony-app already pulls.
+ed25519-dalek = "2"
 ciborium = "0.2"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }

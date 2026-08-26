@@ -63,6 +63,10 @@ test-fixtures = [
     "tauri/test",
     "harmony-identity-crypto/test-fixtures",
     "harmony-foundation/test-fixtures",
+    # ZEB-548 Stage 2 (PR #1): exposes enrollment_verify::quorum_fixtures (moved
+    # to core-types) to harmony-app's --features test-fixtures lib/all-targets
+    # builds; the dev-dep below covers the bare default-feature test path.
+    "harmony-core-types/test-fixtures",
 ]
 
 [dependencies]
@@ -333,6 +337,15 @@ harmony-foundation = { path = "crates/harmony-foundation", features = ["test-fix
 # `--features`) `cargo test --lib` unit-test compile; propagating the feature
 # for dev/test builds restores it. Kept out of release binaries (dev-dep).
 harmony-identity-crypto = { path = "crates/harmony-identity-crypto", features = ["test-fixtures"] }
+# ZEB-548 Stage 2 (PR #1): enrollment_verify moved to core-types with a
+# `test-fixtures`-gated quorum_fixtures module used by ~13 harmony-app modules'
+# `#[cfg(test)]` seam tests. The gate does not propagate to the dependency copy
+# of core-types built for harmony-app's tests, so a bare `cargo test -p
+# harmony-app --lib` (no `--features`) would fail to compile without this dev-dep
+# enabling the feature. The feature entry above covers `--features test-fixtures`
+# builds; this covers the default-feature test path. Same pattern as foundation /
+# identity-crypto / harmony-pkarr. Kept out of release binaries (dev-dep).
+harmony-core-types = { path = "crates/harmony-core-types", features = ["test-fixtures"] }
 # ZEB-329: regex used in network_health redaction-leak test to assert
 # no 32+ char hex run leaks into the redacted export markdown.
 regex = "1"

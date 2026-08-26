@@ -189,7 +189,8 @@ pub mod dm_read_receipt;
 pub mod dm_signing;
 pub mod dm_tunnel_contact;
 pub mod emoji_names;
-pub mod enrollment_verify;
+// enrollment_verify moved to harmony-core-types (ZEB-548 Stage 2 PR #1);
+// re-exported below via `pub use harmony_core_types::{… enrollment_verify …}`.
 pub mod event_loop;
 pub mod feed_authority;
 pub mod file_sharing;
@@ -250,7 +251,12 @@ pub mod pairing;
 // the harmony-core-types crate. Re-exported here so the ~hundreds of existing
 // `crate::owner_state_types::*` / `crate::owner_state_crypto::*` call sites keep
 // resolving unchanged.
-pub use harmony_core_types::{owner_state_crypto, owner_state_types};
+// ZEB-548 Stage 2 (PR #1): enrollment_verify + revoked_device_projection joined
+// core-types as spine-extraction prep; re-exported so crate::enrollment_verify::*
+// and crate::revoked_device_projection::* sites resolve unchanged.
+pub use harmony_core_types::{
+    enrollment_verify, owner_state_crypto, owner_state_types, revoked_device_projection,
+};
 // ZEB-548 Stage 1: broadly-shared leaf primitives extracted to harmony-foundation.
 // Re-exported so existing crate::clock_trust::* / crate::hlc_adopt_floor::* /
 // crate::wall_clock_ms() / crate::profile::* call sites resolve unchanged.
@@ -310,7 +316,8 @@ pub mod voting_rbsr;
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
 pub mod network_health;
-pub mod revoked_device_projection;
+// revoked_device_projection moved to harmony-core-types (ZEB-548 Stage 2 PR #1);
+// re-exported above via `pub use harmony_core_types::{… revoked_device_projection}`.
 // ZEB-391: filters stale/virtual addresses out of the advertised iroh direct
 // address set (feeds the reachability-announce publish path below).
 pub mod direct_addr_filter;
