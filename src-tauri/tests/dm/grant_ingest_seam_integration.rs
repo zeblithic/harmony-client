@@ -232,7 +232,7 @@ async fn sweep_ingests_real_grant_push_via_prod_ctx_device_agnostic() {
 /// asserts the emitted frame via the `RecordingSink` handle.
 #[tokio::test]
 async fn sweep_ingested_grant_emits_shared_with_me_updated() {
-    let (ctx, _crdt_state, _dirty, sink_handle) = prod_ctx_with_dirty_and_sink();
+    let (ctx, _crdt_state, dirty, sink_handle) = prod_ctx_with_dirty_and_sink();
 
     let cid_bytes = [0xC1u8; 32];
     let inner = FileGrantInner {
@@ -284,6 +284,33 @@ async fn sweep_ingested_grant_emits_shared_with_me_updated() {
         matching, 1,
         "exactly one shared-with-me-updated frame for the recorded grant's cid \
          (cardinality + idempotency — a single record must not double-emit); got {frames:?}"
+    );
+
+    // Re-delivery pass (CodeAnt PR #750): sweeping the same doc again must be
+    // a no-op — the entry is already marked `ingested_by` this device, so no
+    // second frame is emitted and owner-state dirty is not re-notified.
+    let dirty_after_first = dirty.load(Ordering::SeqCst);
+    let changed_again = ingest_pending(&mut doc, &ctx).await;
+    assert!(
+        !changed_again,
+        "re-delivered sweep over an already-ingested entry must not mutate the doc"
+    );
+    let matching_after = sink_handle
+        .frames()
+        .iter()
+        .filter(|(name, payload)| {
+            name == "shared-with-me-updated"
+                && payload["cid"] == serde_json::json!(hex::encode(cid_bytes))
+        })
+        .count();
+    assert_eq!(
+        matching_after, 1,
+        "re-delivery must not emit a second shared-with-me-updated frame"
+    );
+    assert_eq!(
+        dirty.load(Ordering::SeqCst),
+        dirty_after_first,
+        "re-delivery must not re-notify owner-state dirty"
     );
 }
 

@@ -40,8 +40,8 @@ fn now_unix_ms() -> u64 {
 // call sites resolve unchanged.
 pub(crate) use crate::enrollment_verify::is_master_issued;
 
-// ZEB-548 Stage 2: the pure ceremony planners (`eligible_cosigners`,
-// `plan_quorum_revocation_request`, `plan_quorum_epoch_bump_request`,
+// ZEB-548 Stage 2: the pure ceremony planners
+// (`plan_quorum_revocation_request`, `plan_quorum_epoch_bump_request`,
 // `cosign_request_core`, `decline_request_core`) moved down beside the
 // `QuorumRequest`/`QuorumReqDoc` types they build (`owner_quorum_sync`);
 // re-imported so this module's `_impl` bodies resolve unchanged.
