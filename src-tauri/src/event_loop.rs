@@ -1726,12 +1726,29 @@ pub async fn run(
                             membership.insert(*cid, mat);
                         }
                     }
+                    // Walk each community's TTL-fresh address-book rows here, in the
+                    // orchestration layer that already depends on the community book,
+                    // and hand the transport-layer backfill only resolved reachability
+                    // bindings — keeping the spine helper free of community wire types
+                    // (ZEB-990). Relay rows carry no dialable node-id and are dropped.
+                    let now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                    let bindings = ids.iter().flat_map(|cid| {
+                        let cid = *cid;
+                        addrbook
+                            .book
+                            .rows_for_community(&cid, now_ms)
+                            .into_iter()
+                            .filter_map(move |row| match &row.entry {
+                                crate::community_address_book::AddressBookEntry::Reachability(
+                                    p,
+                                ) => Some((cid, row.actor, p.iroh_node_id, row.device)),
+                                _ => None,
+                            })
+                    });
                     let bound =
-                        crate::iroh_zenoh_registration::backfill_admission_oracle_from_address_book(
+                        crate::iroh_zenoh_registration::backfill_admission_oracle_from_reachability(
                             &admission_oracle,
-                            &addrbook.book,
-                            ids.iter().copied(),
-                            crate::iroh_friend_acceptor::wall_now_ms(),
+                            bindings,
                             |cid, actor, device| {
                                 membership.get(cid).is_some_and(|m| {
                                     crate::voice_presence::device_is_enrolled(m, actor, device)
