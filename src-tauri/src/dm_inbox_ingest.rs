@@ -1024,6 +1024,38 @@ pub async fn ingest_dm_packet(
     Ok(newly_inserted)
 }
 
+/// ZEB-548 Stage 2: dependency-inversion seam for the file-grant receive side.
+/// The spine's DM inbox applies inbound file-grant push and revoke effects by
+/// mutating the owner-state CRDT, but the grant wire-format and re-seal logic is
+/// `file_sharing`'s domain. Rather than name the higher-tier `file_sharing`
+/// module from the spine, the ingest ctx calls through this trait, and
+/// `file_sharing` provides the concrete `ProdFileGrantIngestor` that boot wiring
+/// installs. Signatures use only spine and shared types, and errors surface as
+/// `String` so the spine never names `file_sharing`'s `FileGrantIngestError`.
+pub trait FileGrantIngestor: Send + Sync {
+    /// Open the per-device sealed grant blob, re-seal the DEK under the
+    /// grantee's own `KeyTree`, and record it in `state.received_file_grants`.
+    /// Returns the recorded root [`ContentId`] (`Some`) iff a blob sealed to
+    /// this device was found and applied; `None` if nothing was ours.
+    fn ingest_grant_push(
+        &self,
+        state: &mut crate::owner_state_crdt::OwnerState,
+        my_device_x25519_priv: &[u8; 32],
+        keytree: &crate::owner_state_crypto::KeyTree,
+        granter_owner: OwnerAddr,
+        grant_push_bytes: &[u8],
+    ) -> Result<Option<ContentId>, String>;
+
+    /// Dismiss the received grant for `cid` iff its recorded granter matches
+    /// `granter_owner`. Returns true iff owner-state changed.
+    fn ingest_grant_revoke(
+        &self,
+        state: &mut crate::owner_state_crdt::OwnerState,
+        granter_owner: OwnerAddr,
+        cid: [u8; 32],
+    ) -> bool;
+}
+
 /// Production [`DmInboxIngestCtx`] over real `start_node` handles (ZEB-418
 /// P1 Task 7). Each method implements its trait doc's production contract
 /// verbatim:
@@ -1082,6 +1114,11 @@ pub struct ProdDmInboxIngestCtx {
     /// re-seals the recovered DEK under it so any of the owner's bound devices
     /// can open the stored grant (Flow A).
     pub owner_keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
+    /// ZEB-548 Stage 2: the file-grant receive-side implementation
+    /// (`file_sharing`'s `ProdFileGrantIngestor` in production). `apply_grant_push`
+    /// / `apply_grant_revoke` call through this so the spine's DM inbox no longer
+    /// names the higher-tier `file_sharing` module directly.
+    pub file_grant_ingestor: std::sync::Arc<dyn FileGrantIngestor>,
 }
 
 #[async_trait]
@@ -1411,14 +1448,15 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         // per-device seal does not authenticate the granter).
         let recorded = {
             let mut state = self.crdt_state.lock().await;
-            crate::file_sharing::ingest_grant_push(
-                &mut state,
-                &self.device_x25519_priv,
-                &self.owner_keytree,
-                OwnerAddr(entry.sender_owner),
-                gp,
-            )
-            .map_err(|e| format!("ingest_grant_push: {e}"))?
+            self.file_grant_ingestor
+                .ingest_grant_push(
+                    &mut state,
+                    &self.device_x25519_priv,
+                    &self.owner_keytree,
+                    OwnerAddr(entry.sender_owner),
+                    gp,
+                )
+                .map_err(|e| format!("ingest_grant_push: {e}"))?
         };
         // `received_file_grants` lives in the owner-state CRDT and has NO
         // deposit-rung re-delivery backstop (the entry is GC'd once covered), so
@@ -1457,11 +1495,10 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         let cid = crate::butler_deposit::decode_grant_revoke(gr)?;
         let changed = {
             let mut state = self.crdt_state.lock().await;
-            crate::file_sharing::ingest_grant_revoke(
+            self.file_grant_ingestor.ingest_grant_revoke(
                 &mut state,
                 OwnerAddr(entry.sender_owner),
                 cid,
-                crate::file_sharing::now_epoch_ms(),
             )
         };
         // `received_file_grants`/`dismissed_received_grants` live in the owner-state
@@ -2664,6 +2701,7 @@ mod tests {
                 &ed25519_dalek::SigningKey::from_bytes(&TEST_DEVICE_ED25519_SEED),
             ),
             owner_keytree: Arc::new(test_owner_keytree()),
+            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
         };
         (ctx, crdt_state, dirty, revoked, sink_handle)
     }
@@ -5922,6 +5960,7 @@ mod tests {
             owner_keytree: Arc::new(
                 crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
             ),
+            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
         };
 
         RecoverInviteFixture {
@@ -6269,6 +6308,7 @@ mod tests {
             owner_keytree: Arc::new(
                 crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
             ),
+            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
         };
 
         let err = prod_ctx
@@ -6484,6 +6524,7 @@ mod tests {
             owner_keytree: Arc::new(
                 crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
             ),
+            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
         };
         (prod_ctx, pending, sink_handle)
     }

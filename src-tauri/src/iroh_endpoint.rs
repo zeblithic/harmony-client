@@ -117,9 +117,10 @@ pub mod alpn {
     /// the accept loop to the late-installed `VineRelayAcceptor` (see
     /// `IrohZenohLinkManager::install_vine_relay_acceptor`); connections
     /// arriving before install are closed (the follower's pull driver
-    /// retries next cadence). Re-exported from `vine_relay` so the wire
-    /// ALPN string lives in exactly one place.
-    pub const HARMONY_VINE_RELAY_V1: &[u8] = crate::vine_relay::VINE_RELAY_ALPN;
+    /// retries next cadence). ZEB-548 Stage 2: the wire ALPN literal lives
+    /// here (the transport core owns the accept-loop dispatch key);
+    /// `vine_relay` re-exports it.
+    pub const HARMONY_VINE_RELAY_V1: &[u8] = b"harmony/vine-relay/v1";
 }
 
 /// The full set of harmony ALPNs the client endpoint advertises, in the same

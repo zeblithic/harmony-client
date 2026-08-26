@@ -533,6 +533,42 @@ pub fn ingest_grant_revoke(
     }
 }
 
+/// ZEB-548 Stage 2: production [`crate::dm_inbox_ingest::FileGrantIngestor`] —
+/// the file-grant receive side, delegating to this module's ingest functions.
+/// Boot wiring installs it on `ProdDmInboxIngestCtx` so the spine's DM inbox
+/// reaches the grant wire-format logic through the trait instead of naming this
+/// higher-tier module directly.
+pub struct ProdFileGrantIngestor;
+
+impl crate::dm_inbox_ingest::FileGrantIngestor for ProdFileGrantIngestor {
+    fn ingest_grant_push(
+        &self,
+        state: &mut OwnerState,
+        my_device_x25519_priv: &[u8; 32],
+        keytree: &KeyTree,
+        granter_owner: OwnerAddr,
+        grant_push_bytes: &[u8],
+    ) -> Result<Option<ContentId>, String> {
+        ingest_grant_push(
+            state,
+            my_device_x25519_priv,
+            keytree,
+            granter_owner,
+            grant_push_bytes,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn ingest_grant_revoke(
+        &self,
+        state: &mut OwnerState,
+        granter_owner: OwnerAddr,
+        cid: [u8; 32],
+    ) -> bool {
+        ingest_grant_revoke(state, granter_owner, cid, now_epoch_ms())
+    }
+}
+
 /// Encode per-device sealed grant blobs into the `DepositPayload.grant_push`
 /// wire value: CBOR of `Vec<serde_bytes Vec<u8>>` (each element a byte-string) —
 /// the EXACT shape [`ingest_grant_push`] decodes. Infallible: a `Vec<ByteBuf>`

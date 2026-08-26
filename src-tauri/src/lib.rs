@@ -6827,6 +6827,9 @@ pub async fn start_node_inner(
                             // so a received grant re-sealed at ingest opens on any of
                             // the owner's bound devices (Flow A).
                             owner_keytree: std::sync::Arc::clone(&kt),
+                            file_grant_ingestor: std::sync::Arc::new(
+                                crate::file_sharing::ProdFileGrantIngestor,
+                            ),
                         });
                         // The ingest sweeper: one startup sweep (entries
                         // deposited while this device was offline), then one

@@ -76,7 +76,12 @@ use crate::iroh_framing::{read_len_prefixed, write_len_prefixed, Endian, Framing
 // Constants (ZEB-811 plan §Global Constraints)
 // =====================================================================
 
-pub const VINE_RELAY_ALPN: &[u8] = b"harmony/vine-relay/v1";
+/// ZEB-548 Stage 2: the wire ALPN literal now lives in
+/// [`crate::iroh_endpoint::alpn::HARMONY_VINE_RELAY_V1`] (the transport core
+/// owns the accept-loop dispatch key); re-exported here so existing
+/// `vine_relay::VINE_RELAY_ALPN` call sites (the pull driver, boot wiring)
+/// resolve unchanged.
+pub const VINE_RELAY_ALPN: &[u8] = crate::iroh_endpoint::alpn::HARMONY_VINE_RELAY_V1;
 
 /// Cap on an inbound REQUEST frame (`VinePullRequest`). Generous for the
 /// largest legal request (`VineContentRequest` — one hex CID string) plus
