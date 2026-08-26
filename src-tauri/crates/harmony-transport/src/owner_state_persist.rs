@@ -137,6 +137,12 @@ struct CrdtFileV2 {
     /// `skip_serializing_if` keeps existing file shapes compact.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     dismissed_received_grants: BTreeMap<[u8; 32], u64>,
+    /// ZEB-1000: persisted dedupe-key tombstones (deleted dedupe identity →
+    /// deletion HLC). Absent in pre-ZEB-1000 V2 files; `serde(default)` loads
+    /// those as empty (no schema-version bump — absent == empty).
+    /// `skip_serializing_if` keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    dedupe_tombstones: BTreeMap<crate::owner_state_types::DedupeKey, crate::owner_state_types::Hlc>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -157,6 +163,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             received_file_grants: s.received_file_grants.clone(),
             burned_content: s.burned_content.clone(),
             dismissed_received_grants: s.dismissed_received_grants.clone(),
+            dedupe_tombstones: s.dedupe_tombstones.clone(),
         }
     }
 }
@@ -179,6 +186,7 @@ impl From<CrdtFileV2> for OwnerState {
             received_file_grants: f.received_file_grants,
             burned_content: f.burned_content,
             dismissed_received_grants: f.dismissed_received_grants,
+            dedupe_tombstones: f.dedupe_tombstones,
         }
     }
 }
@@ -664,6 +672,55 @@ mod tests {
             s.dismissed_received_grants
         );
         assert_eq!(loaded.dismissed_received_grants.len(), 2);
+    }
+
+    #[test]
+    fn crdt_file_v2_round_trips_dedupe_tombstones() {
+        // ZEB-1000: the dedupe-key tombstone map must survive save->load, or a
+        // restart forgets every permanent deletion's dedupe identity and a
+        // stale sibling can resurrect a deleted DM via a fresh SpaceId.
+        // Guards the CrdtFileV2 threading + both From impls. A default
+        // OwnerState (empty map, skipped on the wire) implicitly covers the
+        // pre-ZEB-1000 backward-compat "loads empty" case below.
+        let mut s = OwnerState::default();
+        s.dedupe_tombstones.insert(
+            crate::owner_state_types::DedupeKey::SortedMembers(vec![
+                crate::owner_state_types::OwnerAddr([1; 16]),
+                crate::owner_state_types::OwnerAddr([2; 16]),
+            ]),
+            crate::owner_state_types::Hlc {
+                wall_ms: 2_000,
+                logical: 1,
+                device_id: "dev-a".into(),
+            },
+        );
+        s.dedupe_tombstones.insert(
+            crate::owner_state_types::DedupeKey::Topic("zenoh/topic".into()),
+            crate::owner_state_types::Hlc {
+                wall_ms: 3_000,
+                logical: 0,
+                device_id: "dev-b".into(),
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
+        assert_eq!(loaded.dedupe_tombstones, s.dedupe_tombstones);
+        assert_eq!(loaded.dedupe_tombstones.len(), 2);
+    }
+
+    #[test]
+    fn pre_dedupe_tombstones_snapshot_loads_empty() {
+        // A V2 file serialized WITHOUT the dedupe-tombstone map (skipped on
+        // the wire when empty) must load to an empty map — backward-compat
+        // with snapshots written before ZEB-1000.
+        let s = OwnerState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&crate::device_dataset_file::test_cipher(), &path, &s).unwrap();
+        let loaded = load_crdt(&crate::device_dataset_file::test_cipher(), &path).unwrap();
+        assert!(loaded.dedupe_tombstones.is_empty());
     }
 
     #[test]

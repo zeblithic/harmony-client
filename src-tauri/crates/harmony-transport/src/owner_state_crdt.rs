@@ -35,6 +35,33 @@ pub struct OwnerState {
     /// `Space.left_at` which is reversible.
     #[serde(rename = "tm")]
     pub tombstones: BTreeSet<SpaceId>,
+    /// ZEB-1000: dedupe-key tombstones — `remove_space_permanent` records the
+    /// deleted Space's [`DedupeKey`] with the deletion HLC, closing the
+    /// ZEB-206 §"Tombstones vs leaves" gap where a deleted DM / public
+    /// channel could be resurrected via a FRESH SpaceId carrying the same
+    /// dedupe identity (the `tombstones` set above only blocks the old id).
+    ///
+    /// LWW semantics, NOT a forever-block: `apply_space` rejects an incoming
+    /// Space iff its `created_at` is NOT strictly newer than the stored
+    /// deletion HLC — stale-sibling resurrections and concurrent re-creates
+    /// resolve deterministically on the total HLC order (equal
+    /// `(wall_ms, logical)` falls to the device-id tie-break), while a
+    /// deliberate re-create AFTER the deletion is strictly newer and passes. That
+    /// deliberate-re-create gesture is the spec's "user manually clears the
+    /// tombstone" without needing a separate clear API. Entries are retained
+    /// after a successful re-create (the newer row keeps passing; the old
+    /// row's copies keep dying). Merge: per-key HLC max union — with the
+    /// ZEB-847 receiver-clock reject on future-dated stamps, since a
+    /// forward-skewed deletion would suppress re-creation until real time
+    /// caught up — then a sweep of dominated live rows
+    /// (`owner_state_sync::merge_remote_into_local`).
+    ///
+    /// `DedupeKey::None` (folders) is never recorded. Growth is bounded by
+    /// explicit user deletions — same class as `tombstones`. Absent on the
+    /// wire when empty, so pre-ZEB-1000 snapshots load to an empty map and
+    /// empty states serialize byte-identically to before.
+    #[serde(rename = "dt", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub dedupe_tombstones: BTreeMap<DedupeKey, Hlc>,
     /// ZEB-216 Sub-B Phase 1: per-OwnerAddr device cache for DM unicast
     /// addressing. Replicates across the owner's bound devices via Flow A.
     /// (Phase 3b will use this to resolve from_identity_hash → OwnerAddr
@@ -205,6 +232,15 @@ pub enum ApplyOutcome {
 pub enum RejectionReason {
     #[error("dedupe key collided with permanent tombstone for space {0:?}")]
     Tombstoned(SpaceId),
+    /// ZEB-1000: the incoming Space's dedupe key matches a dedupe-key
+    /// tombstone whose deletion HLC the incoming `created_at` does not
+    /// strictly exceed — a stale resurrection (or a concurrent re-create
+    /// losing the deletion tie) of a permanently deleted Space.
+    #[error("dedupe key {dedupe_key:?} deleted at {deleted_at:?}; incoming created_at not newer")]
+    DedupeTombstoned {
+        dedupe_key: DedupeKey,
+        deleted_at: Hlc,
+    },
     #[error("space invariant violated: {0}")]
     InvariantFail(String),
     #[error("HLC not strictly newer than current {kind} (publisher {device_id:?})")]
@@ -247,19 +283,30 @@ impl OwnerState {
             return ApplyOutcome::Rejected(RejectionReason::InvariantFail(e.0));
         }
 
-        // 2. Tombstone check — if this Space's id is tombstoned, reject.
-        //
-        // Note: tombstones are stored by SpaceId. The ZEB-206 spec
-        // §"Tombstones vs leaves" says re-creating a Space with the same
-        // *dedupe key* should be blocked, which would also block re-adds
-        // via a fresh SpaceId for non-folder kinds (e.g., a tombstoned DM
-        // re-created via a different ULID with the same sorted-members).
-        // That's a Phase-3 concern: it requires durable tombstone storage
-        // keyed by dedupe key, which is the natural shape once the store
-        // is persisted alongside the rest of owner-state. Phase 2 is
-        // in-memory only, so the gap is bounded.
+        // 2. Tombstone checks — by SpaceId, then by dedupe key (ZEB-1000).
         if self.tombstones.contains(&incoming.id) {
             return ApplyOutcome::Rejected(RejectionReason::Tombstoned(incoming.id));
+        }
+        // ZEB-1000: dedupe-key tombstone gate. The id set above cannot block a
+        // resurrection via a FRESH SpaceId carrying the same dedupe identity
+        // (e.g., a deleted DM re-minted with the same sorted-members). LWW by
+        // `created_at` vs the deletion HLC: anything the deletion dominates
+        // in the total HLC order dies — deterministic on every replica,
+        // honoring the spec's "tombstone wins over re-add" — while a
+        // deliberate re-create AFTER the deletion is strictly newer and
+        // passes. Runs before the same-id
+        // branch too: a same-id row necessarily shares the deleted row's
+        // dedupe key, and its copies are equally stale.
+        let incoming_dk = incoming.dedupe_key();
+        if !matches!(incoming_dk, DedupeKey::None) {
+            if let Some(deleted_at) = self.dedupe_tombstones.get(&incoming_dk) {
+                if !incoming.created_at.is_strictly_newer_than(deleted_at) {
+                    return ApplyOutcome::Rejected(RejectionReason::DedupeTombstoned {
+                        dedupe_key: incoming_dk,
+                        deleted_at: deleted_at.clone(),
+                    });
+                }
+            }
         }
 
         // 3. Check for same-SpaceId update first (always valid for
@@ -294,7 +341,7 @@ impl OwnerState {
             // Rejecting on incoming's own dedupe_key catches both
             // cases (LWW winner OR loser).
             let existing_dk = existing.dedupe_key();
-            if incoming.dedupe_key() != existing_dk {
+            if incoming_dk != existing_dk {
                 return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
                     "same-SpaceId update would change dedupe_key for {:?} \
                      (DM members or PublicChannel topic are immutable on \
@@ -389,7 +436,7 @@ impl OwnerState {
         // 4. Find any existing Space sharing the same dedupe key (cross-device
         //    collision). Folders use DedupeKey::None and never cross-dedupe —
         //    a folder write with a fresh SpaceId is always a new Space.
-        let dk = incoming.dedupe_key();
+        let dk = incoming_dk;
         let existing_id = if matches!(dk, DedupeKey::None) {
             None // folders never cross-dedupe — every fresh SpaceId is a new space
         } else {
@@ -427,9 +474,66 @@ impl OwnerState {
     /// Mark a Space as permanently tombstoned. Subsequent `apply_space`
     /// calls with the same SpaceId are rejected. Distinct from
     /// `Space.left_at` (which is reversible).
+    ///
+    /// Id-only primitive: records NO dedupe-key tombstone. The sync merge
+    /// uses this to apply remote id-tombstones (the remote's own dedupe-key
+    /// entries arrive via the `dedupe_tombstones` union, so re-deriving them
+    /// here would double-stamp with a locally-minted HLC). Production
+    /// user-initiated deletion goes through [`Self::remove_space_permanent`].
     pub fn tombstone_space(&mut self, space_id: SpaceId) {
         self.spaces.remove(&space_id);
         self.tombstones.insert(space_id);
+    }
+
+    /// ZEB-1000: explicit user deletion ("delete this forever"). Removes the
+    /// Space and records BOTH tombstones: the SpaceId (blocks the old id) and
+    /// — for kinds with a real dedupe identity — the dedupe key with a
+    /// deletion HLC advanced strictly past the row's own `updated_at`, so the
+    /// deletion dominates every state the deleted row ever replicated (a
+    /// stale sibling's copy can never out-LWW it, even under a regressed
+    /// local wall clock).
+    ///
+    /// Idempotent: absent Space (already tombstoned here or elsewhere) still
+    /// records the id tombstone; the dedupe key is unrecoverable then, but
+    /// the device that performed the first deletion recorded it and the map
+    /// unions in via sync. The CALLER MUST `notify_dirty()` + persist.
+    pub fn remove_space_permanent(&mut self, space_id: SpaceId, wall_now_ms: u64, device_id: &str) {
+        if let Some(space) = self.spaces.get(&space_id) {
+            let dk = space.dedupe_key();
+            if !matches!(dk, DedupeKey::None) {
+                let base = &space.updated_at;
+                let deleted_at = if wall_now_ms > base.wall_ms {
+                    Hlc {
+                        wall_ms: wall_now_ms,
+                        logical: 0,
+                        device_id: device_id.to_string(),
+                    }
+                } else {
+                    Hlc {
+                        wall_ms: base.wall_ms,
+                        logical: base.logical.saturating_add(1),
+                        device_id: device_id.to_string(),
+                    }
+                };
+                self.record_dedupe_tombstone(dk, deleted_at);
+            }
+        }
+        self.tombstone_space(space_id);
+    }
+
+    /// Upsert a dedupe-key tombstone, keeping the per-key HLC maximum
+    /// (concurrent deletions on two devices converge to the later stamp).
+    pub(crate) fn record_dedupe_tombstone(&mut self, dk: DedupeKey, deleted_at: Hlc) {
+        match self.dedupe_tombstones.entry(dk) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(deleted_at);
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                if deleted_at.is_strictly_newer_than(o.get()) {
+                    o.insert(deleted_at);
+                }
+            }
+        }
     }
 
     /// ZEB-722: GC the owner-side file maps when a personal file is burned (its
@@ -1393,7 +1497,17 @@ pub fn record_grant(
         .iter_mut()
         .find(|g| g.grantee_owner == grantee_owner)
     {
-        existing.granted_at = granted_at;
+        // ZEB-999: the caller's stamp is raw wall-clock (`now_epoch_ms`), so a
+        // regressed clock can hand us a value older than the stored row. A bare
+        // assignment would then (a) regress the LWW register the sync merge
+        // `max()`es, and (b) — worst case — stamp `granted_at <= revoked_at`,
+        // turning an explicit RE-SHARE into a silent revoke. Mirror
+        // `revoke_grant_inner`'s forward clamp: never regress, and always land
+        // strictly past `revoked_at` so the documented reactivation contract
+        // holds regardless of clock skew.
+        existing.granted_at = granted_at
+            .max(existing.granted_at)
+            .max(existing.revoked_at.saturating_add(1));
     } else {
         entries.push(GrantEntry {
             grantee_owner,
@@ -1471,6 +1585,62 @@ pub fn dismiss_received_grant_inner(state: &mut OwnerState, cid: [u8; 32], now_m
 }
 
 #[cfg(test)]
+mod record_grant_monotonicity_tests {
+    //! ZEB-999: `record_grant`'s upsert must never regress the LWW
+    //! `granted_at` register, and a re-share must reactivate a revoked
+    //! grant even when the caller's wall clock has regressed below the
+    //! stored `revoked_at` stamp.
+
+    use super::*;
+
+    const CID: [u8; 32] = [7; 32];
+    const GRANTEE: OwnerAddr = OwnerAddr([9; 16]);
+
+    fn entry(state: &OwnerState) -> &GrantEntry {
+        &state.file_grants[&CID][0]
+    }
+
+    #[test]
+    fn regressed_stamp_does_not_regress_active_grant() {
+        let mut state = OwnerState::default();
+        record_grant(&mut state, CID, GRANTEE, 5_000);
+        // Re-share with a wall clock that has regressed below the stored stamp.
+        record_grant(&mut state, CID, GRANTEE, 3_000);
+        let g = entry(&state);
+        assert_eq!(g.granted_at, 5_000, "granted_at must never move backward");
+        assert!(g.granted_at > g.revoked_at, "grant stays active");
+    }
+
+    #[test]
+    fn regressed_stamp_reshare_after_revoke_still_reactivates() {
+        let mut state = OwnerState::default();
+        record_grant(&mut state, CID, GRANTEE, 5_000);
+        assert!(revoke_grant_inner(&mut state, CID, GRANTEE, 6_000));
+        assert_eq!(entry(&state).revoked_at, 6_000);
+        // Pre-fix, this wrote granted_at = 3_000 <= revoked_at = 6_000: an
+        // explicit re-share left the grant INACTIVE (silent self-revoke).
+        record_grant(&mut state, CID, GRANTEE, 3_000);
+        let g = entry(&state);
+        assert_eq!(g.granted_at, 6_001, "clamped strictly past revoked_at");
+        assert!(
+            g.granted_at > g.revoked_at,
+            "re-share reactivates under skew"
+        );
+    }
+
+    #[test]
+    fn healthy_clock_reshare_is_unchanged_by_the_clamp() {
+        let mut state = OwnerState::default();
+        record_grant(&mut state, CID, GRANTEE, 5_000);
+        assert!(revoke_grant_inner(&mut state, CID, GRANTEE, 6_000));
+        record_grant(&mut state, CID, GRANTEE, 7_000);
+        let g = entry(&state);
+        assert_eq!(g.granted_at, 7_000, "healthy stamps pass through verbatim");
+        assert!(g.granted_at > g.revoked_at);
+    }
+}
+
+#[cfg(test)]
 mod apply_space_tests {
     use super::*;
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceKind, TransportBinding};
@@ -1483,7 +1653,8 @@ mod apply_space_tests {
         }
     }
 
-    fn folder(id: u8, ts: u64) -> Space {
+    // pub(super): shared with `dedupe_tombstone_tests` (ZEB-1000).
+    pub(super) fn folder(id: u8, ts: u64) -> Space {
         Space {
             id: SpaceId([id; 16]),
             kind: SpaceKind::Folder,
@@ -1542,7 +1713,8 @@ mod apply_space_tests {
         }
     }
 
-    fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+    // pub(super): shared with `dedupe_tombstone_tests` (ZEB-1000).
+    pub(super) fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
         use crate::owner_state_types::DmContentKey;
         Space {
             id: SpaceId([id; 16]),
@@ -2413,6 +2585,137 @@ mod apply_space_tests {
             s.spaces.get(&SpaceId([1; 16])).unwrap().custom_name,
             Some("renamed".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tombstone_tests {
+    //! ZEB-1000: dedupe-key tombstones — permanent deletion must block
+    //! resurrection via a FRESH SpaceId carrying the same dedupe identity,
+    //! while a deliberate post-deletion re-create (strictly newer
+    //! `created_at`) passes.
+
+    use super::apply_space_tests::{dm, folder};
+    use super::*;
+
+    #[test]
+    fn removed_dm_cannot_be_resurrected_via_fresh_space_id() {
+        let mut s = OwnerState::default();
+        assert_eq!(
+            s.apply_space(dm(1, vec![1, 2], 100)),
+            ApplyOutcome::Inserted
+        );
+        s.remove_space_permanent(SpaceId([1; 16]), 200, "dev-a");
+        assert!(s.spaces.is_empty());
+        assert!(s.tombstones.contains(&SpaceId([1; 16])));
+        // Fresh ULID, same sorted-members, created_at older than the deletion:
+        // pre-ZEB-1000 this re-inserted (the id tombstone cannot see it).
+        let outcome = s.apply_space(dm(2, vec![1, 2], 150));
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::DedupeTombstoned { .. })
+            ),
+            "stale re-mint must die: {outcome:?}"
+        );
+        assert!(s.spaces.is_empty());
+    }
+
+    #[test]
+    fn deliberate_recreate_after_deletion_passes_and_stale_copies_keep_dying() {
+        let mut s = OwnerState::default();
+        assert_eq!(
+            s.apply_space(dm(1, vec![1, 2], 100)),
+            ApplyOutcome::Inserted
+        );
+        s.remove_space_permanent(SpaceId([1; 16]), 200, "dev-a");
+        // A re-create strictly newer than the deletion is the user's explicit
+        // "new conversation" gesture — it passes (this is what makes the
+        // tombstone LWW rather than a forever-block).
+        assert_eq!(
+            s.apply_space(dm(2, vec![1, 2], 300)),
+            ApplyOutcome::Inserted
+        );
+        // The tombstone entry is RETAINED: stale copies of the ORIGINAL keep
+        // dying even while the newer recreation lives (the gate fires before
+        // the cross-id dedupe merge would collapse them).
+        let outcome = s.apply_space(dm(3, vec![1, 2], 150));
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::DedupeTombstoned { .. })
+        ));
+        assert_eq!(s.spaces.len(), 1);
+        assert!(s.spaces.contains_key(&SpaceId([2; 16])));
+    }
+
+    #[test]
+    fn deletion_under_regressed_clock_still_dominates_the_deleted_row() {
+        let mut s = OwnerState::default();
+        assert_eq!(
+            s.apply_space(dm(1, vec![1, 2], 500)),
+            ApplyOutcome::Inserted
+        );
+        // The deleting device's wall clock regressed BELOW the row's own
+        // stamp: the deletion HLC advances past updated_at instead of
+        // trusting the clock (same idiom as the leave path's mint).
+        s.remove_space_permanent(SpaceId([1; 16]), 100, "dev-a");
+        let deleted_at = s.dedupe_tombstones.values().next().expect("entry recorded");
+        assert_eq!((deleted_at.wall_ms, deleted_at.logical), (500, 1));
+        // A stale sibling copy carrying the original creation stamp dies.
+        let outcome = s.apply_space(dm(2, vec![1, 2], 500));
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::DedupeTombstoned { .. })
+        ));
+    }
+
+    #[test]
+    fn folder_removal_records_no_dedupe_tombstone() {
+        let mut s = OwnerState::default();
+        assert_eq!(s.apply_space(folder(1, 100)), ApplyOutcome::Inserted);
+        s.remove_space_permanent(SpaceId([1; 16]), 200, "dev-a");
+        assert!(
+            s.dedupe_tombstones.is_empty(),
+            "DedupeKey::None is never recorded"
+        );
+        // A fresh folder (same name — folders never dedupe) is unaffected.
+        assert_eq!(s.apply_space(folder(2, 300)), ApplyOutcome::Inserted);
+    }
+
+    #[test]
+    fn remove_space_permanent_is_idempotent_and_keeps_the_first_stamp() {
+        let mut s = OwnerState::default();
+        assert_eq!(
+            s.apply_space(dm(1, vec![1, 2], 100)),
+            ApplyOutcome::Inserted
+        );
+        s.remove_space_permanent(SpaceId([1; 16]), 200, "dev-a");
+        let first = s.dedupe_tombstones.values().next().unwrap().clone();
+        // Second call: the Space is gone, so no dedupe key is recoverable —
+        // the id tombstone re-inserts idempotently and the map is untouched.
+        s.remove_space_permanent(SpaceId([1; 16]), 999, "dev-a");
+        assert_eq!(s.dedupe_tombstones.values().next().unwrap(), &first);
+        assert!(s.tombstones.contains(&SpaceId([1; 16])));
+    }
+
+    #[test]
+    fn record_dedupe_tombstone_keeps_the_per_key_maximum() {
+        let mut s = OwnerState::default();
+        let dk = DedupeKey::Topic("t".into());
+        let older = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "a".into(),
+        };
+        let newer = Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "b".into(),
+        };
+        s.record_dedupe_tombstone(dk.clone(), newer.clone());
+        // Concurrent deletion with an older stamp must not regress the entry.
+        s.record_dedupe_tombstone(dk.clone(), older);
+        assert_eq!(s.dedupe_tombstones[&dk], newer);
     }
 }
 

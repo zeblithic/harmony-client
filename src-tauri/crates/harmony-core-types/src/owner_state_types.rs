@@ -2045,7 +2045,10 @@ pub struct Space {
 /// Adjacently tagged: tag key `"tg"` (2 chars), content key `"vl"` (2 chars
 /// to match the same-length-keys precondition at this nesting level);
 /// variant codes `"n"/"i"/"t"/"s"` (1-char values, not keys).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `Ord` (ZEB-1000): lets the key live in `OwnerState.dedupe_tombstones`'s
+// BTreeMap. Derive order (variant index, then payload) is a local, in-memory
+// ordering only — the wire format stays the adjacently-tagged CBOR above.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "tg", content = "vl")]
 pub enum DedupeKey {
     /// Folders never dedupe — same name on different devices = different folders.
