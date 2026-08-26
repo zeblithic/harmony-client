@@ -28,11 +28,10 @@ use crate::owner_state_types::{OwnerAddr, SpaceId};
 // Constants
 // =====================================================================
 
-/// ALPN for the deposit direction: sender → relay deposits a sealed blob.
-pub const COMMUNITY_RELAY_DEPOSIT_ALPN: &[u8] = b"harmony/community-relay-deposit/v1";
-
-/// ALPN for the pull direction: recipient → relay pulls held blobs.
-pub const COMMUNITY_RELAY_PULL_ALPN: &[u8] = b"harmony/community-relay-pull/v1";
+// ZEB-548 Stage 2: the deposit/pull wire ALPN literals now live in
+// `iroh_endpoint::alpn` (`HARMONY_COMMUNITY_RELAY_DEPOSIT_V1` /
+// `HARMONY_COMMUNITY_RELAY_PULL_V1`) — the transport core owns the accept-loop
+// dispatch keys, so this community module no longer needs to define them.
 
 /// Cap on a single pull-RESPONSE frame body ([`RelayPullResponse`], a
 /// `Vec<RelayHeldBlob>`). This is DISTINCT from
@@ -577,15 +576,13 @@ pub fn find_shared_communities(
         .collect()
 }
 
-/// Sender-side last-resort rung (D40). Mirrors the butler deposit client: given
-/// the same outbox candidate the butler rung uses, seal the DepositPayload to
-/// R's advertised butler-set device(s) and deposit to a relay in a shared
-/// community. Returns true iff at least one relay acked. Never touches
-/// AttemptState (the caller treats an acked candidate as delivered-pending-pull).
-#[async_trait::async_trait]
-pub trait CommunityRelayDepositClient: Send + Sync {
-    async fn deposit(&self, req: &crate::butler_deposit::ButlerDepositRequest) -> bool;
-}
+/// Sender-side last-resort deposit rung (D40). ZEB-548 Stage 2 moved this trait
+/// down into [`crate::butler_deposit`] (beside its twin `ButlerDepositClient`)
+/// so the spine's `dm_outbox` no longer depends up on this community module; it
+/// is re-exported here so existing `crate::community_relay::CommunityRelayDepositClient`
+/// call sites — the `ProdCommunityRelayDepositClient` impl, the `dm_outbox`
+/// mock impl, and the boot wiring — resolve unchanged.
+pub use crate::butler_deposit::CommunityRelayDepositClient;
 
 // =====================================================================
 // Tests

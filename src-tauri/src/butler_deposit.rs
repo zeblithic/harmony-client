@@ -545,6 +545,21 @@ pub trait ButlerDepositClient: Send + Sync {
     async fn deposit(&self, req: &ButlerDepositRequest) -> DepositRungOutcome;
 }
 
+/// Sender-side last-resort rung (D40). Mirrors [`ButlerDepositClient`]: given
+/// the same outbox candidate the butler rung uses, seal the DepositPayload to
+/// R's advertised butler-set device(s) and deposit to a relay in a shared
+/// community. Returns true iff at least one relay acked. Never touches
+/// AttemptState (the caller treats an acked candidate as delivered-pending-pull).
+///
+/// ZEB-548 Stage 2: moved here from `community_relay` (beside its twin
+/// [`ButlerDepositClient`]) so the spine's `dm_outbox` no longer depends up on
+/// the community tier; re-exported from `community_relay` for byte-stable call
+/// sites.
+#[async_trait]
+pub trait CommunityRelayDepositClient: Send + Sync {
+    async fn deposit(&self, req: &ButlerDepositRequest) -> bool;
+}
+
 /// Build a [`DepositFrame`] for ONE butler-set entry — the exact
 /// construction `iroh_butler_acceptor::handle_deposit_core` verifies:
 ///
