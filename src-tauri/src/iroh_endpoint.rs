@@ -87,16 +87,15 @@ pub mod alpn {
     /// late-installed `IrohCommunityRelayDepositAcceptor` (see
     /// `IrohZenohLinkManager::install_community_relay_deposit_acceptor`);
     /// connections arriving before install are closed (sender retries — a
-    /// failed relay rung never makes delivery worse). Re-exported from
-    /// `community_relay` so the wire ALPN string lives in exactly one place.
-    pub const HARMONY_COMMUNITY_RELAY_DEPOSIT_V1: &[u8] =
-        crate::community_relay::COMMUNITY_RELAY_DEPOSIT_ALPN;
+    /// failed relay rung never makes delivery worse). ZEB-548 Stage 2: the
+    /// wire ALPN literal lives here (the transport core owns the accept-loop
+    /// dispatch key); `community_relay` no longer defines it.
+    pub const HARMONY_COMMUNITY_RELAY_DEPOSIT_V1: &[u8] = b"harmony/community-relay-deposit/v1";
     /// ZEB-458 (SP2 P4): community sealed-relay pull protocol (`RelayPullQuery`
     /// → `RelayPullResponse` → optional `RelayPullAckFrame`, see
     /// `community_relay` + `iroh_community_relay_acceptor`). Routed to the
     /// late-installed `IrohCommunityRelayPullAcceptor`.
-    pub const HARMONY_COMMUNITY_RELAY_PULL_V1: &[u8] =
-        crate::community_relay::COMMUNITY_RELAY_PULL_ALPN;
+    pub const HARMONY_COMMUNITY_RELAY_PULL_V1: &[u8] = b"harmony/community-relay-pull/v1";
     /// ZEB-473 (Move 1a): post-quantum DM tunnel protocol — the `harmony-tunnel`
     /// PQ session carrying `FrameTag::Dm` bodies over iroh QUIC. Routed by the
     /// accept loop to the late-installed tunnel acceptor (see
