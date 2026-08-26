@@ -12018,7 +12018,19 @@ pub async fn start_node_inner(
                             // The iroh endpoint + owner KeyTree threaded above (Task
                             // 9) double as the dial endpoint + friend-secret seal.
                             .with_self_statics(self_statics_for_friend)
-                            .with_connectivity_settings_path(pkarr_settings_path_for_state.clone())
+                            .with_peer_intro_policy_provider(
+                                pkarr_settings_path_for_state.clone().map(|p| {
+                                    std::sync::Arc::new(move || {
+                                        connectivity_settings::ConnectivitySettings::load_or_default(
+                                            &p,
+                                        )
+                                        .peer_intro_policy
+                                    })
+                                        as std::sync::Arc<
+                                            dyn Fn() -> friend_graph::PeerIntroPolicy + Send + Sync,
+                                        >
+                                }),
+                            )
                             // ZEB-376 Task 10 (durability fix): thread the SAME
                             // post-`Linked` handles the friend acceptor holds so an
                             // auto-`Proceed` introduction link is persisted +
@@ -37242,7 +37254,11 @@ pub(crate) async fn generate_invite_impl(
             .ok()
             .and_then(|g| g.pkarr_invite_publisher.clone());
         match inv_pub {
-            Some(inv_pub) => inv_pub.register_invite(&payload).await,
+            Some(inv_pub) => {
+                inv_pub
+                    .register_invite(payload.invite_token.as_ref().map(|t| t.sig))
+                    .await
+            }
             None if payload.invite_token.is_some() => {
                 return Err("invite-only invite could not be published for cross-WAN \
                             (case-A) discovery: pkarr invite publisher unavailable \

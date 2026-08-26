@@ -105,10 +105,13 @@ pub struct IrohFriendPexAcceptor {
     /// skips the X→introducee dial, or falls back to the default policy) when a
     /// handle is absent rather than panicking.
     ///
-    /// Path to the connectivity-settings JSON so the `Introduction` arm reads
-    /// `PeerIntroPolicy` FRESH per introduction (live-apply, no restart). `None`
-    /// (tests) → the documented `FriendsOfFriends` default.
-    connectivity_settings_path: Option<std::path::PathBuf>,
+    /// Provider the `Introduction` arm calls to read `PeerIntroPolicy` FRESH
+    /// per introduction (live-apply, no restart) — the composition root
+    /// injects a closure that re-loads the connectivity-settings JSON, so this
+    /// acceptor never names the settings type. `None` (tests) → the documented
+    /// `FriendsOfFriends` default.
+    peer_intro_policy_provider:
+        Option<Arc<dyn Fn() -> crate::friend_graph::PeerIntroPolicy + Send + Sync>>,
     /// This node's IMMUTABLE self-handshake statics (identity pub + PQ keys) used
     /// to rebuild X's own dialer `SelfHandshakeReachability` fresh per dial (the
     /// volatile home relay is read fresh from `iroh_endpoint` at dial time — the
@@ -208,7 +211,7 @@ impl IrohFriendPexAcceptor {
             pkarr_resolver: None,
             iroh_endpoint: None,
             owner_keytree: None,
-            connectivity_settings_path: None,
+            peer_intro_policy_provider: None,
             self_statics: None,
             owner_sync_engine: None,
             friend_publisher: None,
@@ -272,11 +275,15 @@ impl IrohFriendPexAcceptor {
         self
     }
 
-    /// ZEB-376 Task 10: wire the connectivity-settings path so X's `Introduction`
-    /// arm reads `PeerIntroPolicy` FRESH per introduction (live-apply, no
-    /// restart). Fluent setter (default `None`).
-    pub fn with_connectivity_settings_path(mut self, path: Option<std::path::PathBuf>) -> Self {
-        self.connectivity_settings_path = path;
+    /// ZEB-376 Task 10: wire the policy provider so X's `Introduction` arm
+    /// reads `PeerIntroPolicy` FRESH per introduction (live-apply, no restart
+    /// — the composition root's closure re-loads the connectivity-settings
+    /// JSON on every call). Fluent setter (default `None`).
+    pub fn with_peer_intro_policy_provider(
+        mut self,
+        provider: Option<Arc<dyn Fn() -> crate::friend_graph::PeerIntroPolicy + Send + Sync>>,
+    ) -> Self {
+        self.peer_intro_policy_provider = provider;
         self
     }
 
@@ -866,16 +873,15 @@ impl IrohFriendPexAcceptor {
                     wall_now_ms(),
                 )?;
 
-                // 4. Enforce policy — read FRESH from the settings file (live-apply,
-                //    no restart). A missing path (tests) falls back to the
-                //    documented default rather than Open.
+                // 4. Enforce policy — read FRESH via the injected provider
+                //    (live-apply, no restart: the composition root's closure
+                //    re-loads the settings file on every call). A missing
+                //    provider (tests) falls back to the documented default
+                //    rather than Open.
                 let policy = self
-                    .connectivity_settings_path
+                    .peer_intro_policy_provider
                     .as_ref()
-                    .map(|p| {
-                        crate::connectivity_settings::ConnectivitySettings::load_or_default(p)
-                            .peer_intro_policy
-                    })
+                    .map(|provider| provider())
                     .unwrap_or(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
 
                 // 5. Decide + act. All three branches fall through to the ack.

@@ -604,7 +604,10 @@ async fn setup(policy: PeerIntroPolicy, settings_dir: &std::path::Path) -> Harne
         )
         .with_iroh_endpoint(Some(Arc::clone(&x_ep)))
         .with_owner_keytree(Some(Arc::clone(&x_keytree)))
-        .with_connectivity_settings_path(Some(settings_path.clone()))
+        .with_peer_intro_policy_provider(Some({
+            let p = settings_path.clone();
+            Arc::new(move || ConnectivitySettings::load_or_default(&p).peer_intro_policy)
+        }))
         .with_pending_requests(Some(Arc::clone(&x_pending))),
     );
     let (x_link_mgr, x_accept, x_rx) = spawn_pex_node(&x_ep, x_pex).await;
@@ -916,7 +919,9 @@ async fn introduction_broker_roundtrip_askme_policy_stages_then_links_on_accept(
             )
             .with_iroh_endpoint(Some(Arc::clone(&x2_ep)))
             .with_owner_keytree(Some(Arc::clone(&h.x_keytree)))
-            .with_connectivity_settings_path(Some(accept_settings_path)),
+            .with_peer_intro_policy_provider(Some(Arc::new(move || {
+                ConnectivitySettings::load_or_default(&accept_settings_path).peer_intro_policy
+            }))),
         );
         let (_x2_link_mgr, _x2_accept, _x2_rx) = spawn_pex_node(&x2_ep, x2_pex).await;
 

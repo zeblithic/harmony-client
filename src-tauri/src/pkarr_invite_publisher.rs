@@ -11,8 +11,6 @@ use harmony_pkarr::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::community_invite::CommunityInvitePayload;
-
 pub struct PkarrInvitePublisher {
     publisher: Arc<PkarrPublisher>,
     identity_signing_key: ed25519_dalek::SigningKey,
@@ -45,9 +43,13 @@ impl PkarrInvitePublisher {
         }
     }
 
-    /// Called from the IPC layer after `generate_invite` succeeds.
-    pub async fn register_invite(&self, invite: &CommunityInvitePayload) {
-        let Some(token) = &invite.invite_token else {
+    /// Called from the IPC layer after `generate_invite` succeeds, with the
+    /// invite token's signature (`invite_token.sig`) — or `None` for an
+    /// open-community invite (`invite_token: None`). Taking the sig directly
+    /// keeps this publisher free of community-invite payload knowledge; the
+    /// composition root extracts it.
+    pub async fn register_invite(&self, invite_token_sig: Option<[u8; 64]>) {
+        let Some(sig) = invite_token_sig else {
             // Open-community invites (invite_token: None) intentionally skip
             // case-A pkarr publish. The case-A primitive exists for the
             // ZEB-217 Phase 4 invite-only flow (counter-sig redemption), which
@@ -57,8 +59,8 @@ impl PkarrInvitePublisher {
             // per-invite secret to key an HKDF record on.
             return;
         };
-        let handle = format!("invite:{}", hex::encode(token.sig));
-        self.register_case_a(handle, token.sig).await;
+        let handle = format!("invite:{}", hex::encode(sig));
+        self.register_case_a(handle, sig).await;
     }
 
     /// Called when the invite is consumed, expires, or is revoked.
@@ -228,6 +230,50 @@ mod tests {
 
         // Verify the unregister path is safe when nothing was registered.
         inv_pub.unregister_invite(&[0u8; 64]).await;
+    }
+
+    /// `register_invite` takes the invite token sig directly (community-invite
+    /// payload knowledge lives at the composition root). `None` — an
+    /// open-community invite — must publish nothing; `Some(sig)` must register
+    /// the `invite:{hex}` case-A handle, and `unregister_invite` retires it.
+    #[tokio::test]
+    async fn register_invite_publishes_only_for_token_bearing_invites() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_identity_pub(&sk);
+        let inv_pub = PkarrInvitePublisher::new(
+            publisher.clone(),
+            sk,
+            id_pub,
+            Arc::new(|| b"fake-iroh-routing".to_vec()),
+        );
+
+        // Open-community invite (no token) → no case-A publication at all.
+        inv_pub.register_invite(None).await;
+        assert!(
+            publisher.active_handles().await.is_empty(),
+            "open-community invite must not publish a case-A record"
+        );
+
+        let token_sig = [0x55u8; 64];
+        let handle = format!("invite:{}", hex::encode(token_sig));
+
+        inv_pub.register_invite(Some(token_sig)).await;
+        assert!(
+            publisher.active_handles().await.contains(&handle),
+            "invite handle must be active after register"
+        );
+
+        inv_pub.unregister_invite(&token_sig).await;
+        assert!(
+            !publisher.active_handles().await.contains(&handle),
+            "invite handle must be gone after unregister"
+        );
     }
 
     #[tokio::test]
