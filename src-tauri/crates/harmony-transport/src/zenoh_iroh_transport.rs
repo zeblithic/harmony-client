@@ -94,6 +94,7 @@ use crate::iroh_endpoint::IrohHandshakeDispatcher;
 use crate::iroh_endpoint::{alpn, IrohEndpoint};
 use crate::reachability_resolver::ReachabilityResolver;
 use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
+use crate::zenoh_inbound_admission::{StrangerVerdict, ZenohInboundAdmission};
 use crate::zenoh_iroh_link::IrohZenohLink;
 
 /// Locator protocol identifier for harmony's zenoh-over-iroh links.
@@ -254,6 +255,12 @@ pub struct IrohZenohLinkManager {
     /// liveness is wired: pre-install, no liveness edges are raised. `Arc`-wrapped
     /// for the same spawn-from-either-path reason as `zenoh_conns` / `reconnect`.
     liveness: Arc<std::sync::OnceLock<crate::peer_liveness::LivenessHandle>>,
+    /// ZEB-996: bounded admission for resolver-unknown inbound zenoh faces.
+    /// Consulted in the accept loop before the registry swap; slots are
+    /// released in [`Self::spawn_drop_watcher`]'s identity-guarded eviction
+    /// (the same lifecycle points as `zenoh_conns`). `Arc`-wrapped for the
+    /// same spawn-from-either-path reason as the neighboring handles.
+    stranger_admission: Arc<ZenohInboundAdmission>,
 }
 
 /// ZEB-616 identity guard for the drop-watcher: only evict a peer's registry
@@ -272,10 +279,45 @@ impl IrohZenohLinkManager {
         resolver: ReachabilityResolver,
         new_link_tx: NewLinkChannelSender,
     ) -> Self {
+        Self::with_stranger_admission(
+            endpoint,
+            resolver,
+            new_link_tx,
+            ZenohInboundAdmission::new(),
+        )
+    }
+
+    /// ZEB-996 test seam: a manager whose stranger-admission caps are
+    /// deterministic and tiny, so integration tests can exercise shed/release
+    /// behavior with a handful of endpoints instead of seventeen.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn with_stranger_caps_for_test(
+        endpoint: Arc<IrohEndpoint>,
+        resolver: ReachabilityResolver,
+        new_link_tx: NewLinkChannelSender,
+        stranger_cap: usize,
+        rate_max: usize,
+        rate_window_ms: u64,
+    ) -> Self {
+        Self::with_stranger_admission(
+            endpoint,
+            resolver,
+            new_link_tx,
+            ZenohInboundAdmission::with_caps_for_test(stranger_cap, rate_max, rate_window_ms),
+        )
+    }
+
+    fn with_stranger_admission(
+        endpoint: Arc<IrohEndpoint>,
+        resolver: ReachabilityResolver,
+        new_link_tx: NewLinkChannelSender,
+        stranger_admission: ZenohInboundAdmission,
+    ) -> Self {
         Self {
             endpoint,
             resolver,
             new_link_tx,
+            stranger_admission: Arc::new(stranger_admission),
             handshake_dispatcher: tokio::sync::OnceCell::new(),
             pending_handshakes: TokioMutex::new(VecDeque::with_capacity(
                 HANDSHAKE_PENDING_QUEUE_CAP,
@@ -393,6 +435,7 @@ impl IrohZenohLinkManager {
         let conns = Arc::clone(&self.zenoh_conns);
         let reconnect = Arc::clone(&self.reconnect);
         let liveness = Arc::clone(&self.liveness);
+        let stranger_admission = Arc::clone(&self.stranger_admission);
         tokio::spawn(async move {
             conn.closed().await;
             let evicted = {
@@ -405,6 +448,15 @@ impl IrohZenohLinkManager {
                     false
                 }
             };
+            // ZEB-996: release this conn's stranger slot UNCONDITIONALLY —
+            // `release` frees the slot only for the conn that owns it, so a
+            // watcher whose conn was superseded by a same-peer re-admission
+            // no-ops (ownership transferred under the admission lock), while
+            // a stranger face replaced by an outbound/known connection (which
+            // never takes admission ownership, so the registry guard below
+            // would say "not evicted") still frees its slot here instead of
+            // leaking it for the replacement's lifetime (PR #752 review).
+            stranger_admission.release(peer_id.as_bytes(), conn_id);
             // Kick only on a guard-passing eviction: a superseded watcher must
             // not re-arm a peer whose live connection replaced this one.
             if evicted {
@@ -627,7 +679,35 @@ impl IrohZenohLinkManager {
                             conn.close(0u32.into(), b"zeb912-test-denylist");
                             return;
                         }
+                        // ZEB-996: bounded stranger admission. Resolver-known
+                        // peers pass untouched; unknown endpoints occupy a
+                        // small bounded pool behind a global admission-rate
+                        // window (see `zenoh_inbound_admission` for why the
+                        // gate bounds availability, not identity). Checked
+                        // BEFORE the registry swap for the same reason as the
+                        // denylist above: a shed peer must never reach
+                        // mark_supervisor_connected.
                         let conn_id = conn.stable_id();
+                        if mgr
+                            .resolver
+                            .resolve_by_node_id(peer_id.as_bytes())
+                            .is_none()
+                        {
+                            match mgr
+                                .stranger_admission
+                                .try_admit_stranger(peer_id.as_bytes(), conn_id)
+                            {
+                                StrangerVerdict::Admit => {}
+                                StrangerVerdict::ShedOccupancy => {
+                                    conn.close(0u32.into(), b"zeb996-stranger-cap");
+                                    return;
+                                }
+                                StrangerVerdict::ShedRate => {
+                                    conn.close(0u32.into(), b"zeb996-stranger-rate");
+                                    return;
+                                }
+                            }
+                        }
                         if let Some(old) = mgr.swap_zenoh_conn(peer_id, conn.clone()) {
                             tracing::debug!(
                                 peer = %peer_id,
@@ -2681,5 +2761,226 @@ mod tests {
 
         alice_ep.shutdown().await;
         bob_ep.shutdown().await;
+    }
+
+    /// ZEB-996: a resolver-unknown peer beyond the stranger cap is shed
+    /// (connection closed, never registered), and closing an admitted
+    /// stranger's connection frees its slot for the next one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stranger_admission_sheds_at_cap_and_frees_on_close() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            stranger_admission_sheds_at_cap_and_frees_on_close_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn stranger_admission_sheds_at_cap_and_frees_on_close_inner() {
+        // Bob: acceptor with a 1-slot stranger pool (generous rate, so this
+        // test exercises ONLY the occupancy axis) and an empty resolver —
+        // every dialer classifies as a stranger.
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let bob_mgr = Arc::new(IrohZenohLinkManager::with_stranger_caps_for_test(
+            Arc::clone(&bob_ep),
+            ReachabilityResolver::new(),
+            new_link_tx,
+            1,
+            100,
+            60_000,
+        ));
+        let _accept = bob_mgr.spawn_accept_loop();
+
+        let bob_socket = *bob_ep
+            .bound_sockets()
+            .first()
+            .expect("bob has a bound socket");
+        let bob_addr = EndpointAddr::new(bob_ep.node_id()).with_ip_addr(bob_socket);
+
+        // Stranger 1: admitted — registered in bob's registry.
+        let s1_ep = build_hermetic_iroh_endpoint().await;
+        let s1_id = s1_ep.node_id();
+        let s1_conn = s1_ep
+            .inner()
+            .connect(bob_addr.clone(), alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("stranger 1 dial bob on zenoh ALPN");
+        for _ in 0..300 {
+            if bob_mgr.zenoh_conns.lock().unwrap().contains_key(&s1_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            bob_mgr.zenoh_conns.lock().unwrap().contains_key(&s1_id),
+            "first stranger must be admitted and registered"
+        );
+
+        // Stranger 2: pool full — bob closes the connection and never
+        // registers the peer.
+        let s2_ep = build_hermetic_iroh_endpoint().await;
+        let s2_id = s2_ep.node_id();
+        let s2_conn = s2_ep
+            .inner()
+            .connect(bob_addr.clone(), alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("stranger 2 dial completes the QUIC handshake");
+        tokio::time::timeout(Duration::from_secs(10), s2_conn.closed())
+            .await
+            .expect("ZEB-996: bob must close the over-cap stranger connection");
+        assert!(
+            !bob_mgr.zenoh_conns.lock().unwrap().contains_key(&s2_id),
+            "shed stranger must never enter the registry"
+        );
+        assert_eq!(
+            bob_mgr.zenoh_conns.lock().unwrap().len(),
+            1,
+            "registry holds exactly the admitted stranger"
+        );
+
+        // Stranger 1 leaves → its slot frees (release rides the same
+        // identity-guarded eviction as the registry removal, so retry the
+        // next dial across that tiny async window).
+        s1_conn.close(0u32.into(), b"test-stranger-1-leaves");
+        for _ in 0..300 {
+            if bob_mgr.zenoh_conns.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Stranger 3: admitted into the freed slot.
+        let s3_ep = build_hermetic_iroh_endpoint().await;
+        let s3_id = s3_ep.node_id();
+        let mut s3_admitted = false;
+        for _ in 0..20 {
+            let conn = s3_ep
+                .inner()
+                .connect(bob_addr.clone(), alpn::HARMONY_ZENOH_V1)
+                .await
+                .expect("stranger 3 dial completes the QUIC handshake");
+            for _ in 0..100 {
+                if bob_mgr.zenoh_conns.lock().unwrap().contains_key(&s3_id) {
+                    break;
+                }
+                if conn.close_reason().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if bob_mgr.zenoh_conns.lock().unwrap().contains_key(&s3_id) {
+                s3_admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            s3_admitted,
+            "ZEB-996: the freed slot must admit the next stranger"
+        );
+
+        bob_ep.shutdown().await;
+        s1_ep.shutdown().await;
+        s2_ep.shutdown().await;
+        s3_ep.shutdown().await;
+    }
+
+    /// ZEB-996: a resolver-known peer bypasses the stranger gate entirely —
+    /// admitted even with a ZERO-capacity stranger pool, while an unknown
+    /// peer sheds. This is the classification claim: the gate must never
+    /// touch legitimate mesh members.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn known_peer_bypasses_stranger_admission() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            known_peer_bypasses_stranger_admission_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn known_peer_bypasses_stranger_admission_inner() {
+        // Bob: acceptor with a zero-capacity, zero-rate stranger pool — the
+        // ONLY way in is resolver classification.
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let bob_resolver = ReachabilityResolver::new();
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let bob_mgr = Arc::new(IrohZenohLinkManager::with_stranger_caps_for_test(
+            Arc::clone(&bob_ep),
+            bob_resolver.clone(),
+            new_link_tx,
+            0,
+            0,
+            60_000,
+        ));
+        let _accept = bob_mgr.spawn_accept_loop();
+
+        let bob_socket = *bob_ep
+            .bound_sockets()
+            .first()
+            .expect("bob has a bound socket");
+        let bob_addr = EndpointAddr::new(bob_ep.node_id()).with_ip_addr(bob_socket);
+
+        // Carol: known — bob's resolver holds a verified-shaped reachability
+        // record binding her node-id (the addresses are irrelevant; only the
+        // reverse node-id lookup classifies inbound).
+        let carol_ep = build_hermetic_iroh_endpoint().await;
+        let carol_id = carol_ep.node_id();
+        bob_resolver.update(
+            OwnerAddr([0xCC; 16]),
+            ReachabilityAnnouncePayload {
+                iroh_node_id: *carol_id.as_bytes(),
+                home_relay_url: String::new(),
+                direct_addresses: vec![],
+                announced_at_ms: 1,
+                identity_signature: [0u8; 64],
+                butler_set: vec![],
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: String::new(),
+            },
+        );
+
+        let _carol_conn = carol_ep
+            .inner()
+            .connect(bob_addr.clone(), alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("carol dial bob on zenoh ALPN");
+        for _ in 0..300 {
+            if bob_mgr.zenoh_conns.lock().unwrap().contains_key(&carol_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            bob_mgr.zenoh_conns.lock().unwrap().contains_key(&carol_id),
+            "ZEB-996: a resolver-known peer must bypass the stranger gate"
+        );
+
+        // Dave: unknown — shed by the zero-capacity pool, never registered.
+        let dave_ep = build_hermetic_iroh_endpoint().await;
+        let dave_id = dave_ep.node_id();
+        let dave_conn = dave_ep
+            .inner()
+            .connect(bob_addr, alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("dave dial completes the QUIC handshake");
+        tokio::time::timeout(Duration::from_secs(10), dave_conn.closed())
+            .await
+            .expect("ZEB-996: bob must close the unknown peer's connection");
+        assert!(
+            !bob_mgr.zenoh_conns.lock().unwrap().contains_key(&dave_id),
+            "shed stranger must never enter the registry"
+        );
+
+        bob_ep.shutdown().await;
+        carol_ep.shutdown().await;
+        dave_ep.shutdown().await;
     }
 }

@@ -76,5 +76,6 @@ pub mod relay_acceptor_watchdog;
 pub mod reply_spill;
 pub mod tunnel_manager;
 pub mod tunnel_task;
+pub(crate) mod zenoh_inbound_admission;
 pub mod zenoh_iroh_link;
 pub mod zenoh_iroh_transport;
