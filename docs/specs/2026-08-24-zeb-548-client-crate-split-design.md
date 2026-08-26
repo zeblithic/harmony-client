@@ -362,6 +362,51 @@ Each stage is an independently shippable, green-CI PR. Value is front-loaded; th
 > (`peer_liveness`→`reconnect_supervisor`; `admission_oracle`→`community_topology`)
 > — they are spine / community-tier and extract with their cluster.
 
+> **Seam closure + firm spine roster (2026-08-26, ZEB-990).** The external-seam
+> phase is complete. PR trail: #741 core-types leaves
+> (`revoked_device_projection`, `enrollment_verify`); #742 accept-loop
+> trait-object inversion; #743 `community_relay` decoupling (ALPN +
+> `CommunityRelayDepositClient` move-down); #744 vine ALPN + file-grant ingest
+> inversion; #745 `dm_outbox` repoint + reachability skew-const move-down;
+> #746 `community_address_book` backfill signature invert; #748 invite-sig
+> invert + `PeerIntroPolicy` provider injection + `is_local_host` move-down;
+> #749 `VineRelayEntry`/`VINE_RELAY_SET_MAX` move-down to
+> `reachability_record` (PR 8, in review at this writing). With PR 8, **every
+> remaining spine→external real-code edge is held by a roster-OUT file below**
+> — the spine is extraction-ready with zero further code cuts.
+>
+> **Firm roster (realized at extraction by git-mv; membership decisions, not
+> code changes).** The name-prefix clustering misfiled in both directions:
+>
+> *Reclassified OUT of the spine* (each depends **down** on the spine; leaving
+> removes its upward community/orch edges and creates no new spine edge):
+>
+> | Module | True tier |
+> |---|---|
+> | `owner_commands` | Tauri command surface (orchestrator) |
+> | `owner_quorum_commands` | command surface (orchestrator) |
+> | `address_book_sync` | community/social sync orchestrator |
+> | `iroh_invite_acceptor` | community acceptor (`iroh_` prefix misfiled it) |
+> | `iroh_community_relay_acceptor` | community acceptor |
+> | `open_join_admit` | open-community join admission (community) |
+> | `relay_held_dto` | relay-hold read DTOs (community) |
+> | `relay_hold_persist` | `RelayHoldDoc` persistence (community) |
+> | `relay_optin_persist` | `RelayOptInDoc` persistence (community) |
+> | `owner_loaded` | boot precondition helper (app wiring) |
+>
+> *Reclassified INTO the spine* (misfiled outward by name; consumers are all
+> spine, no upward deps):
+>
+> | Module | Why |
+> |---|---|
+> | `inflight_handshake_gate` | transport infra (ZEB-866 handshake limiter; sole consumer `iroh_friend_acceptor`) |
+> | `community_topology` | pure ring-math primitive (`std` + `harmony_crypto` only; consumers `admission_oracle`, `reconnect_supervisor`) |
+>
+> Net roster: the scanned 68-file spine −10 +2 = **60 files** extract as the
+> coarse spine crate. Doc-comment-only references from spine files to
+> community/orch modules remain (non-compiling; intra-doc links are tidied at
+> extraction).
+
 *(Original plan, retained for context — superseded by the correction above.)*
 - Surgeries **I** (`file_sharing` → dm), **B** (`CommunityRelayDepositClient` + `lookup_pubkey` seam), **C** (`community_neighbors` → shared) — each removes a cross-edge before the crate on the depending side is extracted.
 - Extract `harmony-dm` (after idc), `harmony-transport` (after dm), `harmony-vine` (after transport).
