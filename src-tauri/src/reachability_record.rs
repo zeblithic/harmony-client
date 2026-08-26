@@ -8,6 +8,16 @@ use std::net::SocketAddr;
 use crate::owner_state_crypto::{canonical_cbor_encode, CryptoError};
 use crate::owner_state_types::{serialize_bytes_as_bstr, Hlc, OwnerAddr};
 
+/// ZEB-321 RCH4: maximum allowed skew (ms) between a ReachabilityAnnounce
+/// payload's `announced_at_ms` and the event's HLC `wall_ms`. ±30 minutes —
+/// generous enough to tolerate normal device clock drift; tight enough to
+/// reject obviously-tampered records (spec §5.5 silent-drop semantics).
+///
+/// ZEB-548 Stage 2: lives here (the reachability payload module) rather than in
+/// `community_membership`; the community membership-reachability check imports
+/// it back (downward), so the spine no longer reaches up for it.
+pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: u64 = 30 * 60 * 1000;
+
 /// Signed validity window applied to every reachability pkarr record
 /// (identity / community / friend / invite). One epoch (7 days): covers the
 /// ~3.5-day republish gap with margin and never outlives the per-epoch
@@ -268,7 +278,7 @@ pub fn verify_inner_signature(
 /// `PkarrRoutingRecord::verify_freshness` bounds a resolved record:
 ///
 /// * **Forged-future guard** — reject a stamp more than
-///   [`crate::community_membership::REACHABILITY_TIMESTAMP_SKEW_MAX_MS`] ahead of
+///   [`REACHABILITY_TIMESTAMP_SKEW_MAX_MS`] ahead of
 ///   the reader's clock (a maliciously future-stamped record must not stay fresh
 ///   forever, the same PR #221-class hazard `fresh_butler_set` guards).
 /// * **Age bound** — reject a stamp older than one signed reachability TTL
@@ -283,7 +293,7 @@ pub(crate) fn reachability_freshness_check(
     now_ms: u64,
 ) -> Result<(), String> {
     let announced = reachability.announced_at_ms;
-    let future_tolerance = crate::community_membership::REACHABILITY_TIMESTAMP_SKEW_MAX_MS;
+    let future_tolerance = REACHABILITY_TIMESTAMP_SKEW_MAX_MS;
     if announced > now_ms.saturating_add(future_tolerance) {
         return Err(format!(
             "relayed reachability announced_at_ms {announced} is implausibly in the future \
@@ -616,7 +626,7 @@ mod tests {
     /// forged-future beyond the skew tolerance is rejected.
     #[test]
     fn reachability_freshness_check_bounds_announced_at() {
-        let skew = crate::community_membership::REACHABILITY_TIMESTAMP_SKEW_MAX_MS;
+        let skew = REACHABILITY_TIMESTAMP_SKEW_MAX_MS;
         let mut p = fixture_payload(); // announced_at_ms = 1_700_000_000_000
         let now = p.announced_at_ms;
 
