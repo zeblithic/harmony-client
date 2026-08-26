@@ -329,6 +329,16 @@ pub fn verify_authority(
                 rev.issued_at,
             )
             .map_err(|e| format!("authority revocation invalid: {e}"))?;
+            // Bind the revocation to THIS record's owner. `verify_revocation_any_issuer`
+            // only checks the revocation's own signature (a Master arm self-verifies
+            // against its embedded master key), so without this a foreign owner could
+            // mint a valid Master revocation that merely names our `device_id` as its
+            // target and, because `n_sig` deliberately does not cover the appendable
+            // revocation field, have it flag our feed revoked (ZEB-993). Mirrors the
+            // `verify_device_retire_certs` contract in community_membership.
+            if rev.owner_id != owner_id {
+                return Err("authority revocation owner does not match owner_id".to_string());
+            }
             if rev.target != device_id {
                 return Err("authority revocation target does not match device_id".to_string());
             }
@@ -819,6 +829,51 @@ mod tests {
         assert!(
             verify_authority(&bad, WORLD_NOW).is_err(),
             "revocation targeting a different device rejected"
+        );
+    }
+
+    #[test]
+    fn verify_authority_rejects_cross_owner_revocation() {
+        // Security (ZEB-993): the revocation field is deliberately unbound by n_sig
+        // ("authenticated separately … an appended revocation never invalidates
+        // n_sig"), so any observer can append one. A foreign owner can mint a valid
+        // Master revocation that merely NAMES the victim's device as `target` and
+        // self-verifies against its own embedded master key. Without binding
+        // `rev.owner_id` to the record's owner, `verify_authority` would flag the
+        // victim's feed revoked on a stranger's say-so. This is the owner axis
+        // alongside the target axis in the test above.
+        use harmony_owner::certs::RevocationReason;
+        let victim = mint_quorum_world(0xA6);
+        let attacker = mint_quorum_world(0xA7); // a different owner + master key
+        let n = gen_identity();
+
+        // Attacker's Master revocation: owner_id = attacker, target = victim's feed
+        // device. Self-verifies against the attacker's own embedded master key.
+        let foreign_rev = RevocationCert::sign_master(
+            &attacker.master_sk,
+            attacker.master_bundle.clone(),
+            victim.a_cert.device_id, // names the victim's device as the target
+            WORLD_NOW,
+            RevocationReason::Lost,
+        )
+        .unwrap();
+        // Appended to the victim's own (master-issued) authority record; n_sig stays
+        // valid because it never covered the revocation field.
+        let rec = record_for(
+            &victim,
+            &victim.a_cert,
+            Vec::new(),
+            Some(foreign_rev),
+            WORLD_NOW,
+            &n,
+        );
+
+        let err = verify_authority(&rec, WORLD_NOW).expect_err(
+            "a foreign-owner revocation targeting the victim's device must be rejected",
+        );
+        assert!(
+            err.contains("revocation owner"),
+            "rejected on the owner binding, not incidentally: {err}"
         );
     }
 
