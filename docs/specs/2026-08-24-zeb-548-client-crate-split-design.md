@@ -116,6 +116,7 @@ Notes on the DAG:
 - `harmony-app-core` (L3) is where `NodeState`, `start_node_inner`, `event_loop.rs`, and the `*_commands.rs` glue live. The thin `#[tauri::command]` wrappers + `generate_handler!` stay in the **binary** crate `harmony-app` (L4) because they need the live `tauri::Wry` runtime; their `_impl` bodies migrate down into the feature crates.
 - **`social_graph` and `voice` end up *above* `community`** (both depend on it one-way) once their shared primitives are promoted out: cycle E's `KeyedSlidingWindow` and cycle G's AEAD helpers move to shared modules, and cycle F's friend-acceptor logic relocates into `social_graph`.
 - **Caveat — the mid-layer edges are the design target, not a guarantee.** The exact residual direction of a few edges (and two file relocations: `file_sharing` → dm in Stage 2, `iroh_friend_acceptor` → social_graph in Stage 3) is finalized as each surgery lands; the layering above is the intended acyclic result.
+- **Stage-2 boundary (ZEB-990, 2026-08-25):** the `harmony-transport`, `harmony-dm`, and `harmony-owner-fleet` nodes drawn separately in L1b are **extracted as ONE `harmony-transport`/spine crate** in Stage 2 — the ground-truth scan found they form a strongly-connected cycle (see the §6 Stage-2 correction), so the three-node split shown here is a **later intra-spine split target**, not the Stage-2 extraction boundary. The DAG is kept at its fine-grained eventual state; Stage 2 realizes the coarse spine.
 
 ---
 

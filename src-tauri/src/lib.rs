@@ -190,7 +190,7 @@ pub mod dm_signing;
 pub mod dm_tunnel_contact;
 pub mod emoji_names;
 // enrollment_verify moved to harmony-core-types (ZEB-548 Stage 2 PR #1);
-// re-exported above via `pub use harmony_core_types::{… enrollment_verify …}`.
+// re-exported below via `pub use harmony_core_types::{… enrollment_verify …}`.
 pub mod event_loop;
 pub mod feed_authority;
 pub mod file_sharing;
