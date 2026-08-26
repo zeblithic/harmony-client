@@ -90,8 +90,8 @@ use zenoh_link::{
 };
 use zenoh_result::{zerror, ZResult};
 
+use crate::iroh_endpoint::IrohHandshakeDispatcher;
 use crate::iroh_endpoint::{alpn, IrohEndpoint};
-use crate::iroh_invite_acceptor::IrohHandshakeDispatcher;
 use crate::reachability_resolver::ReachabilityResolver;
 use crate::reconnect_supervisor::{ReconnectTrigger, SupervisorHandle};
 use crate::zenoh_iroh_link::IrohZenohLink;
@@ -191,21 +191,23 @@ pub struct IrohZenohLinkManager {
     /// `harmony/community-relay-deposit/v1` connections. Same lifecycle as
     /// `butler_deposit_acceptor` — no boot-window queue; a deposit arriving
     /// before install is closed and the sender's fallback chain retries.
-    community_relay_deposit_acceptor: std::sync::OnceLock<
-        Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor>,
-    >,
+    /// ZEB-548 Stage 2: typed as the generic `IrohHandshakeDispatcher` trait
+    /// object (like `tunnel_acceptor` below) so the transport spine stays
+    /// decoupled from the community-relay acceptor module that implements it.
+    community_relay_deposit_acceptor: std::sync::OnceLock<Arc<dyn IrohHandshakeDispatcher>>,
     /// ZEB-458 P4: late-installed acceptor for inbound
     /// `harmony/community-relay-pull/v1` connections. Same lifecycle as the
-    /// deposit acceptor.
-    community_relay_pull_acceptor: std::sync::OnceLock<
-        Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
-    >,
+    /// deposit acceptor. ZEB-548 Stage 2: `dyn IrohHandshakeDispatcher` trait
+    /// object (see the deposit acceptor field).
+    community_relay_pull_acceptor: std::sync::OnceLock<Arc<dyn IrohHandshakeDispatcher>>,
     /// ZEB-811: late-installed acceptor for inbound `harmony/vine-relay/v1`
     /// connections (public-read vine descriptor+content serve). Same
     /// lifecycle as the community-relay pull acceptor — no boot-window
     /// queue; a pull arriving before install is closed and the follower's
-    /// pull driver retries on its next cadence.
-    vine_relay_acceptor: std::sync::OnceLock<Arc<crate::vine_relay::VineRelayAcceptor>>,
+    /// pull driver retries on its next cadence. ZEB-548 Stage 2:
+    /// `dyn IrohHandshakeDispatcher` trait object (see the deposit acceptor
+    /// field) so the spine stays decoupled from the vine-relay module.
+    vine_relay_acceptor: std::sync::OnceLock<Arc<dyn IrohHandshakeDispatcher>>,
     /// ZEB-473 (Move 1a): late-installed acceptor for inbound
     /// `harmony/tunnel/v1` connections (the PQ DM tunnel). Same lifecycle as the
     /// butler/relay acceptors — no boot-window queue; a tunnel dial arriving
@@ -441,9 +443,8 @@ impl IrohZenohLinkManager {
     /// last-resort retry that can never make delivery worse).
     pub fn install_community_relay_deposit_acceptor(
         &self,
-        acceptor: Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor>,
-    ) -> Result<(), Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor>>
-    {
+        acceptor: Arc<dyn IrohHandshakeDispatcher>,
+    ) -> Result<(), Arc<dyn IrohHandshakeDispatcher>> {
         self.community_relay_deposit_acceptor.set(acceptor)
     }
 
@@ -452,8 +453,8 @@ impl IrohZenohLinkManager {
     /// connections. Same install-once lifecycle as the deposit acceptor.
     pub fn install_community_relay_pull_acceptor(
         &self,
-        acceptor: Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
-    ) -> Result<(), Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>> {
+        acceptor: Arc<dyn IrohHandshakeDispatcher>,
+    ) -> Result<(), Arc<dyn IrohHandshakeDispatcher>> {
         self.community_relay_pull_acceptor.set(acceptor)
     }
 
@@ -462,8 +463,8 @@ impl IrohZenohLinkManager {
     /// lifecycle as the community-relay pull acceptor.
     pub fn install_vine_relay_acceptor(
         &self,
-        acceptor: Arc<crate::vine_relay::VineRelayAcceptor>,
-    ) -> Result<(), Arc<crate::vine_relay::VineRelayAcceptor>> {
+        acceptor: Arc<dyn IrohHandshakeDispatcher>,
+    ) -> Result<(), Arc<dyn IrohHandshakeDispatcher>> {
         self.vine_relay_acceptor.set(acceptor)
     }
 

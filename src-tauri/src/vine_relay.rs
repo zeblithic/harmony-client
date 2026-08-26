@@ -789,6 +789,20 @@ impl VineRelayAcceptor {
     }
 }
 
+/// ZEB-548 Stage 2: lets the transport spine hold this acceptor as a
+/// generic `Arc<dyn IrohHandshakeDispatcher>` (see
+/// `IrohZenohLinkManager::install_vine_relay_acceptor`) instead of naming
+/// the concrete type — severing the spine→vine_relay compile edge. The
+/// body delegates to the inherent `handle_connection`; in receiver syntax
+/// inherent-method resolution wins over the trait method, so this does not
+/// recurse.
+#[async_trait::async_trait]
+impl crate::iroh_endpoint::IrohHandshakeDispatcher for VineRelayAcceptor {
+    async fn handle_connection(&self, conn: iroh::endpoint::Connection) {
+        self.handle_connection(conn).await
+    }
+}
+
 // =====================================================================
 // Tests
 // =====================================================================

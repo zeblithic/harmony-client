@@ -160,19 +160,12 @@ impl HandshakeAcceptorConfig {
     }
 }
 
-/// Pluggable dispatcher invoked by `IrohZenohLinkManager`'s accept
-/// loop when an inbound connection negotiates an ALPN other than
-/// `harmony/zenoh/v1`. The link manager passes the accepted
-/// `Connection` directly — implementations are responsible for opening
-/// any bi-streams and consuming the connection.
-#[async_trait]
-pub trait IrohHandshakeDispatcher: Send + Sync + 'static {
-    /// Called once per inbound connection that survives the ALPN
-    /// filter. Implementations may run synchronously or spawn a task;
-    /// the accept loop awaits this call. Errors are not propagated —
-    /// implementations should log and return.
-    async fn handle_connection(&self, conn: Connection);
-}
+/// The accept-loop dispatch contract. ZEB-548 Stage 2 moved this trait
+/// down into [`crate::iroh_endpoint`] (spine transport core); it is
+/// re-exported here so existing
+/// `crate::iroh_invite_acceptor::IrohHandshakeDispatcher` call sites —
+/// and the `impl`s below — resolve unchanged.
+pub use crate::iroh_endpoint::IrohHandshakeDispatcher;
 
 /// Maximum bytes the acceptor accepts per request packet. The wire
 /// shape is `[u32 LE length-prefix][packet]`; we reject any prefix
