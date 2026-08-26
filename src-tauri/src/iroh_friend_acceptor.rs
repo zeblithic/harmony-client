@@ -2408,7 +2408,7 @@ where
 }
 
 #[async_trait]
-impl<H> crate::iroh_invite_acceptor::IrohHandshakeDispatcher for IrohFriendHandshakeAcceptor<H>
+impl<H> crate::iroh_endpoint::IrohHandshakeDispatcher for IrohFriendHandshakeAcceptor<H>
 where
     H: FriendEventEmit,
 {
@@ -2535,11 +2535,11 @@ pub fn route_handshake_alpn(alpn: &[u8]) -> FriendDispatchTarget {
 /// and delegates.
 pub struct MultiplexHandshakeDispatcher {
     /// Receives `harmony/handshake/v1` connections (community-invite redemption).
-    invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+    invite: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
     /// Receives `harmony/friend/v1` connections (friend-link handshake).
-    friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+    friend: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
     /// ZEB-375: receives `harmony/friend-pex/v1` connections (referral catalog).
-    pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+    pex: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
     /// ZEB-866: per-source + node-wide concurrency gate consulted before
     /// delegating, bounding in-flight handshakes against a pre-`accept_bi`
     /// slowloris. Shared node-wide.
@@ -2558,7 +2558,7 @@ pub struct KeylessRefusingDispatcher {
 }
 
 #[async_trait::async_trait]
-impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for KeylessRefusingDispatcher {
+impl crate::iroh_endpoint::IrohHandshakeDispatcher for KeylessRefusingDispatcher {
     async fn handle_connection(&self, conn: Connection) {
         // debug, not info: this fires per inbound connection BEFORE peer
         // authentication, so a reconnect-flooding remote could otherwise
@@ -2578,9 +2578,9 @@ impl MultiplexHandshakeDispatcher {
     /// Build a multiplexer over the invite + friend + friend-PEX acceptors,
     /// with the production in-flight gate caps.
     pub fn new(
-        invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
-        friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
-        pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+        invite: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
+        friend: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
+        pex: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
     ) -> Self {
         Self::with_gate_caps(
             invite,
@@ -2595,9 +2595,9 @@ impl MultiplexHandshakeDispatcher {
     /// caps so tests can drive the concurrency ceiling deterministically with
     /// tiny values.
     pub fn with_gate_caps(
-        invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
-        friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
-        pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+        invite: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
+        friend: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
+        pex: Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher>,
         per_source_max: usize,
         global_max: usize,
     ) -> Self {
@@ -2625,7 +2625,7 @@ impl MultiplexHandshakeDispatcher {
     fn select_for_alpn(
         &self,
         alpn: &[u8],
-    ) -> &Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher> {
+    ) -> &Arc<dyn crate::iroh_endpoint::IrohHandshakeDispatcher> {
         match route_handshake_alpn(alpn) {
             FriendDispatchTarget::Friend => &self.friend,
             FriendDispatchTarget::Invite => &self.invite,
@@ -2635,7 +2635,7 @@ impl MultiplexHandshakeDispatcher {
 }
 
 #[async_trait]
-impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for MultiplexHandshakeDispatcher {
+impl crate::iroh_endpoint::IrohHandshakeDispatcher for MultiplexHandshakeDispatcher {
     async fn handle_connection(&self, conn: Connection) {
         // ZEB-866: bound concurrent in-flight handshakes BEFORE delegating to
         // the inner acceptor (whose first await is `accept_bi`, up to
@@ -2669,7 +2669,7 @@ impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for MultiplexHandshake
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::community_membership::mint_test_owner;
+    use crate::enrollment_verify::quorum_fixtures::mint_test_owner;
     use ed25519_dalek::Signer;
 
     /// ZEB-680: an empty revoked-device projection for the many verifier call
@@ -4375,7 +4375,7 @@ mod tests {
     // ── Task 9: ALPN dispatch multiplexer ────────────────────────────────
 
     use crate::iroh_endpoint::alpn;
-    use crate::iroh_invite_acceptor::IrohHandshakeDispatcher;
+    use crate::iroh_endpoint::IrohHandshakeDispatcher;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Stub dispatcher that records whether it was handed a connection. We can't

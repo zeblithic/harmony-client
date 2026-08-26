@@ -1632,12 +1632,32 @@ mod tests {
     const TEST_DEVICE_ED25519_SEED: [u8; 32] = [0x33; 32];
     const TEST_KEYTREE_SEED: [u8; 32] = [0x44; 32];
 
-    /// The X25519 public key a grant must be sealed to so `prod_ctx_with_dirty`'s
-    /// device key opens it (production's `birational(vk)` seal target).
-    fn test_device_x25519_pub() -> [u8; 32] {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&TEST_DEVICE_ED25519_SEED);
-        crate::dm_signing::ed25519_pub_to_x25519(&sk.verifying_key().to_bytes())
-            .expect("valid x25519 pub")
+    /// ZEB-548 Stage 2: a no-op [`FileGrantIngestor`] for fixtures that are
+    /// not about grant ingestion, so this spine module's inline tests never
+    /// name the orchestration-tier `file_sharing::ProdFileGrantIngestor`. The
+    /// seam tests that drive the REAL ingestor live in
+    /// `tests/dm/grant_ingest_seam_integration.rs`.
+    struct NoopGrantIngestor;
+    impl FileGrantIngestor for NoopGrantIngestor {
+        fn ingest_grant_push(
+            &self,
+            _state: &mut crate::owner_state_crdt::OwnerState,
+            _my_device_x25519_priv: &[u8; 32],
+            _keytree: &crate::owner_state_crypto::KeyTree,
+            _granter_owner: OwnerAddr,
+            _grant_push_bytes: &[u8],
+        ) -> Result<Option<ContentId>, String> {
+            Ok(None)
+        }
+
+        fn ingest_grant_revoke(
+            &self,
+            _state: &mut crate::owner_state_crdt::OwnerState,
+            _granter_owner: OwnerAddr,
+            _cid: [u8; 32],
+        ) -> bool {
+            false
+        }
     }
 
     /// The grantee's shared KeyTree matching `prod_ctx_with_dirty`'s
@@ -2701,7 +2721,7 @@ mod tests {
                 &ed25519_dalek::SigningKey::from_bytes(&TEST_DEVICE_ED25519_SEED),
             ),
             owner_keytree: Arc::new(test_owner_keytree()),
-            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
+            file_grant_ingestor: std::sync::Arc::new(NoopGrantIngestor),
         };
         (ctx, crdt_state, dirty, revoked, sink_handle)
     }
@@ -2739,310 +2759,6 @@ mod tests {
             deposited_by: "butler-device".into(),
             ingested_by: Default::default(),
         }
-    }
-
-    /// ZEB-674 (C4) sweeper integration: a grant-only entry carrying a REAL
-    /// `grant_push` (sealed to this ctx's device key) is swept end-to-end through
-    /// the PRODUCTION `apply_grant_push` — it lands on `received_file_grants`,
-    /// fires `notify_owner_state_dirty` exactly once, and the stored DEK is
-    /// openable BOTH via `open_received_file` (the grantee read path) AND
-    /// directly via `open_dek_at_rest` with a freshly-derived KeyTree of the same
-    /// material (a DIFFERENT device with the same shared KeyTree — device-
-    /// agnostic, mirroring `file_deks`). The granter recorded is the entry's
-    /// butler-verified `sender_owner`.
-    #[tokio::test]
-    async fn sweep_ingests_real_grant_push_via_prod_ctx_device_agnostic() {
-        use crate::file_sharing::{
-            open_dek_at_rest, open_received_file, seal_grant_for_devices, FileGrantInner,
-        };
-        let (ctx, crdt_state, dirty, _revoked) = prod_ctx_with_dirty();
-
-        // A real sealed grant, targeted at the ctx device's X25519 pubkey.
-        let dek_bytes = [0x5Au8; 32];
-        let cid_bytes = [0xC1u8; 32];
-        let inner = FileGrantInner {
-            cid: cid_bytes,
-            file_name: "shared.md".into(),
-            file_size: 42,
-            mime: "text/markdown".into(),
-            dek: dek_bytes,
-        };
-        let sealed = seal_grant_for_devices(&inner, &[test_device_x25519_pub()]).expect("seal");
-        let list: Vec<serde_bytes::ByteBuf> =
-            sealed.into_iter().map(serde_bytes::ByteBuf::from).collect();
-        let mut grant_push = Vec::new();
-        ciborium::into_writer(&list, &mut grant_push).expect("encode grant_push");
-
-        let granter = OwnerAddr([0xB0; 16]);
-        let key = DmInboxDoc::grant_key(&granter.0, &grant_push);
-        // Deposit "now" (the Prod ctx's `now_ms` is the real wall clock, and an
-        // empty enrolled set disables coverage-GC) so the entry survives the
-        // sweep's TTL check and we can assert it was marked ingested.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let entry = DmInboxEntry {
-            sender_owner: granter.0,
-            cidnotify_packet: None,
-            storage_blob: Vec::new(),
-            invite_packet: None,
-            revocation_push: None,
-            grant_push: Some(grant_push),
-            grant_revoke: None,
-            deposited_at: hlc(now),
-            deposited_by: "butler-device".into(),
-            ingested_by: Default::default(),
-        };
-        let mut doc = DmInboxDoc::default();
-        doc.entries.insert(key.clone(), entry);
-
-        let changed = ingest_pending(&mut doc, &ctx).await;
-        assert!(changed, "grant sweep mutated the doc (ig growth)");
-        assert!(
-            doc.entries[&key].ingested_by.contains(SELF_ID),
-            "entry marked ingested"
-        );
-        assert_eq!(
-            dirty.load(Ordering::SeqCst),
-            1,
-            "a recorded grant fires notify_owner_state_dirty exactly once"
-        );
-
-        let cid = ContentId::from_bytes(cid_bytes);
-        let state = crdt_state.lock().await;
-        let rec = state
-            .received_file_grants
-            .get(&cid_bytes)
-            .expect("received_file_grants populated");
-        assert_eq!(
-            rec.granter_owner, granter,
-            "granter is the butler-verified deposit sender"
-        );
-        assert_ne!(
-            rec.sealed_dek.as_slice(),
-            dek_bytes.as_slice(),
-            "stored blob is the KeyTree-sealed envelope, never the raw DEK"
-        );
-
-        // (a) grantee read path recovers the DEK.
-        let recovered =
-            open_received_file(&state, &test_owner_keytree(), cid).expect("open received file");
-        assert_eq!(recovered.as_bytes(), &dek_bytes, "recovered DEK matches");
-
-        // (b) device-agnostic: a FRESH KeyTree of the same shared material (a
-        // different device of the same owner) opens the stored blob directly.
-        let other_device_tree = test_owner_keytree();
-        let via_tree =
-            open_dek_at_rest(&other_device_tree, &rec.sealed_dek).expect("open via shared KeyTree");
-        assert_eq!(
-            via_tree.as_bytes(),
-            &dek_bytes,
-            "any device with the shared KeyTree opens the re-sealed grant"
-        );
-    }
-
-    /// ZEB-723: a genuinely-recorded grant (the `Some(cid)` branch of
-    /// `apply_grant_push`, same gate as `notify_owner_state_dirty`) must also
-    /// emit `shared-with-me-updated` so the grantee's "Shared with me" UI can
-    /// refresh and bump its unread badge. Drives a REAL per-device-sealed
-    /// `grant_push` through the production sweeper, exactly like
-    /// `sweep_ingests_real_grant_push_via_prod_ctx_device_agnostic`, and
-    /// asserts the emitted frame via the `RecordingSink` handle.
-    #[tokio::test]
-    async fn sweep_ingested_grant_emits_shared_with_me_updated() {
-        use crate::file_sharing::{seal_grant_for_devices, FileGrantInner};
-        let (ctx, _crdt_state, _dirty, _revoked, sink_handle) = prod_ctx_with_dirty_and_sink();
-
-        let cid_bytes = [0xC1u8; 32];
-        let inner = FileGrantInner {
-            cid: cid_bytes,
-            file_name: "shared.md".into(),
-            file_size: 42,
-            mime: "text/markdown".into(),
-            dek: [0x5Au8; 32],
-        };
-        let sealed = seal_grant_for_devices(&inner, &[test_device_x25519_pub()]).expect("seal");
-        let list: Vec<serde_bytes::ByteBuf> =
-            sealed.into_iter().map(serde_bytes::ByteBuf::from).collect();
-        let mut grant_push = Vec::new();
-        ciborium::into_writer(&list, &mut grant_push).expect("encode grant_push");
-
-        let granter = OwnerAddr([0xB0; 16]);
-        let key = DmInboxDoc::grant_key(&granter.0, &grant_push);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let entry = DmInboxEntry {
-            sender_owner: granter.0,
-            cidnotify_packet: None,
-            storage_blob: Vec::new(),
-            invite_packet: None,
-            revocation_push: None,
-            grant_push: Some(grant_push),
-            grant_revoke: None,
-            deposited_at: hlc(now),
-            deposited_by: "butler-device".into(),
-            ingested_by: Default::default(),
-        };
-        let mut doc = DmInboxDoc::default();
-        doc.entries.insert(key, entry);
-
-        let changed = ingest_pending(&mut doc, &ctx).await;
-        assert!(changed, "grant sweep mutated the doc");
-
-        let frames = sink_handle.frames();
-        let matching = frames
-            .iter()
-            .filter(|(name, payload)| {
-                name == "shared-with-me-updated"
-                    && payload["cid"] == serde_json::json!(hex::encode(cid_bytes))
-            })
-            .count();
-        assert_eq!(
-            matching, 1,
-            "exactly one shared-with-me-updated frame for the recorded grant's cid \
-             (cardinality + idempotency — a single record must not double-emit); got {frames:?}"
-        );
-    }
-
-    /// ZEB-730 seed helper: install a `ReceivedFileGrant` on a seeded owner-state
-    /// with `granter_owner == granter` so `apply_grant_revoke`'s granter-of-record
-    /// authorization can be exercised without a full grant_push ingest.
-    async fn seed_received_grant(
-        crdt_state: &Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
-        cid: [u8; 32],
-        granter: OwnerAddr,
-    ) {
-        let mut state = crdt_state.lock().await;
-        state.received_file_grants.insert(
-            cid,
-            crate::owner_state_types::ReceivedFileGrant {
-                granter_owner: granter,
-                cid,
-                file_name: "doc.pdf".into(),
-                file_size: 10,
-                mime: "application/pdf".into(),
-                sealed_dek: vec![1, 2, 3],
-                received_at: 100,
-            },
-        );
-    }
-
-    /// ZEB-730 (prod path): an AUTHORIZED grant-revoke (deposit sender ==
-    /// granter-of-record) applied through the PRODUCTION `apply_grant_revoke`
-    /// GCs the received-grant entry, stamps ZEB-727's tombstone, fires
-    /// `notify_owner_state_dirty` exactly once, and emits exactly one
-    /// `shared-with-me-updated` frame carrying the canonical lowercase-hex cid.
-    #[tokio::test]
-    async fn apply_grant_revoke_authorized_gcs_notifies_and_emits() {
-        let (ctx, crdt_state, dirty, _revoked, sink_handle) = prod_ctx_with_dirty_and_sink();
-
-        let granter = OwnerAddr([0xB0; 16]);
-        let cid = [0xC1u8; 32];
-        seed_received_grant(&crdt_state, cid, granter).await;
-
-        let entry = DmInboxEntry {
-            sender_owner: granter.0, // butler-verified sender == granter-of-record
-            cidnotify_packet: None,
-            storage_blob: Vec::new(),
-            invite_packet: None,
-            revocation_push: None,
-            grant_push: None,
-            grant_revoke: Some(crate::butler_deposit::encode_grant_revoke(cid)),
-            deposited_at: hlc(500),
-            deposited_by: "butler-device".into(),
-            ingested_by: Default::default(),
-        };
-
-        ctx.apply_grant_revoke(&entry)
-            .await
-            .expect("an authorized grant-revoke applies");
-
-        {
-            let state = crdt_state.lock().await;
-            assert!(
-                !state.received_file_grants.contains_key(&cid),
-                "authorized revoke GCs the received-grant entry"
-            );
-            assert!(
-                state.dismissed_received_grants.contains_key(&cid),
-                "authorized revoke stamps the ZEB-727 dismiss tombstone"
-            );
-        }
-        assert_eq!(
-            dirty.load(Ordering::SeqCst),
-            1,
-            "an authorized revoke fires notify_owner_state_dirty exactly once"
-        );
-        let frames = sink_handle.frames();
-        let matching = frames
-            .iter()
-            .filter(|(name, payload)| {
-                name == "shared-with-me-updated"
-                    && payload["cid"] == serde_json::json!(hex::encode(cid))
-            })
-            .count();
-        assert_eq!(
-            matching, 1,
-            "exactly one shared-with-me-updated frame carrying the canonical \
-             lowercase-hex cid; got {frames:?}"
-        );
-    }
-
-    /// ZEB-730 SECURITY (prod path, griefing guard): a grant-revoke whose
-    /// butler-verified deposit sender is NOT the granter-of-record is a silent
-    /// no-op — entry intact, no tombstone, no notify, no emit — so no Active
-    /// friend can grief a grantee into losing a file they did not share. Returns
-    /// `Ok(())` (a dropped revoke is not an error).
-    #[tokio::test]
-    async fn apply_grant_revoke_unauthorized_is_noop() {
-        let (ctx, crdt_state, dirty, _revoked, sink_handle) = prod_ctx_with_dirty_and_sink();
-
-        let granter = OwnerAddr([0xB0; 16]);
-        let attacker = OwnerAddr([0x1A; 16]);
-        let cid = [0xC1u8; 32];
-        seed_received_grant(&crdt_state, cid, granter).await;
-
-        // Deposit sender is the attacker, NOT the granter-of-record.
-        let entry = DmInboxEntry {
-            sender_owner: attacker.0,
-            cidnotify_packet: None,
-            storage_blob: Vec::new(),
-            invite_packet: None,
-            revocation_push: None,
-            grant_push: None,
-            grant_revoke: Some(crate::butler_deposit::encode_grant_revoke(cid)),
-            deposited_at: hlc(500),
-            deposited_by: "butler-device".into(),
-            ingested_by: Default::default(),
-        };
-
-        ctx.apply_grant_revoke(&entry)
-            .await
-            .expect("a dropped (unauthorized) revoke is not an error");
-
-        {
-            let state = crdt_state.lock().await;
-            assert!(
-                state.received_file_grants.contains_key(&cid),
-                "the received grant is intact (griefing guard)"
-            );
-            assert!(
-                state.dismissed_received_grants.is_empty(),
-                "no tombstone minted from an unauthorized revoke"
-            );
-        }
-        assert_eq!(
-            dirty.load(Ordering::SeqCst),
-            0,
-            "no notify on an unauthorized revoke"
-        );
-        assert!(
-            sink_handle.frames().is_empty(),
-            "no shared-with-me-updated emit on an unauthorized revoke"
-        );
     }
 
     #[tokio::test]
@@ -5960,7 +5676,7 @@ mod tests {
             owner_keytree: Arc::new(
                 crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
             ),
-            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
+            file_grant_ingestor: std::sync::Arc::new(NoopGrantIngestor),
         };
 
         RecoverInviteFixture {
@@ -6308,7 +6024,7 @@ mod tests {
             owner_keytree: Arc::new(
                 crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
             ),
-            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
+            file_grant_ingestor: std::sync::Arc::new(NoopGrantIngestor),
         };
 
         let err = prod_ctx
@@ -6524,7 +6240,7 @@ mod tests {
             owner_keytree: Arc::new(
                 crate::owner_state_crypto::KeyTree::derive(&[0x44; 32]).expect("keytree"),
             ),
-            file_grant_ingestor: std::sync::Arc::new(crate::file_sharing::ProdFileGrantIngestor),
+            file_grant_ingestor: std::sync::Arc::new(NoopGrantIngestor),
         };
         (prod_ctx, pending, sink_handle)
     }

@@ -447,7 +447,7 @@ pub fn project_referrals(cat: &ReferralCatalog, fg: &FriendGraph) -> Vec<Referra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::community_membership::mint_test_owner;
+    use crate::enrollment_verify::quorum_fixtures::mint_test_owner;
     use crate::friend_graph::{FriendEntry, FriendOrigin};
     use crate::owner_state_types::{Hlc, OwnerAddr};
 

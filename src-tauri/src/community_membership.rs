@@ -2142,62 +2142,14 @@ pub enum MemberStatus {
     PendingJoin,
 }
 
-/// ZEB-339 test helper: a realistic owner with an enrolled device key.
-/// Produced by `mint_test_owner`; consumed by membership tests that need
-/// the new `actor = owner_id ≠ address_hash(device_key)` signing model.
+// ZEB-548 Stage 2: `TestOwner` + `mint_test_owner` moved down beside the
+// quorum fixtures (`enrollment_verify::quorum_fixtures`, core-types) so spine
+// modules' tests no longer reach up for them; re-exported here so this
+// module's own tests and community-tier consumers resolve unchanged. `pub use`
+// — not `pub(crate)` — so the feature-on non-test lib target does not trip
+// `unused_imports` under `clippy --all-targets --features test-fixtures`.
 #[cfg(any(test, feature = "test-fixtures"))]
-#[derive(Debug, Clone)]
-pub struct TestOwner {
-    pub owner: OwnerAddr,
-    pub device_key: ed25519_dalek::SigningKey,
-    pub cert: EnrollmentCert,
-}
-
-/// ZEB-339 test helper: produce a realistic owner — owner_id (master),
-/// an enrolled device signing key, and a self-minted Master EnrollmentCert
-/// binding them. `seed` makes it deterministic.
-///
-/// Note on seeds: the master key derives from `[seed; 32]` and the device
-/// key from `[seed ^ 0xFF; 32]`, so seeds `N` and `N ^ 0xFF` share raw key
-/// material (with master/device roles swapped). Use seeds in `0x01..=0xFE`
-/// and avoid pairing `N` with `N ^ 0xFF` in the same test.
-#[cfg(any(test, feature = "test-fixtures"))]
-pub fn mint_test_owner(seed: u8) -> TestOwner {
-    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
-    let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
-    let master_bundle = PubKeyBundle {
-        classical: ClassicalKeys {
-            ed25519_verify: master_sk.verifying_key().to_bytes(),
-            x25519_pub: [0u8; 32],
-        },
-        post_quantum: None,
-    };
-    let owner_id = master_bundle.identity_hash();
-    let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]);
-    let device_bundle = PubKeyBundle {
-        classical: ClassicalKeys {
-            ed25519_verify: device_sk.verifying_key().to_bytes(),
-            x25519_pub: [0u8; 32],
-        },
-        post_quantum: None,
-    };
-    let device_id = device_bundle.identity_hash();
-    let cert = EnrollmentCert::sign_master(
-        &master_sk,
-        master_bundle,
-        device_id,
-        device_bundle,
-        1_700_000_000,
-        None,
-    )
-    .expect("sign_master");
-    cert.verify(0).expect("self-minted cert verifies");
-    TestOwner {
-        owner: OwnerAddr(owner_id),
-        device_key: device_sk,
-        cert,
-    }
-}
+pub use crate::enrollment_verify::quorum_fixtures::{mint_test_owner, TestOwner};
 
 /// ZEB-339 test helper: the singleton set of `owner`'s enrolled device key,
 /// for seeding a hand-built `MemberState.enrolled_device_keys`.

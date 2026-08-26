@@ -32,5 +32,7 @@ mod dm_send_integration;
 mod dm_thread_integration;
 #[path = "dm/friend_token_roundtrip_integration.rs"]
 mod friend_token_roundtrip_integration;
+#[path = "dm/grant_ingest_seam_integration.rs"]
+mod grant_ingest_seam_integration;
 #[path = "dm/mail_sync_integration.rs"]
 mod mail_sync_integration;
