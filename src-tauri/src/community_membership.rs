@@ -514,6 +514,10 @@ impl CanonicalPayload for MembershipEventKind {}
 
 use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr};
 use crate::owner_state_types::{Hlc, SpaceId};
+// ZEB-548 Stage 2: the reachability skew bound now lives in `reachability_record`
+// (its true home); imported here so the membership-reachability check keeps using
+// it by the same bare name without the spine reaching up for it.
+use crate::reachability_record::REACHABILITY_TIMESTAMP_SKEW_MAX_MS;
 
 /// 16-byte ULID identifying a single signed membership event within
 /// a community's CRDT log. Generated client-side at event creation.
@@ -5783,12 +5787,9 @@ pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// is now 5 min, not 30. Delete once no external reference remains.
 pub const ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS: u64 = crate::clock_trust::MAX_FORWARD_SKEW_MS;
 
-/// ZEB-321 RCH4: maximum allowed skew (ms) between a
-/// ReachabilityAnnounce payload's `announced_at_ms` and the event's
-/// HLC `wall_ms`. ±30 minutes — generous enough to tolerate normal
-/// device clock drift; tight enough to reject obviously-tampered
-/// records (spec §5.5 silent-drop semantics).
-pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: u64 = 30 * 60 * 1000;
+// ZEB-548 Stage 2: REACHABILITY_TIMESTAMP_SKEW_MAX_MS moved to
+// `reachability_record` (the reachability payload module); imported at the top
+// of this module and still used by the same bare name below.
 
 /// ZEB-713 RD4: floor on `SetRecoveryDesignates.veto_window_ms`.
 /// 7 days — enforced at verify time on every replica, so a malicious

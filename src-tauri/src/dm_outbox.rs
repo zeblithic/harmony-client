@@ -758,7 +758,7 @@ pub struct DmOutbox {
     /// client via `set_community_relay_deposit_client` at start_node; tests
     /// inject a mock.
     community_relay_deposit_client:
-        Option<Arc<dyn crate::community_relay::CommunityRelayDepositClient>>,
+        Option<Arc<dyn crate::butler_deposit::CommunityRelayDepositClient>>,
     /// ZEB-418 SP2 P2 Task 3: outbound-hold side-table. `None` (default)
     /// disables the hold write entirely — send_dm behaves exactly as before.
     /// Production installs both via `set_outhold` at start_node alongside the
@@ -929,7 +929,7 @@ impl DmOutbox {
     /// butler or direct paths.
     pub fn set_community_relay_deposit_client(
         &mut self,
-        client: Arc<dyn crate::community_relay::CommunityRelayDepositClient>,
+        client: Arc<dyn crate::butler_deposit::CommunityRelayDepositClient>,
     ) {
         self.community_relay_deposit_client = Some(client);
     }
@@ -9055,7 +9055,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::community_relay::CommunityRelayDepositClient for MockRelay {
+    impl crate::butler_deposit::CommunityRelayDepositClient for MockRelay {
         async fn deposit(&self, req: &ButlerDepositRequest) -> bool {
             self.calls
                 .lock()
