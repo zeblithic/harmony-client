@@ -102,8 +102,9 @@ pub const DM_INBOX_FIRST_OBSERVED_FILENAME: &str = "dm_inbox_first_observed.cbor
 const DM_INBOX_FIRST_OBSERVED_SCHEMA_V1: u8 = 1;
 
 /// Load the LOCAL first-observation clock from `path` (strict). Returns
-/// `Ok(BTreeMap::new())` if the file does not exist yet (→ today's re-stamp
-/// behavior; no doc-file migration needed).
+/// `Ok(BTreeMap::new())` if the file does not exist yet (→ entries then
+/// inherit their own deposit stamp as the observation floor at restore,
+/// ZEB-998 Q-3; no doc-file migration needed).
 pub fn load_first_observed(
     cipher: &DatasetCipher,
     path: &Path,
@@ -117,8 +118,9 @@ pub fn load_first_observed(
 }
 
 /// Same recovery contract as [`load_doc_or_recover`]. A missing/empty clock is
-/// safe — the next sweep re-stamps `now`, exactly today's behavior — so
-/// quarantine-to-empty never loses correctness, only punctuality.
+/// safe — restore then seeds each entry's stamp from its own deposit floor
+/// (ZEB-998 Q-3), which can only shorten retention relative to the lost local
+/// stamps, never extend it — so quarantine-to-empty never loses correctness.
 pub fn load_first_observed_or_recover(
     cipher: &DatasetCipher,
     path: &Path,
@@ -231,6 +233,11 @@ impl crate::fleet_sync::FleetPersist<DmInboxDoc> for DmInboxPersist {
         // tombstone-present + stale-doc — healed by restore_expired at boot —
         // instead of fresh-doc + missing-tombstone, which resurrects the
         // expired entry with a fresh TTL window (un-healable).
+        //
+        // ZEB-998: the remaining torn window (doc landed, first_observed did
+        // not) is healed at boot by restore_first_observed's Q-3 rule — a
+        // stampless entry inherits its own deposit floor, so the tear cannot
+        // extend its TTL. The four renames therefore need no commit marker.
         save_expired(&self.cipher, &self.expired_path, state.expired_at_ms())?;
         save(&self.cipher, &self.doc_path, state)?;
         save_replay(&self.cipher, &self.replay_path, tracker)?;
@@ -604,6 +611,67 @@ mod tests {
         doc.restore_expired(m.clone(), 7);
         p.persist(&doc, &std::collections::BTreeMap::new()).unwrap();
         assert_eq!(load_expired(&p.cipher, &p.expired_path).unwrap(), m);
+    }
+
+    #[test]
+    fn crash_between_doc_and_first_observed_writes_cannot_extend_ttl() {
+        // ZEB-998 regression: simulate the torn multi-file write. Generation 1
+        // persists one stamped entry; generation 2 adds a second entry and
+        // persists — but the crash "lands" the doc rename and not the
+        // first-observed rename, which we simulate by putting generation 1's
+        // sidecar bytes back. The boot shape must give the orphaned entry its
+        // deposit floor, not the boot `now` (which would restart its TTL).
+        let dir = tempfile::tempdir().unwrap();
+        let p = DmInboxPersist {
+            doc_path: dir.path().join("dm_inbox.cbor"),
+            replay_path: dir.path().join("dm_inbox_replay.cbor"),
+            first_observed_path: dir.path().join("dm_inbox_first_observed.cbor"),
+            expired_path: dir.path().join("dm_inbox_expired.cbor"),
+            cipher: test_cipher(),
+        };
+        use crate::fleet_sync::FleetPersist;
+        let k1 = DmInboxDoc::key(&[1u8; 16], &[2u8; 32]);
+        let k2 = DmInboxDoc::key(&[3u8; 16], &[4u8; 32]);
+
+        // Generation 1: one entry, locally observed at t=500.
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(k1.clone(), sample_entry());
+        doc.restore_first_observed([(k1.clone(), 500u64)].into_iter().collect(), 1_000);
+        p.persist(&doc, &std::collections::BTreeMap::new()).unwrap();
+        let gen1_fo = std::fs::read(&p.first_observed_path).unwrap();
+
+        // Generation 2: a second entry deposited at wall_ms=7_777 arrives and
+        // is observed; persist writes all four files...
+        let mut e2 = sample_entry();
+        e2.deposited_at.wall_ms = 7_777;
+        doc.entries.insert(k2.clone(), e2);
+        doc.gc_expired(8_000, &std::collections::BTreeSet::new());
+        p.persist(&doc, &std::collections::BTreeMap::new()).unwrap();
+        // ...but the crash tears the write: the first-observed rename never
+        // happened, so generation 1's sidecar is what boot finds.
+        std::fs::write(&p.first_observed_path, &gen1_fo).unwrap();
+
+        // Boot shape (mirrors lib.rs): doc, expired, then first-observed.
+        let boot_now = 5_000_000u64;
+        let mut booted = load_doc_or_recover(&p.cipher, &p.doc_path).unwrap();
+        booted.restore_expired(
+            load_expired_or_recover(&p.cipher, &p.expired_path).unwrap(),
+            boot_now,
+        );
+        booted.restore_first_observed(
+            load_first_observed_or_recover(&p.cipher, &p.first_observed_path).unwrap(),
+            boot_now,
+        );
+        assert_eq!(
+            booted.first_observed_ms()[&k1],
+            500,
+            "covered entry keeps its persisted stamp"
+        );
+        assert_eq!(
+            booted.first_observed_ms()[&k2],
+            7_777,
+            "torn-write entry inherits its deposit floor, not boot now"
+        );
     }
 
     #[test]
