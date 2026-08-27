@@ -19786,11 +19786,12 @@ pub(crate) async fn publish_vine_impl(
     // Capture publish availability up front so we don't ingest (mint a CID +
     // write content) only to fail the publish afterward, leaving orphaned bytes
     // that no published descriptor references. (Qodo)
-    let (node_addr, ingest_tx, has_publish_tx) = {
+    let (node_addr, ingest_tx, content_verb_tx, has_publish_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
             guard.node_addr.clone(),
             guard.ingest_tx.clone(),
+            guard.content_verb_tx.clone(),
             guard.publish_tx.is_some(),
         )
     };
@@ -19800,6 +19801,12 @@ pub(crate) async fn publish_vine_impl(
 
     // Resolve the video CID: use the caller's if non-empty, else ingest a small
     // synthetic payload so the descriptor references real, fetchable content.
+    // ZEB-1014: `minted` records the synthetic ingest's acknowledged
+    // admissions — empty when the caller supplied their own CID — so both
+    // the ingest failure arm and a downstream publish failure can evict a
+    // mint no descriptor will ever reference (the up-front publish_tx check
+    // above only covers the channel being ABSENT, not the publish failing).
+    let mut minted = Vec::new();
     let video_cid = match args.video_cid {
         Some(cid) if !cid.trim().is_empty() => cid,
         _ => {
@@ -19810,14 +19817,27 @@ pub(crate) async fn publish_vine_impl(
             )
             .into_bytes();
             let reader = tokio::io::BufReader::new(std::io::Cursor::new(synthetic));
-            let (root, _size) = streaming_ingest(
+            let root = match streaming_ingest_collecting(
                 reader,
                 &ingest_tx,
                 harmony_content::chunker::ChunkerConfig::DEFAULT,
                 None,
+                IngestOptions::default(),
+                &mut minted,
             )
             .await
-            .map_err(|e| format!("synthetic ingest: {e}"))?;
+            {
+                Ok((root, _size)) => root,
+                Err(e) => {
+                    rollback_ingested_cids(
+                        content_verb_tx.as_ref(),
+                        &minted,
+                        "publish_vine synthetic",
+                    )
+                    .await;
+                    return Err(format!("synthetic ingest: {e}"));
+                }
+            };
             hex::encode(root.to_bytes())
         }
     };
@@ -19847,7 +19867,12 @@ pub(crate) async fn publish_vine_impl(
         device_sig: None,
     };
 
-    publish_vine_descriptor(state, descriptor).await?;
+    if let Err(e) = publish_vine_descriptor(state, descriptor).await {
+        // The synthetic mint (if any) is referenced by nothing once the
+        // publish fails — a headless retry mints a fresh random payload.
+        rollback_ingested_cids(content_verb_tx.as_ref(), &minted, "publish_vine publish").await;
+        return Err(e);
+    }
     Ok(PublishVineResult {
         vine_id: id,
         video_cid,
@@ -25853,6 +25878,7 @@ pub(crate) const AVATAR_MAX_BYTES: usize = 512 * 1024;
 
 pub(crate) async fn ingest_avatar_bytes_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_verb_tx: Option<&tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
     use harmony_content::chunker::ChunkerConfig;
@@ -25866,10 +25892,25 @@ pub(crate) async fn ingest_avatar_bytes_inner(
         ));
     }
     let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
-    let (root, _size) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(hex::encode(root.to_bytes()))
+    // ZEB-1014: collect acknowledged admissions so a mid-stream failure can
+    // evict its partial set instead of leaving unpinned cache orphans.
+    let mut sent = Vec::new();
+    match streaming_ingest_collecting(
+        reader,
+        ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        IngestOptions::default(),
+        &mut sent,
+    )
+    .await
+    {
+        Ok((root, _size)) => Ok(hex::encode(root.to_bytes())),
+        Err(e) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_avatar_bytes").await;
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -25877,14 +25918,17 @@ async fn ingest_avatar_bytes(
     bytes: Vec<u8>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<String, String> {
-    let ingest_tx = {
+    let (ingest_tx, content_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .ingest_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_verb_tx.clone(),
+        )
     };
-    ingest_avatar_bytes_inner(&ingest_tx, bytes).await
+    ingest_avatar_bytes_inner(&ingest_tx, content_verb_tx.as_ref(), bytes).await
 }
 
 /// ZEB-559: maximum vine video size accepted by the GUI uploader. Vines are
@@ -25914,6 +25958,7 @@ pub(crate) const VINE_VIDEO_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// cap.
 pub(crate) async fn ingest_vine_video_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_verb_tx: Option<&tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
     path: &std::path::Path,
 ) -> Result<String, String> {
     use harmony_content::chunker::ChunkerConfig;
@@ -25945,10 +25990,30 @@ pub(crate) async fn ingest_vine_video_inner(
     // Bound the reader so a file that grows after the fstat still cannot exceed
     // the cap, and treat the streamed byte count as authoritative.
     let reader = tokio::io::BufReader::new(file).take(VINE_VIDEO_MAX_BYTES.saturating_add(1));
-    let (root, streamed) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    // ZEB-1014: collect acknowledged admissions — this path can admit up to
+    // 100 MiB + 1 before its post-stream cap check errors, the largest
+    // single-arm orphan among the streaming callers.
+    let mut sent = Vec::new();
+    let (root, streamed) = match streaming_ingest_collecting(
+        reader,
+        ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        IngestOptions::default(),
+        &mut sent,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(e) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_vine_video stream").await;
+            return Err(e.to_string());
+        }
+    };
     if streamed > VINE_VIDEO_MAX_BYTES {
+        // The whole tree (root included) was admitted before this check —
+        // `sent` covers it on the Ok return, so evict it all.
+        rollback_ingested_cids(content_verb_tx, &sent, "ingest_vine_video size cap").await;
         return Err(format!(
             "video too large: streamed {streamed} bytes exceeds the 100 MB limit"
         ));
@@ -26002,14 +26067,17 @@ async fn ingest_vine_video(
         .unwrap_or("video")
         .to_string();
 
-    let ingest_tx = {
+    let (ingest_tx, content_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .ingest_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_verb_tx.clone(),
+        )
     };
-    let video_cid = ingest_vine_video_inner(&ingest_tx, path).await?;
+    let video_cid = ingest_vine_video_inner(&ingest_tx, content_verb_tx.as_ref(), path).await?;
     Ok(Some(VineVideoIngest {
         video_cid,
         file_name,
@@ -26044,6 +26112,7 @@ pub(crate) async fn ingest_profile_doc_inner(
     links: Vec<ProfileLinkInput>,
     fields: Vec<ProfileFieldInput>,
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_verb_tx: Option<&tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
 ) -> Result<String, String> {
     use crate::profile_page_doc::{
         encode_profile_doc, ProfileField, ProfileLink, ProfilePageDoc, PROFILE_DOC_VERSION,
@@ -26073,10 +26142,25 @@ pub(crate) async fn ingest_profile_doc_inner(
     // surfaced to the IPC caller.
     let bytes = encode_profile_doc(&doc).map_err(|e| e.to_string())?;
     let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
-    let (root, _size) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(hex::encode(root.to_bytes()))
+    // ZEB-1014: collect acknowledged admissions so a mid-stream failure can
+    // evict its partial set instead of leaving unpinned cache orphans.
+    let mut sent = Vec::new();
+    match streaming_ingest_collecting(
+        reader,
+        ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        IngestOptions::default(),
+        &mut sent,
+    )
+    .await
+    {
+        Ok((root, _size)) => Ok(hex::encode(root.to_bytes())),
+        Err(e) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_profile_doc").await;
+            Err(e.to_string())
+        }
+    }
 }
 
 /// ZEB-345 IPC: ingest a long-form profile document (bio + links + fields)
@@ -26088,14 +26172,17 @@ async fn ingest_profile_doc(
     fields: Vec<ProfileFieldInput>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<String, String> {
-    let ingest_tx = {
+    let (ingest_tx, content_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .ingest_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_verb_tx.clone(),
+        )
     };
-    ingest_profile_doc_inner(bio, links, fields, &ingest_tx).await
+    ingest_profile_doc_inner(bio, links, fields, &ingest_tx, content_verb_tx.as_ref()).await
 }
 
 /// Ingest a leaf file already present on disk through the same pipeline as
@@ -26117,6 +26204,7 @@ async fn ingest_profile_doc(
 #[allow(dead_code)] // Tests cover it; production callers land with the share-sheet IPC.
 pub(crate) async fn ingest_file_at_path(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_verb_tx: Option<&tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
     content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
     path: &std::path::Path,
     _parent_sidecar_id: Option<content_index::SidecarId>,
@@ -26131,14 +26219,32 @@ pub(crate) async fn ingest_file_at_path(
     // Stream the file through the chunker — bounded memory regardless of
     // size (ZEB-161). Replaces the pre-ZEB-161 `tokio::fs::read` that
     // allocated the entire file into a Vec before chunking. `size_bytes` is
-    // the actual streamed total (returned by `streaming_ingest`), not the
+    // the actual streamed total (returned by the collecting ingest), not the
     // pre-stream `meta.len()` — closes a TOCTOU window where the file could
     // mutate between stat and stream.
     let file = tokio::fs::File::open(path).await?;
     let reader = tokio::io::BufReader::new(file);
-    let (root, size_bytes) =
-        streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None).await?;
-    send_ingest_with_name(
+    // ZEB-1014: mirrors `ingest_content` — evict the admitted set on both
+    // the mid-stream failure (partial set) and the post-ingest sidecar
+    // failure (whole tree, which nothing would ever reference).
+    let mut sent = Vec::new();
+    let (root, size_bytes) = match streaming_ingest_collecting(
+        reader,
+        ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        IngestOptions::default(),
+        &mut sent,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(e) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_file_at_path stream").await;
+            return Err(e);
+        }
+    };
+    match send_ingest_with_name(
         content_index,
         root.to_bytes(),
         file_name,
@@ -26146,6 +26252,13 @@ pub(crate) async fn ingest_file_at_path(
         _parent_sidecar_id,
     )
     .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_file_at_path sidecar").await;
+            Err(e)
+        }
+    }
 }
 
 /// Insert a sidecar row for an already-ingested root CID.
@@ -26274,7 +26387,7 @@ mod path_ingest_tests {
             .await
             .expect("write");
 
-        let result = ingest_file_at_path(&tx, &index, &file_path, None, "hello.txt".into())
+        let result = ingest_file_at_path(&tx, None, &index, &file_path, None, "hello.txt".into())
             .await
             .expect("ingest");
 
@@ -26332,7 +26445,7 @@ mod path_ingest_tests {
         let index = fresh_content_index();
         let missing = std::path::Path::new("definitely-not-a-real-path-zeb163");
 
-        let err = ingest_file_at_path(&tx, &index, missing, None, "x".into())
+        let err = ingest_file_at_path(&tx, None, &index, missing, None, "x".into())
             .await
             .expect_err("must error on missing file");
         assert!(matches!(err, IngestError::Io(_)), "got: {err:?}");
@@ -26353,7 +26466,7 @@ mod path_ingest_tests {
         tokio::fs::write(&target, b"payload").await.expect("write");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
-        let err = ingest_file_at_path(&tx, &index, &link, None, "link.txt".into())
+        let err = ingest_file_at_path(&tx, None, &index, &link, None, "link.txt".into())
             .await
             .expect_err("symlink must error");
         assert!(matches!(err, IngestError::Symlink), "got: {err:?}");
@@ -26374,7 +26487,7 @@ mod path_ingest_tests {
             }
         });
         let bytes = vec![0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4]; // PNG-magic-ish payload
-        let cid_hex = ingest_avatar_bytes_inner(&ingest_tx, bytes.clone())
+        let cid_hex = ingest_avatar_bytes_inner(&ingest_tx, None, bytes.clone())
             .await
             .expect("ingest");
         let raw = hex::decode(&cid_hex).unwrap();
@@ -26406,7 +26519,7 @@ mod path_ingest_tests {
             .await
             .expect("write temp video");
 
-        let cid_hex = ingest_vine_video_inner(&ingest_tx, &path)
+        let cid_hex = ingest_vine_video_inner(&ingest_tx, None, &path)
             .await
             .expect("ingest");
         let raw = hex::decode(&cid_hex).unwrap();
@@ -26441,7 +26554,7 @@ mod path_ingest_tests {
         f.set_len(VINE_VIDEO_MAX_BYTES + 1).expect("set_len");
         drop(f);
 
-        let err = ingest_vine_video_inner(&ingest_tx, &path)
+        let err = ingest_vine_video_inner(&ingest_tx, None, &path)
             .await
             .expect_err("oversize must error");
         assert!(err.contains("too large"), "got: {err}");
@@ -26479,6 +26592,7 @@ mod path_ingest_tests {
             links.clone(),
             fields.clone(),
             &ingest_tx,
+            None,
         )
         .await
         .expect("ingest profile doc");
@@ -26531,13 +26645,155 @@ mod path_ingest_tests {
         // A bio one byte over the cap must fail at validation, before any
         // bytes are streamed into CAS.
         let oversize_bio = "x".repeat(MAX_BIO_BYTES + 1);
-        let err = ingest_profile_doc_inner(oversize_bio, Vec::new(), Vec::new(), &ingest_tx)
+        let err = ingest_profile_doc_inner(oversize_bio, Vec::new(), Vec::new(), &ingest_tx, None)
             .await
             .expect_err("oversize bio must be rejected");
         assert!(err.contains("bio"), "expected bio-cap error, got: {err}");
 
         drop(ingest_tx);
         let _ = drainer.await;
+    }
+
+    // ── ZEB-1014: rollback on mid-stream ingest failure ──────────────────
+
+    type VerbSender = tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>;
+    type RollbackLog = Arc<std::sync::Mutex<Vec<Vec<[u8; 32]>>>>;
+    type AckedCids = Arc<std::sync::Mutex<Vec<[u8; 32]>>>;
+
+    /// Verb handler capturing every `RollbackIngest` request's cid list and
+    /// ACKing it with the eviction count, mirroring the event loop's reply
+    /// contract.
+    fn spawn_recording_verb_handler() -> (VerbSender, RollbackLog) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<event_loop::ContentVerbRequest>(8);
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_clone = log.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                if let event_loop::ContentVerbRequest::RollbackIngest { cids, reply } = req {
+                    let n = cids.len();
+                    log_clone.lock().unwrap().push(cids);
+                    let _ = reply.send(Ok(n));
+                }
+            }
+        });
+        (tx, log)
+    }
+
+    /// Ingest handler that ACKs the first admission (recording its cid) and
+    /// NACKs every subsequent one — deterministically failing a multi-chunk
+    /// stream with a non-empty acknowledged partial set.
+    fn spawn_fail_after_first_ingest_handler() -> (IngestSender, AckedCids) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<event_loop::IngestRequest>(8);
+        let acked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let acked_clone = acked.clone();
+        tokio::spawn(async move {
+            let mut seen = 0u32;
+            while let Some(req) = rx.recv().await {
+                seen += 1;
+                if seen > 1 {
+                    let _ = req.reply.send(Err("chunk rejected".to_string()));
+                    continue;
+                }
+                let cid: [u8; 32] = hex::decode(&req.cid_hex)
+                    .expect("cid hex")
+                    .try_into()
+                    .expect("32 bytes");
+                acked_clone.lock().unwrap().push(cid);
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        (tx, acked)
+    }
+
+    /// 2.5 MiB of patterned bytes — larger than two max-size chunks
+    /// (`MAX_PAYLOAD_SIZE` = 1,048,575), so the chunker MUST emit at least
+    /// three admissions and the fail-after-first handler leaves exactly one
+    /// acknowledged cid behind.
+    fn multi_chunk_bytes() -> Vec<u8> {
+        (0..(5 * 1024 * 1024 / 2))
+            .map(|i| (i % 251) as u8)
+            .collect()
+    }
+
+    /// ZEB-1014: a vine-video ingest that fails mid-stream must evict the
+    /// exact acknowledged partial set via `RollbackIngest`.
+    #[tokio::test]
+    async fn ingest_vine_video_partial_stream_failure_rolls_back_admitted_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, multi_chunk_bytes()).expect("write video fixture");
+
+        let (ingest_tx, acked) = spawn_fail_after_first_ingest_handler();
+        let (verb_tx, rollbacks) = spawn_recording_verb_handler();
+
+        let err = ingest_vine_video_inner(&ingest_tx, Some(&verb_tx), &path)
+            .await
+            .expect_err("second admission NACKs, so the stream must fail");
+        assert!(
+            err.contains("chunk rejected"),
+            "error must surface the ingest NACK; got: {err}"
+        );
+
+        let acked = acked.lock().unwrap().clone();
+        assert_eq!(acked.len(), 1, "exactly the first admission was ACKed");
+        let rollbacks = rollbacks.lock().unwrap().clone();
+        assert_eq!(
+            rollbacks.len(),
+            1,
+            "one failed stream => one RollbackIngest; got {}",
+            rollbacks.len()
+        );
+        assert_eq!(
+            rollbacks[0], acked,
+            "rollback must name exactly the acknowledged partial set"
+        );
+    }
+
+    /// ZEB-1014: same contract for the share-sheet seam — and the sidecar
+    /// index must stay empty (the row is only inserted post-ingest).
+    #[tokio::test]
+    async fn ingest_file_at_path_stream_failure_rolls_back_and_leaves_no_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("doc.bin");
+        std::fs::write(&path, multi_chunk_bytes()).expect("write fixture");
+        let index = fresh_content_index();
+
+        let (ingest_tx, acked) = spawn_fail_after_first_ingest_handler();
+        let (verb_tx, rollbacks) = spawn_recording_verb_handler();
+
+        let err = ingest_file_at_path(
+            &ingest_tx,
+            Some(&verb_tx),
+            &index,
+            &path,
+            None,
+            "doc.bin".into(),
+        )
+        .await
+        .expect_err("second admission NACKs, so the stream must fail");
+        assert!(
+            format!("{err:?}").contains("chunk rejected"),
+            "error must surface the ingest NACK; got: {err:?}"
+        );
+
+        let acked = acked.lock().unwrap().clone();
+        assert_eq!(acked.len(), 1, "exactly the first admission was ACKed");
+        let rollbacks = rollbacks.lock().unwrap().clone();
+        assert_eq!(
+            rollbacks.len(),
+            1,
+            "one failed stream => one RollbackIngest; got {}",
+            rollbacks.len()
+        );
+        assert_eq!(
+            rollbacks[0], acked,
+            "rollback must name exactly the acknowledged partial set"
+        );
+        assert_eq!(
+            index.lock().unwrap().entries().count(),
+            0,
+            "no sidecar row lands for a failed ingest"
+        );
     }
 }
 
@@ -27195,9 +27451,10 @@ pub(crate) async fn create_folder_nested_with_children(
     // the original root_old (intact). Bytes ingested before the
     // failure become orphans, but W-TinyLFU evicts them under cache
     // pressure since nothing pins them — recoverable, vs. data-loss
-    // for the user. ZEB-167 still tracks the rekey-rollback path for
-    // the residual rekey-OldMissing case (would leave orphans without
-    // user-visible damage).
+    // for the user. ZEB-1015 tracks adopting the ZEB-1012
+    // RollbackIngest machinery for this drain's orphans (KB-scale
+    // folder metadata; its predecessor ZEB-167 was canceled when this
+    // reorder removed the sidecar-corruption hazard it targeted).
     let new_bundle_size = last_bundle_size;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

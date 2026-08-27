@@ -17,8 +17,11 @@
 //!   failure, and pre-walk failure on a missing root.
 //!
 //! The walker is driven with `parent_path = []` (root drops) throughout,
-//! so the `content_verb_tx` channel is never exercised — the test handler
-//! drops the rx and only holds a live sender.
+//! so the nested-parent rekey path never exercises `content_verb_tx`.
+//! Since ZEB-1014 the walker DOES use the verb channel on failure/cancel
+//! paths (`ContentVerbRequest::RollbackIngest` for orphaned admissions),
+//! so the harness spawns a recording verb handler that captures rollback
+//! requests and ACKs them.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,6 +84,31 @@ fn walk_root_tempdir() -> tempfile::TempDir {
         .expect("tempdir")
 }
 
+/// Recorded `RollbackIngest` requests: one inner Vec per request, holding
+/// that request's cid list. Tests assert on both the request count and
+/// the exact cid sets.
+type RollbackLog = Arc<Mutex<Vec<Vec<[u8; 32]>>>>;
+
+/// In-test content-verb handler: captures `RollbackIngest` requests into
+/// the returned log and ACKs each with its cid count (mirrors the event
+/// loop's reply contract). Root drops never exercise any other verb, so
+/// other variants are dropped un-replied.
+fn spawn_recording_verb_handler() -> (tokio::sync::mpsc::Sender<ContentVerbRequest>, RollbackLog) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ContentVerbRequest>(8);
+    let log: RollbackLog = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = log.clone();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            if let ContentVerbRequest::RollbackIngest { cids, reply } = req {
+                let n = cids.len();
+                log_clone.lock().unwrap().push(cids);
+                let _ = reply.send(Ok(n));
+            }
+        }
+    });
+    (tx, log)
+}
+
 /// Bag of channels + state every test needs. Held by name so individual
 /// scenarios can reach in for the recorded ingest log or the index.
 struct WalkerHarness {
@@ -90,16 +118,14 @@ struct WalkerHarness {
     index: Arc<Mutex<ContentIndex>>,
     registry: CancelRegistry,
     log: IngestLog,
+    rollbacks: RollbackLog,
 }
 
 fn fresh_harness() -> WalkerHarness {
     let app = tauri::test::mock_app();
     let app_handle = app.handle().clone();
     let (ingest_tx, log) = spawn_recording_ingest_handler();
-    // Verb-rx is dropped; root drops never route through it. Keeping the
-    // sender live is the only requirement for the walker entry to clone
-    // it through the call chain.
-    let (verb_tx, _verb_rx) = tokio::sync::mpsc::channel::<ContentVerbRequest>(8);
+    let (verb_tx, rollbacks) = spawn_recording_verb_handler();
     WalkerHarness {
         app: app_handle,
         ingest_tx,
@@ -107,6 +133,7 @@ fn fresh_harness() -> WalkerHarness {
         index: fresh_content_index(),
         registry: Arc::new(Mutex::new(Default::default())),
         log,
+        rollbacks,
     }
 }
 
@@ -608,6 +635,28 @@ async fn cancel_mid_walk_settles_with_cancelled_true_and_no_root_sidecar() {
         h.registry.lock().unwrap().is_empty(),
         "registry entry must be stripped after settle (even on cancel)"
     );
+
+    // ZEB-1014: the cancel unwind must roll back everything admitted before
+    // the flag fired. Exactly one leaf (file_00) settled before the cancel
+    // was observed, and all five fixtures share the same bytes, so the
+    // rolled-back set is exactly the one shared leaf cid.
+    let data_cid: [u8; 32] = hex::decode(leaf_cid_hex(b"data"))
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let rollbacks = h.rollbacks.lock().unwrap().clone();
+    assert_eq!(
+        rollbacks.len(),
+        1,
+        "cancel unwind sends one RollbackIngest for the level holding the \
+         admitted children; got {}",
+        rollbacks.len()
+    );
+    assert_eq!(
+        rollbacks[0],
+        vec![data_cid],
+        "rollback must name exactly the admitted-before-cancel leaf set"
+    );
 }
 
 // ── Test 8: per-leaf I/O error via chmod 000 (unix-only) ───────────────────
@@ -675,6 +724,215 @@ async fn per_leaf_io_error_is_recorded_and_walk_continues() {
         names,
         vec!["survivor.txt"],
         "manifest must include surviving children and exclude the failed one; got {names:?}"
+    );
+}
+
+// ── ZEB-1014: rollback of orphaned admissions ──────────────────────────────
+
+/// Poison-marker predicate shared by the ZEB-1014 failure-injection
+/// handlers: leaf chunks cut from a file filled by `poison_bytes` are the
+/// only admissions whose payload is entirely inside 0x70..=0x77. Sibling
+/// fixtures use ASCII text outside that range, bundle/manifest bytes carry
+/// binary headers, and the empty-file admission has no bytes at all.
+fn is_poison_payload(data: &[u8]) -> bool {
+    !data.is_empty() && data.iter().all(|b| (0x70..=0x77).contains(b))
+}
+
+/// 2.5 MiB of period-7 patterned bytes in 0x70..=0x77. Larger than two
+/// max-size chunks (`MAX_PAYLOAD_SIZE` = 1,048,575), so the chunker MUST
+/// emit at least three leaf admissions regardless of where FastCDC cuts —
+/// guaranteeing the failure injection below fires on a NON-first admission
+/// and the walker is left holding a non-empty partial `sent` set.
+fn poison_bytes() -> Vec<u8> {
+    (0..(5 * 1024 * 1024 / 2))
+        .map(|i| (i % 7 + 0x70) as u8)
+        .collect()
+}
+
+/// ZEB-1014 pinned invariant: a leaf whose ingest fails MID-STREAM gets its
+/// already-admitted partial chunk set rolled back, and the rollback names
+/// ONLY that leaf's admissions — sibling files' trees are untouched and the
+/// walk still completes with the survivors in the root manifest.
+#[tokio::test]
+async fn failed_leaf_partial_admissions_roll_back_without_disturbing_siblings() {
+    let dir = walk_root_tempdir();
+    std::fs::write(dir.path().join("alpha.txt"), b"a-data").expect("write alpha");
+    std::fs::write(dir.path().join("poison.bin"), poison_bytes()).expect("write poison");
+    std::fs::write(dir.path().join("zulu.txt"), b"z-data").expect("write zulu");
+
+    // Failure-injection ingest handler: ACK everything, except poison-file
+    // chunks after the first — the first poison admission ACKs (so the
+    // walker's collecting ingest records it as admitted), every subsequent
+    // one NACKs, failing the stream with a non-empty partial set.
+    let acked_poison: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
+    let acked_poison_clone = acked_poison.clone();
+    let acked_log: IngestLog = Arc::new(Mutex::new(Vec::new()));
+    let acked_log_clone = acked_log.clone();
+    let (ingest_tx, mut ingest_rx) = tokio::sync::mpsc::channel::<IngestRequest>(128);
+    tokio::spawn(async move {
+        let mut poison_seen = 0u32;
+        while let Some(req) = ingest_rx.recv().await {
+            if is_poison_payload(&req.data) {
+                poison_seen += 1;
+                if poison_seen > 1 {
+                    let _ = req.reply.send(Err("poison chunk rejected".to_string()));
+                    continue;
+                }
+                let cid: [u8; 32] = hex::decode(&req.cid_hex)
+                    .expect("cid hex")
+                    .try_into()
+                    .expect("32 bytes");
+                acked_poison_clone.lock().unwrap().push(cid);
+            }
+            acked_log_clone
+                .lock()
+                .unwrap()
+                .push((req.cid_hex, req.data));
+            let _ = req.reply.send(Ok(()));
+        }
+    });
+
+    let mut h = fresh_harness();
+    h.ingest_tx = ingest_tx;
+    h.log = acked_log;
+
+    let result = run_walker(&h, dir.path().to_path_buf())
+        .await
+        .expect("ingest_folder_tree completes despite the poisoned leaf");
+
+    assert_eq!(result.succeeded, 2, "alpha + zulu must settle");
+    assert_eq!(
+        result.failed.len(),
+        1,
+        "exactly the poisoned leaf fails; got {:?}",
+        result.failed
+    );
+    assert!(
+        result.failed[0].path.contains("poison.bin"),
+        "failed entry must point at poison.bin; got {}",
+        result.failed[0].path
+    );
+    assert!(!result.cancelled, "no cancellation in this scenario");
+    let root_cid = result.root_cid.as_ref().expect("root settles");
+    let names: Vec<String> = parse_root_manifest(&h.log, root_cid)
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha.txt", "zulu.txt"],
+        "manifest holds exactly the survivors"
+    );
+
+    // THE ZEB-1014 assertion: exactly one rollback, naming exactly the
+    // poison file's ACKED partial set — nothing of the siblings' trees.
+    let rollbacks = h.rollbacks.lock().unwrap().clone();
+    assert_eq!(
+        rollbacks.len(),
+        1,
+        "one failed leaf => one RollbackIngest; got {}",
+        rollbacks.len()
+    );
+    let acked = acked_poison.lock().unwrap().clone();
+    assert!(
+        !acked.is_empty(),
+        "injection must have ACKed at least one poison chunk before failing"
+    );
+    let rolled: std::collections::HashSet<[u8; 32]> = rollbacks[0].iter().copied().collect();
+    let expected: std::collections::HashSet<[u8; 32]> = acked.into_iter().collect();
+    assert_eq!(
+        rolled, expected,
+        "rollback must name exactly the poison leaf's admitted chunk set"
+    );
+}
+
+/// ZEB-1014: a nested directory whose manifest build fails orphans its
+/// entire already-ingested subtree — the walker must roll back the
+/// accumulated children (the RollbackIngest handler walks descendants), and
+/// sibling entries outside the failed dir survive into the root manifest.
+#[tokio::test]
+async fn failed_dir_manifest_rolls_back_subtree_and_spares_siblings() {
+    let dir = walk_root_tempdir();
+    std::fs::write(dir.path().join("keeper.txt"), b"keeper-data").expect("write keeper");
+    std::fs::create_dir(dir.path().join("sub")).expect("mkdir sub");
+    std::fs::write(dir.path().join("sub").join("inner1.bin"), b"inner-data").expect("write inner");
+
+    // Failure injection: NACK the manifest book for `sub` (recognized as
+    // the only admission that parses as a folder manifest listing
+    // "inner1.bin"). Its leaf children ingest fine first, so the dir's
+    // failure arm is reached with a non-empty accumulated children list.
+    let acked_log: IngestLog = Arc::new(Mutex::new(Vec::new()));
+    let acked_log_clone = acked_log.clone();
+    let (ingest_tx, mut ingest_rx) = tokio::sync::mpsc::channel::<IngestRequest>(128);
+    tokio::spawn(async move {
+        while let Some(req) = ingest_rx.recv().await {
+            let is_sub_manifest = folders::parse_manifest(&req.data)
+                .map(|m| {
+                    m.folder_manifest
+                        .entries
+                        .iter()
+                        .any(|e| e.name == "inner1.bin")
+                })
+                .unwrap_or(false);
+            if is_sub_manifest {
+                let _ = req.reply.send(Err("sub manifest rejected".to_string()));
+            } else {
+                acked_log_clone
+                    .lock()
+                    .unwrap()
+                    .push((req.cid_hex, req.data));
+                let _ = req.reply.send(Ok(()));
+            }
+        }
+    });
+
+    let mut h = fresh_harness();
+    h.ingest_tx = ingest_tx;
+    h.log = acked_log;
+
+    let result = run_walker(&h, dir.path().to_path_buf())
+        .await
+        .expect("ingest_folder_tree completes despite the failed subdir");
+
+    assert_eq!(
+        result.failed.len(),
+        1,
+        "exactly the failed dir is recorded; got {:?}",
+        result.failed
+    );
+    assert!(
+        result.failed[0].path.ends_with("sub"),
+        "failed entry must point at the sub dir; got {}",
+        result.failed[0].path
+    );
+    let root_cid = result.root_cid.as_ref().expect("root settles");
+    let names: Vec<String> = parse_root_manifest(&h.log, root_cid)
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["keeper.txt"],
+        "root manifest must exclude the failed dir"
+    );
+
+    // The rollback names the failed dir's accumulated children — here the
+    // single-chunk inner leaf, whose manifest-entry cid IS its leaf cid.
+    let inner_cid: [u8; 32] = hex::decode(leaf_cid_hex(b"inner-data"))
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let rollbacks = h.rollbacks.lock().unwrap().clone();
+    assert_eq!(
+        rollbacks.len(),
+        1,
+        "one failed dir => one RollbackIngest; got {}",
+        rollbacks.len()
+    );
+    assert_eq!(
+        rollbacks[0],
+        vec![inner_cid],
+        "rollback must name exactly the failed dir's ingested children"
     );
 }
 

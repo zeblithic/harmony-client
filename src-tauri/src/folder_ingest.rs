@@ -17,11 +17,15 @@
 //!
 //! Cancellation is best-effort: the walker checks the shared `AtomicBool` at
 //! the top of every recursive call and the top of every per-child loop
-//! iteration. On cancel the walker returns immediately with whatever has
-//! been ingested so far — partial children remain in the chunk cache (no
-//! references hold them, so W-TinyLFU evicts on pressure), and the result's
-//! `cancelled` flag is `true`. `root_sidecar_id` is `None` whenever cancel
-//! fires before the root's manifest gets built.
+//! iteration. On cancel the walker returns immediately, and (ZEB-1014) each
+//! recursion level rolls back its accumulated children on the way out via
+//! `ContentVerbRequest::RollbackIngest` — composing to a best-effort evict
+//! of everything the cancelled walk had admitted, instead of leaving it for
+//! W-TinyLFU pressure. The result's `cancelled` flag is `true`, and
+//! `root_sidecar_id` is `None` whenever cancel fires before the root's
+//! manifest gets built. The same rollback runs for a leaf whose mid-stream
+//! ingest fails (its partial admitted chunk set) and for a directory whose
+//! manifest build fails (its whole already-ingested subtree).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -396,6 +400,29 @@ pub async fn ingest_folder_tree<R: Runtime>(
     })
 }
 
+/// ZEB-1014: best-effort rollback of a walk level's accumulated children
+/// when the level itself fails or the walk is cancelled. Without it the
+/// already-ingested subtrees are referenced by nothing (their parent
+/// manifest never builds) and sit as unpinned cache orphans until
+/// W-TinyLFU pressure or restart. `RollbackIngest`'s doom-set walks
+/// descendants, so passing just the top-level child cids covers each
+/// child's whole subtree; its keep-set spares anything a pinned root
+/// claims via content dedup.
+async fn rollback_children(
+    content_verb_tx: &tokio::sync::mpsc::Sender<crate::event_loop::ContentVerbRequest>,
+    children: &[ManifestEntry],
+    context: &'static str,
+) {
+    if children.is_empty() {
+        return;
+    }
+    let cids: Vec<harmony_content::cid::ContentId> = children
+        .iter()
+        .map(|c| harmony_content::cid::ContentId::from_bytes(c.cid))
+        .collect();
+    crate::rollback_ingested_cids(Some(content_verb_tx), &cids, context).await;
+}
+
 /// Recursive walker. Returns a `WalkOutcome` to its parent describing how
 /// to splice this node into the parent's children list.
 ///
@@ -449,6 +476,13 @@ fn walk<'a, R: Runtime>(
             let mut children: Vec<ManifestEntry> = Vec::with_capacity(entries.len());
             for (child_name, child_path) in entries {
                 if ctx.cancel.load(Ordering::Relaxed) {
+                    // ZEB-1014: this level's settled children are about to
+                    // become unreferenced (their parent manifest will never
+                    // build) — roll them back on the way out. Deeper levels
+                    // do the same as `Cancelled` unwinds, composing to a
+                    // best-effort evict of everything the cancelled walk
+                    // admitted.
+                    rollback_children(content_verb_tx, &children, "folder walk cancel").await;
                     return WalkOutcome::Cancelled;
                 }
                 match walk(
@@ -465,12 +499,19 @@ fn walk<'a, R: Runtime>(
                 {
                     WalkOutcome::Ingested(entry) => children.push(entry),
                     WalkOutcome::Skipped => {}
+                    // A failed child already rolled back its own partial
+                    // work (leaf arm / deeper dir arm); this level's other
+                    // children stay — the walk continues without it.
                     WalkOutcome::Failed(msg) => counters.record_fail(&child_path, msg),
-                    WalkOutcome::Cancelled => return WalkOutcome::Cancelled,
+                    WalkOutcome::Cancelled => {
+                        rollback_children(content_verb_tx, &children, "folder walk cancel").await;
+                        return WalkOutcome::Cancelled;
+                    }
                 }
             }
 
             if ctx.cancel.load(Ordering::Relaxed) {
+                rollback_children(content_verb_tx, &children, "folder walk cancel").await;
                 return WalkOutcome::Cancelled;
             }
 
@@ -480,9 +521,13 @@ fn walk<'a, R: Runtime>(
                 // (for non-empty parent_path) and the rollback-on-ingest-
                 // failure logic (for root-of-root drops) stays in one
                 // place.
+                // `children` is cloned into the call so the failure arm can
+                // still roll the accumulated subtrees back (ZEB-1014); the
+                // entries are 32-byte cids + names, cheap relative to the
+                // walk itself.
                 match crate::create_folder_with_children(
                     name.clone(),
-                    children,
+                    children.clone(),
                     parent_sidecar_id.map(|s| s.to_string()),
                     parent_path.to_vec(),
                     &ctx.ingest_tx,
@@ -497,6 +542,10 @@ fn walk<'a, R: Runtime>(
                         let cid_bytes = match hex_to_cid(&result.cid) {
                             Some(b) => b,
                             None => {
+                                // Deliberately NO children rollback here:
+                                // the root sidecar row landed and references
+                                // this subtree — evicting the bytes would
+                                // leave a listed-but-unfetchable folder.
                                 return WalkOutcome::Failed(format!(
                                     "create_folder_with_children returned malformed cid {}",
                                     result.cid
@@ -514,7 +563,16 @@ fn walk<'a, R: Runtime>(
                             kind: ContentKind::Folder,
                         })
                     }
-                    Err(e) => WalkOutcome::Failed(e),
+                    Err(e) => {
+                        // ZEB-1014: the root create failed (sidecar row is
+                        // rolled back or never inserted by the callee), so
+                        // every accumulated subtree is unreferenced — evict
+                        // it. The root's own manifest/bundle partial sends
+                        // stay with W-TinyLFU (KB-scale; the callee doesn't
+                        // report which of the two landed).
+                        rollback_children(content_verb_tx, &children, "folder walk root").await;
+                        WalkOutcome::Failed(e)
+                    }
                 }
             } else {
                 // Manifest-only path: nested dirs do NOT get a sidecar.
@@ -532,7 +590,14 @@ fn walk<'a, R: Runtime>(
                             kind: ContentKind::Folder,
                         })
                     }
-                    Err(e) => WalkOutcome::Failed(e.to_string()),
+                    Err(e) => {
+                        // ZEB-1014: this dir's manifest never landed, so its
+                        // whole already-ingested subtree is unreferenced —
+                        // the parent records the failure and walks on, and
+                        // nothing will ever point at these bytes. Evict them.
+                        rollback_children(content_verb_tx, &children, "folder walk dir").await;
+                        WalkOutcome::Failed(e.to_string())
+                    }
                 }
             }
         } else if metadata.is_file() {
@@ -552,11 +617,17 @@ fn walk<'a, R: Runtime>(
             // effectively non-cancellable until EOF. The walker's top-of-
             // recursion check already short-circuits between leaves; this
             // closes the long-pole gap inside a single large file.
-            match crate::streaming_ingest(
+            // ZEB-1014: the collecting variant records every ACKNOWLEDGED
+            // admission so both failure arms below can evict the exact
+            // partial set instead of leaving it for W-TinyLFU pressure.
+            let mut sent: Vec<harmony_content::cid::ContentId> = Vec::new();
+            match crate::streaming_ingest_collecting(
                 reader,
                 &ctx.ingest_tx,
                 ChunkerConfig::DEFAULT,
                 Some(&ctx.cancel),
+                crate::IngestOptions::default(),
+                &mut sent,
             )
             .await
             {
@@ -570,13 +641,27 @@ fn walk<'a, R: Runtime>(
                     })
                 }
                 // Structural match on the typed `IngestError::Cancelled`
-                // variant — `streaming_ingest` returns it when its cancel
-                // parameter fires. Route to `WalkOutcome::Cancelled` so the
-                // summary modal shows the cancelled headline (and doesn't
-                // bucket it under `Failed`). Any other error stays in the
-                // failure list.
-                Err(crate::IngestError::Cancelled) => WalkOutcome::Cancelled,
-                Err(e) => WalkOutcome::Failed(e.to_string()),
+                // variant — `streaming_ingest_collecting` returns it when
+                // its cancel parameter fires. Route to
+                // `WalkOutcome::Cancelled` so the summary modal shows the
+                // cancelled headline (and doesn't bucket it under
+                // `Failed`). Any other error stays in the failure list.
+                // Both arms roll back this file's partial admissions —
+                // the parent levels' unwind handles their settled children.
+                Err(crate::IngestError::Cancelled) => {
+                    crate::rollback_ingested_cids(
+                        Some(content_verb_tx),
+                        &sent,
+                        "folder walk leaf cancel",
+                    )
+                    .await;
+                    WalkOutcome::Cancelled
+                }
+                Err(e) => {
+                    crate::rollback_ingested_cids(Some(content_verb_tx), &sent, "folder walk leaf")
+                        .await;
+                    WalkOutcome::Failed(e.to_string())
+                }
             }
         } else {
             // FIFOs, sockets, block/char devices: not addressable in the
