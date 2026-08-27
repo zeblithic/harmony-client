@@ -233,6 +233,7 @@ async fn setup_one_community(
         signing_key: signing_key_from(admin),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     });
 

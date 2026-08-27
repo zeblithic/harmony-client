@@ -223,6 +223,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         signing_key: Arc::clone(&alice_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
     // ZEB-790: Bob's single adoption floor — Bob's registry, channel-log
@@ -243,6 +244,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         signing_key: Arc::clone(&bob_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

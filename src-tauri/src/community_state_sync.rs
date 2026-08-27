@@ -651,6 +651,23 @@ pub type PendingRedemptionMap = std::sync::Arc<
 /// `None` (no-op).
 pub type NavPendingClearEmitter = std::sync::Arc<dyn Fn(SpaceId, String) + Send + Sync>;
 
+/// ZEB-1016: callback fired after membership events land in a community's
+/// CRDT — once per local apply (`insert_local_event` / `_pair`) and once
+/// per incoming publish batch that inserted at least one event
+/// (`handle_incoming_publish`). Receives the community `SpaceId`.
+/// Production wires a closure that emits the
+/// `community-membership-updated { communityId }` Tauri event so
+/// moderation panels (PendingJoinsPanel / PendingAdminProposalsPanel) can
+/// refetch; tests pass `None` (no-op).
+///
+/// Deliberately an "applied, refetch" signal, NOT a convergence claim —
+/// the pub/sub plane has no anti-entropy, so "converged" is unknowable
+/// here (the never-emitted `community-state-sync-converged` event removed
+/// in ZEB-976 made exactly that mistake). Batch-level firing bounds the
+/// emit rate: one per received publish, regardless of how many events the
+/// merge inserts.
+pub type MembershipUpdatedEmitter = std::sync::Arc<dyn Fn(SpaceId) + Send + Sync>;
+
 /// Fire any oneshot registered against `event_id` in `pending`.
 /// No-op if no registration exists. Lock is held only across `remove`;
 /// the `send(())` happens after the guard is dropped.
@@ -1229,6 +1246,12 @@ pub struct CommunitySyncEngineConfig {
     /// IPC events.
     pub nav_emitter: Option<NavPendingClearEmitter>,
 
+    /// ZEB-1016: callback fired after membership events land (see
+    /// [`MembershipUpdatedEmitter`]). Production wires the
+    /// `community-membership-updated` Tauri emit; `None` for tests that
+    /// don't assert on IPC events.
+    pub membership_updated_emitter: Option<MembershipUpdatedEmitter>,
+
     /// ZEB-434 D1/D2: receive half of the state-root query-serve
     /// channel. The event_loop queryable task holds the sender and
     /// forwards one `RootServeRequest` per inbound zenoh query; the
@@ -1356,6 +1379,11 @@ pub struct CommunitySyncEngine {
     /// `None` for admin engines and tests that don't assert on IPC events.
     nav_emitter: Option<NavPendingClearEmitter>,
 
+    /// ZEB-1016: membership-updated callback for the local apply paths
+    /// (`insert_local_event` / `_pair`). Shared with `InternalCtx` (which
+    /// fires it per incoming publish batch) via `Arc` clone.
+    membership_updated_emitter: Option<MembershipUpdatedEmitter>,
+
     /// ZEB-254 Task 11: owner-state CRDT handle, retained on the engine so
     /// the `insert_local_event` path's pending-clear hook can update
     /// `Space.pending_join_at`. Mirrors the same Arc held by `InternalCtx`.
@@ -1418,6 +1446,11 @@ impl CommunitySyncEngine {
         // same callback; `None` for admin engines and tests.
         let nav_emitter_for_engine = cfg.nav_emitter.clone();
         let nav_emitter_for_task = cfg.nav_emitter;
+        // ZEB-1016: same dual-path sharing as nav_emitter — the engine
+        // struct fires it on local applies, the InternalCtx task per
+        // incoming publish batch.
+        let membership_updated_for_engine = cfg.membership_updated_emitter.clone();
+        let membership_updated_for_task = cfg.membership_updated_emitter;
 
         // ZEB-805: fetch-retry plumbing. Channel capacity is sized to the
         // semaphore cap so a full permit set can never overflow the channel.
@@ -1467,6 +1500,7 @@ impl CommunitySyncEngine {
             pending_redemptions: cfg.pending_redemptions,
             crdt_state: crdt_state_for_task,
             nav_emitter: nav_emitter_for_task,
+            membership_updated_emitter: membership_updated_for_task,
             root_serve_rx: cfg.root_serve_rx,
             fetch_retry_tx,
             fetch_retry_rx: Some(fetch_retry_rx),
@@ -1506,6 +1540,9 @@ impl CommunitySyncEngine {
             device_id: device_id_for_engine,
             // ZEB-254 Task 11: retain nav_emitter for the insert_local_event path.
             nav_emitter: nav_emitter_for_engine,
+            // ZEB-1016: retain the membership-updated emitter for the
+            // local apply paths.
+            membership_updated_emitter: membership_updated_for_engine,
             // ZEB-254 Task 11: retain crdt_state for the insert_local_event pending-clear hook.
             crdt_state: crdt_state_for_engine,
         }
@@ -2075,6 +2112,12 @@ impl CommunitySyncEngine {
                 });
             }
             self.notify_dirty();
+            // ZEB-1016: one applied-event signal per local insert so
+            // moderation panels refetch (sync callback, fires after the
+            // state lock is released).
+            if let Some(cb) = self.membership_updated_emitter.as_ref() {
+                cb(self.community_id);
+            }
         }
 
         Ok(outcome)
@@ -2244,6 +2287,11 @@ impl CommunitySyncEngine {
             || matches!(second_outcome, InsertOutcome::Inserted)
         {
             self.notify_dirty();
+            // ZEB-1016: a single applied-event signal covers the pair,
+            // matching the single dirty notification above.
+            if let Some(cb) = self.membership_updated_emitter.as_ref() {
+                cb(self.community_id);
+            }
         }
 
         Ok((first_outcome, second_outcome))
@@ -2447,6 +2495,11 @@ struct InternalCtx {
     /// Shared with the engine struct via `Arc` clone so both paths observe the
     /// same configured callback. `None` for admin engines and tests.
     nav_emitter: Option<NavPendingClearEmitter>,
+
+    /// ZEB-1016: membership-updated callback, fired once per incoming
+    /// publish batch that inserted at least one event. Shared with the
+    /// engine struct via `Arc` clone.
+    membership_updated_emitter: Option<MembershipUpdatedEmitter>,
 
     /// ZEB-434 D2: query-serve request channel. `internal_task` takes
     /// it out of the ctx at start (`Option<Receiver>` can't be polled
@@ -5845,6 +5898,18 @@ async fn apply_ingest(
         );
     }
 
+    // ZEB-1016: ONE applied-events signal per merge batch (not per event)
+    // so moderation panels refetch. Batch-level firing is the coalescing:
+    // a large root merge inserting thousands of events still produces a
+    // single emit, and publishes themselves are debounced upstream by the
+    // publisher's dirty window. Gated on inserted_any so duplicate Zenoh
+    // fanout echoes (all-AlreadyKnown batches) emit nothing.
+    if inserted_any {
+        if let Some(cb) = ctx.membership_updated_emitter.as_ref() {
+            cb(ctx.community_id);
+        }
+    }
+
     // 14. Advance the replay tracker — the SINGLE state-mutation
     //     point for tracker progress. Happens AFTER Phase B's
     //     state-merge (and AFTER the TOCTOU re-check inside Phase B)
@@ -6356,6 +6421,12 @@ pub struct CommunityRegistryConfig {
     /// handle joiner-side pending-clear events.
     pub nav_emitter: Option<NavPendingClearEmitter>,
 
+    /// ZEB-1016: optional callback cloned into every spawned engine's
+    /// `CommunitySyncEngineConfig.membership_updated_emitter`. Production
+    /// passes a closure that emits `community-membership-updated
+    /// { communityId }`. `None` for tests.
+    pub membership_updated_emitter: Option<MembershipUpdatedEmitter>,
+
     /// ZEB-618: presence-driven reachability kick for each engine's
     /// root-fetch driver (ZEB-599 D1 parity with the channel-log
     /// drivers). Cloned per spawned driver. `None` for tests/callers
@@ -6411,6 +6482,11 @@ pub struct CommunitySyncRegistry {
     /// to every spawned engine so each can fire the joiner-side
     /// pending-clear hook independently. `None` for tests.
     nav_emitter: Option<NavPendingClearEmitter>,
+
+    /// ZEB-1016: optional membership-updated callback cloned from
+    /// `CommunityRegistryConfig.membership_updated_emitter` at
+    /// construction; passed to every spawned engine. `None` for tests.
+    membership_updated_emitter: Option<MembershipUpdatedEmitter>,
 
     /// ZEB-434 D3/D4: per-community shutdown senders for the spawned
     /// `run_root_fetch_driver` tasks. Inserted when a spawn wires a
@@ -6713,6 +6789,7 @@ impl CommunitySyncRegistry {
     pub fn new(cfg: CommunityRegistryConfig) -> Self {
         let crdt_state = cfg.crdt_state.as_ref().map(Arc::clone);
         let nav_emitter = cfg.nav_emitter.clone();
+        let membership_updated_emitter = cfg.membership_updated_emitter.clone();
         Self {
             cfg: Arc::new(cfg),
             engines: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -6721,6 +6798,7 @@ impl CommunitySyncRegistry {
                 std::collections::HashMap::new(),
             )),
             nav_emitter,
+            membership_updated_emitter,
             root_fetch_shutdowns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             in_flight_redemption_mints: InFlightRedemptionMints::default(),
             latched_reattempt_shutdowns: tokio::sync::Mutex::new(LatchedReattemptSlots::default()),
@@ -7376,6 +7454,9 @@ impl CommunitySyncRegistry {
             // the engine can fire nav-updated on joiner-side countersign.
             // `None` for test registries that don't supply one.
             nav_emitter: self.nav_emitter.clone(),
+            // ZEB-1016: clone the membership-updated emitter so the engine
+            // fires `community-membership-updated` on applied events.
+            membership_updated_emitter: self.membership_updated_emitter.clone(),
             // ZEB-434 D1/D2: engine half of the queryable-serve
             // channel; the event_loop queryable task holds the
             // matching sender. `None` for legacy/test callers.
@@ -8222,6 +8303,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
 
@@ -8268,6 +8350,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -8341,6 +8424,278 @@ mod tests {
             bob_adopt_floor.merged_now(at_wall_ms),
             at_wall_ms + 1,
             "accepted publish feeds the floor (+1 rule)"
+        );
+    }
+
+    /// ZEB-1016: the membership-updated emitter fires once per applied local
+    /// insert and once per incoming publish batch that inserted at least one
+    /// event — and stays silent on AlreadyKnown duplicates (local re-insert,
+    /// duplicate fanout echo / all-known root). Same deterministic two-engine
+    /// harness as `accepted_publish_feeds_adopt_floor`: packets are pulled via
+    /// the query-serve arm (no debounce race) and the adopt floor is the
+    /// processed-batch sync point — the floor is fed at step 14, AFTER the
+    /// batch-level emit site, so a floor advance proves the emit decision for
+    /// that batch already happened.
+    #[tokio::test]
+    async fn membership_updated_emitter_fires_per_apply_and_per_batch() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+
+        let alice = mint_test_owner(0xA5);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+
+        let community_id = SpaceId([0x6A; 16]);
+        let membership_key = EpochKey::new([0x77; 32]);
+
+        // Counting emitters: every fire records the SpaceId it was handed.
+        let a_fires = Arc::new(std::sync::Mutex::new(Vec::<SpaceId>::new()));
+        let b_fires = Arc::new(std::sync::Mutex::new(Vec::<SpaceId>::new()));
+        let a_emitter: MembershipUpdatedEmitter = {
+            let a_fires = Arc::clone(&a_fires);
+            Arc::new(move |cid| a_fires.lock().unwrap().push(cid))
+        };
+        let b_emitter: MembershipUpdatedEmitter = {
+            let b_fires = Arc::clone(&b_fires);
+            Arc::new(move |cid| b_fires.lock().unwrap().push(cid))
+        };
+
+        let (serve_tx, serve_rx) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            inviter_identity_pub: None,
+            nav_emitter: None,
+            membership_updated_emitter: Some(a_emitter),
+            root_serve_rx: Some(serve_rx),
+        });
+
+        let bob_addr = OwnerAddr([0xB0; 16]);
+        let bob_adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let (b_pub_tx, _b_pub_rx_held) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let membership_key_for_decode = membership_key.clone();
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            device_cipher: crate::device_dataset_file::test_cipher(),
+            adopt_floor: bob_adopt_floor.clone(),
+            community_id,
+            membership_key,
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xB0; 32])),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            inviter_identity_pub: None,
+            nav_emitter: None,
+            membership_updated_emitter: Some(b_emitter),
+            root_serve_rx: None,
+        });
+
+        // Alice's EnrollmentCert-bearing bootstrap Join.
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at.clone(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join")
+        };
+
+        // Local apply on A → exactly one fire, carrying this community's id.
+        assert_eq!(
+            engine_a
+                .insert_local_event(alice_join.clone())
+                .await
+                .expect("alice bootstrap insert"),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(a_fires.lock().unwrap().as_slice(), &[community_id]);
+
+        // AlreadyKnown local re-insert → no additional fire.
+        assert_eq!(
+            engine_a
+                .insert_local_event(alice_join.clone())
+                .await
+                .expect("alice re-insert"),
+            InsertOutcome::AlreadyKnown
+        );
+        assert_eq!(a_fires.lock().unwrap().len(), 1);
+
+        // OOB-seed into B (its own local apply) → one fire on B.
+        assert_eq!(
+            engine_b
+                .insert_local_event(alice_join)
+                .await
+                .expect("bob OOB-seeds alice bootstrap"),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(b_fires.lock().unwrap().as_slice(), &[community_id]);
+
+        // A second event on A only, so the served root gives B's merge
+        // something genuinely new to insert.
+        let create_payload = EventPayload {
+            id: [0x20; 16],
+            community_id,
+            kind: MembershipEventKind::ChannelCreate {
+                channel_id: ChannelId([0x51; 16]),
+                name: "general".into(),
+                write_power: 0,
+                kind: ChannelKind::Text,
+            },
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: alice_join_at.wall_ms,
+                logical: alice_join_at.logical + 1,
+                device_id: alice_join_at.device_id.clone(),
+            },
+        };
+        let create = sign_event(&create_payload, alice_sk.as_ref()).expect("sign create");
+        assert_eq!(
+            engine_a
+                .insert_local_event(create)
+                .await
+                .expect("alice channel-create insert"),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(a_fires.lock().unwrap().len(), 2);
+
+        // Serve a packet from A and feed it to B: the batch inserts the
+        // ChannelCreate (the Join is AlreadyKnown) → exactly ONE more fire,
+        // not one per event.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx.send(reply_tx).await.expect("send serve request");
+        let packet = reply_rx.await.expect("engine replied").expect("encode ok");
+        let decrypted =
+            decrypt_root_publish(&membership_key_for_decode, &packet).expect("decrypt packet");
+        let decoded: CommunityRootPublishPayload =
+            canonical_cbor_decode(&decrypted).expect("decode payload");
+        let at1 = decoded.at.wall_ms;
+        b_sub_tx.send(packet).await.expect("inject packet into B");
+
+        let mut committed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if bob_adopt_floor.merged_now(at1) == at1 + 1 {
+                committed = true;
+                break;
+            }
+        }
+        assert!(committed, "first packet must commit within the poll window");
+        assert_eq!(
+            b_fires.lock().unwrap().as_slice(),
+            &[community_id, community_id],
+            "an inserting batch fires the emitter exactly once"
+        );
+
+        // A second serve pull carries a strictly later `at` but no events B
+        // doesn't already have: the all-AlreadyKnown batch must NOT fire.
+        // The floor advancing to at2+1 proves B processed the batch past the
+        // emit decision point before we assert.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx.send(reply_tx).await.expect("send serve request 2");
+        let packet2 = reply_rx
+            .await
+            .expect("engine replied 2")
+            .expect("encode ok 2");
+        let decrypted2 =
+            decrypt_root_publish(&membership_key_for_decode, &packet2).expect("decrypt packet 2");
+        let decoded2: CommunityRootPublishPayload =
+            canonical_cbor_decode(&decrypted2).expect("decode payload 2");
+        let at2 = decoded2.at.wall_ms;
+        assert!(at2 > at1, "second serve must stamp a later HLC");
+        b_sub_tx
+            .send(packet2)
+            .await
+            .expect("inject packet 2 into B");
+
+        let mut committed2 = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if bob_adopt_floor.merged_now(at2) == at2 + 1 {
+                committed2 = true;
+                break;
+            }
+        }
+        assert!(
+            committed2,
+            "second packet must commit within the poll window"
+        );
+        assert_eq!(
+            b_fires.lock().unwrap().len(),
+            2,
+            "an all-AlreadyKnown batch (duplicate fanout echo) must not fire"
         );
     }
 
@@ -8490,6 +8845,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
 
@@ -8530,6 +8886,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx_b),
         });
 
@@ -8676,6 +9033,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
 
@@ -8717,6 +9075,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
         // Force a small chunk on THIS engine only — the merge yields at 2.
@@ -8893,6 +9252,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
 
@@ -8932,6 +9292,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -9121,6 +9482,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
 
@@ -9160,6 +9522,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -9379,6 +9742,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -9794,6 +10158,7 @@ mod tests {
             signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             presence_resync_rx: None,
         }));
 
@@ -10333,6 +10698,7 @@ mod tests {
             signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             presence_resync_rx: None,
         }));
         let (community_adapter_tx, _adapter_rx_hold) = mpsc::channel(64);
@@ -11663,6 +12029,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
 
@@ -11703,6 +12070,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -11881,6 +12249,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -11914,6 +12283,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -12088,6 +12458,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -12207,6 +12578,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
 
@@ -12432,6 +12804,7 @@ mod tests {
                 crdt_state: None,
                 inviter_identity_pub: None,
                 nav_emitter: None,
+                membership_updated_emitter: None,
                 root_serve_rx: Some(serve_rx),
             });
 
@@ -12470,6 +12843,7 @@ mod tests {
                 crdt_state: None,
                 inviter_identity_pub: None,
                 nav_emitter: None,
+                membership_updated_emitter: None,
                 root_serve_rx: None,
             });
 
@@ -13250,6 +13624,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
         let stats = engine_b.sync_stats();
@@ -13420,6 +13795,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
 
@@ -13461,6 +13837,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
 
@@ -13771,6 +14148,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
         (engine, sub_tx)
@@ -14093,6 +14471,7 @@ mod tests {
             crdt_state: None,
             inviter_identity_pub: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             root_serve_rx: None,
         });
         (engine, sub_tx, adopt_floor, cs, membership_key)

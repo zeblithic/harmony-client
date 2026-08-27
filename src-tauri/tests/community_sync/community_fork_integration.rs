@@ -443,6 +443,7 @@ impl PairedEngines {
             signing_key: Arc::clone(&a_signing),
             crdt_state: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             presence_resync_rx: None,
         }));
 
@@ -460,6 +461,7 @@ impl PairedEngines {
             signing_key: Arc::clone(&b_signing),
             crdt_state: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             presence_resync_rx: None,
         }));
 

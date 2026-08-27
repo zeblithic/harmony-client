@@ -279,6 +279,7 @@ async fn setup_witness_community() -> WitnessFixture {
         signing_key: Arc::new(witness.device_key.clone()),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

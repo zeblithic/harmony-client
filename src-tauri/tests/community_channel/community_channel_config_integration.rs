@@ -204,6 +204,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
         signing_key: Arc::clone(&alice_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
@@ -220,6 +221,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
         signing_key: Arc::clone(&bob_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 
@@ -445,6 +447,7 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
         signing_key: Arc::clone(&bob_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 
@@ -612,6 +615,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
         signing_key: Arc::clone(&alice_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
@@ -628,6 +632,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
         signing_key: Arc::clone(&bob_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

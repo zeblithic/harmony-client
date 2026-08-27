@@ -147,6 +147,7 @@ fn build_acceptor(
         signing_key: Arc::clone(&alice_comm_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

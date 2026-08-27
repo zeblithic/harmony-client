@@ -456,6 +456,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         signing_key: Arc::clone(&alice_comm_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
     // ZEB-790: Bob's single adoption floor (see OpenJoinSetup.bob_adopt_floor).
@@ -474,6 +475,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         signing_key: Arc::clone(&bob_comm_sk),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

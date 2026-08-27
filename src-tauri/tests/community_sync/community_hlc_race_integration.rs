@@ -192,6 +192,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 

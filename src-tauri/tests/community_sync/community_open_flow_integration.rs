@@ -208,6 +208,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
@@ -237,6 +238,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -577,6 +579,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
@@ -606,6 +609,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -1087,6 +1091,7 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
@@ -1116,6 +1121,7 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -1387,6 +1393,7 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
@@ -1416,6 +1423,7 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 

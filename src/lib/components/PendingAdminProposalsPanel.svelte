@@ -1,5 +1,9 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  // ZEB-1016: live refresh on membership sync activity via the
+  // `community-membership-updated` Tauri event (emitted by the community
+  // sync engines once per applied local insert / incoming publish batch).
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
   type ProposalKindDto =
     | { kind: 'SetPower'; target_addr: string; target_display_name: string | null; level: number }
@@ -84,16 +88,54 @@
     }
   }
 
-  // ZEB-976: this effect previously also registered a listener for a
-  // `community-state-sync-converged` Tauri event, but no Rust code has ever
-  // emitted it — refresh happens on mount, on prop changes, and after
-  // countersign(). Live refresh on sync activity is tracked separately.
+  // ZEB-1016: the effect also registers a `community-membership-updated`
+  // listener so an admin sitting on this panel sees newly synced proposals
+  // and countersigns without re-opening it. (ZEB-976 removed a listener for
+  // `community-state-sync-converged` here because nothing ever emitted it;
+  // this one is backed by real emit sites in community_state_sync.rs.) The
+  // effect cleanup handles both the community-switch re-run and unmount;
+  // the `cancelled` flag covers the window where the async `listen`
+  // registration resolves after cleanup. refresh() itself no-ops (and
+  // clears) when canAdmin is false, so the listener is only registered on
+  // the admin path.
   $effect(() => {
     // Track reactive dependencies so the effect re-runs when they change.
-    void communityId;
-    void canAdmin;
+    const cid = communityId;
+    const isAdmin = canAdmin;
 
     void refresh();
+
+    if (!isAdmin) {
+      return;
+    }
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    void listen<{ communityId: string }>('community-membership-updated', (event) => {
+      // Events for other communities are not ours to refetch.
+      if (event.payload.communityId === cid) {
+        void refresh();
+      }
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch((e) => {
+        // Non-Tauri harnesses (vitest/jsdom) have no event bridge; a failed
+        // subscription degrades to mount/prop/action-only refresh (the
+        // IrohRelaySettings precedent).
+        console.warn(
+          'PendingAdminProposalsPanel: failed to subscribe to membership updates',
+          e
+        );
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   });
 
   // Bucket sort: pending → effective → expired.

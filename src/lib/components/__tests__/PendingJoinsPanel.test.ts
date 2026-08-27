@@ -11,6 +11,10 @@ import { formatFullTimestamp } from '../../time-format';
 vi.mock('@tauri-apps/api/core', () => ({
     invoke: vi.fn(),
 }));
+// ZEB-1016: the panel listens for `community-membership-updated`.
+vi.mock('@tauri-apps/api/event', () => ({
+    listen: vi.fn().mockResolvedValue(() => {}),
+}));
 
 describe('PendingJoinsPanel', () => {
     beforeEach(() => {
@@ -137,6 +141,53 @@ describe('PendingJoinsPanel', () => {
             const chip = container.querySelector('details:first-of-type .count-chip');
             expect(chip?.classList.contains('neutral')).toBe(true);
             expect(chip?.querySelector('.cc-value')?.textContent).toBe('2');
+        });
+    });
+
+    test('membership_updated_event_triggers_refresh (ZEB-1016)', async () => {
+        const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+        const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
+
+        let capturedHandler:
+            | ((event: { payload: { communityId: string } }) => void)
+            | null = null;
+        listen.mockImplementation(((_event: string, handler: unknown) => {
+            capturedHandler = handler as (event: {
+                payload: { communityId: string };
+            }) => void;
+            return Promise.resolve(() => {});
+        }) as typeof listen);
+        invoke.mockResolvedValue([]);
+
+        render(PendingJoinsPanel, {
+            props: { communityId: 'abc', canModerate: true },
+        });
+
+        // Initial refresh makes two IPCs (pending + recent) and registers
+        // the listener.
+        await waitFor(() => {
+            expect(invoke).toHaveBeenCalledTimes(2);
+            expect(listen).toHaveBeenCalledWith(
+                'community-membership-updated',
+                expect.any(Function)
+            );
+            expect(capturedHandler).not.toBeNull();
+        });
+
+        // A membership event applied for THIS community → refetch (two more
+        // IPCs); a different community's event is ignored.
+        capturedHandler!({ payload: { communityId: 'other' } });
+        await new Promise((r) => setTimeout(r, 0));
+        expect(invoke).toHaveBeenCalledTimes(2);
+
+        capturedHandler!({ payload: { communityId: 'abc' } });
+        await waitFor(() => {
+            expect(invoke).toHaveBeenCalledTimes(4);
+            expect(invoke).toHaveBeenNthCalledWith(
+                3,
+                'list_pending_joins',
+                expect.objectContaining({ communityId: 'abc' })
+            );
         });
     });
 

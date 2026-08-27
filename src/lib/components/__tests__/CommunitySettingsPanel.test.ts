@@ -9,6 +9,11 @@ import type { CommunityMember, CommunityLineageDto, ForkDescendantDto } from '..
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn().mockResolvedValue([]),
 }));
+// ZEB-1016: the mounted moderation panels listen for
+// `community-membership-updated`.
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
 
 const adminMember: CommunityMember = { address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' };
 const modMember: CommunityMember = { address: 'cc99', displayName: 'Charlie', power: 50, status: 'joined' };

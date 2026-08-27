@@ -848,6 +848,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         signing_key: Arc::clone(&admin_signing_key),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 
@@ -1246,6 +1247,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
         signing_key: Arc::clone(&admin_signing_key),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 
