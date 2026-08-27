@@ -63,6 +63,22 @@ pub enum ContentVerbRequest {
         cid: [u8; 32],
         reply: oneshot::Sender<Result<bool, String>>,
     },
+    /// ZEB-1012 / ZEB-157: best-effort eviction of the CIDs a FAILED ingest
+    /// had already admitted — a partial leaf list (mid-stream failure) or a
+    /// fully-built root (post-ingest failure arm), duplicates tolerated.
+    ///
+    /// Evict-unclaimed semantics, deliberately NOT `Burn`: nothing reachable
+    /// from a pinned or buddy-held root is touched, and no pin-intent /
+    /// buddy-ledger bookkeeping is mutated — on a content-dedup collision
+    /// with an already-pinned identical file, `Burn`'s intent removal would
+    /// un-pin the user's good copy. Replies with the number of CIDs actually
+    /// evicted (observability + tests); callers treat any error or a dropped
+    /// reply as best-effort-failed and move on (the cache reclaims orphans
+    /// under W-TinyLFU pressure and at restart regardless).
+    RollbackIngest {
+        cids: Vec<[u8; 32]>,
+        reply: oneshot::Sender<Result<usize, String>>,
+    },
     /// Snapshot the set of currently-pinned CIDs in the runtime cache.
     /// Used by `list_content` to fill the `pinned` field per entry.
     PinnedSet {

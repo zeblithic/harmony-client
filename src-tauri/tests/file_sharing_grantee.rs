@@ -447,6 +447,7 @@ async fn grantee_decrypts_multi_frame_file() {
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        None,
         &crdt_state,
         &std::sync::atomic::AtomicBool::new(false),
         &keytree,

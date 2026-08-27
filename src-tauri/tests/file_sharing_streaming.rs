@@ -39,6 +39,7 @@ async fn round_trip(plaintext: Vec<u8>) {
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        None,
         &crdt_state,
         &std::sync::atomic::AtomicBool::new(false),
         &keytree,
