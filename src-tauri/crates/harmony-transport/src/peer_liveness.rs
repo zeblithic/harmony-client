@@ -69,8 +69,9 @@ pub enum LivenessStateWire {
 
 /// Internal per-peer liveness state. Structurally mirrors [`LivenessStateWire`]
 /// today but is kept distinct so future non-serializable bookkeeping (Task 2+)
-/// can hang off it without perturbing the wire shape.
-#[derive(Debug, Clone)]
+/// can hang off it without perturbing the wire shape. `PartialEq` backs
+/// `report_path`'s observable-change detection (ZEB-1002).
+#[derive(Debug, Clone, PartialEq)]
 enum SlotState {
     Connected {
         mode: LivenessMode,
@@ -290,8 +291,15 @@ impl LivenessHandle {
     /// Path event for `conn_id`'s connection. Ignored unless the slot's current
     /// conn matches (a superseded conn's watcher is silenced). A selected path
     /// promotes to `Connected` (preserving `since_ms` across a Connected→Connected
-    /// path change); a lost path drops to `Degraded`. `min_relay_rtt_ms` is
-    /// always refreshed from the report.
+    /// path change); a lost path drops to `Degraded` (preserving `since_ms`
+    /// across a Degraded→Degraded refresh — ZEB-1002: the 30s RTT tick must not
+    /// make a continuously-degraded link look newly degraded). `min_relay_rtt_ms`
+    /// is always refreshed from the report.
+    ///
+    /// The changed watch fires only on an OBSERVABLE change — the slot's wire
+    /// projection or its `min_relay_rtt_ms` — so an identical refresh doesn't
+    /// drip `network-health-changed` recomputes downstream (ZEB-1002; the 2s
+    /// rate limiter bounds burst rate, not steady-state waste).
     pub fn report_path(
         &self,
         peer: [u8; 32],
@@ -304,25 +312,34 @@ impl LivenessHandle {
             match slots.get_mut(&peer) {
                 Some(slot) if slot.conn_id == Some(conn_id) => {
                     let was_up = slot.state.is_up();
-                    match selected {
+                    let new_state = match selected {
                         Some((mode, rtt)) => {
                             let since_ms = match &slot.state {
                                 SlotState::Connected { since_ms, .. } => *since_ms,
                                 _ => now_ms(),
                             };
-                            slot.state = SlotState::Connected {
+                            SlotState::Connected {
                                 mode,
                                 rtt_ms: Some(rtt),
                                 since_ms,
-                            };
-                            slot.ever_connected = true;
+                            }
                         }
                         None => {
-                            slot.state = SlotState::Degraded { since_ms: now_ms() };
+                            let since_ms = match &slot.state {
+                                SlotState::Degraded { since_ms } => *since_ms,
+                                _ => now_ms(),
+                            };
+                            SlotState::Degraded { since_ms }
                         }
+                    };
+                    let observable =
+                        new_state != slot.state || slot.min_relay_rtt_ms != min_relay_rtt_ms;
+                    if matches!(new_state, SlotState::Connected { .. }) {
+                        slot.ever_connected = true;
                     }
+                    slot.state = new_state;
                     slot.min_relay_rtt_ms = min_relay_rtt_ms;
-                    (true, was_up, slot.state.is_up())
+                    (observable, was_up, slot.state.is_up())
                 }
                 _ => (false, false, false),
             }
@@ -688,6 +705,68 @@ mod tests {
                 )]
             ),
             "external down leaves a registry-backed slot unchanged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn degraded_since_ms_stable_across_repeated_lost_path_reports() {
+        let h = LivenessHandle::new();
+        h.on_transport_up(peer(1), 11);
+        h.report_path(peer(1), 11, Some((LivenessMode::Direct, 12)), None);
+        // Lost path → Degraded, stamped now.
+        h.report_path(peer(1), 11, None, None);
+        let since1 = match h.states_snapshot().as_slice() {
+            [(_, LivenessStateWire::Degraded { since_ms })] => *since_ms,
+            other => panic!("expected Degraded, got {other:?}"),
+        };
+        let mut changed = h.changed_rx();
+        let before = *changed.borrow_and_update();
+        // `now_ms()` is SystemTime-based (tokio's paused clock doesn't apply),
+        // so a real-clock sleep is what makes a ZEB-1002 reset observable.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        // The 30s RTT-refresh tick re-reports the same lost-path state.
+        h.report_path(peer(1), 11, None, None);
+        let since2 = match h.states_snapshot().as_slice() {
+            [(_, LivenessStateWire::Degraded { since_ms })] => *since_ms,
+            other => panic!("expected Degraded, got {other:?}"),
+        };
+        assert_eq!(
+            since1, since2,
+            "a refresh of an already-Degraded slot must not reset since_ms \
+             (degraded-duration telemetry would be meaningless)"
+        );
+        assert_eq!(
+            *changed.borrow_and_update(),
+            before,
+            "an unchanged Degraded refresh is not an observable change"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_path_refresh_does_not_bump_changed() {
+        let h = LivenessHandle::new();
+        h.on_transport_up(peer(1), 11);
+        h.report_path(peer(1), 11, Some((LivenessMode::Direct, 12)), Some(40));
+        let mut changed = h.changed_rx();
+        let before = *changed.borrow_and_update();
+        // Identical 30s-tick refresh: same selected path, same rtt, same
+        // min relay → nothing observable changed → no changed bump (the
+        // downstream network-health notify pipeline stays quiet).
+        h.report_path(peer(1), 11, Some((LivenessMode::Direct, 12)), Some(40));
+        assert_eq!(
+            *changed.borrow_and_update(),
+            before,
+            "identical path refresh must not bump the changed watch"
+        );
+        // A real RTT drift is observable (wire rttMs) → signals.
+        h.report_path(peer(1), 11, Some((LivenessMode::Direct, 13)), Some(40));
+        let after_rtt = *changed.borrow_and_update();
+        assert!(after_rtt > before, "rtt change is observable → signals");
+        // A min-relay-only change is observable via min_relay_rtt_ms() → signals.
+        h.report_path(peer(1), 11, Some((LivenessMode::Direct, 13)), Some(35));
+        assert!(
+            *changed.borrow_and_update() > after_rtt,
+            "min-relay-rtt change is observable → signals"
         );
     }
 

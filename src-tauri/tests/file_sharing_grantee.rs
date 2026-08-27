@@ -448,6 +448,7 @@ async fn grantee_decrypts_multi_frame_file() {
         &ingest_tx,
         &content_index,
         &crdt_state,
+        None,
         &keytree,
         None,
         reader,

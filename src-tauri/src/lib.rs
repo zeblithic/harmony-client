@@ -1000,6 +1000,21 @@ pub struct NodeState {
     /// clone so the IPC handler can lock it independently of SyncEngine).
     /// Stored as Option because identity-restore can null out everything.
     crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
+    /// ZEB-1011: per-generation detach flag for `crdt_state`. Set `true`
+    /// inside the same critical sections that take `crdt_state` out
+    /// (`stop_inner` and `start_node_inner`'s prior-identity teardown);
+    /// replaced with a fresh `false` Arc at the ZEB-221 successful-install
+    /// point. Mutating commands that snapshot `crdt_state` clone this
+    /// alongside it and re-check it INSIDE their crdt-lock scope right
+    /// before writing (`ensure_owner_state_attached`), because per ZEB-895
+    /// `generation` does not move on stop — a generation fence can never
+    /// observe a stop-without-restart, so without this flag a command's
+    /// mutation lands in the detached owner-state after the SyncEngine's
+    /// final flush and is silently lost. The flag-set precedes that final
+    /// flush in both teardown sequences, and the flush reads state under
+    /// the crdt lock, so every interleaving either durably includes the
+    /// mutation or rejects it loudly — never loses it.
+    owner_state_detached: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// HLC tracker (mirror of SyncEngine's tracker; the dm_outbox handler
     /// reads/writes the local device's entry to keep send_dm's HLCs
     /// monotone with state-root publishes).
@@ -2183,6 +2198,7 @@ impl Default for NodeState {
             dm_transport: None,
             butler_deposit_client: None,
             crdt_state: None,
+            owner_state_detached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hlc_tracker: None,
             hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             dm_device_id: None,
@@ -2663,6 +2679,28 @@ fn shutdown_fleet_sync_blocking<T>(
     });
 }
 
+/// ZEB-1011: refuse an owner-state mutation once the snapshot's `crdt_state`
+/// has been detached by `stop_inner` / `start_node_inner`'s prior-identity
+/// teardown. Call INSIDE the `crdt_state.lock().await` scope, immediately
+/// before the mutating write — the lock is what orders this check against the
+/// teardown's flag-set and the SyncEngine's final flush (see the
+/// `NodeState::owner_state_detached` field doc). Without it the write lands in
+/// a detached state nobody flushes and silently vanishes; `generation` fences
+/// cannot catch this because a stop doesn't bump `generation` (ZEB-895).
+fn ensure_owner_state_attached(
+    detached: &std::sync::atomic::AtomicBool,
+    op: &str,
+) -> Result<(), String> {
+    if detached.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(format!(
+            "node stopped during {op}: owner-state write abandoned (the state \
+             this command snapshotted is detached and would never be persisted \
+             — re-issue after the node restarts)"
+        ));
+    }
+    Ok(())
+}
+
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
@@ -2794,6 +2832,17 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
             }
         }
         guard.node_addr.clear();
+        // ZEB-1011: mark the outgoing owner-state detached INSIDE the same
+        // critical section that takes `crdt_state` out, and BEFORE any engine
+        // final flush below. Mutating commands re-check this under the crdt
+        // lock right before writing; the SyncEngine final flush also reads
+        // under that lock, so a mutation either precedes the flush (durably
+        // included) or observes this flag and fails loudly — never silently
+        // lost into the detached state (ZEB-895: `generation` does not move
+        // on stop, so generation fences cannot see this case).
+        guard
+            .owner_state_detached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         // ZEB-687: clear the observability clone of the revoked-device projection
         // so a stopped node keeps no live handle — parity with the
         // community_registry / community_delta_tx takes below. Cheap Arc drop; no
@@ -4436,6 +4485,14 @@ pub async fn start_node_inner(
         // NodeState after this point finds None and rejects immediately.
         old_dm_send_inflight = guard.dm_send_inflight.take();
         old_dm_send_stopping = guard.dm_send_stopping.take();
+        // ZEB-1011: mark the previous identity's owner-state detached in the
+        // same critical section that takes it out — mirrors stop_inner's
+        // flag-set, and precedes the old engines' final flush below. The
+        // successful-install block installs a fresh `false` Arc for the new
+        // generation.
+        guard
+            .owner_state_detached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let tup = (
             guard.shutdown_tx.take(),
             guard.thread.take(),
@@ -11564,19 +11621,28 @@ pub async fn start_node_inner(
                                         let cutoff = now_ms.saturating_sub(
                                             crate::butler_deposit::BUTLER_SET_FRESHNESS_MS,
                                         );
-                                        let changed =
-                                            crate::fleet_net::selection_view(&prev_doc, cutoff)
-                                                != crate::fleet_net::selection_view(
-                                                    &new_doc, cutoff,
-                                                );
+                                        let changed = crate::fleet_net::selection_view(
+                                            &prev_doc,
+                                            &task_device_id,
+                                            cutoff,
+                                        ) != crate::fleet_net::selection_view(
+                                            &new_doc,
+                                            &task_device_id,
+                                            cutoff,
+                                        );
                                         // ZEB-820: the vine set (cap 4) can change
                                         // even when the butler prefix (cap 2) does
                                         // not — e.g. a 3rd device joining.
-                                        let vine_changed =
-                                            crate::fleet_net::vine_selection_view(&prev_doc, cutoff)
-                                                != crate::fleet_net::vine_selection_view(
-                                                    &new_doc, cutoff,
-                                                );
+                                        let vine_changed = crate::fleet_net::vine_selection_view(
+                                            &prev_doc,
+                                            &task_device_id,
+                                            cutoff,
+                                        )
+                                            != crate::fleet_net::vine_selection_view(
+                                                &new_doc,
+                                                &task_device_id,
+                                                cutoff,
+                                            );
                                         *task_snapshot
                                             .write()
                                             .unwrap_or_else(|p| p.into_inner()) =
@@ -14259,6 +14325,12 @@ pub async fn start_node_inner(
                         // `guard.generation` against `our_gen` and rely on
                         // this invariant.
                         guard.generation += 1;
+                        // ZEB-1011: fresh detach flag for the new generation.
+                        // Prior-generation snapshots keep their old (now
+                        // permanently `true`) Arc; commands snapshotting from
+                        // here on pair the new `crdt_state` with this one.
+                        guard.owner_state_detached =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         guard.thread = Some(thread);
                         guard.shutdown_tx = Some(shutdown_tx);
                         // ZEB-683: keep a clone for the vine-authority re-offer
@@ -24327,10 +24399,16 @@ async fn produce_ciphertext(
 /// after the local `file_deks` mutation, or the sealed DEK is dropped on the
 /// floor — never persisted, never replicated (ZEB-709). Pass `None` only in
 /// focused tests that inspect `crdt_state` directly.
+#[allow(clippy::too_many_arguments)] // handle fan-in seam; mirrors the sibling *_inner shapes
 pub async fn ingest_content_encrypted_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    // ZEB-1011: the caller's snapshot-paired detach flag — the sealed-DEK
+    // write below must not land in a detached owner-state (the ingested
+    // bytes would be permanently undecryptable after restart). `None` only
+    // in focused tests, mirroring `sync_engine`.
+    owner_state_detached: Option<&std::sync::atomic::AtomicBool>,
     keytree: &crate::owner_state_crypto::KeyTree,
     sync_engine: Option<&std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
     plaintext_reader: tokio::fs::File,
@@ -24381,6 +24459,12 @@ pub async fn ingest_content_encrypted_inner(
         .map_err(|e| format!("seal DEK at rest: {e:?}"))?;
     {
         let mut st = crdt_state.lock().await;
+        // ZEB-1011: a stop racing this ingest would detach the state — the
+        // sealed DEK would vanish and the just-ingested ciphertext would be
+        // permanently undecryptable. Fail loudly instead.
+        if let Some(flag) = owner_state_detached {
+            ensure_owner_state_attached(flag, "ingest_content_encrypted")?;
+        }
         st.file_deks.insert(root.to_bytes(), sealed);
     }
     if let Some(engine) = sync_engine {
@@ -24446,7 +24530,7 @@ pub(crate) async fn ingest_content_encrypted_impl(
 
     // 2. Snapshot the handles the encrypt path needs, then drop the sync lock
     //    before any await. `owner_keytree`/`crdt_state` are `None` pre-mint.
-    let (ingest_tx, content_index, crdt_state, keytree, sync_engine) = {
+    let (ingest_tx, content_index, crdt_state, owner_state_detached, keytree, sync_engine) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let ingest_tx = guard
             .ingest_tx
@@ -24466,6 +24550,7 @@ pub(crate) async fn ingest_content_encrypted_impl(
             ingest_tx,
             guard.content_index.clone(),
             crdt_state,
+            guard.owner_state_detached.clone(),
             keytree,
             guard.sync_engine.clone(),
         )
@@ -24498,6 +24583,7 @@ pub(crate) async fn ingest_content_encrypted_impl(
         &ingest_tx,
         &content_index,
         &crdt_state,
+        Some(&owner_state_detached),
         &keytree,
         sync_engine.as_ref(),
         plaintext_reader,
@@ -24601,7 +24687,7 @@ pub(crate) async fn grant_read_impl(
     let grantee_owner = parse_owner_addr(&grantee_address)?;
 
     // Snapshot NodeState handles under the std lock, then drop before awaiting.
-    let (crdt_state, keytree, content_store, sync_engine, butler, meta) = {
+    let (crdt_state, owner_state_detached, keytree, content_store, sync_engine, butler, meta) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let crdt_state = guard
             .crdt_state
@@ -24634,6 +24720,7 @@ pub(crate) async fn grant_read_impl(
         };
         (
             crdt_state,
+            guard.owner_state_detached.clone(),
             keytree,
             content_store,
             sync_engine,
@@ -24668,6 +24755,9 @@ pub(crate) async fn grant_read_impl(
     let now_ms = crate::file_sharing::now_epoch_ms();
     {
         let mut st = crdt_state.lock().await;
+        // ZEB-1011: refuse to record into a detached owner-state (stop raced
+        // this command; generation fences can't see a stop — ZEB-895).
+        ensure_owner_state_attached(&owner_state_detached, "grant_read")?;
         crate::file_sharing::record_grant(&mut st, cid, grantee_owner, now_ms);
     }
     if let Some(engine) = sync_engine {
@@ -24756,7 +24846,7 @@ pub(crate) async fn revoke_read_impl(
     // Snapshot the butler alongside the handle set (mirror `grant_read_impl`'s
     // `guard.butler_deposit_client.clone()`) so the best-effort revoke deposit
     // below never holds the std lock across an await.
-    let (crdt_state, sync_engine, butler) = {
+    let (crdt_state, owner_state_detached, sync_engine, butler) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let crdt_state = guard
             .crdt_state
@@ -24764,6 +24854,7 @@ pub(crate) async fn revoke_read_impl(
             .ok_or_else(|| "no owner loaded".to_string())?;
         (
             crdt_state,
+            guard.owner_state_detached.clone(),
             guard.sync_engine.clone(),
             guard.butler_deposit_client.clone(),
         )
@@ -24771,6 +24862,8 @@ pub(crate) async fn revoke_read_impl(
     let now_ms = crate::file_sharing::now_epoch_ms();
     let removed = {
         let mut st = crdt_state.lock().await;
+        // ZEB-1011: see grant_read — a detached-state tombstone would vanish.
+        ensure_owner_state_attached(&owner_state_detached, "revoke_read")?;
         crate::file_sharing::revoke_grant_inner(&mut st, cid, grantee_owner, now_ms)
     };
     if removed {
@@ -24825,17 +24918,23 @@ pub(crate) async fn dismiss_received_grant_impl(
 ) -> Result<(), String> {
     let cid = parse_cid_hex(&cid)?;
 
-    let (crdt_state, sync_engine) = {
+    let (crdt_state, owner_state_detached, sync_engine) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let crdt_state = guard
             .crdt_state
             .clone()
             .ok_or_else(|| "no owner loaded".to_string())?;
-        (crdt_state, guard.sync_engine.clone())
+        (
+            crdt_state,
+            guard.owner_state_detached.clone(),
+            guard.sync_engine.clone(),
+        )
     };
     let now_ms = crate::file_sharing::now_epoch_ms();
     let changed = {
         let mut st = crdt_state.lock().await;
+        // ZEB-1011: see grant_read — a detached-state dismiss would vanish.
+        ensure_owner_state_attached(&owner_state_detached, "dismiss_received_grant")?;
         crate::file_sharing::dismiss_received_grant_inner(&mut st, cid, now_ms)
     };
     if changed {
@@ -25472,6 +25571,59 @@ mod file_share_ipc_tests {
         assert_eq!(frames.len(), 1, "exactly one refresh event emitted");
         assert_eq!(frames[0].0, "shared-with-me-updated");
         assert_eq!(frames[0].1, serde_json::json!({ "cid": hex::encode(cid) }));
+    }
+
+    /// ZEB-1011 family pin: a command whose snapshot's owner-state has been
+    /// detached by a completed stop must fail loudly, not record into the
+    /// detached state (the deep interleaving is exercised end-to-end by
+    /// `remove_space_tests::stop_between_snapshot_and_mutation_...`; this pins
+    /// the guard's presence on a second family member).
+    #[tokio::test]
+    async fn dismiss_after_detach_errs_and_writes_nothing() {
+        use crate::owner_state_types::ReceivedFileGrant;
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store);
+        let cid = [0x5E; 32];
+        {
+            let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+            crdt.lock().await.received_file_grants.insert(
+                cid,
+                ReceivedFileGrant {
+                    granter_owner: crate::owner_state_types::OwnerAddr([0x77; 16]),
+                    cid,
+                    file_name: "shared.txt".into(),
+                    file_size: 42,
+                    mime: "text/plain".into(),
+                    sealed_dek: vec![9, 9, 9],
+                    received_at: 1_234,
+                },
+            );
+        }
+        // Simulate a completed stop: the flag the command will snapshot is set
+        // (a real stop also takes crdt_state; the command in this race holds
+        // its Arc from before the stop, which the test state stands in for).
+        state
+            .lock()
+            .unwrap()
+            .owner_state_detached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let sink = crate::node_event_sink::RecordingSink::new();
+        let err = dismiss_received_grant_impl(&state, &sink, hex::encode(cid))
+            .await
+            .expect_err("detached owner-state must refuse the dismiss");
+        assert!(
+            err.contains("stopped during dismiss_received_grant"),
+            "{err}"
+        );
+        // Nothing written, nothing emitted.
+        {
+            let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+            let st = crdt.lock().await;
+            assert!(st.received_file_grants.contains_key(&cid));
+            assert!(st.dismissed_received_grants.is_empty());
+        }
+        assert!(sink.frames().is_empty(), "no event on a refused dismiss");
     }
 }
 
@@ -46771,6 +46923,7 @@ async fn add_library(
     // racing through this command (mirrors add_space, send_dm).
     let (
         crdt_state,
+        owner_state_detached,
         library_directory,
         hlc_tracker,
         adopt_floor,
@@ -46785,6 +46938,7 @@ async fn add_library(
             g.crdt_state
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.owner_state_detached.clone(),
             g.library_directory
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
@@ -46832,6 +46986,10 @@ async fn add_library(
                 ));
             }
         }
+        // ZEB-1011: the generation fence above cannot see a stop-without-
+        // restart (ZEB-895: stop doesn't bump generation) — the detach flag
+        // closes that half.
+        ensure_owner_state_attached(&owner_state_detached, "add_library")?;
         // R3 F1: never regress the LWW state. If a remote bound device
         // already synced an add with a HIGHER HLC than our local now_hlc
         // (e.g., wall-clock skew or a synced concurrent add), keep the
@@ -46869,6 +47027,7 @@ async fn remove_library(
     // racing through this command (mirrors add_library, add_space).
     let (
         crdt_state,
+        owner_state_detached,
         library_directory,
         hlc_tracker,
         adopt_floor,
@@ -46883,6 +47042,7 @@ async fn remove_library(
             g.crdt_state
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.owner_state_detached.clone(),
             g.library_directory
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
@@ -46926,6 +47086,9 @@ async fn remove_library(
                 ));
             }
         }
+        // ZEB-1011: the generation fence above cannot see a stop-without-
+        // restart (ZEB-895) — the detach flag closes that half.
+        ensure_owner_state_attached(&owner_state_detached, "remove_library")?;
         // R3 F2: symmetric LWW guard. If our tombstone HLC doesn't beat
         // the row's `added_at` (e.g., a remote add with a later HLC just
         // synced), `is_effective()` will still return true after this
@@ -47222,7 +47385,15 @@ pub(crate) async fn set_space_read_receipt_pref_impl(
     } else {
         crate::owner_state_types::ReadReceiptPref::Off
     };
-    let (crdt_state, hlc_tracker, adopt_floor, device_id, sync_engine, snapshot_generation) = {
+    let (
+        crdt_state,
+        owner_state_detached,
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        sync_engine,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -47230,6 +47401,7 @@ pub(crate) async fn set_space_read_receipt_pref_impl(
             g.crdt_state
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.owner_state_detached.clone(),
             g.hlc_tracker
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
@@ -47263,6 +47435,9 @@ pub(crate) async fn set_space_read_receipt_pref_impl(
     .await;
     let changed = {
         let mut g = crdt_state.lock().await;
+        // ZEB-1011: the post-check below is generation-only and cannot see a
+        // stop-without-restart (ZEB-895) — the detach flag closes that half.
+        ensure_owner_state_attached(&owner_state_detached, "set_space_read_receipt_pref")?;
         g.set_read_receipt_pref(sid, pref, new_hlc)?
     };
     // Detached-node post-check (mirrors set_space_shared_in_profile): a restart
@@ -49654,7 +49829,15 @@ pub(crate) async fn remove_space_impl(
     let space_id = decode_space_id_16(&space_id)?;
     let id_hex = hex::encode(space_id.0);
 
-    let (self_owner, community_registry, crdt_state, sync_engine, snapshot_generation, device_id) = {
+    let (
+        self_owner,
+        community_registry,
+        crdt_state,
+        owner_state_detached,
+        sync_engine,
+        snapshot_generation,
+        device_id,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -49664,6 +49847,7 @@ pub(crate) async fn remove_space_impl(
             g.crdt_state
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.owner_state_detached.clone(),
             g.sync_engine.clone(),
             g.generation,
             // ZEB-1000: HLC tie-break identity for the dedupe-key tombstone
@@ -49756,6 +49940,7 @@ pub(crate) async fn remove_space_impl(
             check_generation()?;
             {
                 let mut g = crdt_state.lock().await;
+                ensure_owner_state_attached(&owner_state_detached, "remove_space")?;
                 g.remove_space_permanent(space_id, crate::file_sharing::now_epoch_ms(), &device_id);
             }
             // Delete the on-disk data ONLY once the tombstone is durably flushed
@@ -49776,6 +49961,7 @@ pub(crate) async fn remove_space_impl(
             check_generation()?;
             {
                 let mut g = crdt_state.lock().await;
+                ensure_owner_state_attached(&owner_state_detached, "remove_space")?;
                 g.remove_space_permanent(space_id, crate::file_sharing::now_epoch_ms(), &device_id);
             }
             // No on-disk dir to delete; the tombstone flush is best-effort (same
@@ -50427,6 +50613,77 @@ mod remove_space_tests {
         let g = cs.lock().await;
         assert!(!g.spaces.contains_key(&SpaceId([3; 16])));
         assert!(g.tombstones.contains(&SpaceId([3; 16])));
+    }
+
+    /// ZEB-1011: a stop_node that completes between remove_space's snapshot
+    /// and its mutating write must fail the command loudly instead of writing
+    /// the tombstone into the detached owner-state. The generation fence
+    /// CANNOT catch this — per ZEB-895 a stop doesn't bump `generation`
+    /// (asserted below) — so before the detach flag the DM arm returned Ok
+    /// while the tombstone silently vanished (its flush-fence result is
+    /// deliberately discarded).
+    ///
+    /// Deterministic interleaving: the command is parked on an externally
+    /// held crdt lock (its kind-read), the stop runs to completion, then the
+    /// lock is released.
+    #[tokio::test(start_paused = true)]
+    async fn stop_between_snapshot_and_mutation_errs_instead_of_losing_the_tombstone() {
+        let mut os = OwnerState::default();
+        os.spaces
+            .insert(SpaceId([7; 16]), space(7, SpaceKind::Dm, false));
+        let crdt = std::sync::Arc::new(tokio::sync::Mutex::new(os));
+        let node = {
+            let mut ns = NodeState::default();
+            ns.set_test_crdt_state(crdt.clone());
+            std::sync::Arc::new(std::sync::Mutex::new(ns))
+        };
+
+        // Park the command before its kind-read.
+        let held = crdt.lock().await;
+        let node_for_cmd = std::sync::Arc::clone(&node);
+        let cmd =
+            tokio::spawn(
+                async move { remove_space_impl(&node_for_cmd, hex::encode([7u8; 16])).await },
+            );
+        // Let the command run to the parked lock acquisition (paused clock:
+        // the sleep resolves as soon as every task is idle).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // A full stop completes while the command is parked.
+        stop_inner(&node, None);
+        {
+            let g = node.lock().unwrap();
+            assert!(
+                g.owner_state_detached
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "stop_inner marks the outgoing owner-state detached"
+            );
+            assert_eq!(
+                g.generation, 0,
+                "ZEB-895 premise: a stop does not bump generation — the \
+                 generation fence alone cannot see this race"
+            );
+        }
+
+        drop(held);
+        let err = cmd
+            .await
+            .expect("command task")
+            .expect_err("mutating a detached owner-state must fail loudly");
+        assert!(
+            err.contains("stopped during remove_space"),
+            "unexpected error: {err}"
+        );
+        // The detached state was NOT mutated: row intact, no tombstone.
+        let g = crdt.lock().await;
+        assert!(
+            g.spaces.contains_key(&SpaceId([7; 16])),
+            "space row must survive the refused write"
+        );
+        assert!(
+            !g.tombstones.contains(&SpaceId([7; 16])),
+            "no tombstone may be written into the detached state"
+        );
     }
 }
 
@@ -68533,6 +68790,10 @@ fn apply_set_referrable(
 
 pub async fn unfriend_inner(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    // ZEB-1011: the caller's snapshot-paired detach flag — a Revoked
+    // tombstone written into a detached state silently resurrects the
+    // friendship on restart. `None` only in focused tests.
+    owner_state_detached: Option<&std::sync::atomic::AtomicBool>,
     hlc_tracker: &std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
@@ -68581,6 +68842,11 @@ pub async fn unfriend_inner(
         sealed_secret: None,
     };
     let mut state = crdt_state.lock().await;
+    // ZEB-1011: refuse the tombstone if a stop detached this state (the
+    // generation-blind stop case — ZEB-895).
+    if let Some(flag) = owner_state_detached {
+        ensure_owner_state_attached(flag, "unfriend")?;
+    }
     match state.apply_friend_update(peer_addr, tombstone) {
         crate::owner_state_crdt::ApplyOutcome::Inserted
         | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {
@@ -68984,6 +69250,7 @@ async fn unfriend(
 
     let (
         crdt_state,
+        owner_state_detached,
         hlc_tracker,
         adopt_floor,
         device_id,
@@ -68998,6 +69265,7 @@ async fn unfriend(
             g.crdt_state
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.owner_state_detached.clone(),
             g.hlc_tracker
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
@@ -69011,7 +69279,15 @@ async fn unfriend(
         )
     };
 
-    let changed = unfriend_inner(&crdt_state, &hlc_tracker, &adopt_floor, &device_id, peer).await?;
+    let changed = unfriend_inner(
+        &crdt_state,
+        Some(&owner_state_detached),
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        peer,
+    )
+    .await?;
 
     // Owner-state mutated → arm the debounced publish-root + persist on the
     // owner-state SyncEngine so the tombstone reaches the user's other devices
@@ -69070,7 +69346,7 @@ async fn set_friend_referrable(
         .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
     let owner = crate::owner_state_types::OwnerAddr(addr_bytes);
 
-    let (crdt_state, hlc_tracker, adopt_floor, device_id, sync_engine) = {
+    let (crdt_state, owner_state_detached, hlc_tracker, adopt_floor, device_id, sync_engine) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -69078,6 +69354,7 @@ async fn set_friend_referrable(
             g.crdt_state
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.owner_state_detached.clone(),
             g.hlc_tracker
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
@@ -69103,6 +69380,9 @@ async fn set_friend_referrable(
 
     {
         let mut s = crdt_state.lock().await;
+        // ZEB-1011: refuse the LWW write if a stop detached this state (the
+        // generation-blind stop case — ZEB-895).
+        ensure_owner_state_attached(&owner_state_detached, "set_friend_referrable")?;
         // `Ok(None)` ⇒ the flag already had the requested value: idempotent
         // no-op. Skip the LWW write + notify + emit so we don't churn an
         // owner-state re-sync or risk clobbering a concurrent toggle. The
@@ -70513,7 +70793,7 @@ pub(crate) async fn accept_dm_invite_impl(
     // `.await` (mirrors `unfriend` / `set_friend_referrable` — NodeState's sync
     // mutex must never span an `.await`).
     let not_loaded_msg;
-    let (store, crdt_state, device_id, sync_engine) = {
+    let (store, crdt_state, owner_state_detached, device_id, sync_engine) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -70522,6 +70802,7 @@ pub(crate) async fn accept_dm_invite_impl(
         (
             g.pending_dm_invites.clone(),
             g.crdt_state.clone(),
+            g.owner_state_detached.clone(),
             g.dm_device_id.clone(),
             g.sync_engine.clone(),
         )
@@ -70569,16 +70850,33 @@ pub(crate) async fn accept_dm_invite_impl(
     // Run the accept tail under the owner-state lock, then DROP the guard before
     // touching the store / sink (the store `Mutex` + event sink must not nest
     // inside the held `crdt_state` lock — ZEB-236 T3 caller contract).
+    // ZEB-1011: the detach check runs INSIDE the lock scope (that ordering is
+    // what makes it race-free against stop_inner's final flush), but its
+    // re-stage handling happens after the guard drops, honoring the same
+    // no-nesting contract.
     let apply_result = {
         let mut g = crdt_state.lock().await;
-        crate::dm_outbox::run_invite_accept_tail(
-            &mut g,
-            &device_id,
-            staged.signed,
-            now_ms,
-            staged.refresh_owner_device_cache,
-            signer_identity_pub,
-        )
+        ensure_owner_state_attached(&owner_state_detached, "accept_dm_invite").map(|()| {
+            crate::dm_outbox::run_invite_accept_tail(
+                &mut g,
+                &device_id,
+                staged.signed,
+                now_ms,
+                staged.refresh_owner_device_cache,
+                signer_identity_pub,
+            )
+        })
+    };
+    let apply_result = match apply_result {
+        Ok(inner) => inner,
+        Err(detached) => {
+            // A stop raced the accept: nothing was written. Re-stage the
+            // invite (mirrors the transient-failure arm — a silently lost
+            // accept is indistinguishable from a decline) and surface the
+            // detach loudly.
+            store.stage(restage_copy);
+            return Err(detached);
+        }
     };
     if let Err(e) = apply_result {
         return match e {
@@ -72102,6 +72400,7 @@ mod friend_ipc_tests {
 
         let changed = unfriend_inner(
             &crdt_state,
+            None,
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
@@ -72139,6 +72438,7 @@ mod friend_ipc_tests {
         let unknown = OwnerAddr([0xEE; 16]);
         let err = unfriend_inner(
             &crdt_state,
+            None,
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
@@ -72175,6 +72475,7 @@ mod friend_ipc_tests {
 
         let changed = unfriend_inner(
             &crdt_state,
+            None,
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
@@ -72221,6 +72522,7 @@ mod friend_ipc_tests {
         );
         let changed = unfriend_inner(
             &crdt_state,
+            None,
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "self",
@@ -72272,6 +72574,7 @@ mod friend_ipc_tests {
         }
         let changed = unfriend_inner(
             &crdt_state,
+            None,
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
@@ -82930,6 +83233,7 @@ mod start_node_race_tests {
             dm_transport: None,
             butler_deposit_client: None,
             crdt_state: None,
+            owner_state_detached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hlc_tracker: None,
             hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             dm_device_id: None,

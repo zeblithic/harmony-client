@@ -40,6 +40,7 @@ async fn round_trip(plaintext: Vec<u8>) {
         &ingest_tx,
         &content_index,
         &crdt_state,
+        None,
         &keytree,
         None,
         reader,

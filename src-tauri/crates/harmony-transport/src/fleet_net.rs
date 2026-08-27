@@ -519,46 +519,103 @@ pub fn build_vine_relay_set(
     out
 }
 
-/// Selection-relevant projection of the fleet-net doc (ZEB-418 P2, D16):
-/// the advertised prefix's (device-id, endpoint, relay, pinned) tuples.
-/// Deliberately EXCLUDES `seen_at` — stamp-only refreshes (the periodic
-/// re-stamp every BUTLER_SET_REFRESH_MS) must not look like fleet changes,
-/// otherwise every sibling heartbeat would schedule a debounced republish.
-pub fn selection_view(
+/// Shared body of [`selection_view`] / [`vine_selection_view`] (ZEB-1006):
+/// project the capped `butler_set_order` prefix to (device-id, endpoint,
+/// relay, pinned) tuples, then mirror the builders' `!saw_self` self-force
+/// eviction so the view tracks the *effective* published set, not the raw
+/// snapshot prefix.
+///
+/// When self's row is absent from the capped fresh prefix (stale/missing row,
+/// or fresh siblings filled the cap), both builders evict the lowest-priority
+/// entry (when full) and force-insert self — a pinned fresh sibling keeps
+/// slot 0. Without re-applying that transform here, churn in the evicted
+/// sibling flips the change signal while the published set is unchanged →
+/// a redundant debounced republish.
+///
+/// Self's tuple carries its doc row data when present (fresh row: the change
+/// proxy for the live entry, which follows the doc via the next self-stamp;
+/// stale row: frozen until re-stamped, so it can't churn) or a zeroed
+/// placeholder when the row is missing (also constant). Known, accepted
+/// approximation vs `build_butler_set`: unresolvable-vk sibling skips aren't
+/// modeled here (no `vk_lookup` at view time) — same as before this fix.
+fn selection_view_with_cap(
     doc: &FleetNetDoc,
+    self_device_id: &str,
     stale_before_ms: u64,
+    cap: usize,
 ) -> Vec<(String, [u8; 32], String, bool)> {
-    butler_set_order(doc, stale_before_ms)
+    let mut view: Vec<(String, [u8; 32], String, bool)> = butler_set_order(doc, stale_before_ms)
         .into_iter()
-        .take(crate::butler_deposit::BUTLER_SET_MAX_ENTRIES)
+        .take(cap)
         .map(|(id, row)| {
             let pinned = doc.pinned.as_deref() == Some(id.as_str());
             (id, row.iroh_endpoint_id, row.home_relay, pinned)
         })
-        .collect()
+        .collect();
+    if !view.iter().any(|(id, ..)| id == self_device_id) {
+        if view.len() >= cap {
+            view.pop();
+        }
+        let self_pinned = doc.pinned.as_deref() == Some(self_device_id);
+        let (endpoint, relay) = doc
+            .devices
+            .get(self_device_id)
+            .map(|r| (r.iroh_endpoint_id, r.home_relay.clone()))
+            .unwrap_or(([0u8; 32], String::new()));
+        let idx = if !self_pinned && view.first().is_some_and(|(.., pinned)| *pinned) {
+            1
+        } else {
+            0
+        };
+        let idx = idx.min(view.len());
+        view.insert(
+            idx,
+            (self_device_id.to_string(), endpoint, relay, self_pinned),
+        );
+    }
+    view
 }
 
-/// The vines analogue of [`selection_view`] (ZEB-820): the up-to-
-/// `VINE_RELAY_SET_MAX` prefix that `build_vine_relay_set` would publish,
-/// projected to (device-id, endpoint, relay, pinned) and EXCLUDING `seen_at`
-/// for the same reason — so the fleet-change task can debounce a vine
-/// re-publish on a change to the advertised set (a sibling joining, aging out,
-/// or changing its relay) without every heartbeat's stamp churn triggering one.
-/// Self's live entry is constant across ticks, so this sibling/pin prefix is the
-/// change signal that matters. Wider than [`selection_view`] (cap 4 vs 2), so a
-/// device entering only the vine set — not the butler set — is still caught.
-pub fn vine_selection_view(
+/// Selection-relevant projection of the fleet-net doc (ZEB-418 P2, D16):
+/// the tuples of the butler set [`build_butler_set`] would publish —
+/// (device-id, endpoint, relay, pinned), including the self-force eviction
+/// (ZEB-1006, see [`selection_view_with_cap`]). Deliberately EXCLUDES
+/// `seen_at` — stamp-only refreshes (the periodic re-stamp every
+/// BUTLER_SET_REFRESH_MS) must not look like fleet changes, otherwise every
+/// sibling heartbeat would schedule a debounced republish.
+pub fn selection_view(
     doc: &FleetNetDoc,
+    self_device_id: &str,
     stale_before_ms: u64,
 ) -> Vec<(String, [u8; 32], String, bool)> {
-    butler_set_order(doc, stale_before_ms)
-        .into_iter()
-        .take(crate::reachability_record::VINE_RELAY_SET_MAX)
-        .map(|(id, row)| {
-            let pinned = doc.pinned.as_deref() == Some(id.as_str());
-            (id, row.iroh_endpoint_id, row.home_relay, pinned)
-        })
-        .collect()
+    selection_view_with_cap(
+        doc,
+        self_device_id,
+        stale_before_ms,
+        crate::butler_deposit::BUTLER_SET_MAX_ENTRIES,
+    )
+}
+
+/// The vines analogue of [`selection_view`] (ZEB-820): the set
+/// [`build_vine_relay_set`] would publish, projected to (device-id, endpoint,
+/// relay, pinned) and EXCLUDING `seen_at` for the same reason — so the
+/// fleet-change task can debounce a vine re-publish on a change to the
+/// advertised set (a sibling joining, aging out, or changing its relay)
+/// without every heartbeat's stamp churn triggering one. Wider than
+/// [`selection_view`] (cap 4 vs 2), so a device entering only the vine set —
+/// not the butler set — is still caught. Mirrors the self-force eviction
+/// (ZEB-1006, see [`selection_view_with_cap`]).
+pub fn vine_selection_view(
+    doc: &FleetNetDoc,
+    self_device_id: &str,
+    stale_before_ms: u64,
+) -> Vec<(String, [u8; 32], String, bool)> {
+    selection_view_with_cap(
+        doc,
+        self_device_id,
+        stale_before_ms,
+        crate::reachability_record::VINE_RELAY_SET_MAX,
+    )
 }
 
 /// ZEB-510: project a durable fleet-net device row into a dial-target
@@ -2213,14 +2270,102 @@ mod vine_relay_set_tests {
             ("cc", row(0x99, "https://c2.example", now)),
         ]);
         assert_eq!(
-            selection_view(&base, cutoff),
-            selection_view(&changed, cutoff),
+            selection_view(&base, SELF_ID, cutoff),
+            selection_view(&changed, SELF_ID, cutoff),
             "butler top-2 view must be unchanged"
         );
         assert_ne!(
-            vine_selection_view(&base, cutoff),
-            vine_selection_view(&changed, cutoff),
+            vine_selection_view(&base, SELF_ID, cutoff),
+            vine_selection_view(&changed, SELF_ID, cutoff),
             "vine top-4 view must catch the 3rd-device change"
+        );
+    }
+
+    #[test]
+    fn vine_selection_view_ignores_churn_in_the_sibling_self_force_evicts() {
+        // ZEB-1006: self's row is absent while 4 fresh siblings fill the vine
+        // cap — build_vine_relay_set evicts the last-priority sibling ("ee")
+        // and force-inserts self, so "ee" is not in the published set. Churn
+        // in "ee" must therefore not flip the change signal.
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let cutoff = now.saturating_sub(BUTLER_SET_FRESHNESS_MS);
+        let base = doc_with(&[
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x33, "https://c.example", now)),
+            ("dd", row(0x44, "https://d.example", now)),
+            ("ee", row(0x55, "https://e.example", now)),
+        ]);
+        let evicted_churn = doc_with(&[
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x33, "https://c.example", now)),
+            ("dd", row(0x44, "https://d.example", now)),
+            ("ee", row(0x66, "https://e2.example", now)),
+        ]);
+        // Premise: the published sets really are identical (the builder
+        // evicted "ee" both times) — the view must agree with the builder.
+        let eps = |out: Vec<VineRelayEntry>| -> Vec<[u8; 32]> {
+            out.into_iter().map(|e| e.iroh_endpoint_id).collect()
+        };
+        assert_eq!(
+            eps(build_vine_relay_set(&base, SELF_ID, self_entry(), now)),
+            eps(build_vine_relay_set(
+                &evicted_churn,
+                SELF_ID,
+                self_entry(),
+                now
+            )),
+            "builder output identical across evicted-sibling churn"
+        );
+        assert_eq!(
+            vine_selection_view(&base, SELF_ID, cutoff),
+            vine_selection_view(&evicted_churn, SELF_ID, cutoff),
+            "evicted-sibling churn must not flip the vine change signal"
+        );
+        // A surviving sibling's change still flips it.
+        let survivor_churn = doc_with(&[
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x77, "https://c2.example", now)),
+            ("dd", row(0x44, "https://d.example", now)),
+            ("ee", row(0x55, "https://e.example", now)),
+        ]);
+        assert_ne!(
+            vine_selection_view(&base, SELF_ID, cutoff),
+            vine_selection_view(&survivor_churn, SELF_ID, cutoff),
+            "surviving-sibling change must still flip the vine signal"
+        );
+    }
+
+    #[test]
+    fn selection_view_mirrors_builder_self_force_placement() {
+        // ZEB-1006: the view's self-force transform mirrors the builders' —
+        // self leads when unpinned; a fresh pinned sibling keeps slot 0.
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let cutoff = now.saturating_sub(BUTLER_SET_FRESHNESS_MS);
+        let mut doc = doc_with(&[
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x33, "https://c.example", now)),
+            ("dd", row(0x44, "https://d.example", now)),
+            ("ee", row(0x55, "https://e.example", now)),
+        ]);
+        let ids = |view: Vec<(String, [u8; 32], String, bool)>| -> Vec<String> {
+            view.into_iter().map(|(id, ..)| id).collect()
+        };
+        assert_eq!(
+            ids(vine_selection_view(&doc, SELF_ID, cutoff)),
+            vec![SELF_ID, "bb", "cc", "dd"],
+            "unpinned self leads; the cap-overflow sibling is evicted"
+        );
+        // Butler view (cap 2) applies the same transform.
+        assert_eq!(
+            ids(selection_view(&doc, SELF_ID, cutoff)),
+            vec![SELF_ID, "bb"],
+            "butler view mirrors build_butler_set's self-force eviction"
+        );
+        doc.pinned = Some("bb".to_string());
+        assert_eq!(
+            ids(vine_selection_view(&doc, SELF_ID, cutoff)),
+            vec!["bb", SELF_ID, "cc", "dd"],
+            "a fresh pinned sibling keeps slot 0; self inserts after it"
         );
     }
 }
