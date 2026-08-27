@@ -19,14 +19,22 @@
 //! See `docs/superpowers/specs/2026-08-13-zeb928-r4-wiring-design.md`.
 
 use crate::community_topology::community_neighbors;
+use crate::owner_state_types::Hlc;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
 
-/// The *current* enrolled device verify key each owner asserts for a node_id. Keyed by owner so
+/// The *current* enrolled device verify key each owner asserts for a node_id, with the
+/// freshness stamp of the record that asserted it. Keyed by owner so
 /// (a) a departing owner never evicts a co-resident owner's binding for a shared node_id, and
 /// (b) a superseded reachability record REPLACES that owner's prior key rather than accumulating
 /// stale keys that could keep the node admitted after its verified key changed (Greptile P1).
-type OwnerDeviceKeys = HashMap<[u8; 16], [u8; 32]>;
+/// The stamp (ZEB-995) orders competing binds for the same `(owner, node_id)`: book ingest is
+/// per-community LWW, so without it, community iteration/delivery order — not record freshness —
+/// decided which community's key won the slot. It is the record's full [`Hlc`] (wall clamped by
+/// the caller), whose derived lexicographic `Ord` is the resolver's exact "strictly newer"
+/// relation (ZEB-211) — so wall-millisecond ties break the same way everywhere, not by
+/// delivery order (CodeAnt PR #756 r1).
+type OwnerDeviceKeys = HashMap<[u8; 16], ([u8; 32], Hlc)>;
 
 /// Shared admission classifier. Cheap to read; the hot path takes read locks only.
 pub struct AdmissionOracle {
@@ -73,7 +81,7 @@ impl AdmissionOracle {
             None => return true, // fail-open on unknown identity
         };
         let admitted = self.admitted.read().expect("admitted poisoned");
-        owners.values().any(|dk| admitted.contains(dk))
+        owners.values().any(|(dk, _)| admitted.contains(dk))
     }
 
     /// Controller: replace the admitted device-key set (called on a membership delta).
@@ -81,16 +89,40 @@ impl AdmissionOracle {
         *self.admitted.write().expect("admitted poisoned") = keys;
     }
 
-    /// Resolver: record that `node_id`'s *current* verified key under `owner` is `device_key`.
-    /// Replaces any prior key this owner asserted for the node_id, so a superseded record can't
-    /// leave a stale key admitted (Greptile P1, PR #674).
-    pub fn bind(&self, owner: [u8; 16], node_id: [u8; 32], device_key: [u8; 32]) {
-        self.node_to_owned_devices
+    /// Resolver: record that `node_id`'s *current* verified key under `owner` is `device_key`,
+    /// asserted by a record stamped `stamp` (the record's HLC, wall time clamped by the caller
+    /// to its site's skew tolerance so a future-dated record can't squat the slot). Replaces any
+    /// prior key this owner asserted for the node_id, so a superseded record can't leave a stale
+    /// key admitted (Greptile P1, PR #674).
+    ///
+    /// Returns whether the binding was installed — `false` means a strictly-newer record already
+    /// holds the slot and this (stale) one was ignored, so callers counting "bindings applied"
+    /// count only real installs (CodeAnt PR #756 r1).
+    pub fn bind(
+        &self,
+        owner: [u8; 16],
+        node_id: [u8; 32],
+        device_key: [u8; 32],
+        stamp: Hlc,
+    ) -> bool {
+        let mut map = self
+            .node_to_owned_devices
             .write()
-            .expect("node_to_owned_devices poisoned")
-            .entry(node_id)
-            .or_default()
-            .insert(owner, device_key);
+            .expect("node_to_owned_devices poisoned");
+        let owners = map.entry(node_id).or_default();
+        // ZEB-995: per-(owner, node_id) LWW on the record's full HLC (the resolver's exact
+        // "strictly newer" relation). Book ingest is per-community LWW, so bind order across
+        // communities tracks iteration/delivery order, not global freshness — a strictly older
+        // record must not clobber the current key. A fully-equal stamp still replaces,
+        // preserving the #674 same-stamp refresh semantics exactly (only an identical record
+        // re-ingest can tie on all three HLC fields — its author is the device_id tie-break).
+        match owners.get(&owner) {
+            Some((_, existing)) if *existing > stamp => false,
+            _ => {
+                owners.insert(owner, (device_key, stamp));
+                true
+            }
+        }
     }
 
     /// Resolver `remove_owner`: forget only `owner`'s binding for these node_ids. A node_id still
@@ -149,6 +181,13 @@ mod tests {
     fn own(b: u8) -> [u8; 16] {
         [b; 16]
     }
+    fn stamp(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: String::new(),
+        }
+    }
     fn synth(n: usize) -> BTreeSet<[u8; 32]> {
         (0..n)
             .map(|i| harmony_crypto::hash::blake3_hash(&(i as u64).to_be_bytes()))
@@ -176,8 +215,8 @@ mod tests {
     fn router_mode_admits_bound_admitted_denies_bound_unadmitted() {
         let o = AdmissionOracle::new(true);
         o.publish_admitted(BTreeSet::from([dk(1)]));
-        o.bind(own(1), nid(1), dk(1));
-        o.bind(own(2), nid(2), dk(2));
+        o.bind(own(1), nid(1), dk(1), stamp(1_000));
+        o.bind(own(2), nid(2), dk(2), stamp(1_000));
         assert!(o.admit(&nid(1)), "bound to admitted device key");
         assert!(!o.admit(&nid(2)), "bound to non-admitted device key");
     }
@@ -187,8 +226,8 @@ mod tests {
         // A new record for the same (owner, node_id) with a different enrolled key must REPLACE
         // the prior key — the superseded key can't keep the node admitted (Greptile P1, #674).
         let o = AdmissionOracle::new(true);
-        o.bind(own(1), nid(1), dk(4)); // old key, once a neighbor
-        o.bind(own(1), nid(1), dk(5)); // rotation: dk(5) is now the current key
+        o.bind(own(1), nid(1), dk(4), stamp(1_000)); // old key, once a neighbor
+        o.bind(own(1), nid(1), dk(5), stamp(1_000)); // rotation: dk(5) is now the current key
         o.publish_admitted(BTreeSet::from([dk(4)]));
         assert!(
             !o.admit(&nid(1)),
@@ -198,10 +237,87 @@ mod tests {
         assert!(o.admit(&nid(1)), "current key dk(5) admits");
     }
 
+    // ---- ZEB-995: stamp-LWW bind (cross-community bind-overwrite) ----
+
+    #[test]
+    fn bind_stale_stamp_does_not_overwrite_fresh() {
+        // Cross-community replay: community B's fresh record bound first, then community A's
+        // stale-but-TTL-fresh row for the same (owner, node_id) arrives. Iteration/delivery
+        // order must not decide the winner — the fresher record's key must survive.
+        let o = AdmissionOracle::new(true);
+        o.bind(own(1), nid(1), dk(2), stamp(200)); // fresh (rotated-identity key)
+        o.bind(own(1), nid(1), dk(1), stamp(100)); // stale (pre-recovery key, other community's book)
+        o.publish_admitted(BTreeSet::from([dk(2)]));
+        assert!(o.admit(&nid(1)), "fresh binding survives a stale re-bind");
+        o.publish_admitted(BTreeSet::from([dk(1)]));
+        assert!(!o.admit(&nid(1)), "stale key did not install");
+    }
+
+    #[test]
+    fn bind_fresh_stamp_replaces_stale() {
+        let o = AdmissionOracle::new(true);
+        o.bind(own(1), nid(1), dk(1), stamp(100));
+        o.bind(own(1), nid(1), dk(2), stamp(200));
+        o.publish_admitted(BTreeSet::from([dk(1)]));
+        assert!(!o.admit(&nid(1)), "superseded key no longer admits");
+        o.publish_admitted(BTreeSet::from([dk(2)]));
+        assert!(o.admit(&nid(1)), "fresh key admits");
+    }
+
+    #[test]
+    fn bind_equal_stamp_replaces() {
+        // At a fully-equal HLC the later write still replaces — the #674 replace-semantics are
+        // preserved exactly for same-stamp refreshes (never accumulate, never resurrect). In
+        // practice only an identical record re-ingest ties on all three HLC fields.
+        let o = AdmissionOracle::new(true);
+        o.bind(own(1), nid(1), dk(1), stamp(100));
+        o.bind(own(1), nid(1), dk(2), stamp(100));
+        o.publish_admitted(BTreeSet::from([dk(2)]));
+        assert!(
+            o.admit(&nid(1)),
+            "equal-stamp bind replaces (#674 semantics)"
+        );
+    }
+
+    #[test]
+    fn bind_equal_wall_ms_ties_break_by_full_hlc_either_order() {
+        // CodeAnt PR #756 r1: two divergent records at the SAME wall millisecond must resolve
+        // by the full HLC (logical, then device_id) — the resolver's exact tie-break — not by
+        // delivery order. Both orders must converge on the higher-HLC record's key.
+        let lo = Hlc {
+            wall_ms: 100,
+            logical: 1,
+            device_id: "dev-a".into(),
+        };
+        let hi = Hlc {
+            wall_ms: 100,
+            logical: 2,
+            device_id: "dev-b".into(),
+        };
+        for (first, second) in [
+            ((dk(1), lo.clone()), (dk(2), hi.clone())),
+            ((dk(2), hi.clone()), (dk(1), lo.clone())),
+        ] {
+            let o = AdmissionOracle::new(true);
+            o.bind(own(1), nid(1), first.0, first.1);
+            o.bind(own(1), nid(1), second.0, second.1);
+            o.publish_admitted(BTreeSet::from([dk(2)]));
+            assert!(
+                o.admit(&nid(1)),
+                "higher-HLC record's key wins the wall-ms tie in both orders"
+            );
+            o.publish_admitted(BTreeSet::from([dk(1)]));
+            assert!(
+                !o.admit(&nid(1)),
+                "lower-HLC record's key must not hold the slot in either order"
+            );
+        }
+    }
+
     #[test]
     fn publish_admitted_transitions_membership() {
         let o = AdmissionOracle::new(true);
-        o.bind(own(2), nid(2), dk(2));
+        o.bind(own(2), nid(2), dk(2), stamp(1_000));
         assert!(!o.admit(&nid(2)));
         o.publish_admitted(BTreeSet::from([dk(2)]));
         assert!(o.admit(&nid(2)), "admitted after republish");
@@ -211,7 +327,7 @@ mod tests {
     fn unbind_owner_drops_only_that_owners_binding() {
         let o = AdmissionOracle::new(true);
         o.publish_admitted(BTreeSet::from([dk(2)]));
-        o.bind(own(2), nid(2), dk(2));
+        o.bind(own(2), nid(2), dk(2), stamp(1_000));
         assert!(o.admit(&nid(2)));
         o.unbind_owner(own(2), &[nid(2)]);
         assert!(o.admit(&nid(2)), "binding gone -> unknown -> fail open");
@@ -223,8 +339,8 @@ mod tests {
         // evict owner B's live, admitted binding (CR-2 / CodeRabbit PR #674).
         let o = AdmissionOracle::new(true);
         let shared = nid(7);
-        o.bind(own(0xA), shared, dk(1)); // owner A, NOT admitted
-        o.bind(own(0xB), shared, dk(2)); // owner B, admitted
+        o.bind(own(0xA), shared, dk(1), stamp(1_000)); // owner A, NOT admitted
+        o.bind(own(0xB), shared, dk(2), stamp(1_000)); // owner B, admitted
         o.publish_admitted(BTreeSet::from([dk(2)]));
         assert!(o.admit(&shared), "admitted via owner B");
         o.unbind_owner(own(0xA), &[shared]);
