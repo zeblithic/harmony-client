@@ -49,6 +49,12 @@ impl From<MintError> for String {
 /// this magic doubles as the pre-ZEB-985 plaintext detector.
 const SQLITE_PLAINTEXT_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
+/// Guards the detect→export→rename sequence in [`open_database`] so
+/// concurrent first opens serialize the one-time plaintext migration.
+/// Thread layer only — the fd-lock taken alongside it in `open_database`
+/// extends the same exclusion across processes.
+static MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Open (or create) the Mint SQLite database at `path`, encrypted at rest
 /// with SQLCipher under `key` (ZEB-985).
 ///
@@ -70,8 +76,38 @@ pub fn open_database(path: &std::path::Path, key: &[u8; 32]) -> Result<Connectio
         std::fs::create_dir_all(parent)?;
     }
 
-    if is_plaintext_sqlite(path)? {
-        migrate_plaintext_to_encrypted(path, key)?;
+    // Serialize the one-time migration across concurrent first opens:
+    // `mint_db_handle`'s documented double-checked slow path (and a boot
+    // racing an early mint command) can run two `open_database` calls at
+    // once, and unserialized both would detect the plaintext file, fight
+    // over the shared temp sibling, and race the final rename (PR #763
+    // review). The plaintext re-check happens UNDER the locks so the loser
+    // sees the winner's completed migration and proceeds straight to the
+    // keyed open. Two layers, always taken in this order (single site, no
+    // inversion): the std Mutex serializes threads in this process; the
+    // fd-lock below serializes PROCESSES — a plain GUI launch holds no
+    // profile lock (`api/serve.lock` is only taken by `serve` and
+    // GUI-with-API), so a plain GUI and a `serve` on the same profile can
+    // both reach a first open concurrently (PR #764 review). Blocking
+    // `write()` is deliberate: the loser waits out the winner's migration
+    // rather than erroring, and the re-check then routes it to the keyed
+    // open. The OS releases the lock on process death, so a crashed
+    // migrator never wedges later opens.
+    {
+        let _migration_guard = MIGRATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(migration_lock_path(path))?;
+        let mut os_lock = fd_lock::RwLock::new(lock_file);
+        let _os_guard = os_lock.write()?;
+        if is_plaintext_sqlite(path)? {
+            migrate_plaintext_to_encrypted(path, key)?;
+        }
     }
 
     let conn = Connection::open(path)?;
@@ -94,6 +130,15 @@ fn apply_sqlcipher_key(conn: &Connection, key: &[u8; 32]) -> Result<(), MintErro
 
 fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Sibling lock file (`ledger.db.migrate-lock`) guarding the one-time
+/// plaintext migration across PROCESSES. Kept permanently once created —
+/// unlinking a lock file another process holds (or is blocked on) silently
+/// breaks flock exclusion on Unix, the same rule the profile lock's
+/// `api/serve.lock` and `identity.enc.lock` follow.
+fn migration_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("db.migrate-lock")
 }
 
 /// Does the file at `path` start with the plaintext SQLite magic?
@@ -1182,6 +1227,115 @@ mod tests {
         // Second open: migration is one-shot; data still there.
         let conn = open_database(&path, &KEY_A).expect("post-migration reopen");
         assert_eq!(list_accounts(&conn).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn concurrent_first_opens_serialize_the_migration() {
+        // PR #763 review: `mint_db_handle`'s double-checked slow path can
+        // run two `open_database` calls at once. Both racing the one-time
+        // plaintext migration must serialize on MIGRATION_LOCK — each open
+        // succeeds and the migrated rows survive.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = Connection::open(&path).expect("plain open");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("wal");
+            apply_migrations(&conn).expect("migrations");
+            create_account(&conn, "raced").expect("create account");
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || -> Result<usize, String> {
+                    barrier.wait();
+                    let conn = open_database(&path, &KEY_A).map_err(|e| e.to_string())?;
+                    list_accounts(&conn)
+                        .map(|a| a.len())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for handle in handles {
+            let accounts = handle.join().expect("thread").expect("concurrent open");
+            assert_eq!(accounts, 1, "both racers see the migrated row");
+        }
+        assert_ne!(
+            &read_header(&path),
+            SQLITE_PLAINTEXT_MAGIC,
+            "post-race file is still plaintext"
+        );
+    }
+
+    /// PR #764 review: a plain GUI launch holds no profile lock
+    /// (`api/serve.lock` is only taken by `serve` and GUI-with-API), so a
+    /// plain GUI and a `serve` on the same profile can both reach a first
+    /// open concurrently from separate processes. The OS advisory lock must
+    /// make the loser WAIT out the winner's migration. The external holder
+    /// here stands in for the other process — fd-lock excludes per
+    /// open-file-description, so a second handle in this process contends
+    /// exactly like a second process would. The "still blocked" assert is
+    /// kernel-guaranteed while the holder guard lives, not a timing race.
+    #[test]
+    fn migration_waits_for_cross_process_lock_holder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        // Plaintext database exactly as the pre-ZEB-985 open built it.
+        {
+            let conn = Connection::open(&path).expect("plain open");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("wal");
+            conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+            apply_migrations(&conn).expect("migrations");
+            create_account(&conn, "checking").expect("create account");
+        }
+        assert_eq!(
+            &read_header(&path),
+            SQLITE_PLAINTEXT_MAGIC,
+            "precondition: pre-migration file is plaintext"
+        );
+
+        // The stand-in "other process" takes the migration lock first.
+        let holder_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(migration_lock_path(&path))
+            .expect("open lock file");
+        let mut holder = fd_lock::RwLock::new(holder_file);
+        let holder_guard = holder.write().expect("external hold");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        let opener = std::thread::spawn(move || {
+            let res = open_database(&p, &KEY_A)
+                .map_err(|e| e.to_string())
+                .map(|conn| list_accounts(&conn).expect("list").len());
+            let _ = done_tx.send(res);
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "open_database completed while another process held the migration lock"
+        );
+
+        drop(holder_guard);
+        let rows = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("open completes once the lock is released")
+            .expect("open succeeds");
+        opener.join().expect("opener thread");
+        assert_eq!(rows, 1, "migrated row visible to the waiting opener");
+        assert_ne!(
+            &read_header(&path),
+            SQLITE_PLAINTEXT_MAGIC,
+            "file still plaintext after lock-serialized migration"
+        );
     }
 
     #[test]
