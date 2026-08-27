@@ -71,6 +71,42 @@ impl<R: tauri::Runtime> super::NodeStateAccess for GuiStateAccess<R> {
     }
 }
 
+/// ZEB-1007: the sink the GUI API server's RPC dispatch emits through —
+/// webview emission plus a DIRECT handle to the WS broadcast. Deliberately
+/// NOT `AppHandleSink`: its WS mirror resolves `ApiHost` via `try_state`,
+/// which is `None` in the window between the server going live (bind +
+/// discovery files + accept loop, all inside [`start_gui_api_at`]) and
+/// setup's `app.manage(host)` a few statements later — an RPC processed in
+/// that window would emit into the void, and the no-replay broadcast makes
+/// the drop permanent for an already-subscribed client. This sink holds
+/// `events` directly, so manage timing is irrelevant to it. The webview arm
+/// uses the raw `Emitter` (same as `AppHandleSink`'s), NOT `AppHandleSink`
+/// itself — routing through it would double-mirror every frame post-manage.
+struct GuiApiServerSink<R: tauri::Runtime> {
+    app: tauri::AppHandle<R>,
+    events: Arc<ApiEventSink>,
+}
+
+impl<R: tauri::Runtime> crate::node_event_sink::NodeEventSink for GuiApiServerSink<R> {
+    fn emit(&self, event: &str, payload: serde_json::Value) {
+        crate::node_event_sink::NodeEventSink::emit(&*self.events, event, payload.clone());
+        if let Err(e) = tauri::Emitter::emit(&self.app, event, payload) {
+            tracing::warn!(event, error = %e, "tauri emit failed");
+        }
+    }
+}
+
+/// The sink the GUI API server's RPC dispatch emits through: webview
+/// emission plus the WS broadcast, so API-triggered events reach both
+/// surfaces with one vocabulary — including in the pre-manage boot window
+/// (see [`GuiApiServerSink`]).
+fn server_sink<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    events: Arc<ApiEventSink>,
+) -> Arc<dyn crate::node_event_sink::NodeEventSink> {
+    Arc::new(GuiApiServerSink { app, events })
+}
+
 /// Start the API server inside the GUI process (called from `run()`'s
 /// setup hook when HARMONY_API_PORT is set). Returns the `ApiHost` for
 /// `app.manage`.
@@ -117,12 +153,7 @@ fn start_gui_api_at<R: tauri::Runtime>(
     };
     let events = ApiEventSink::new();
     let state: Arc<dyn super::NodeStateAccess> = Arc::new(GuiStateAccess(app.clone()));
-    // The server's RPC dispatch emits through the AppHandle sink — the
-    // SAME sink the Tauri wrappers use — so API-triggered events reach the
-    // webview AND (via the mirror in node_event_sink.rs) the WS stream.
-    // Passing `events` directly here would skip the webview.
-    let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
-        Arc::new(crate::node_event_sink::AppHandleSink(app.clone()));
+    let sink = server_sink(app.clone(), events.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (handle, server_task) = match tauri::async_runtime::block_on(super::start_server(
         &data_dir,
@@ -256,6 +287,29 @@ mod tests {
             !dir.path().join("api").join("token").exists(),
             "failed bind must not leave a token file"
         );
+    }
+
+    /// ZEB-1007: the server's own sink must mirror onto the WS broadcast
+    /// even BEFORE ApiHost is managed. The server goes live (bind +
+    /// discovery files + accept loop) inside `start_gui_api_at`, a beat
+    /// before setup's `app.manage(host)` — an RPC processed in that window
+    /// emits through this sink, and the no-replay broadcast means a frame
+    /// dropped there is gone for good for an already-subscribed client.
+    /// (IPC emissions can't fire pre-manage — the main-thread event loop
+    /// isn't pumping during setup — so this is the only reachable arm.)
+    #[test]
+    fn server_sink_reaches_ws_broadcast_before_apihost_is_managed() {
+        let app = tauri::test::mock_app();
+        let events = ApiEventSink::new();
+        let mut rx = events.subscribe();
+        // Deliberately NO app.manage(ApiHost) — the pre-manage window.
+        let sink = server_sink(app.handle().clone(), events.clone());
+        sink.emit("early-rpc-event", serde_json::json!({"n": 1}));
+        let frame = rx
+            .try_recv()
+            .expect("pre-manage emission must reach the WS broadcast");
+        assert_eq!(frame.event, "early-rpc-event");
+        assert_eq!(frame.payload, serde_json::json!({"n": 1}));
     }
 
     /// Without a managed ApiHost (and with a disabled one), the AppHandle

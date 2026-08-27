@@ -12056,15 +12056,42 @@ pub async fn start_node_inner(
                             .with_self_statics(self_statics_for_friend)
                             .with_peer_intro_policy_provider(
                                 pkarr_settings_path_for_state.clone().map(|p| {
-                                    std::sync::Arc::new(move || {
-                                        connectivity_settings::ConnectivitySettings::load_or_default(
-                                            &p,
-                                        )
-                                        .peer_intro_policy
-                                    })
-                                        as std::sync::Arc<
-                                            dyn Fn() -> friend_graph::PeerIntroPolicy + Send + Sync,
-                                        >
+                                    // ZEB-1008: the settings read + JSON parse run via
+                                    // spawn_blocking, not inline on the tokio worker
+                                    // processing the inbound introduction — a slow or
+                                    // unavailable filesystem must not stall the arm
+                                    // before its ack. Fresh-per-call is preserved
+                                    // (live-apply, no caching). JoinError (blocking
+                                    // task panicked / runtime shutting down) fails
+                                    // CLOSED, mirroring `fail_closed_defaults`
+                                    // (ZEB-376): a CONFIGURED policy we could not
+                                    // read must never silently admit a stranger.
+                                    std::sync::Arc::new(
+                                        move || -> iroh_pex_acceptor::PeerIntroPolicyFuture {
+                                            let p = p.clone();
+                                            Box::pin(async move {
+                                                match tokio::task::spawn_blocking(move || {
+                                                    connectivity_settings::ConnectivitySettings::load_or_default(
+                                                        &p,
+                                                    )
+                                                    .peer_intro_policy
+                                                })
+                                                .await
+                                                {
+                                                    Ok(policy) => policy,
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            error = %e,
+                                                            "ZEB-1008: settings read for PeerIntroPolicy \
+                                                             failed to join; failing closed"
+                                                        );
+                                                        friend_graph::PeerIntroPolicy::Closed
+                                                    }
+                                                }
+                                            })
+                                        },
+                                    )
+                                        as iroh_pex_acceptor::PeerIntroPolicyProvider
                                 }),
                             )
                             // ZEB-376 Task 10 (durability fix): thread the SAME

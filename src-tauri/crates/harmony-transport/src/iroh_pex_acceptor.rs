@@ -67,6 +67,57 @@ pub fn serve_catalog_for_request(
     ))
 }
 
+/// ZEB-1008: the future a [`PeerIntroPolicyProvider`] call resolves to. Boxed
+/// so the composition root can hide a `spawn_blocking` (file read + JSON
+/// parse) behind the seam; the acceptor just awaits it. A sync `Fn ->
+/// PeerIntroPolicy` seam could not host `spawn_blocking` at all (nothing to
+/// await it from), which is why the seam is async-shaped rather than kept
+/// sync with `block_in_place` (panics on current-thread runtimes).
+pub type PeerIntroPolicyFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::friend_graph::PeerIntroPolicy> + Send>,
+>;
+
+/// ZEB-1008: the injected `PeerIntroPolicy` provider — called fresh per
+/// introduction (live-apply, no restart), resolved asynchronously.
+pub type PeerIntroPolicyProvider = Arc<dyn Fn() -> PeerIntroPolicyFuture + Send + Sync>;
+
+/// ZEB-1008 (PR #760 review): upper bound on one policy resolution. The
+/// production provider reads a small local JSON via `spawn_blocking`, so this
+/// never fires in practice — it exists so a wedged filesystem or saturated
+/// blocking pool cannot hold the authenticated introduction stream (and its
+/// pending ack) open without bound. Generous on purpose: firing spuriously
+/// would fail-closed a legitimate introduction.
+pub const PEER_INTRO_POLICY_RESOLVE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Resolve the effective `PeerIntroPolicy` for one introduction, bounded by
+/// `deadline`. `None` provider (tests) → the documented `FriendsOfFriends`
+/// default. A provider that exceeds the deadline → **`Closed`**, mirroring the
+/// settings layer's fail-closed convention (`fail_closed_defaults`, ZEB-376):
+/// when a CONFIGURED policy cannot be read, never silently accept an
+/// introduction from a stranger — reject until it is readable again. `Closed`
+/// still falls through to the protocol ack, so failing closed degrades the
+/// decision, not the stream.
+async fn resolve_peer_intro_policy(
+    provider: Option<&PeerIntroPolicyProvider>,
+    deadline: std::time::Duration,
+) -> crate::friend_graph::PeerIntroPolicy {
+    match provider {
+        Some(provider) => match tokio::time::timeout(deadline, provider()).await {
+            Ok(policy) => policy,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    deadline_ms = deadline.as_millis() as u64,
+                    "ZEB-1008: PeerIntroPolicy provider exceeded its deadline; \
+                     failing closed (Closed) for this introduction"
+                );
+                crate::friend_graph::PeerIntroPolicy::Closed
+            }
+        },
+        None => crate::friend_graph::PeerIntroPolicy::FriendsOfFriends,
+    }
+}
+
 /// Inbound dispatcher for the `harmony/friend-pex/v1` ALPN. Holds the read-only
 /// handles the pure serve-decision needs plus the IO plumbing. Mirrors
 /// `iroh_friend_acceptor::IrohFriendHandshakeAcceptor` (same `crdt_state` type,
@@ -109,9 +160,10 @@ pub struct IrohFriendPexAcceptor {
     /// per introduction (live-apply, no restart) — the composition root
     /// injects a closure that re-loads the connectivity-settings JSON, so this
     /// acceptor never names the settings type. `None` (tests) → the documented
-    /// `FriendsOfFriends` default.
-    peer_intro_policy_provider:
-        Option<Arc<dyn Fn() -> crate::friend_graph::PeerIntroPolicy + Send + Sync>>,
+    /// `FriendsOfFriends` default. ZEB-1008: async-shaped so the composition
+    /// root can run the file read + parse via `spawn_blocking` instead of
+    /// inline on the tokio worker processing the introduction.
+    peer_intro_policy_provider: Option<PeerIntroPolicyProvider>,
     /// This node's IMMUTABLE self-handshake statics (identity pub + PQ keys) used
     /// to rebuild X's own dialer `SelfHandshakeReachability` fresh per dial (the
     /// volatile home relay is read fresh from `iroh_endpoint` at dial time — the
@@ -281,7 +333,7 @@ impl IrohFriendPexAcceptor {
     /// JSON on every call). Fluent setter (default `None`).
     pub fn with_peer_intro_policy_provider(
         mut self,
-        provider: Option<Arc<dyn Fn() -> crate::friend_graph::PeerIntroPolicy + Send + Sync>>,
+        provider: Option<PeerIntroPolicyProvider>,
     ) -> Self {
         self.peer_intro_policy_provider = provider;
         self
@@ -887,14 +939,18 @@ impl IrohFriendPexAcceptor {
 
                 // 4. Enforce policy — read FRESH via the injected provider
                 //    (live-apply, no restart: the composition root's closure
-                //    re-loads the settings file on every call). A missing
+                //    re-loads the settings file on every call — ZEB-1008: via
+                //    `spawn_blocking`, awaited here, so the file I/O never
+                //    runs inline on this worker). Bounded (PR #760 review):
+                //    a stalled provider fails closed rather than holding the
+                //    stream and its pending ack open without bound. A missing
                 //    provider (tests) falls back to the documented default
                 //    rather than Open.
-                let policy = self
-                    .peer_intro_policy_provider
-                    .as_ref()
-                    .map(|provider| provider())
-                    .unwrap_or(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
+                let policy = resolve_peer_intro_policy(
+                    self.peer_intro_policy_provider.as_ref(),
+                    PEER_INTRO_POLICY_RESOLVE_DEADLINE,
+                )
+                .await;
 
                 // 5. Decide + act. All three branches fall through to the ack.
                 match crate::friend_intro::decide_introduction(policy, voucher_is_active_friend) {
@@ -1002,6 +1058,49 @@ mod tests {
     /// don't exercise revocation (it revokes nothing).
     fn no_revocations() -> crate::revoked_device_projection::RevokedDeviceProjection {
         crate::revoked_device_projection::RevokedDeviceProjection::new()
+    }
+
+    /// ZEB-1008 (PR #760 review): the bounded policy resolution's three arms.
+    /// The load-bearing one is the timeout → `Closed` fail-closed choice
+    /// (mirrors `fail_closed_defaults`): a stalled provider must never
+    /// silently admit a stranger's introduction, and must not hold the
+    /// resolution open past the deadline. `start_paused` auto-advances the
+    /// clock, so the never-resolving provider trips the deadline instantly.
+    #[tokio::test(start_paused = true)]
+    async fn policy_resolution_deadline_fails_closed() {
+        let stalled: super::PeerIntroPolicyProvider =
+            std::sync::Arc::new(|| Box::pin(std::future::pending()));
+        let policy =
+            super::resolve_peer_intro_policy(Some(&stalled), std::time::Duration::from_secs(5))
+                .await;
+        assert_eq!(
+            policy,
+            crate::friend_graph::PeerIntroPolicy::Closed,
+            "a provider that outlives its deadline must fail CLOSED, not open"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_resolution_prompt_provider_and_none_fallback() {
+        let open: super::PeerIntroPolicyProvider = std::sync::Arc::new(|| {
+            Box::pin(std::future::ready(
+                crate::friend_graph::PeerIntroPolicy::Open,
+            ))
+        });
+        let policy =
+            super::resolve_peer_intro_policy(Some(&open), std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            policy,
+            crate::friend_graph::PeerIntroPolicy::Open,
+            "a prompt provider's value passes through untouched"
+        );
+        let fallback =
+            super::resolve_peer_intro_policy(None, std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            fallback,
+            crate::friend_graph::PeerIntroPolicy::FriendsOfFriends,
+            "no provider (tests) keeps the documented FriendsOfFriends default"
+        );
     }
 
     /// Deterministic HLC for fixtures.
