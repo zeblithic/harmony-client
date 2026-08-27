@@ -448,7 +448,7 @@ async fn grantee_decrypts_multi_frame_file() {
         &ingest_tx,
         &content_index,
         &crdt_state,
-        None,
+        &std::sync::atomic::AtomicBool::new(false),
         &keytree,
         None,
         reader,

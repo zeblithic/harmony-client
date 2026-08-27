@@ -535,17 +535,25 @@ pub fn build_vine_relay_set(
 /// Self's tuple carries its doc row data when present (fresh row: the change
 /// proxy for the live entry, which follows the doc via the next self-stamp;
 /// stale row: frozen until re-stamped, so it can't churn) or a zeroed
-/// placeholder when the row is missing (also constant). Known, accepted
-/// approximation vs `build_butler_set`: unresolvable-vk sibling skips aren't
-/// modeled here (no `vk_lookup` at view time) — same as before this fix.
+/// placeholder when the row is missing (also constant).
+///
+/// `sibling_included` mirrors `build_butler_set`'s `vk_lookup` skip: a
+/// sibling the builder would drop without consuming a cap slot must not
+/// consume a VIEW slot either, or it can shadow a resolvable sibling whose
+/// churn then never flips the signal (missed republish — stale routing).
+/// Self is exempt (the builders resolve/insert self unconditionally). The
+/// vine view passes an always-true filter because `build_vine_relay_set`
+/// has no resolution layer.
 fn selection_view_with_cap(
     doc: &FleetNetDoc,
     self_device_id: &str,
+    sibling_included: &dyn Fn(&str) -> bool,
     stale_before_ms: u64,
     cap: usize,
 ) -> Vec<(String, [u8; 32], String, bool)> {
     let mut view: Vec<(String, [u8; 32], String, bool)> = butler_set_order(doc, stale_before_ms)
         .into_iter()
+        .filter(|(id, _)| id == self_device_id || sibling_included(id))
         .take(cap)
         .map(|(id, row)| {
             let pinned = doc.pinned.as_deref() == Some(id.as_str());
@@ -583,14 +591,22 @@ fn selection_view_with_cap(
 /// `seen_at` — stamp-only refreshes (the periodic re-stamp every
 /// BUTLER_SET_REFRESH_MS) must not look like fleet changes, otherwise every
 /// sibling heartbeat would schedule a debounced republish.
+///
+/// `vk_resolvable` mirrors the builder's `vk_lookup` skip (pass a
+/// containment check on the same vk map the publisher's lookup reads);
+/// see [`selection_view_with_cap`]. Both sides of a prev-vs-new compare
+/// must use the SAME predicate snapshot — a vk-map-only change is
+/// (deliberately, as before) not a republish trigger.
 pub fn selection_view(
     doc: &FleetNetDoc,
     self_device_id: &str,
+    vk_resolvable: &dyn Fn(&str) -> bool,
     stale_before_ms: u64,
 ) -> Vec<(String, [u8; 32], String, bool)> {
     selection_view_with_cap(
         doc,
         self_device_id,
+        vk_resolvable,
         stale_before_ms,
         crate::butler_deposit::BUTLER_SET_MAX_ENTRIES,
     )
@@ -610,9 +626,12 @@ pub fn vine_selection_view(
     self_device_id: &str,
     stale_before_ms: u64,
 ) -> Vec<(String, [u8; 32], String, bool)> {
+    // `build_vine_relay_set` has no vk-resolution layer — every fresh row is
+    // publishable — so the vine view stays unfiltered.
     selection_view_with_cap(
         doc,
         self_device_id,
+        &|_| true,
         stale_before_ms,
         crate::reachability_record::VINE_RELAY_SET_MAX,
     )
@@ -2270,8 +2289,8 @@ mod vine_relay_set_tests {
             ("cc", row(0x99, "https://c2.example", now)),
         ]);
         assert_eq!(
-            selection_view(&base, SELF_ID, cutoff),
-            selection_view(&changed, SELF_ID, cutoff),
+            selection_view(&base, SELF_ID, &|_: &str| true, cutoff),
+            selection_view(&changed, SELF_ID, &|_: &str| true, cutoff),
             "butler top-2 view must be unchanged"
         );
         assert_ne!(
@@ -2357,7 +2376,7 @@ mod vine_relay_set_tests {
         );
         // Butler view (cap 2) applies the same transform.
         assert_eq!(
-            ids(selection_view(&doc, SELF_ID, cutoff)),
+            ids(selection_view(&doc, SELF_ID, &|_: &str| true, cutoff)),
             vec![SELF_ID, "bb"],
             "butler view mirrors build_butler_set's self-force eviction"
         );
@@ -2366,6 +2385,58 @@ mod vine_relay_set_tests {
             ids(vine_selection_view(&doc, SELF_ID, cutoff)),
             vec!["bb", SELF_ID, "cc", "dd"],
             "a fresh pinned sibling keeps slot 0; self inserts after it"
+        );
+    }
+
+    #[test]
+    fn selection_view_skips_unresolvable_siblings_like_the_builder() {
+        // ZEB-1006 (PR #759 review): build_butler_set skips a vk-unresolvable
+        // sibling WITHOUT consuming a cap slot. The view must apply the same
+        // filter before capping — otherwise the unresolvable row shadows a
+        // resolvable sibling whose churn then never flips the signal (missed
+        // republish → stale routing data).
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let cutoff = now.saturating_sub(BUTLER_SET_FRESHNESS_MS);
+        // Ordering (same seen_at → id tiebreak): bb, cc, self-device.
+        // "bb" is unresolvable; butler cap is 2. Builder: skip bb (no slot),
+        // take cc, replace self's row → {cc, self}.
+        let base = doc_with(&[
+            (SELF_ID, row(0xEE, "https://self.example", now)),
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x33, "https://c.example", now)),
+        ]);
+        let resolvable = |id: &str| id != "bb";
+        let ids = |view: Vec<(String, [u8; 32], String, bool)>| -> Vec<String> {
+            view.into_iter().map(|(id, ..)| id).collect()
+        };
+        assert_eq!(
+            ids(selection_view(&base, SELF_ID, &resolvable, cutoff)),
+            vec!["cc", SELF_ID],
+            "unresolvable bb must not consume a butler view slot"
+        );
+        // cc IS in the published set — its churn must flip the signal (the
+        // unfiltered view had [self, bb] and missed this entirely).
+        let cc_churn = doc_with(&[
+            (SELF_ID, row(0xEE, "https://self.example", now)),
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x44, "https://c2.example", now)),
+        ]);
+        assert_ne!(
+            selection_view(&base, SELF_ID, &resolvable, cutoff),
+            selection_view(&cc_churn, SELF_ID, &resolvable, cutoff),
+            "resolvable sibling churn must flip the butler signal"
+        );
+        // The unresolvable row's own churn is invisible in the published set →
+        // must not flip.
+        let bb_churn = doc_with(&[
+            (SELF_ID, row(0xEE, "https://self.example", now)),
+            ("bb", row(0x55, "https://b2.example", now)),
+            ("cc", row(0x33, "https://c.example", now)),
+        ]);
+        assert_eq!(
+            selection_view(&base, SELF_ID, &resolvable, cutoff),
+            selection_view(&bb_churn, SELF_ID, &resolvable, cutoff),
+            "unresolvable sibling churn must not flip the butler signal"
         );
     }
 }

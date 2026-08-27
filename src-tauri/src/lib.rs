@@ -11606,30 +11606,39 @@ pub async fn start_node_inner(
                                                 task_self_vk,
                                             )
                                         };
-                                        *task_vk_map
-                                            .write()
-                                            .unwrap_or_else(|p| p.into_inner()) = vk_map;
+                                        // ZEB-1006 (PR #759 review): the butler
+                                        // view mirrors build_butler_set's
+                                        // vk_lookup skip, using the SAME fresh
+                                        // map the publisher's lookup reads —
+                                        // same predicate on both compare sides.
+                                        let vk_resolvable =
+                                            |id: &str| vk_map.contains_key(id);
+                                        // Same cutoff for both views so a row
+                                        // crossing the staleness boundary
+                                        // between nudges doesn't read as a
+                                        // change retroactively.
                                         let now_ms = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_millis()
                                             as u64;
-                                        // Same cutoff for both views so a row
-                                        // crossing the staleness boundary
-                                        // between nudges doesn't read as a
-                                        // change retroactively.
                                         let cutoff = now_ms.saturating_sub(
                                             crate::butler_deposit::BUTLER_SET_FRESHNESS_MS,
                                         );
                                         let changed = crate::fleet_net::selection_view(
                                             &prev_doc,
                                             &task_device_id,
+                                            &vk_resolvable,
                                             cutoff,
                                         ) != crate::fleet_net::selection_view(
                                             &new_doc,
                                             &task_device_id,
+                                            &vk_resolvable,
                                             cutoff,
                                         );
+                                        *task_vk_map
+                                            .write()
+                                            .unwrap_or_else(|p| p.into_inner()) = vk_map;
                                         // ZEB-820: the vine set (cap 4) can change
                                         // even when the butler prefix (cap 2) does
                                         // not — e.g. a 3rd device joining.
@@ -24406,9 +24415,9 @@ pub async fn ingest_content_encrypted_inner(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     // ZEB-1011: the caller's snapshot-paired detach flag — the sealed-DEK
     // write below must not land in a detached owner-state (the ingested
-    // bytes would be permanently undecryptable after restart). `None` only
-    // in focused tests, mirroring `sync_engine`.
-    owner_state_detached: Option<&std::sync::atomic::AtomicBool>,
+    // bytes would be permanently undecryptable after restart). Required
+    // (PR #759 review): focused tests pass a local `false` flag.
+    owner_state_detached: &std::sync::atomic::AtomicBool,
     keytree: &crate::owner_state_crypto::KeyTree,
     sync_engine: Option<&std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
     plaintext_reader: tokio::fs::File,
@@ -24462,9 +24471,7 @@ pub async fn ingest_content_encrypted_inner(
         // ZEB-1011: a stop racing this ingest would detach the state — the
         // sealed DEK would vanish and the just-ingested ciphertext would be
         // permanently undecryptable. Fail loudly instead.
-        if let Some(flag) = owner_state_detached {
-            ensure_owner_state_attached(flag, "ingest_content_encrypted")?;
-        }
+        ensure_owner_state_attached(owner_state_detached, "ingest_content_encrypted")?;
         st.file_deks.insert(root.to_bytes(), sealed);
     }
     if let Some(engine) = sync_engine {
@@ -24583,7 +24590,7 @@ pub(crate) async fn ingest_content_encrypted_impl(
         &ingest_tx,
         &content_index,
         &crdt_state,
-        Some(&owner_state_detached),
+        &owner_state_detached,
         &keytree,
         sync_engine.as_ref(),
         plaintext_reader,
@@ -68792,8 +68799,9 @@ pub async fn unfriend_inner(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     // ZEB-1011: the caller's snapshot-paired detach flag — a Revoked
     // tombstone written into a detached state silently resurrects the
-    // friendship on restart. `None` only in focused tests.
-    owner_state_detached: Option<&std::sync::atomic::AtomicBool>,
+    // friendship on restart. Required (PR #759 review): focused tests pass
+    // a local `false` flag.
+    owner_state_detached: &std::sync::atomic::AtomicBool,
     hlc_tracker: &std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
@@ -68844,9 +68852,7 @@ pub async fn unfriend_inner(
     let mut state = crdt_state.lock().await;
     // ZEB-1011: refuse the tombstone if a stop detached this state (the
     // generation-blind stop case — ZEB-895).
-    if let Some(flag) = owner_state_detached {
-        ensure_owner_state_attached(flag, "unfriend")?;
-    }
+    ensure_owner_state_attached(owner_state_detached, "unfriend")?;
     match state.apply_friend_update(peer_addr, tombstone) {
         crate::owner_state_crdt::ApplyOutcome::Inserted
         | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {
@@ -69281,7 +69287,7 @@ async fn unfriend(
 
     let changed = unfriend_inner(
         &crdt_state,
-        Some(&owner_state_detached),
+        &owner_state_detached,
         &hlc_tracker,
         &adopt_floor,
         &device_id,
@@ -72400,7 +72406,7 @@ mod friend_ipc_tests {
 
         let changed = unfriend_inner(
             &crdt_state,
-            None,
+            &std::sync::atomic::AtomicBool::new(false),
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
@@ -72438,7 +72444,7 @@ mod friend_ipc_tests {
         let unknown = OwnerAddr([0xEE; 16]);
         let err = unfriend_inner(
             &crdt_state,
-            None,
+            &std::sync::atomic::AtomicBool::new(false),
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
@@ -72475,7 +72481,7 @@ mod friend_ipc_tests {
 
         let changed = unfriend_inner(
             &crdt_state,
-            None,
+            &std::sync::atomic::AtomicBool::new(false),
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
@@ -72522,7 +72528,7 @@ mod friend_ipc_tests {
         );
         let changed = unfriend_inner(
             &crdt_state,
-            None,
+            &std::sync::atomic::AtomicBool::new(false),
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "self",
@@ -72574,7 +72580,7 @@ mod friend_ipc_tests {
         }
         let changed = unfriend_inner(
             &crdt_state,
-            None,
+            &std::sync::atomic::AtomicBool::new(false),
             &hlc_tracker,
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "d",
