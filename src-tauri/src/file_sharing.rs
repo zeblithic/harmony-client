@@ -212,6 +212,16 @@ pub enum FileGrantIngestError {
 /// devices — the honest new-device edge), returns `Ok(None)` and leaves `state`
 /// untouched. A blob that opens but does not parse is `Err(Decode)`.
 ///
+/// `Ok(None)` is ALSO the identical-replay no-op (ZEB-994): when the cid's
+/// recorded grant already carries the same granter, metadata, and DEK material,
+/// nothing is mutated — no `received_at` refresh, no fresh-nonce re-seal — so a
+/// crash-window replay of the same deposit (the dm-inbox `ingested_by` ack and
+/// this owner-state record persist through independent debounced engines) does
+/// not churn a persist, Flow-A replication, or a UI emit. A genuinely-changed
+/// grant (rotated DEK, different granter, new metadata) still replaces and
+/// refreshes `received_at`; an unopenable stored envelope counts as changed
+/// (self-healing).
+///
 /// `granter_owner` is the AUTHENTICATED deposit sender (the butler-verified
 /// frame `sender_owner`), passed in by the recover-path demux — it is NOT read
 /// from the sealed payload, which the seal does not authenticate (anyone can
@@ -241,6 +251,30 @@ pub fn ingest_grant_push(
         // corruption of an authenticated-to-us payload, so it propagates.
         let mut inner: FileGrantInner = canonical_cbor_decode(&plaintext)?;
         let cid = ContentId::from_bytes(inner.cid);
+        // ZEB-994 replay guard: the dm-inbox `ingested_by` ack and this
+        // owner-state mutation persist through two independent debounced
+        // engines, so a crash between the two flushes replays the same deposit
+        // at the next startup sweep. An IDENTICAL grant already recorded —
+        // same granter, same metadata, same DEK material — is a no-op
+        // `Ok(None)`: no `received_at` refresh, no nondeterministic re-seal
+        // (which would churn the CRDT value fleet-wide), and the caller's
+        // `Some`-gated persist/replicate/emit stays quiet (mirroring the
+        // revoke path's changed-signal contract). The stored `sealed_dek` is
+        // a fresh-nonce re-seal, so identity is checked by OPENING it; an
+        // unopenable envelope counts as changed (re-recording self-heals a
+        // corrupt entry).
+        if let Some(existing) = state.received_file_grants.get(&inner.cid) {
+            if existing.granter_owner == granter_owner
+                && existing.file_name == inner.file_name
+                && existing.file_size == inner.file_size
+                && existing.mime == inner.mime
+                && open_dek_at_rest(keytree, &existing.sealed_dek)
+                    .is_ok_and(|stored| stored.as_bytes() == &inner.dek)
+            {
+                inner.dek.zeroize();
+                return Ok(None);
+            }
+        }
         // Re-seal the recovered DEK under the grantee's OWN shared KeyTree so
         // any of the grantee's bound devices can open the stored grant (Flow A),
         // not only the device this per-device envelope was sealed to. Mirrors

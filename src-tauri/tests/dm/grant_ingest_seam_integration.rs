@@ -314,6 +314,114 @@ async fn sweep_ingested_grant_emits_shared_with_me_updated() {
     );
 }
 
+/// ZEB-994 (crash-window replay): the dm-inbox `ingested_by` ack and the
+/// owner-state grant record persist through two INDEPENDENT debounced engines
+/// — a crash after the owner-state flush but before the doc flush leaves the
+/// on-disk doc without our ack, and the next startup sweep re-applies the
+/// same entry. Modeled here by sweeping a SECOND doc holding the same entry
+/// with an empty `ingested_by` (the restart's persisted-doc image): the
+/// replay must re-establish the ack (doc mutated) but the identical grant is
+/// a no-op on owner-state — no second `notify_owner_state_dirty`, no second
+/// `shared-with-me-updated` frame, `received_at` untouched.
+#[tokio::test]
+async fn crash_window_replay_does_not_renotify_or_reemit() {
+    let (ctx, crdt_state, dirty, sink_handle) = prod_ctx_with_dirty_and_sink();
+
+    let cid_bytes = [0xC7u8; 32];
+    let inner = FileGrantInner {
+        cid: cid_bytes,
+        file_name: "replayed.md".into(),
+        file_size: 21,
+        mime: "text/markdown".into(),
+        dek: [0x5Cu8; 32],
+    };
+    let sealed = seal_grant_for_devices(&inner, &[test_device_x25519_pub()]).expect("seal");
+    let list: Vec<serde_bytes::ByteBuf> =
+        sealed.into_iter().map(serde_bytes::ByteBuf::from).collect();
+    let mut grant_push = Vec::new();
+    ciborium::into_writer(&list, &mut grant_push).expect("encode grant_push");
+
+    let granter = OwnerAddr([0xB0; 16]);
+    let key = DmInboxDoc::grant_key(&granter.0, &grant_push);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mk_entry = || DmInboxEntry {
+        sender_owner: granter.0,
+        cidnotify_packet: None,
+        storage_blob: Vec::new(),
+        invite_packet: None,
+        revocation_push: None,
+        grant_push: Some(grant_push.clone()),
+        grant_revoke: None,
+        deposited_at: hlc(now),
+        deposited_by: "butler-device".into(),
+        ingested_by: Default::default(),
+    };
+
+    let mut doc = DmInboxDoc::default();
+    doc.entries.insert(key.clone(), mk_entry());
+    let changed = ingest_pending(&mut doc, &ctx).await;
+    assert!(changed, "first sweep records the grant");
+    assert_eq!(dirty.load(Ordering::SeqCst), 1, "first sweep notifies once");
+
+    // Sentinel stamp: the replayed apply must not refresh `received_at`.
+    {
+        let mut state = crdt_state.lock().await;
+        state
+            .received_file_grants
+            .get_mut(&cid_bytes)
+            .expect("grant recorded")
+            .received_at = 777;
+    }
+
+    // The restart image: the SAME entry, ack never persisted (`ingested_by`
+    // empty), swept again — the ZEB-994 replay.
+    let mut replay_doc = DmInboxDoc::default();
+    replay_doc.entries.insert(key.clone(), mk_entry());
+    let changed_again = ingest_pending(&mut replay_doc, &ctx).await;
+    assert!(
+        changed_again,
+        "replay sweep re-establishes the ig ack (doc mutated)"
+    );
+    assert!(
+        replay_doc.entries[&key].ingested_by.contains(SELF_ID),
+        "entry re-marked ingested so the ack can re-persist"
+    );
+
+    assert_eq!(
+        dirty.load(Ordering::SeqCst),
+        1,
+        "an identical replayed grant must not re-notify owner-state dirty \
+         (no redundant persist + Flow-A replication)"
+    );
+    let frames = sink_handle.frames();
+    let matching = frames
+        .iter()
+        .filter(|(name, payload)| {
+            name == "shared-with-me-updated"
+                && payload["cid"] == serde_json::json!(hex::encode(cid_bytes))
+        })
+        .count();
+    assert_eq!(
+        matching, 1,
+        "an identical replayed grant must not re-emit shared-with-me-updated; got {frames:?}"
+    );
+    {
+        let state = crdt_state.lock().await;
+        assert_eq!(
+            state
+                .received_file_grants
+                .get(&cid_bytes)
+                .expect("grant still recorded")
+                .received_at,
+            777,
+            "received_at untouched by the replayed no-op apply"
+        );
+    }
+}
+
 /// ZEB-730 (prod path): an AUTHORIZED grant-revoke (deposit sender ==
 /// granter-of-record) applied through the PRODUCTION `apply_grant_revoke`
 /// GCs the received-grant entry, stamps ZEB-727's tombstone, fires
