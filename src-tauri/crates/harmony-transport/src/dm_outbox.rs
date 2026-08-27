@@ -9,9 +9,11 @@
 //!   - `DmOutbox` orchestrator: `send_dm`, `drain`, `handle_ack`.
 //!   - Wall-clock-driven 30-day expiration + per-recipient exponential backoff.
 //!
-//! Phase 3b will:
-//!   - Replace `StubTransport` with a real harmony-runtime adapter that
-//!     emits `RuntimeAction::SendUnicastToDevice` per resolved device hash.
+//! Phase 3b shipped `RuntimeUnicastTransport` (below) as the harmony-runtime
+//! adapter. The runtime unicast channel it fed was removed with the Reticulum
+//! teardown (harmony#280, ZEB-473 Move 1a), so that adapter is retained
+//! test-only; production wires `IrohTunnelDmTransport` (iroh PQ tunnel +
+//! butler deposit).
 //!
 //! Inbound demux note (ZEB-710): the direct `handle_unicast` /
 //! `handle_cidnotify_lifted` receive handlers were deleted — they had no
@@ -183,11 +185,11 @@ impl DmTransport for StubTransport {
     }
 }
 
-/// Payload pushed by `RuntimeUnicastTransport` into the event-loop's
-/// outbound channel. Task 7 wires the receiver into `event_loop` which
-/// translates each request into `RuntimeEvent::SendUnicastToDevice` for
-/// `NodeRuntime`. Per-destination FIFO + cross-destination best-effort
-/// ordering inherits from ZEB-226's runtime.
+/// Payload pushed by the (test-only) `RuntimeUnicastTransport` into its
+/// injected channel. Historically the event loop translated each request into
+/// the runtime's unicast-send event; that flow was removed with the Reticulum
+/// teardown (harmony#280, ZEB-473 Move 1a), so today the struct only carries
+/// the resolved DM destination hash + packet bytes to test receivers.
 #[derive(Debug, Clone)]
 pub struct UnicastSendRequest {
     pub destination_hash: [u8; 16],

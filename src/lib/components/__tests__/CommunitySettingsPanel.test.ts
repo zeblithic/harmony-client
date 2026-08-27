@@ -4,13 +4,10 @@ import CommunitySettingsPanel from '../CommunitySettingsPanel.svelte';
 import type { CommunityMember, CommunityLineageDto, ForkDescendantDto } from '../../types';
 
 // ZEB-250: CommunitySettingsPanel now imports invoke (for pending-badge map)
-// and mounts PendingAdminProposalsPanel (which also imports invoke + listen).
-// Hoist mocks so all tests render cleanly; default to empty-list resolution.
+// and mounts PendingAdminProposalsPanel (which also imports invoke).
+// Hoist the mock so all tests render cleanly; default to empty-list resolution.
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn().mockResolvedValue([]),
-}));
-vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
 const adminMember: CommunityMember = { address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' };

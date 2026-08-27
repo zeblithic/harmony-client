@@ -1,23 +1,16 @@
 <script lang="ts">
-  import type { CodecType } from '../voice/voice-codec';
-  import CodecToggle from './CodecToggle.svelte';
-
   let {
     active = false,
     processing = false,
     disabled = false,
-    selectedCodec = 'opus' as CodecType,
     onPttStart,
     onPttStop,
-    onCodecChange,
   }: {
     active?: boolean;
     processing?: boolean;
     disabled?: boolean;
-    selectedCodec?: CodecType;
     onPttStart?: () => void;
     onPttStop?: () => void;
-    onCodecChange?: (codec: CodecType) => void;
   } = $props();
 
   // Track which input sources are currently held to prevent one release
@@ -51,7 +44,7 @@
     const tag = el.tagName ?? '';
     if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(tag)) return true;
     // Also treat elements with interactive ARIA roles as form controls
-    // (e.g., CodecToggle's role="radio" divs)
+    // (e.g., role="radio"/"switch" divs rendered by sibling settings controls)
     const role = el.getAttribute?.('role') ?? '';
     return ['button', 'radio', 'checkbox', 'switch', 'slider', 'spinbutton', 'combobox', 'listbox', 'textbox'].includes(role);
   }
@@ -108,11 +101,6 @@
       {/if}
     </span>
   </button>
-  <CodecToggle
-    selected={selectedCodec}
-    disabled={disabled || active || !onCodecChange}
-    {onCodecChange}
-  />
 </div>
 
 <style>

@@ -1,8 +1,14 @@
 //! Owner-private Notes IPC surface (ZEB-417 SP1). Tauri commands
-//! `notes_list` / `notes_upsert` / `notes_delete` plus their Tauri-free
-//! testable cores. The dataset handles live on `NodeState` and stay `None`
-//! until the FleetSyncEngine is wired at startup (next task); until then the
-//! commands reject with "notes dataset not loaded".
+//! `notes_list` / `notes_upsert` plus their Tauri-free testable cores. The
+//! dataset handles live on `NodeState` and stay `None` until the
+//! FleetSyncEngine is wired at startup (next task); until then the commands
+//! reject with "notes dataset not loaded".
+//!
+//! ZEB-976: the `notes_delete` Tauri wrapper was removed — NotesView is
+//! append-only and nothing (frontend or headless RPC) ever called it.
+//! `notes_delete_core` stays: it is the tested local-tombstone primitive
+//! (LWW delete semantics + cross-device convergence coverage below) that a
+//! future delete UI wraps when the feature ships.
 
 use crate::notes_crdt::{Note, NotesDoc};
 use crate::owner_state_types::Hlc;
@@ -100,9 +106,14 @@ pub(crate) async fn notes_upsert_core(
 
 /// Tombstone a note (LWW on a freshly minted HLC). Returns `Ok(true)` when a
 /// live note was tombstoned; `Ok(false)` when the id is absent or already
-/// tombstoned (a no-op — no HLC is minted, so the wrapper skips `notify_dirty`
-/// and we avoid publishing unchanged state). Returns `Err` when our delete
-/// would lose LWW to a concurrent newer edit (mirrors `notes_upsert_core`).
+/// tombstoned (a no-op — no HLC is minted, so the caller must skip
+/// `notify_dirty` and avoid publishing unchanged state). Returns `Err` when our
+/// delete would lose LWW to a concurrent newer edit (mirrors
+/// `notes_upsert_core`).
+// Deliberately compiled un-gated (not #[cfg(test)]) so the primitive can't
+// bit-rot; its only callers are the tests below until a delete UI ships
+// (ZEB-976 removed the caller-less `notes_delete` Tauri wrapper).
+#[allow(dead_code)]
 pub(crate) async fn notes_delete_core(
     doc: &Arc<Mutex<NotesDoc>>,
     tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
@@ -116,7 +127,7 @@ pub(crate) async fn notes_delete_core(
     // concurrent tombstone — from another IPC or a remote merge — in the gap
     // would make this a CRDT no-op that still returns `Ok(true)` and triggers
     // a spurious `notify_dirty()` publish of unchanged state. Absent or
-    // already-tombstoned ids are a no-op (no HLC minted) so the wrapper skips
+    // already-tombstoned ids are a no-op (no HLC minted) so the caller skips
     // `notify_dirty`. Holding `d` across the tracker-lock is deadlock-free: no
     // path locks the tracker while holding the doc in the opposite order.
     let mut d = doc.lock().await;
@@ -190,31 +201,6 @@ pub async fn notes_upsert(
     let view = notes_upsert_core(&doc, &tracker, &adopt_floor, &device_id, id, text).await?;
     sync.notify_dirty();
     Ok(view)
-}
-
-/// Tombstone a note, then schedule a sync publish.
-#[tauri::command]
-pub async fn notes_delete(
-    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
-    id: String,
-) -> Result<(), String> {
-    let (doc, tracker, adopt_floor, device_id, sync) = {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        (
-            g.notes_doc.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
-            g.notes_tracker.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
-            g.hlc_adopt_floor.clone(),
-            g.notes_device_id.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
-            g.notes_sync.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
-        )
-    };
-    let changed = notes_delete_core(&doc, &tracker, &adopt_floor, &device_id, id).await?;
-    if changed {
-        sync.notify_dirty();
-    }
-    Ok(())
 }
 
 #[cfg(test)]

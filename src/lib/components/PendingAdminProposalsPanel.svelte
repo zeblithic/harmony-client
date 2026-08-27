@@ -1,7 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
 
   type ProposalKindDto =
     | { kind: 'SetPower'; target_addr: string; target_display_name: string | null; level: number }
@@ -44,8 +42,6 @@
   let loading = $state(false);
   let errorMessage: string | null = $state(null);
   let latestCallId = 0;
-  let latestWatchId = 0;
-  let unsubConverged: (() => void) | null = null;
 
   async function refresh() {
     if (!canAdmin) {
@@ -88,47 +84,16 @@
     }
   }
 
+  // ZEB-976: this effect previously also registered a listener for a
+  // `community-state-sync-converged` Tauri event, but no Rust code has ever
+  // emitted it — refresh happens on mount, on prop changes, and after
+  // countersign(). Live refresh on sync activity is tracked separately.
   $effect(() => {
-    const myWatchId = ++latestWatchId;
     // Track reactive dependencies so the effect re-runs when they change.
     void communityId;
     void canAdmin;
 
     void refresh();
-
-    if (canAdmin) {
-      let cancelled = false;
-      listen('community-state-sync-converged', () => {
-        if (myWatchId !== latestWatchId) return;
-        void refresh();
-      }).then((unlisten) => {
-        if (cancelled || myWatchId !== latestWatchId) {
-          unlisten();
-          return;
-        }
-        const prev = unsubConverged;
-        unsubConverged = () => {
-          unlisten();
-        };
-        prev?.();
-      }).catch(() => {
-        // Event listener registration may fail in some test environments — that's OK.
-      });
-      return () => {
-        cancelled = true;
-        unsubConverged?.();
-        unsubConverged = null;
-      };
-    } else {
-      unsubConverged?.();
-      unsubConverged = null;
-      return () => {};
-    }
-  });
-
-  onDestroy(() => {
-    unsubConverged?.();
-    unsubConverged = null;
   });
 
   // Bucket sort: pending → effective → expired.
