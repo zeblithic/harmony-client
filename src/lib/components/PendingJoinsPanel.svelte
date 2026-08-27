@@ -48,8 +48,23 @@
     // R4-7: latestCallId is captured at the start of each refresh(); out-of-order
     // async responses must not overwrite the results of the latest refresh.
     let latestCallId = 0;
+    // ZEB-1016 (CodeAnt #767): coalesce refreshes. A burst of membership
+    // events (each backend apply emits once) must not stack overlapping
+    // IPC list requests — while one refresh is in flight, further calls
+    // fold into ONE trailing re-run that fetches the freshest state.
+    let refreshInFlight = false;
+    let refreshQueued = false;
 
     async function refresh() {
+        if (refreshInFlight) {
+            // Invalidate the in-flight pass's results (it may be fetching
+            // for a stale communityId after a switch) and let the trailing
+            // run below fetch fresh.
+            ++latestCallId;
+            refreshQueued = true;
+            return;
+        }
+        refreshInFlight = true;
         // R3 (M4): reset loading state at the start of every refresh so
         // subsequent fetches (kickJoiner-then-refresh) also surface a
         // transient loading indicator. Without this, after the first load
@@ -90,6 +105,16 @@
             // must not clobber that here.
             if (myCallId === latestCallId) {
                 loading = false;
+            }
+            refreshInFlight = false;
+            if (refreshQueued) {
+                refreshQueued = false;
+                // Trailing coalesced run. Gate on the live prop — a
+                // canModerate flip mid-flight already cleared the panel
+                // and must not refetch.
+                if (canModerate) {
+                    void refresh();
+                }
             }
         }
     }

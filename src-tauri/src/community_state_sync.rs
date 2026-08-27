@@ -652,9 +652,10 @@ pub type PendingRedemptionMap = std::sync::Arc<
 pub type NavPendingClearEmitter = std::sync::Arc<dyn Fn(SpaceId, String) + Send + Sync>;
 
 /// ZEB-1016: callback fired after membership events land in a community's
-/// CRDT — once per local apply (`insert_local_event` / `_pair`) and once
-/// per incoming publish batch that inserted at least one event
-/// (`handle_incoming_publish`). Receives the community `SpaceId`.
+/// CRDT — once per local apply (`insert_local_event` / `_pair`, and the
+/// auto-counter-sign task's direct insert), and once per incoming publish
+/// batch that inserted at least one event (`handle_incoming_publish`).
+/// Receives the community `SpaceId`.
 /// Production wires a closure that emits the
 /// `community-membership-updated { communityId }` Tauri event so
 /// moderation panels (PendingJoinsPanel / PendingAdminProposalsPanel) can
@@ -1658,6 +1659,9 @@ impl CommunitySyncEngine {
         // R3 (C4): plumb the delta channel so the auto-counter-sign task
         // can emit CommunityMembershipDelta on Inserted.
         let delta_tx = self.delta_tx.clone();
+        // ZEB-1016: the task's direct insert must fire the panels' refresh
+        // signal too (CodeRabbit #767).
+        let membership_updated_emitter = self.membership_updated_emitter.clone();
 
         tokio::spawn(spawn_auto_counter_sign_task(
             pending_id,
@@ -1673,6 +1677,7 @@ impl CommunitySyncEngine {
             has_pending_dirty,
             closing,
             delta_tx,
+            membership_updated_emitter,
         ));
     }
 
@@ -2582,6 +2587,13 @@ async fn spawn_auto_counter_sign_task(
     // this, the admin's own UI doesn't observe the local counter-sign
     // until the event round-trips back through state-root sync.
     delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
+    // ZEB-1016 (CodeRabbit #767): this task inserts directly (bypassing
+    // `insert_local_event`, see the closing-fence note above), so it must
+    // carry the membership-updated emitter itself — otherwise the
+    // "pending join → countersigned" transition, the panel-visible change
+    // this signal exists for, never live-refreshes the moderation panels
+    // on the very node that auto-countersigned.
+    membership_updated_emitter: Option<MembershipUpdatedEmitter>,
 ) {
     use crate::community_membership::{EventPayload, MemberStatus, MembershipEventKind};
 
@@ -2824,6 +2836,11 @@ async fn spawn_auto_counter_sign_task(
             // Dirty flag already latched under the insertion lock above
             // (ZEB-712 R1); only the task wake-up remains post-lock.
             notify_dirty.notify_one();
+            // ZEB-1016: one applied-event signal for the locally minted
+            // countersign, mirroring the insert_local_event paths.
+            if let Some(cb) = membership_updated_emitter.as_ref() {
+                cb(community_id);
+            }
         }
         InsertOutcome::AlreadyKnown => {
             // Concurrent insert won the race — that's fine (idempotent).
@@ -2874,6 +2891,9 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
     let closing = Arc::clone(&ctx.closing);
     // R3 (C4): receive-path delta channel for the auto-counter-sign emission.
     let delta_tx = ctx.delta_tx.clone();
+    // ZEB-1016: the task's direct insert must fire the panels' refresh
+    // signal too (CodeRabbit #767).
+    let membership_updated_emitter = ctx.membership_updated_emitter.clone();
 
     tokio::spawn(spawn_auto_counter_sign_task(
         pending_id,
@@ -2889,6 +2909,7 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
         has_pending_dirty,
         closing,
         delta_tx,
+        membership_updated_emitter,
     ));
 }
 

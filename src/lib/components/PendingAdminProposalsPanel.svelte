@@ -46,8 +46,22 @@
   let loading = $state(false);
   let errorMessage: string | null = $state(null);
   let latestCallId = 0;
+  // ZEB-1016 (CodeAnt #767): coalesce refreshes. A burst of membership
+  // events (each backend apply emits once) must not stack overlapping IPC
+  // list requests — while one refresh is in flight, further calls fold
+  // into ONE trailing re-run that fetches the freshest state.
+  let refreshInFlight = false;
+  let refreshQueued = false;
 
   async function refresh() {
+    if (refreshInFlight) {
+      // Invalidate the in-flight pass's results (it may be fetching for a
+      // stale communityId after a switch) and let the trailing run below
+      // fetch fresh. The trailing run re-evaluates canAdmin itself.
+      ++latestCallId;
+      refreshQueued = true;
+      return;
+    }
     if (!canAdmin) {
       // Bump latestCallId so any in-flight refresh from before canAdmin
       // flipped to false is discarded.
@@ -55,6 +69,7 @@
       proposals = [];
       return;
     }
+    refreshInFlight = true;
     const myCallId = ++latestCallId;
     loading = true;
     errorMessage = null;
@@ -71,6 +86,13 @@
       errorMessage = msg;
     } finally {
       if (myCallId === latestCallId) loading = false;
+      refreshInFlight = false;
+      if (refreshQueued) {
+        refreshQueued = false;
+        // Trailing coalesced run; refresh() itself no-ops (and clears)
+        // when canAdmin flipped false mid-flight.
+        void refresh();
+      }
     }
   }
 

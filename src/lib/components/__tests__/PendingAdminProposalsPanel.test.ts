@@ -129,6 +129,51 @@ describe('PendingAdminProposalsPanel', () => {
     expect(invoke).toHaveBeenCalledTimes(1);
   });
 
+  it('membership_updated_event_bursts_coalesce_into_one_trailing_refresh', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
+
+    let capturedHandler:
+      | ((event: { payload: { communityId: string } }) => void)
+      | null = null;
+    listen.mockImplementation(((_event: string, handler: unknown) => {
+      capturedHandler = handler as (event: {
+        payload: { communityId: string };
+      }) => void;
+      return Promise.resolve(() => {});
+    }) as typeof listen);
+    let resolveFirst: ((v: unknown) => void) | null = null;
+    invoke
+      .mockImplementationOnce(
+        () => new Promise((res) => (resolveFirst = res)) as Promise<unknown>
+      )
+      .mockResolvedValue([]);
+
+    render(PendingAdminProposalsPanel, {
+      props: { communityId: 'community-x', canAdmin: true },
+    });
+    await waitFor(() => {
+      expect(capturedHandler).not.toBeNull();
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    // A burst of membership events while the initial fetch is still in
+    // flight must not stack IPC requests...
+    capturedHandler!({ payload: { communityId: 'community-x' } });
+    capturedHandler!({ payload: { communityId: 'community-x' } });
+    capturedHandler!({ payload: { communityId: 'community-x' } });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    // ...it folds into exactly ONE trailing refresh when the in-flight
+    // request completes.
+    resolveFirst!([]);
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledTimes(2);
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
   it('renders_pending_proposal_cards_with_signers_count', async () => {
     const { invoke } = await import('@tauri-apps/api/core');
     (invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce([makeProposal()]);
