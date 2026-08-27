@@ -2014,6 +2014,17 @@ pub fn cosign_request_core(
         if !decliners.is_empty() {
             return Err("declined: another device declined the request".to_string());
         }
+        // ZEB-1005: enrollment survives revocation — a revoked co-signer whose
+        // pre-signed slot is still in the request must fail here, not at
+        // completion-time validation. Checked BEFORE the idempotent
+        // already-signed return so a device that co-signed while active and
+        // was revoked afterwards reports selfRevoked, not success (CodeAnt
+        // PR #755 r1).
+        if trust.is_revoked(self_id) {
+            return Err(
+                "selfRevoked: this device has been removed, so it cannot co-sign".to_string(),
+            );
+        }
         if req.signatures.contains_key(&self_hex) {
             return Ok(false);
         }
@@ -2029,14 +2040,6 @@ pub fn cosign_request_core(
             return Err(
                 "notEligible: this device's enrollment is not master-issued, so it cannot co-sign"
                     .to_string(),
-            );
-        }
-        // ZEB-1005: enrollment survives revocation — a revoked co-signer whose
-        // pre-signed slot is still in the request must fail here, not at
-        // completion-time validation.
-        if trust.is_revoked(self_id) {
-            return Err(
-                "selfRevoked: this device has been removed, so it cannot co-sign".to_string(),
             );
         }
         let initiator = parse_device_id_hex(&req.initiator_hex)?;
@@ -2121,6 +2124,14 @@ pub fn cosign_request_core(
     if !decliners.is_empty() {
         return Err("declined: another device declined the request".to_string());
     }
+    // ZEB-1005: enrollment survives revocation — a revoked co-signer whose
+    // pre-signed slot is still in the request must fail here, not at
+    // completion-time validation. Checked BEFORE the idempotent already-signed
+    // return so a device that co-signed while active and was revoked
+    // afterwards reports selfRevoked, not success (CodeAnt PR #755 r1).
+    if trust.is_revoked(self_id) {
+        return Err("selfRevoked: this device has been removed, so it cannot co-sign".to_string());
+    }
     if req.signatures.contains_key(&self_hex) {
         return Ok(false);
     }
@@ -2142,12 +2153,6 @@ pub fn cosign_request_core(
             "notEligible: this device's enrollment is not master-issued, so it cannot co-sign"
                 .to_string(),
         );
-    }
-    // ZEB-1005: enrollment survives revocation — a revoked co-signer whose
-    // pre-signed slot is still in the request must fail here, not at
-    // completion-time validation.
-    if trust.is_revoked(self_id) {
-        return Err("selfRevoked: this device has been removed, so it cannot co-sign".to_string());
     }
     let initiator = parse_device_id_hex(&req.initiator_hex)?;
     let initiator_cert = trust
@@ -4683,6 +4688,54 @@ mod planner_tests {
         master_revoke(&mut f, b_id);
         assert!(
             cosign_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id, NOW_MS + 20_000)
+                .unwrap_err()
+                .starts_with("selfRevoked:")
+        );
+    }
+
+    #[test]
+    fn cosign_rejects_revoked_self_after_prior_cosign() {
+        // ZEB-1005 (CodeAnt PR #755 r1): the guard must precede the idempotent
+        // already-signed return — a device that co-signed while active and was
+        // revoked afterwards must NOT get a success no-op on re-invoke.
+        let mut f = three_device_fleet();
+        let (mut doc, id) = doc_with_request(&f);
+        let signed = cosign_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id, NOW_MS + 20_000)
+            .expect("cosign while active");
+        assert!(signed);
+        let b_id = f.b_id;
+        master_revoke(&mut f, b_id);
+        assert!(
+            cosign_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id, NOW_MS + 21_000)
+                .unwrap_err()
+                .starts_with("selfRevoked:")
+        );
+    }
+
+    #[test]
+    fn epoch_bump_cosign_rejects_revoked_self_after_prior_cosign() {
+        // ZEB-1005 (CodeAnt PR #755 r1): same reachability on the EpochBump
+        // branch.
+        let mut f = three_device_fleet();
+        let (id, req) = plan_quorum_epoch_bump_request(
+            &f.trust,
+            &f.a_sk,
+            false,
+            4,
+            NOW + 10,
+            NOW_MS + 10_000,
+            [0xee; 16],
+        )
+        .expect("plan bump");
+        let mut doc = QuorumReqDoc::default();
+        doc.requests.insert(id.clone(), req);
+        let signed = cosign_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id, NOW_MS + 20_000)
+            .expect("cosign while active");
+        assert!(signed);
+        let b_id = f.b_id;
+        master_revoke(&mut f, b_id);
+        assert!(
+            cosign_request_core(&mut doc, &f.trust, &f.b_sk, f.b_id, &id, NOW_MS + 21_000)
                 .unwrap_err()
                 .starts_with("selfRevoked:")
         );
