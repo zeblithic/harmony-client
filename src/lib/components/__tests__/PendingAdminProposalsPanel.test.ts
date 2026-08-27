@@ -152,10 +152,12 @@ describe('PendingAdminProposalsPanel', () => {
     render(PendingAdminProposalsPanel, {
       props: { communityId: 'community-x', canAdmin: true },
     });
+    // The initial fetch starts only after listener registration resolves,
+    // so wait for both the captured handler AND the first invoke.
     await waitFor(() => {
       expect(capturedHandler).not.toBeNull();
+      expect(invoke).toHaveBeenCalledTimes(1);
     });
-    expect(invoke).toHaveBeenCalledTimes(1);
 
     // A burst of membership events while the initial fetch is still in
     // flight must not stack IPC requests...
@@ -172,6 +174,57 @@ describe('PendingAdminProposalsPanel', () => {
     });
     await new Promise((r) => setTimeout(r, 0));
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('initial_fetch_waits_for_listener_registration', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
+
+    // Subscription-before-snapshot (PR #767): an update applied after the
+    // list snapshot but before registration would be in neither (Tauri
+    // events are not replayed), so the fetch must not start until the
+    // subscription is live.
+    let resolveListen: ((fn: () => void) => void) | null = null;
+    listen.mockImplementation(((_event: string, _handler: unknown) =>
+      new Promise<() => void>((res) => (resolveListen = res))) as typeof listen);
+    invoke.mockResolvedValue([]);
+
+    render(PendingAdminProposalsPanel, {
+      props: { communityId: 'community-x', canAdmin: true },
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(listen).toHaveBeenCalledTimes(1);
+    expect(invoke).not.toHaveBeenCalled();
+
+    resolveListen!(() => {});
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('failed_listener_registration_still_runs_initial_fetch', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    listen.mockRejectedValue(new Error('no event bridge'));
+    invoke.mockResolvedValue([]);
+
+    render(PendingAdminProposalsPanel, {
+      props: { communityId: 'community-x', canAdmin: true },
+    });
+
+    // Degraded path (non-Tauri harness): the mount fetch still happens...
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledTimes(1);
+    });
+    // ...and the rejection is logged as a normalized message, not raw `e`.
+    expect(warn).toHaveBeenCalledWith(
+      'PendingAdminProposalsPanel: failed to subscribe to membership updates',
+      'no event bridge'
+    );
+    warn.mockRestore();
   });
 
   it('renders_pending_proposal_cards_with_signers_count', async () => {

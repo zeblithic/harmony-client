@@ -120,14 +120,24 @@
   // registration resolves after cleanup. refresh() itself no-ops (and
   // clears) when canAdmin is false, so the listener is only registered on
   // the admin path.
+  //
+  // Subscription BEFORE snapshot (Greptile/Qodo, PR #767): on the admin
+  // path the initial refresh only starts once `listen` has resolved.
+  // Fetching first would leave a gap where an update applied after the list
+  // snapshot but before registration is in neither — Tauri events are not
+  // replayed — leaving the panel stale. An event arriving during the
+  // initial fetch instead coalesces into the trailing re-run. If
+  // registration rejects (non-Tauri harnesses: vitest/jsdom have no event
+  // bridge), the panel degrades to mount/prop/action-only refresh — the
+  // initial fetch still runs.
   $effect(() => {
     // Track reactive dependencies so the effect re-runs when they change.
     const cid = communityId;
     const isAdmin = canAdmin;
 
-    void refresh();
-
     if (!isAdmin) {
+      // refresh() no-ops (and clears any prior data) on the non-admin path.
+      void refresh();
       return;
     }
     let cancelled = false;
@@ -140,19 +150,23 @@
     })
       .then((fn) => {
         if (cancelled) {
+          // Cleaned up before registration resolved: the replacement effect
+          // run (or nothing, on unmount) owns the fetch.
           fn();
-        } else {
-          unlisten = fn;
+          return;
         }
+        unlisten = fn;
+        void refresh();
       })
       .catch((e) => {
-        // Non-Tauri harnesses (vitest/jsdom) have no event bridge; a failed
-        // subscription degrades to mount/prop/action-only refresh (the
-        // IrohRelaySettings precedent).
+        const msg = e instanceof Error ? e.message : String(e);
         console.warn(
           'PendingAdminProposalsPanel: failed to subscribe to membership updates',
-          e
+          msg
         );
+        if (!cancelled) {
+          void refresh();
+        }
       });
     return () => {
       cancelled = true;
