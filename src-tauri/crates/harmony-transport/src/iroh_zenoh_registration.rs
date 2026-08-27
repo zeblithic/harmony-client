@@ -184,6 +184,7 @@ pub fn backfill_admission_oracle_from_reachability(
             crate::owner_state_types::OwnerAddr, // actor
             [u8; 32],                            // iroh_node_id
             [u8; 32],                            // enrolled device key
+            u64,                                 // clamped record stamp (HLC wall ms)
         ),
     >,
     is_enrolled: impl Fn(
@@ -193,9 +194,12 @@ pub fn backfill_admission_oracle_from_reachability(
     ) -> bool,
 ) -> usize {
     let mut bound = 0usize;
-    for (community, actor, iroh_node_id, device) in bindings {
+    for (community, actor, iroh_node_id, device, stamp_ms) in bindings {
         if is_enrolled(&community, &actor, &device) {
-            oracle.bind(actor.0, iroh_node_id, device);
+            // ZEB-995: the stamp lets the oracle LWW-reconcile the same (owner, node_id)
+            // asserted with divergent keys across communities — without it, community
+            // iteration order decided the winner here.
+            oracle.bind(actor.0, iroh_node_id, device, stamp_ms);
             bound += 1;
         }
     }
@@ -439,12 +443,30 @@ mod tests {
         use crate::owner_state_types::{OwnerAddr, SpaceId};
         use std::collections::BTreeSet;
 
-        // (community, actor, iroh_node_id, enrolled device key)
+        // (community, actor, iroh_node_id, enrolled device key, record stamp)
         let community = SpaceId([0x77; 16]);
         let bindings = vec![
-            (community, OwnerAddr([0x01; 16]), [0x0A; 32], [0xA1; 32]), // ring neighbor (enrolled)
-            (community, OwnerAddr([0x02; 16]), [0x0B; 32], [0xB2; 32]), // non-neighbor (enrolled)
-            (community, OwnerAddr([0x03; 16]), [0x0C; 32], [0xC3; 32]), // departed member (NOT enrolled)
+            (
+                community,
+                OwnerAddr([0x01; 16]),
+                [0x0A; 32],
+                [0xA1; 32],
+                1_000u64,
+            ), // ring neighbor (enrolled)
+            (
+                community,
+                OwnerAddr([0x02; 16]),
+                [0x0B; 32],
+                [0xB2; 32],
+                1_000u64,
+            ), // non-neighbor (enrolled)
+            (
+                community,
+                OwnerAddr([0x03; 16]),
+                [0x0C; 32],
+                [0xC3; 32],
+                1_000u64,
+            ), // departed member (NOT enrolled)
         ];
 
         let oracle = AdmissionOracle::new(true); // router mode
@@ -485,5 +507,45 @@ mod tests {
             oracle.admit(&[0x0C; 32]),
             "departed row skipped -> unbound -> fail open, not mis-parked"
         );
+    }
+
+    /// ZEB-995: the same `(owner, iroh_node_id)` asserted with DIVERGENT enrolled keys by two
+    /// communities' books — reachable after a fresh-identity recovery on a keychain-persisted
+    /// iroh key, while the stale community's row is still TTL-fresh and its old device still
+    /// enrolled there. Community iteration order must NOT decide the winner: the fresher
+    /// record's key must hold the slot in BOTH orders.
+    #[test]
+    fn backfill_cross_community_divergent_keys_freshest_wins_either_order() {
+        use crate::admission_oracle::AdmissionOracle;
+        use crate::owner_state_types::{OwnerAddr, SpaceId};
+        use std::collections::BTreeSet;
+
+        let owner = OwnerAddr([0x01; 16]);
+        let nid = [0x0A; 32];
+        let stale = (SpaceId([0xAA; 16]), owner, nid, [0xA1; 32], 100u64); // pre-recovery key
+        let fresh = (SpaceId([0xBB; 16]), owner, nid, [0xA2; 32], 200u64); // current key
+
+        for order in [vec![stale, fresh], vec![fresh, stale]] {
+            let oracle = AdmissionOracle::new(true);
+            let bound = backfill_admission_oracle_from_reachability(
+                &oracle,
+                order,
+                |_cid, _actor, _device| true, // both rows enrollment-pass in their community
+            );
+            assert_eq!(bound, 2, "both rows walked through the gate");
+
+            // Only the CURRENT key is a ring neighbor (the stale one is enrolled in a large
+            // community but not on self's ring) — the exact wrong-denial window.
+            oracle.publish_admitted(BTreeSet::from([[0xA2u8; 32]]));
+            assert!(
+                oracle.admit(&nid),
+                "freshest key wins the (owner, node_id) slot regardless of community order"
+            );
+            oracle.publish_admitted(BTreeSet::from([[0xA1u8; 32]]));
+            assert!(
+                !oracle.admit(&nid),
+                "the superseded key must not linger in the slot in either order"
+            );
+        }
     }
 }

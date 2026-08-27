@@ -1739,9 +1739,21 @@ pub async fn run(
                             .rows_for_community(&cid, now_ms)
                             .into_iter()
                             .filter_map(move |row| match &row.entry {
+                                // ZEB-995: carry the record's clamped HLC wall time so the
+                                // oracle LWW-reconciles colliding (owner, node_id) rows
+                                // across communities — iteration order over `ids` must not
+                                // decide which community's key wins the slot.
                                 crate::community_address_book::AddressBookEntry::Reachability(
                                     p,
-                                ) => Some((cid, row.actor, p.iroh_node_id, row.device)),
+                                ) => Some((
+                                    cid,
+                                    row.actor,
+                                    p.iroh_node_id,
+                                    row.device,
+                                    row.at.wall_ms.min(now_ms.saturating_add(
+                                        crate::community_address_book::ADDRBOOK_SKEW_TOLERANCE_MS,
+                                    )),
+                                )),
                                 _ => None,
                             })
                     });

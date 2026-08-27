@@ -2448,7 +2448,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk);
+        oracle.bind([0u8; 16], p, dk, 1_000);
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2507,7 +2507,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk);
+        oracle.bind([0u8; 16], p, dk, 1_000);
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied — and stays denied
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2555,7 +2555,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk);
+        oracle.bind([0u8; 16], p, dk, 1_000);
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2626,7 +2626,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk);
+        oracle.bind([0u8; 16], p, dk, 1_000);
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2702,7 +2702,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk);
+        oracle.bind([0u8; 16], p, dk, 1_000);
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2781,7 +2781,7 @@ mod tests {
                 let node_id = peer(i as u8);
                 let owner = [i as u8; 16];
                 seed_peer(&resolver, owner, node_id);
-                oracle.bind(owner, node_id, device_keys[i]);
+                oracle.bind(owner, node_id, device_keys[i], 1_000);
                 node_id
             })
             .collect();
