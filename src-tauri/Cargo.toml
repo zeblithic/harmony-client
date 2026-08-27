@@ -284,7 +284,7 @@ base64 = "0.22"
 flate2 = "1"
 thiserror = "1"
 tempfile = "3"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 rust_decimal = "1"
 csv = "1"
 chrono = "0.4"

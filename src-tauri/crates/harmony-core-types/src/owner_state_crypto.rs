@@ -772,6 +772,24 @@ pub fn derive_device_dataset_key(seed: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>,
     Ok(key)
 }
 
+/// HKDF info for the mint ledger SQLCipher key (ZEB-985). Golden-pinned in
+/// tests — changing it (or DEVICE_DATASET_SALT) strands every encrypted
+/// ledger.db on disk.
+const INFO_MINT_LEDGER_SQLCIPHER: &[u8] = b"mint-ledger-sqlcipher";
+
+/// Derive the raw SQLCipher key for `mint/ledger.db` from the node identity
+/// master seed (ZEB-985). A sibling of [`derive_device_dataset_key`] under
+/// the same salt with a distinct info label: SQLCipher consumes the raw key
+/// directly (`PRAGMA key = "x'…'"`, no PBKDF2 pass), so it must never be
+/// byte-shared with the ChaCha20-Poly1305 dataset key.
+pub fn derive_mint_ledger_key(seed: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    let hk = Hkdf::<Sha256>::new(Some(DEVICE_DATASET_SALT), seed);
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(INFO_MINT_LEDGER_SQLCIPHER, key.as_mut())
+        .map_err(|e| CryptoError::Hkdf(format!("mint-ledger-sqlcipher: {e}")))?;
+    Ok(key)
+}
+
 /// Seal a file image under the device dataset key (ZEB-982). Same layout as
 /// [`seal_dataset_file`] (random nonce; `nonce(12) ‖ ct+tag`) in the device
 /// AAD domain. `label` is the file's canonical filename constant.
@@ -1725,6 +1743,25 @@ mod tests {
         assert_eq!(
             hex, "7f58aa4a60e8c386d2098a08589a17ee171745f2bb8f53f3d1ebd3c0360dd11a",
             "device dataset key derivation drifted"
+        );
+    }
+
+    #[test]
+    fn mint_ledger_key_derivation_golden_pin() {
+        // ZEB-985: changing DEVICE_DATASET_SALT or INFO_MINT_LEDGER_SQLCIPHER
+        // strands every encrypted ledger.db on disk — this pin makes any
+        // drift loud. The derivation must also never collide with the
+        // device dataset AEAD key (SQLCipher consumes the raw bytes).
+        let key = derive_mint_ledger_key(&[7u8; 32]).unwrap();
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "0b900cb623591506c29170bb705a7e77392753df10ec9af4ab4290487832221c",
+            "mint ledger key derivation drifted"
+        );
+        let device = derive_device_dataset_key(&[7u8; 32]).unwrap();
+        assert_ne!(
+            &*key, &*device,
+            "mint ledger key must not equal device dataset key"
         );
     }
 
