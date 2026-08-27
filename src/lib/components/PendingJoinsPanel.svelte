@@ -1,7 +1,5 @@
 <script lang="ts">
-    import { onDestroy } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
-    import { listen } from '@tauri-apps/api/event';
     import CountChip from './governance/CountChip.svelte';
     import PeerName from './PeerName.svelte';
     // ZEB-946: the "since …" HLC timestamp honors the owner's time-format prefs.
@@ -41,24 +39,18 @@
     // start of each fetch (M4 fix).
     let loading = $state(false);
 
-    // Non-reactive stale-guard tokens (plain `let`, NOT `$state`): these are
-    // monotonic counters/handles used only inside async guards, never rendered.
+    // Non-reactive stale-guard token (plain `let`, NOT `$state`): a monotonic
+    // counter used only inside async guards, never rendered.
     // R4-7: latestCallId is captured at the start of each refresh(); out-of-order
     // async responses must not overwrite the results of the latest refresh.
     let latestCallId = 0;
-    // R5-3: latestWatchId is the analogous token for $effect invocations, so a
-    // stale effect (deps changed mid-flight) doesn't register a listener for the
-    // OLD community or clobber convergedUnlisten.
-    let latestWatchId = 0;
-    let convergedUnlisten: (() => void) | null = null;
 
     async function refresh() {
         // R3 (M4): reset loading state at the start of every refresh so
-        // subsequent fetches (triggered by community-state-sync-converged
-        // events or kickJoiner-then-refresh) also surface a transient
-        // loading indicator. Without this, after the first load completes
-        // loading stays false forever and the UI shows stale data with no
-        // visual cue that a refresh is in flight.
+        // subsequent fetches (kickJoiner-then-refresh) also surface a
+        // transient loading indicator. Without this, after the first load
+        // completes loading stays false forever and the UI shows stale data
+        // with no visual cue that a refresh is in flight.
         const myCallId = ++latestCallId;
         loading = true;
         try {
@@ -118,32 +110,23 @@
         return formatFullTimestamp(hlc.wallMs, prefs);
     }
 
-    // Teardown of a Tauri unlisten handle must never throw mid-sequence: if it
-    // did, the cleanup/handoff below could abort and leave the converged listener
-    // registered (stale refresh callbacks firing after a deps change/unmount).
-    // Swallow — the listener is being discarded regardless (restores the Svelte-4
-    // original's try/catch teardowns).
-    function safeUnlisten(fn: (() => void) | null | undefined) {
-        try {
-            fn?.();
-        } catch {
-            /* ignore — teardown errors are non-fatal */
-        }
-    }
-
     // R3 (M3): re-fetch when `canModerate` or `communityId` change. Svelte-5
     // $effect re-runs only when its tracked deps change and cleans up the prior
     // run first, so it natively replaces the Svelte-4 reactive-statement +
-    // manual `lastWatched*` dedup. The stale-guard tokens below preserve the
-    // original R4-7/R5-3 race protections.
+    // manual `lastWatched*` dedup. The stale-guard token above preserves the
+    // original R4-7 race protection.
+    //
+    // ZEB-976: this effect previously also registered a listener for a
+    // `community-state-sync-converged` Tauri event, but no Rust code has ever
+    // emitted it — refresh happens on mount, on prop changes, and after
+    // kickJoiner(). Live refresh on sync activity is tracked separately.
     $effect(() => {
-        const myWatchId = ++latestWatchId;
         // Read deps synchronously so the effect re-runs when they change.
-        const cid = communityId;
         const canMod = canModerate;
+        void communityId;
 
         if (!canMod) {
-            // Non-moderator path: clear any prior data and register no listener.
+            // Non-moderator path: clear any prior data and skip the fetch.
             // R4-7: bump latestCallId so any in-flight refresh (kicked off before
             // canMod flipped to false) discards its result when it resolves rather
             // than re-populating pending/recent for a community the caller is no
@@ -157,42 +140,6 @@
         }
 
         void refresh();
-
-        // R5-3: `cancelled` (per-run) + `myWatchId` guard the async listen()
-        // registration against a deps change that starts a newer effect run while
-        // this listen() promise is still in flight.
-        let cancelled = false;
-        listen('community-state-sync-converged', async (evt) => {
-            if (myWatchId !== latestWatchId) return;
-            const payload = evt.payload as { communityId?: string };
-            if (payload?.communityId === cid) {
-                await refresh();
-            }
-        })
-            .then((unlisten) => {
-                if (cancelled || myWatchId !== latestWatchId) {
-                    safeUnlisten(unlisten);
-                    return;
-                }
-                const prev = convergedUnlisten;
-                convergedUnlisten = unlisten;
-                safeUnlisten(prev);
-            })
-            .catch(() => {
-                // Event listener registration may fail in some test environments —
-                // that's OK; manual refresh still works.
-            });
-
-        return () => {
-            cancelled = true;
-            safeUnlisten(convergedUnlisten);
-            convergedUnlisten = null;
-        };
-    });
-
-    onDestroy(() => {
-        safeUnlisten(convergedUnlisten);
-        convergedUnlisten = null;
     });
 </script>
 

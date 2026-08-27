@@ -1087,8 +1087,10 @@ pub struct NodeState {
     /// start_node alongside the SyncEngine; shared with the IPC handler
     /// (send_dm) and the event-loop drain tick.
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
-    /// Phase 2: in-process StubTransport. Phase 3b replaces with a real
-    /// adapter that pushes RuntimeAction::SendUnicastToDevice.
+    /// Production wires `IrohTunnelDmTransport` (iroh PQ tunnel + butler
+    /// deposit) at node start; `StubTransport` remains for tests. (The
+    /// Phase 3b runtime unicast adapter this field once anticipated was
+    /// retired with the Reticulum teardown, harmony#280 / ZEB-473 Move 1a.)
     dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
     /// ZEB-691: the butler deposit client (same `Arc` set on the `DmOutbox`),
     /// exposed here so `push_revocation_to_friends` can deposit a revocation to a
@@ -18172,8 +18174,8 @@ pub(crate) const MAX_DM_SPACE_MEMBERS: usize = 16;
 
 /// Pure inner implementation of `add_space`'s DM/GroupDm dispatch. The
 /// `#[tauri::command]` shim snapshots NodeState handles, drops the sync
-/// mutex, calls this, then forwards each `UnicastSendRequest` into the
-/// outbound unicast channel.
+/// mutex, calls this, then routes the returned invite fan-out (wire bytes +
+/// recipient owners) over the iroh tunnel via `send_dm` — see step 8 below.
 ///
 /// Behavior:
 ///   1. Validate kind ∈ {Dm, GroupDm} and the recipient list:
@@ -44009,10 +44011,10 @@ where
         // behavior. The PendingJoin reaches the admin via the engine's state-root
         // publisher.
         //
-        // The unicast fan-out below is DORMANT (ZEB-474 → ZEB-473/Move 1a): the
-        // Reticulum carrier is gone; these packets reach the pinned core's
-        // SendUnicastToDevice handler and are dropped (no worse than today off-LAN).
-        // Move 1a (ZEB-473) rewires this fan-out onto the iroh tunnel.
+        // The unicast fan-out that used to live below was removed (ZEB-474 →
+        // ZEB-473/Move 1a) — see the comment in the else-branch: delivery is
+        // via CRDT state-root sync; `destinations` is resolved only for
+        // diagnostics.
         //
         // ZEB-325 PR #159 R6: when `pre_delivered_countersign` is Some, the
         // countersign has already been inserted at step 7b — skip the fan-out
@@ -76621,10 +76623,11 @@ pub fn run() {
             add_iroh_relay,
             remove_iroh_relay,
             reset_iroh_relays,
-            // ZEB-417 SP1: owner-private Notes IPCs.
+            // ZEB-417 SP1: owner-private Notes IPCs. (notes_delete removed in
+            // ZEB-976 — zero callers; notes_delete_core remains for a future
+            // delete UI.)
             notes_commands::notes_list,
             notes_commands::notes_upsert,
-            notes_commands::notes_delete,
             // ZEB-977: owner-private Contacts IPCs (petname + notes, any identity).
             contacts_commands::contacts_list,
             contacts_commands::set_contact_petname,

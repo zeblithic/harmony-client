@@ -1,9 +1,9 @@
 <script lang="ts">
   // ZEB-944: Time & date format settings — two independent radiogroups (Clock
   // and Date order) driving the owner-scoped time-format preference. Keyboard
-  // model mirrors AppearanceSettings.svelte / CodecToggle.svelte exactly:
-  // arrows/Home/End move and select, Space/Enter select, roving tabindex +
-  // focus follows selection, applied per group.
+  // model mirrors AppearanceSettings.svelte exactly: arrows/Home/End move and
+  // select, Space/Enter select, roving tabindex + focus follows selection,
+  // applied per group.
   import { tick } from 'svelte';
   import {
     setTimeFormatSettings,
@@ -129,8 +129,8 @@
 <style>
   /* Tokens only (ZEB-604 ratchet). Mirrors AppearanceSettings.svelte: row and
      typography model from NetworkDiscoverabilitySettings.svelte; segmented
-     control from CodecToggle.svelte — borders var(--border), selected fill
-     var(--primary-soft), selected text var(--primary-deep). */
+     control from AppearanceSettings.svelte — borders var(--border), selected
+     fill var(--primary-soft), selected text var(--primary-deep). */
   .time-format-settings {
     padding: 12px 0;
     display: flex;

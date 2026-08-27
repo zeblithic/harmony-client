@@ -1,8 +1,10 @@
 <script lang="ts">
   // ZEB-605 T3: Appearance settings — a three-option theme radiogroup
   // (System / Light / Dark) that drives the owner-scoped theme preference.
-  // Keyboard model mirrors CodecToggle.svelte exactly: arrows/Home/End move and
-  // select, Space/Enter select, roving tabindex + focus follows selection.
+  // Keyboard model (originally from the removed CodecToggle.svelte, ZEB-976):
+  // arrows/Home/End move and select, Space/Enter select, roving tabindex +
+  // focus follows selection. This file is now the canonical segmented-control
+  // reference (TimeFormatSettings.svelte mirrors it).
   import { tick } from 'svelte';
   import {
     setThemePreference,
@@ -89,9 +91,9 @@
 
 <style>
   /* Tokens only (ZEB-604 ratchet). Row/typography model on
-     NetworkDiscoverabilitySettings.svelte; segmented control on
-     CodecToggle.svelte — borders var(--border), selected fill
-     var(--primary-soft), selected text var(--primary-deep). */
+     NetworkDiscoverabilitySettings.svelte; segmented control (canonical here
+     since CodecToggle.svelte was removed, ZEB-976) — borders var(--border),
+     selected fill var(--primary-soft), selected text var(--primary-deep). */
   .appearance-settings {
     padding: 12px 0;
   }

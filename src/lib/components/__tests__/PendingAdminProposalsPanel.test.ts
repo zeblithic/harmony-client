@@ -5,9 +5,6 @@ import PendingAdminProposalsPanel from '../PendingAdminProposalsPanel.svelte';
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
 }));
-vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
-}));
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -48,14 +45,12 @@ describe('PendingAdminProposalsPanel', () => {
     vi.clearAllMocks();
   });
 
-  it('non_admin_skips_fetch_and_listen_registration', async () => {
+  it('non_admin_skips_fetch', async () => {
     const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
-    const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
     render(PendingAdminProposalsPanel, {
       props: { communityId: 'community-x', canAdmin: false },
     });
     expect(invoke).not.toHaveBeenCalled();
-    expect(listen).not.toHaveBeenCalled();
   });
 
   it('renders_pending_proposal_cards_with_signers_count', async () => {
@@ -187,42 +182,6 @@ describe('PendingAdminProposalsPanel', () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
         'countersign_admin_proposal',
-        expect.objectContaining({ communityId: 'community-x' })
-      );
-    });
-  });
-
-  it('community_state_sync_converged_event_triggers_refresh', async () => {
-    const { invoke } = await import('@tauri-apps/api/core');
-    const { listen } = await import('@tauri-apps/api/event');
-    const mockInvoke = invoke as ReturnType<typeof vi.fn>;
-    const mockListen = listen as ReturnType<typeof vi.fn>;
-
-    let capturedHandler: (() => void) | null = null;
-    mockListen.mockImplementation((_event: string, handler: () => void) => {
-      capturedHandler = handler;
-      return Promise.resolve(() => {});
-    });
-    mockInvoke.mockResolvedValue([]);
-
-    render(PendingAdminProposalsPanel, {
-      props: { communityId: 'community-x', canAdmin: true },
-    });
-
-    // Wait for initial fetch + listener registration
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledTimes(1);
-      expect(capturedHandler).not.toBeNull();
-    });
-
-    // Trigger the converged event
-    capturedHandler!();
-
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledTimes(2);
-      expect(mockInvoke).toHaveBeenNthCalledWith(
-        2,
-        'list_pending_admin_proposals',
         expect.objectContaining({ communityId: 'community-x' })
       );
     });

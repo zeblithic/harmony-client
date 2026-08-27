@@ -130,28 +130,6 @@ describe('PttButton', () => {
     document.body.removeChild(select);
   });
 
-  it('renders codec toggle', () => {
-    render(PttButton, { props: { active: false } });
-    const toggle = screen.getByRole('radiogroup', { name: /voice codec/i });
-    expect(toggle).toBeTruthy();
-  });
-
-  it('fires onCodecChange when codec toggle is clicked', async () => {
-    const onCodecChange = vi.fn();
-    render(PttButton, { props: { active: false, onCodecChange } });
-    const codec2 = screen.getByRole('radio', { name: /codec2/i });
-    await fireEvent.click(codec2);
-    expect(onCodecChange).toHaveBeenCalledWith('codec2');
-  });
-
-  it('disables codec toggle when PTT is active', () => {
-    render(PttButton, { props: { active: true } });
-    const radios = screen.getAllByRole('radio');
-    for (const radio of radios) {
-      expect(radio.getAttribute('aria-disabled')).toBe('true');
-    }
-  });
-
   it('still fires onPttStop on mouseup when disabled flips true mid-hold', async () => {
     // Regression guard: if a parent toggles `disabled` (e.g., calibration
     // lost, permission revoked) during a press, release must still
