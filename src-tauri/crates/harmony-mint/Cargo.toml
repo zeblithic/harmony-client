@@ -39,6 +39,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+# OS advisory lock (flock/LockFileEx) serializing the one-time ZEB-985
+# plaintext migration across processes; released automatically on process
+# death, so no PID-liveness logic (same crate the app's profile lock uses).
+fd-lock = "4"
 chrono = "0.4"
 async-trait = "0.1"
 thiserror = "1"
