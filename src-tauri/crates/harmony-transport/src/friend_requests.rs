@@ -129,14 +129,26 @@ impl PendingFriendRequests {
     /// (#6) would strand the user with a request they can't accept-as-introduction.
     /// A re-delivered SAME offer just replaces itself (resetting `received_at_ms`
     /// to `now_ms` — acceptable; it is the same verified offer).
+    ///
+    /// ZEB-1001: if `subject` has already been APPROVED (Path-A accept recorded,
+    /// link not yet complete), the call is a no-op and returns `false` — a
+    /// delayed offer must not resurrect a pending row the user already decided
+    /// (mirrors [`record_inbound`](Self::record_inbound)'s approved guard; the
+    /// supersede rule above applies only to *pending* entries). Returns `true`
+    /// when the offer was recorded, so the caller can gate its
+    /// `friend-request-received` prompt on a row actually existing.
+    #[must_use]
     pub fn record_introduction_offer(
         &self,
         subject: OwnerAddr,
         display: Option<String>,
         now_ms: u64,
         offer: StoredIntroductionOffer,
-    ) {
+    ) -> bool {
         let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
+        if inner.approved.contains(&subject) {
+            return false;
+        }
         inner.inbound.insert(
             subject,
             PendingInbound {
@@ -145,6 +157,7 @@ impl PendingFriendRequests {
                 kind: PendingKind::IntroductionOffer(Box::new(offer)),
             },
         );
+        true
     }
 
     /// ZEB-376 Task 11: remove + return the staged introduction offer for
@@ -792,7 +805,7 @@ mod tests {
             subject: addr(1),
             reachability: fixture_reach(),
         };
-        store.record_introduction_offer(addr(1), Some("alice".into()), 1_000, offer);
+        assert!(store.record_introduction_offer(addr(1), Some("alice".into()), 1_000, offer));
         // Surfaces in the inbox with its introduced_by voucher.
         let list = store.list();
         assert_eq!(list.len(), 1);
@@ -820,7 +833,10 @@ mod tests {
             subject: addr(1),
             reachability: fixture_reach(),
         };
-        store.record_introduction_offer(addr(1), Some("offer".into()), 2_000, offer);
+        assert!(
+            store.record_introduction_offer(addr(1), Some("offer".into()), 2_000, offer),
+            "superseding a pending LinkRequest is a recorded offer"
+        );
         // The offer now occupies the slot and is take-able.
         let taken = store.take_offer(&addr(1));
         assert!(
@@ -832,6 +848,34 @@ mod tests {
             store.list().is_empty(),
             "take consumed the superseding offer"
         );
+    }
+
+    /// ZEB-1001: a delayed introduction offer for a subject the user ALREADY
+    /// approved (Path-A accept recorded, link not yet complete) must not
+    /// resurrect a pending inbox row — the approval stands and the requester's
+    /// next dial completes via `prior_accept`. Mirrors `record_inbound`'s
+    /// approved guard; the supersede rule above applies only to *pending*
+    /// entries, never to approved subjects.
+    #[test]
+    fn late_offer_after_approval_is_ignored() {
+        let store = PendingFriendRequests::new();
+        let subject = addr(0x51);
+        store.record_inbound(subject, Some("link".into()), 1_000);
+        store.approve(subject); // inbox row consumed, approval recorded
+        let offer = StoredIntroductionOffer {
+            voucher: addr(0x52),
+            subject,
+            reachability: fixture_reach(),
+        };
+        assert!(
+            !store.record_introduction_offer(subject, Some("offer".into()), 2_000, offer),
+            "late offer for an approved subject must report not-recorded"
+        );
+        assert!(
+            store.list().is_empty(),
+            "late offer must not resurrect a pending row for an approved subject"
+        );
+        assert!(store.is_approved(&subject), "approval must remain active");
     }
 
     #[test]
@@ -855,7 +899,7 @@ mod tests {
             subject: subj,
             reachability: fixture_reach(), // existing helper in this test module (:383)
         };
-        store.record_introduction_offer(subj, Some("x".into()), 4242, offer.clone());
+        assert!(store.record_introduction_offer(subj, Some("x".into()), 4242, offer.clone()));
         let (peeked, received_at) = store.peek_offer(&subj).expect("offer present");
         assert_eq!(peeked, offer);
         assert_eq!(received_at, 4242);
@@ -1057,8 +1101,13 @@ mod tests {
             reachability: fixture_reach(), // existing helper in this test module (friend_requests.rs:383)
         };
         let now = 10 * INTRODUCTION_OFFER_TTL_MS;
-        store.record_introduction_offer(fresh, None, now, mk(fresh)); // received now → fresh
-        store.record_introduction_offer(stale, None, now - INTRODUCTION_OFFER_TTL_MS, mk(stale)); // exactly TTL old → expired
+        assert!(store.record_introduction_offer(fresh, None, now, mk(fresh))); // received now → fresh
+        assert!(store.record_introduction_offer(
+            stale,
+            None,
+            now - INTRODUCTION_OFFER_TTL_MS,
+            mk(stale)
+        )); // exactly TTL old → expired
         store.record_inbound(link, None, 0); // a LinkRequest, never swept
 
         assert!(is_offer_expired(now - INTRODUCTION_OFFER_TTL_MS, now));
