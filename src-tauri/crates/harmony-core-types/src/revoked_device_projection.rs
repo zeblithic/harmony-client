@@ -26,18 +26,22 @@
 //!   beyond the CURRENT feed is intra-session leave-stickiness (keys retained
 //!   after leaving the community that carried them), and that surplus resets
 //!   at restart.
-//! * **Bounded by resident state.** Every key here is cloned from
-//!   `MemberState.revoked_device_keys` rows the node already holds in its
-//!   materialized views — the projection is at most a constant factor over
-//!   revoked-key data already resident, and introduces no new asymptotic
-//!   growth.
-//! * **Absolute sizing.** Entries are 32-byte keys under per-owner
-//!   `BTreeSet`s (order ~100 B/key with tree overhead). Revocations are rare,
-//!   per-owner lifetime events (device loss / retirement / compromise), not a
-//!   rate: even a node sharing communities with 10⁶ distinct owners at a 10%
-//!   lifetime-revocation incidence and ~2 keys each is ~2·10⁵ keys ≈ tens of
-//!   MB worst-case, with O(log n) lookups. Typical fleets are orders of
-//!   magnitude below that.
+//! * **Cumulative since boot, fed only by resident state.** Every key arrives
+//!   from a `MemberState.revoked_device_keys` row that was resident in the
+//!   materialized views at some point THIS session; stickiness means the
+//!   projection holds the cumulative distinct-key union observed since boot
+//!   (keys from since-departed communities included), not a snapshot of the
+//!   current feed. So it can exceed the current views by the session's
+//!   leave-surplus — but never holds a key the node did not itself
+//!   materialize this session, and the surplus resets at restart.
+//! * **Illustrative sizing** (no enforced cap — the bound above is the
+//!   feed, not a limit). Entries are 32-byte keys under per-owner `BTreeSet`s
+//!   (order ~100 B/key with tree overhead). Revocations are rare, per-owner
+//!   lifetime events (device loss / retirement / compromise), not a rate: a
+//!   node that materialized communities totalling 10⁶ distinct owners in one
+//!   session, at a 10% lifetime-revocation incidence and ~2 keys each, holds
+//!   ~2·10⁵ keys ≈ tens of MB, with O(log n) lookups. Typical fleets sit
+//!   orders of magnitude below that.
 
 use crate::owner_state_types::OwnerAddr;
 use std::collections::{BTreeMap, BTreeSet};

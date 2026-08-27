@@ -12062,8 +12062,10 @@ pub async fn start_node_inner(
                                     // unavailable filesystem must not stall the arm
                                     // before its ack. Fresh-per-call is preserved
                                     // (live-apply, no caching). JoinError (blocking
-                                    // task panicked / runtime shutting down) falls
-                                    // back to the acceptor's documented default.
+                                    // task panicked / runtime shutting down) fails
+                                    // CLOSED, mirroring `fail_closed_defaults`
+                                    // (ZEB-376): a CONFIGURED policy we could not
+                                    // read must never silently admit a stranger.
                                     std::sync::Arc::new(
                                         move || -> iroh_pex_acceptor::PeerIntroPolicyFuture {
                                             let p = p.clone();
@@ -12081,9 +12083,9 @@ pub async fn start_node_inner(
                                                         tracing::warn!(
                                                             error = %e,
                                                             "ZEB-1008: settings read for PeerIntroPolicy \
-                                                             failed to join; using default"
+                                                             failed to join; failing closed"
                                                         );
-                                                        friend_graph::PeerIntroPolicy::default()
+                                                        friend_graph::PeerIntroPolicy::Closed
                                                     }
                                                 }
                                             })
