@@ -605,6 +605,29 @@ pub async fn streaming_ingest_with_options<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let mut sent = Vec::new();
+    streaming_ingest_collecting(reader, ingest_tx, chunker_config, cancel, opts, &mut sent).await
+}
+
+/// ZEB-1012 / ZEB-157: the collecting core of [`streaming_ingest_with_options`].
+/// Records every CID whose admission the event loop ACKNOWLEDGED (leaves,
+/// interior bundles, root — `send_ingest` awaits each reply) into `sent`, so
+/// a failure arm can evict the exact admitted set via
+/// [`rollback_ingested_cids`]. `sent` is meaningful on BOTH returns: on `Err`
+/// it holds the partial set admitted before the failure; on `Ok` it covers
+/// the whole tree (root included), so post-ingest failure arms in callers can
+/// reuse it as-is.
+pub async fn streaming_ingest_collecting<R>(
+    reader: R,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    chunker_config: harmony_content::chunker::ChunkerConfig,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    opts: IngestOptions,
+    sent: &mut Vec<harmony_content::cid::ContentId>,
+) -> Result<(harmony_content::cid::ContentId, u64), IngestError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use harmony_content::chunker::Chunker;
     use harmony_content::cid::ContentId;
     use tokio::io::AsyncReadExt;
@@ -660,6 +683,7 @@ where
             )
             .await
             .map_err(IngestError::IngestChannel)?;
+            sent.push(cid);
             leaf_cids.push(cid);
             window_pos = cut;
         }
@@ -682,6 +706,7 @@ where
         )
         .await
         .map_err(IngestError::IngestChannel)?;
+        sent.push(cid);
         leaf_cids.push(cid);
     }
 
@@ -701,11 +726,72 @@ where
         )
         .await
         .map_err(IngestError::IngestChannel)?;
+        sent.push(cid);
         return Ok((cid, 0));
     }
 
-    let root = build_bundle_tree_with_options(leaf_cids, total_bytes, ingest_tx, opts).await?;
+    let root =
+        build_bundle_tree_with_options(leaf_cids, total_bytes, ingest_tx, opts, sent).await?;
     Ok((root, total_bytes))
+}
+
+/// ZEB-1012 / ZEB-157: best-effort eviction of the CIDs a FAILED ingest had
+/// already admitted (the `sent` list a [`streaming_ingest_collecting`] call
+/// accumulated — partial on a mid-stream failure, the whole tree on a
+/// post-ingest failure arm). Sends one `ContentVerbRequest::RollbackIngest`
+/// and waits briefly for the eviction count so it can be logged.
+///
+/// Every failure mode here is swallowed by design: the event loop being gone
+/// (the usual reason an ingest failed at all) means the in-memory cache died
+/// with it, and a missed rollback merely leaves unpinned cache entries that
+/// W-TinyLFU pressure or the next restart reclaims anyway. Serve-allowlist
+/// entries for rolled-back CIDs are likewise left to their lease sweep:
+/// process-local, ~40 B each, and unservable once the bytes are evicted.
+///
+/// `None` verb channel = caller has no rollback route (focused tests, or a
+/// node state without a running loop) — a no-op, not an error.
+pub(crate) async fn rollback_ingested_cids(
+    verb_tx: Option<&tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
+    sent: &[harmony_content::cid::ContentId],
+    context: &'static str,
+) {
+    let Some(verb_tx) = verb_tx else {
+        return;
+    };
+    if sent.is_empty() {
+        return;
+    }
+    let cids: Vec<[u8; 32]> = sent.iter().map(|c| c.to_bytes()).collect();
+    let admitted = cids.len();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if verb_tx
+        .send(event_loop::ContentVerbRequest::RollbackIngest {
+            cids,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            context,
+            admitted,
+            "ingest rollback skipped: event loop not running"
+        );
+        return;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+        Ok(Ok(Ok(evicted))) => {
+            tracing::debug!(context, admitted, evicted, "rolled back failed ingest");
+        }
+        _ => {
+            tracing::debug!(
+                context,
+                admitted,
+                "ingest rollback reply missing or failed (best-effort; cache \
+                 pressure / restart reclaims the orphans regardless)"
+            );
+        }
+    }
 }
 
 /// Build the nested-bundle tree bottom-up from a vector of leaf CIDs and
@@ -731,7 +817,14 @@ pub(crate) async fn build_bundle_tree(
     total_size: u64,
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
 ) -> Result<harmony_content::cid::ContentId, IngestError> {
-    build_bundle_tree_with_options(leaf_cids, total_size, ingest_tx, IngestOptions::default()).await
+    build_bundle_tree_with_options(
+        leaf_cids,
+        total_size,
+        ingest_tx,
+        IngestOptions::default(),
+        &mut Vec::new(),
+    )
+    .await
 }
 
 /// ZEB-535: options-aware variant of [`build_bundle_tree`]. Stamps `opts.flags`
@@ -742,6 +835,10 @@ pub(crate) async fn build_bundle_tree_with_options(
     total_size: u64,
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     opts: IngestOptions,
+    // ZEB-1012 / ZEB-157: every acknowledged interior-bundle admission is
+    // recorded here (the streaming caller threads its leaf list through the
+    // same vec) so a failure arm can roll the exact admitted set back.
+    sent: &mut Vec<harmony_content::cid::ContentId>,
 ) -> Result<harmony_content::cid::ContentId, IngestError> {
     use harmony_content::bundle::{BundleBuilder, MAX_BUNDLE_ENTRIES};
 
@@ -791,6 +888,7 @@ pub(crate) async fn build_bundle_tree_with_options(
             )
             .await
             .map_err(IngestError::IngestChannel)?;
+            sent.push(bundle_cid);
             next_level.push(bundle_cid);
         }
 
@@ -24300,13 +24398,17 @@ async fn ingest_content(
         .unwrap_or("unknown")
         .to_string();
 
-    let (ingest_tx, content_index) = {
+    let (ingest_tx, content_index, content_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .ingest_tx
             .clone()
             .ok_or_else(|| "not connected".to_string())?;
-        (tx, guard.content_index.clone())
+        (
+            tx,
+            guard.content_index.clone(),
+            guard.content_verb_tx.clone(),
+        )
     };
 
     // 3. Stream the file through the chunker into a nested-bundle tree.
@@ -24318,14 +24420,36 @@ async fn ingest_content(
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     let reader = tokio::io::BufReader::new(file);
-    let (root, size_bytes) = streaming_ingest(reader, &ingest_tx, ChunkerConfig::DEFAULT, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut sent = Vec::new();
+    let (root, size_bytes) = match streaming_ingest_collecting(
+        reader,
+        &ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        IngestOptions::default(),
+        &mut sent,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(e) => {
+            // ZEB-157: leaves/bundles admitted before the failure are
+            // orphans (no root, no sidecar) — evict them best-effort.
+            rollback_ingested_cids(content_verb_tx.as_ref(), &sent, "ingest_content").await;
+            return Err(e.to_string());
+        }
+    };
 
     // 4. Insert the sidecar row pointing at the streamed root CID.
-    send_ingest_with_name(&content_index, root.to_bytes(), file_name, size_bytes, None)
-        .await
-        .map_err(|e| e.to_string())
+    match send_ingest_with_name(&content_index, root.to_bytes(), file_name, size_bytes, None).await
+    {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            // ZEB-1012: the whole admitted tree has no sidecar row — evict it.
+            rollback_ingested_cids(content_verb_tx.as_ref(), &sent, "ingest_content sidecar").await;
+            Err(e.to_string())
+        }
+    }
 }
 
 /// Read up to `buf.len()` bytes, tolerating short reads; returns bytes filled
@@ -24439,6 +24563,10 @@ async fn produce_ciphertext(
 pub async fn ingest_content_encrypted_inner(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    // ZEB-1012: best-effort rollback route — on any failure AFTER chunks were
+    // admitted, the exact admitted set is evicted from the runtime cache.
+    // `None` in focused tests that inspect the recorded admissions directly.
+    content_verb_tx: Option<&tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     // ZEB-1011: the caller's snapshot-paired detach flag — the sealed-DEK
     // write below must not land in a detached owner-state (the ingested
@@ -24472,33 +24600,64 @@ pub async fn ingest_content_encrypted_inner(
     let producer = tokio::spawn(async move {
         produce_ciphertext(plaintext_reader, dek_for_producer, frame_size, &mut pipe_w).await
     });
-    let ingest_res =
-        streaming_ingest_with_options(pipe_r, ingest_tx, ChunkerConfig::DEFAULT, None, opts).await;
-    let produce_res = producer
-        .await
-        .map_err(|e| format!("encrypt task join: {e}"))?;
+    let mut sent = Vec::new();
+    let ingest_res = streaming_ingest_collecting(
+        pipe_r,
+        ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        opts,
+        &mut sent,
+    )
+    .await;
+    let produce_res = match producer.await {
+        Ok(res) => res,
+        Err(e) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_content_encrypted join").await;
+            return Err(format!("encrypt task join: {e}"));
+        }
+    };
     // Surface the ROOT error and never commit state on any failure. If the
     // ingest side failed, that is the root cause — it drops the pipe reader,
     // so the producer's error (if any) is a derivative broken-pipe write that
     // must not mask the real ingest error. If ingest succeeded but the producer
     // failed, ingest saw a clean short stream (a truncated file) and the
     // producer error is the root cause. Either failure returns before any
-    // `file_deks`/sidecar commit.
+    // `file_deks`/sidecar commit — after evicting whatever the failed call
+    // already admitted (ZEB-1012).
     let (root, size_bytes) = match (ingest_res, produce_res) {
-        (Err(e), _) => return Err(e.to_string()),
-        (Ok(_), Err(e)) => return Err(e),
+        (Err(e), _) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_content_encrypted stream").await;
+            return Err(e.to_string());
+        }
+        (Ok(_), Err(e)) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_content_encrypted producer")
+                .await;
+            return Err(e);
+        }
         (Ok(rooted), Ok(())) => rooted,
     };
 
     // 3. Seal the DEK at rest and store it keyed by the root CID (ZEB-709).
-    let sealed = crate::file_sharing::seal_dek_at_rest(keytree, &dek)
-        .map_err(|e| format!("seal DEK at rest: {e:?}"))?;
+    let sealed = match crate::file_sharing::seal_dek_at_rest(keytree, &dek) {
+        Ok(sealed) => sealed,
+        Err(e) => {
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_content_encrypted seal").await;
+            return Err(format!("seal DEK at rest: {e:?}"));
+        }
+    };
     {
         let mut st = crdt_state.lock().await;
         // ZEB-1011: a stop racing this ingest would detach the state — the
         // sealed DEK would vanish and the just-ingested ciphertext would be
         // permanently undecryptable. Fail loudly instead.
-        ensure_owner_state_attached(owner_state_detached, "ingest_content_encrypted")?;
+        if let Err(e) =
+            ensure_owner_state_attached(owner_state_detached, "ingest_content_encrypted")
+        {
+            drop(st);
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_content_encrypted detach").await;
+            return Err(e);
+        }
         st.file_deks.insert(root.to_bytes(), sealed);
     }
     if let Some(engine) = sync_engine {
@@ -24506,9 +24665,19 @@ pub async fn ingest_content_encrypted_inner(
     }
 
     // 4. Insert the sidecar row pointing at the streamed root CID.
-    send_ingest_with_name(content_index, root.to_bytes(), file_name, size_bytes, None)
-        .await
-        .map_err(|e| e.to_string())
+    match send_ingest_with_name(content_index, root.to_bytes(), file_name, size_bytes, None).await {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            // ZEB-1012: evict the unlisted tree. The already-committed
+            // `file_deks` row is deliberately LEFT IN PLACE: a concurrent
+            // ingest of identical bytes lands on the same root key, so
+            // removing the row here could clobber the DEK of a file that
+            // DID get its sidecar — a small orphan row is the safe side.
+            rollback_ingested_cids(content_verb_tx, &sent, "ingest_content_encrypted sidecar")
+                .await;
+            Err(e.to_string())
+        }
+    }
 }
 
 /// ZEB-674 Task 1 (C1): encrypted-file ingest via the native file picker.
@@ -24564,7 +24733,15 @@ pub(crate) async fn ingest_content_encrypted_impl(
 
     // 2. Snapshot the handles the encrypt path needs, then drop the sync lock
     //    before any await. `owner_keytree`/`crdt_state` are `None` pre-mint.
-    let (ingest_tx, content_index, crdt_state, owner_state_detached, keytree, sync_engine) = {
+    let (
+        ingest_tx,
+        content_index,
+        content_verb_tx,
+        crdt_state,
+        owner_state_detached,
+        keytree,
+        sync_engine,
+    ) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let ingest_tx = guard
             .ingest_tx
@@ -24583,6 +24760,7 @@ pub(crate) async fn ingest_content_encrypted_impl(
         (
             ingest_tx,
             guard.content_index.clone(),
+            guard.content_verb_tx.clone(),
             crdt_state,
             guard.owner_state_detached.clone(),
             keytree,
@@ -24616,6 +24794,7 @@ pub(crate) async fn ingest_content_encrypted_impl(
     ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        content_verb_tx.as_ref(),
         &crdt_state,
         &owner_state_detached,
         &keytree,
@@ -35524,23 +35703,48 @@ pub(crate) async fn ingest_channel_artifact_impl(
         // streamed byte count, which becomes the authoritative `size` and is
         // cap-checked post-stream.
         use harmony_content::chunker::ChunkerConfig;
-        let ingest_tx = {
+        let (ingest_tx, content_verb_tx) = {
             let g = state.lock().map_err(|e| format!("lock: {e}"))?;
-            g.ingest_tx
-                .clone()
-                .ok_or_else(|| "not connected".to_string())?
+            (
+                g.ingest_tx
+                    .clone()
+                    .ok_or_else(|| "not connected".to_string())?,
+                g.content_verb_tx.clone(),
+            )
         };
         let reader = tokio::io::BufReader::new(file).take(MAX_ARTIFACT_BYTES.saturating_add(1));
-        let (root, n) = streaming_ingest_with_options(
+        let mut sent = Vec::new();
+        let (root, n) = match streaming_ingest_collecting(
             reader,
             &ingest_tx,
             ChunkerConfig::DEFAULT,
             None,
             IngestOptions::default(),
+            &mut sent,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        {
+            Ok(ok) => ok,
+            Err(e) => {
+                rollback_ingested_cids(
+                    content_verb_tx.as_ref(),
+                    &sent,
+                    "ingest_channel_artifact stream",
+                )
+                .await;
+                return Err(e.to_string());
+            }
+        };
         if n > MAX_ARTIFACT_BYTES {
+            // ZEB-1012: the WHOLE over-cap tree was admitted before this check
+            // could see the streamed size — the largest-magnitude orphan arm
+            // (up to MAX_ARTIFACT_BYTES + 1 of chunks). Evict it.
+            rollback_ingested_cids(
+                content_verb_tx.as_ref(),
+                &sent,
+                "ingest_channel_artifact size cap",
+            )
+            .await;
             return Err(format!("artifact too large: {n} > {MAX_ARTIFACT_BYTES}"));
         }
         Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
@@ -35576,22 +35780,27 @@ async fn ingest_channel_artifact_bytes_inner(
     use harmony_content::chunker::ChunkerConfig;
     use harmony_content::cid::{ContentFlags, ContentId};
 
-    let ingest_tx = {
+    let (ingest_tx, content_verb_tx) = {
         let g = state.lock().map_err(|e| format!("lock: {e}"))?;
-        g.ingest_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
+        (
+            g.ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            g.content_verb_tx.clone(),
+        )
     };
 
     // The DTO `size` is the plaintext length (what download/preview verify
     // against), independent of whether we ingest ciphertext or plaintext.
     let size = plaintext.len() as u64;
-    let root: ContentId = if encrypt {
+    // ZEB-1012: on a mid-stream failure, evict the partial admitted set.
+    let mut sent = Vec::new();
+    let ingested = if encrypt {
         let epoch_key = current_epoch_key_for(state, &space).await?;
         let ciphertext = crate::community_state_sync::encrypt_blob(&epoch_key, &plaintext)
             .map_err(|e| format!("encrypt: {e:?}"))?;
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(ciphertext));
-        let (root, _n) = streaming_ingest_with_options(
+        streaming_ingest_collecting(
             reader,
             &ingest_tx,
             ChunkerConfig::DEFAULT,
@@ -35603,22 +35812,32 @@ async fn ingest_channel_artifact_bytes_inner(
                 },
                 serveable: true,
             },
+            &mut sent,
         )
         .await
-        .map_err(|e| e.to_string())?;
-        root
     } else {
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(plaintext));
-        let (root, _n) = streaming_ingest_with_options(
+        streaming_ingest_collecting(
             reader,
             &ingest_tx,
             ChunkerConfig::DEFAULT,
             None,
             IngestOptions::default(),
+            &mut sent,
         )
         .await
-        .map_err(|e| e.to_string())?;
-        root
+    };
+    let root: ContentId = match ingested {
+        Ok((root, _n)) => root,
+        Err(e) => {
+            rollback_ingested_cids(
+                content_verb_tx.as_ref(),
+                &sent,
+                "ingest_channel_artifact_bytes",
+            )
+            .await;
+            return Err(e.to_string());
+        }
     };
 
     Ok(crate::community_channel_log_engine::ChannelAttachmentDto {
@@ -64931,6 +65150,9 @@ mod zeb427_fence_tests {
         // Capacity-1 publisher channel whose receiver is alive but never
         // drained — the first publish fills it, the second blocks forever.
         let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        // ZEB-1013: probe handle for the deterministic channel-full assertion
+        // below (`pub_tx` itself is moved into the engine).
+        let pub_probe = pub_tx.clone();
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let state = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::owner_state_crdt::OwnerState::default(),
@@ -64961,15 +65183,24 @@ mod zeb427_fence_tests {
             .flush_now()
             .await
             .expect("first flush must succeed (channel has capacity)");
+        // ZEB-1013: deterministic channel-full proof — no scheduling window
+        // involved. flush #1's publish consumed the single capacity slot and
+        // the receiver never drains, so every later publish must block.
+        assert_eq!(
+            pub_probe.capacity(),
+            0,
+            "publisher channel must be full after the first flush"
+        );
 
-        // Deterministically wedge the single-writer task instead of sleeping: a
-        // SECOND flush_now must block forever inside `publish_root_now` on the
-        // now-full channel, so its oneshot reply never arrives. Asserting this
-        // second flush times out both ESTABLISHES and PROVES the wedged state —
-        // no fixed "hope the task got there" sleep. The flush can never actually
-        // complete (the channel is provably full), so the assertion holds
-        // regardless of scheduling; the bound only gives the task time to pick
-        // up the oneshot and enter the blocked publish before the fence runs.
+        // Wedge the single-writer task: a SECOND flush_now must block forever
+        // inside `publish_root_now` on the now-full channel, so its oneshot
+        // reply never arrives. The flush can never complete (the channel is
+        // provably full, above), so this assertion holds regardless of
+        // scheduling; whether the task has already entered the blocked send
+        // when the fence below runs does not matter either — the ZEB-710
+        // direct-persist fence never touches the task, and the task holds no
+        // lock across the blocked send (`encode_root_wire` snapshots-then-
+        // releases before `publisher_tx.send`).
         let wedge =
             tokio::time::timeout(std::time::Duration::from_millis(500), engine.flush_now()).await;
         assert!(
@@ -64985,17 +65216,29 @@ mod zeb427_fence_tests {
         state.lock().await.tombstones.insert(tombstoned);
         engine.notify_dirty();
 
+        // ZEB-1013: the fence bound must comfortably contain a REAL disk
+        // write. `persist_now` runs two atomic-rename + fsync writes in
+        // `spawn_blocking`; the original 100 ms bound raced that on loaded CI
+        // runners — on timeout the write deliberately continues DETACHED
+        // (persist_direct's owned sink guard), and the load below then read
+        // flush #1's pre-tombstone file. 30 s is a cancellation backstop, not
+        // the property under test: the regression this test pins (a fence
+        // routed through the wedged task, pre-ZEB-710) persists NOTHING, so
+        // it still fails the discriminating tombstone assertion below.
         let started = std::time::Instant::now();
+        const FENCE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
         fence_owner_state_flush(
             &engine,
-            std::time::Duration::from_millis(100),
+            FENCE_BOUND,
             "zeb427_fence_test",
             "deadbeefdeadbeefdeadbeefdeadbeef",
         )
         .await;
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "bounded fence must return promptly on a stalled engine; took {:?}",
+            started.elapsed() < FENCE_BOUND + std::time::Duration::from_secs(5),
+            "fence must return within its own bound plus slack — it can only \
+             exceed the bound by blocking on something its timeout does not \
+             cover; took {:?}",
             started.elapsed()
         );
         // The discriminating assertion: the mutation made while the task was

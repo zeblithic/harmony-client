@@ -5563,6 +5563,36 @@ pub async fn run(
                         }
                         let _ = reply.send(Ok(true));
                     }
+                    ContentVerbRequest::RollbackIngest { cids, reply } => {
+                        // ZEB-1012 / ZEB-157: best-effort eviction of the
+                        // CIDs a failed ingest had already admitted.
+                        // Evict-unclaimed, NOT Burn: no pin_intent /
+                        // buddy-ledger mutation (a content-dedup collision
+                        // with an already-pinned identical file must not
+                        // un-pin the good copy) and no unpin (nothing here
+                        // was pinned by the failed ingest; anything pinned
+                        // is keep-set-protected, and `remove_content` —
+                        // StorageTier::remove — refuses pinned CIDs as a
+                        // second line). Doom-set logic lives in
+                        // `compute_rollback_doomed`; keep this loop in sync
+                        // with `pin_cascade_tests::apply_rollback`.
+                        let protective: std::collections::HashSet<[u8; 32]> = pin_intent
+                            .union(&buddy_engine.buddy_pins)
+                            .copied()
+                            .collect();
+                        let doomed = compute_rollback_doomed(
+                            runtime.storage_tier().cache(),
+                            &protective,
+                            &cids,
+                        );
+                        let mut evicted = 0usize;
+                        for id in doomed {
+                            if runtime.remove_content(&id).is_some() {
+                                evicted += 1;
+                            }
+                        }
+                        let _ = reply.send(Ok(evicted));
+                    }
                     ContentVerbRequest::PinnedSet { reply } => {
                         let cache = runtime.storage_tier().cache();
                         let pinned: std::collections::HashSet<[u8; 32]> = cache
@@ -8508,6 +8538,40 @@ pub(crate) fn compute_keep_set<S: BookStore>(
         keep.extend(collect_descendants(store, kr));
     }
     keep
+}
+
+/// ZEB-1012 / ZEB-157: the doom-set for a failed-ingest rollback — every CID
+/// reachable from the freshly-ingested `cids` (deduplicated; a partial leaf
+/// list and a fully-built root are both valid inputs) minus everything
+/// reachable from a `protective` root (pin intent ∪ buddy pins), via the
+/// shared ZEB-156 `compute_keep_set`. Pure so the cascade is unit-testable
+/// without the `!Send` runtime harness — same rationale as the
+/// `pin_cascade_tests` mirrors, but factored rather than mirrored: the
+/// `RollbackIngest` arm calls THIS function.
+///
+/// The caller applies `remove_content` only — never unpin, never pin-intent
+/// or buddy-ledger bookkeeping (that is what separates rollback from `Burn`:
+/// on a content-dedup collision with an already-pinned identical file,
+/// `Burn`'s `pin_intent.remove` would un-pin the user's good copy).
+/// `StorageTier::remove` additionally refuses pinned CIDs, so even a
+/// protective-set omission cannot destroy pinned bytes.
+pub(crate) fn compute_rollback_doomed<S: BookStore>(
+    store: &ContentStore<S>,
+    protective: &std::collections::HashSet<[u8; 32]>,
+    cids: &[[u8; 32]],
+) -> Vec<ContentId> {
+    let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+    let mut doomed: Vec<ContentId> = Vec::new();
+    for cid in cids {
+        for id in collect_descendants(store, ContentId::from_bytes(*cid)) {
+            if seen.insert(id) {
+                doomed.push(id);
+            }
+        }
+    }
+    let keep = compute_keep_set(store, protective, doomed.len());
+    doomed.retain(|id| !keep.contains(id));
+    doomed
 }
 
 /// Fetch the bytes of a content tree by repeatedly calling `fetch_one` per
@@ -14059,6 +14123,137 @@ mod pin_cascade_tests {
             assert!(!cache.is_pinned(&cid), "{cid:?} unpinned");
             assert!(cache.get(&cid).is_none(), "{cid:?} evicted from cache");
         }
+    }
+
+    // ── ZEB-1012 / ZEB-157: RollbackIngest cascade ──────────────────────
+    //
+    // Unlike Unpin/Burn above, the rollback doom-set is a factored
+    // production function (`compute_rollback_doomed`), not a mirrored
+    // body — these tests call it directly. Only the per-id effect is
+    // mirrored here: the arm applies `runtime.remove_content`, which is
+    // `StorageTier::remove` = refuse-pinned + `BookStore::remove`.
+
+    /// Mirror of the `ContentVerbRequest::RollbackIngest` arm's effect
+    /// loop. KEEP IN SYNC with the arm: `remove_content` refuses pinned
+    /// CIDs (StorageTier::remove), then removes — never unpins, never
+    /// touches intent bookkeeping.
+    fn apply_rollback(cache: &mut ContentStore<MemoryBookStore>, doomed: Vec<ContentId>) -> usize {
+        let mut evicted = 0usize;
+        for id in doomed {
+            if !cache.is_pinned(&id) && cache.remove(&id).is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// A failed ingest's whole admitted set (root + leaves), unclaimed by
+    /// any pin: rollback must evict every CID.
+    #[test]
+    fn rollback_evicts_unclaimed_ingest_set() {
+        let mut cache = new_cache();
+        let l1 = cache
+            .insert_with_flags(b"rb-leaf-1", ContentFlags::default())
+            .unwrap();
+        let l2 = cache
+            .insert_with_flags(b"rb-leaf-2", ContentFlags::default())
+            .unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(l1).add(l2);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(root, payload);
+
+        let protective: HashSet<[u8; 32]> = HashSet::new();
+        let doomed = super::compute_rollback_doomed(&cache, &protective, &[root.to_bytes()]);
+        assert_eq!(doomed.len(), 3, "root + 2 leaves doomed");
+        let evicted = apply_rollback(&mut cache, doomed);
+        assert_eq!(evicted, 3);
+        for cid in [root, l1, l2] {
+            assert!(cache.get(&cid).is_none(), "{cid:?} evicted by rollback");
+        }
+    }
+
+    /// The dedup-collision hazard that rules out `Burn` semantics: the
+    /// failed ingest shares a leaf with an already-PINNED file. Rollback
+    /// must spare the shared leaf (keep-set) and must not disturb the
+    /// pinned file's pin state or bytes; the `protective` set is taken by
+    /// shared reference, so intent mutation is impossible by signature.
+    #[test]
+    fn rollback_spares_content_claimed_by_pinned_root() {
+        let mut cache = new_cache();
+        let shared = cache
+            .insert_with_flags(b"rb-shared-leaf", ContentFlags::default())
+            .unwrap();
+        let good_only = cache
+            .insert_with_flags(b"rb-good-only", ContentFlags::default())
+            .unwrap();
+        let failed_only = cache
+            .insert_with_flags(b"rb-failed-only", ContentFlags::default())
+            .unwrap();
+        let mut b_good = BundleBuilder::new();
+        b_good.add(shared).add(good_only);
+        let (good_payload, good_root) = b_good.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(good_root, good_payload);
+        let mut b_failed = BundleBuilder::new();
+        b_failed.add(shared).add(failed_only);
+        let (failed_payload, failed_root) =
+            b_failed.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(failed_root, failed_payload);
+
+        let mut protective: HashSet<[u8; 32]> = HashSet::new();
+        protective.insert(good_root.to_bytes());
+        cascade_pin(&mut cache, good_root);
+
+        let doomed = super::compute_rollback_doomed(&cache, &protective, &[failed_root.to_bytes()]);
+        // `shared` is reachable from the protective root: not doomed.
+        assert!(
+            !doomed.contains(&shared),
+            "shared leaf spared by the keep-set"
+        );
+        let evicted = apply_rollback(&mut cache, doomed);
+        assert_eq!(evicted, 2, "failed_root + failed_only evicted");
+
+        assert!(cache.get(&failed_root).is_none(), "failed root evicted");
+        assert!(
+            cache.get(&failed_only).is_none(),
+            "failed-only leaf evicted"
+        );
+        assert!(
+            cache.get(&shared).is_some(),
+            "shared leaf survives — evicting it would cold the pinned file"
+        );
+        assert!(
+            cache.is_pinned(&shared),
+            "shared leaf still pinned (rollback never unpins)"
+        );
+        assert!(cache.get(&good_root).is_some(), "pinned file untouched");
+        assert!(cache.is_pinned(&good_root), "pinned root still pinned");
+    }
+
+    /// Mid-stream failure shape: the caller passes the PARTIAL leaf list
+    /// (no root was ever built), with duplicates tolerated. Each CID is
+    /// doomed once and evicted.
+    #[test]
+    fn rollback_partial_leaf_list_dedups_and_evicts() {
+        let mut cache = new_cache();
+        let l1 = cache
+            .insert_with_flags(b"rb-part-1", ContentFlags::default())
+            .unwrap();
+        let l2 = cache
+            .insert_with_flags(b"rb-part-2", ContentFlags::default())
+            .unwrap();
+
+        let protective: HashSet<[u8; 32]> = HashSet::new();
+        let doomed = super::compute_rollback_doomed(
+            &cache,
+            &protective,
+            &[l1.to_bytes(), l2.to_bytes(), l1.to_bytes()],
+        );
+        assert_eq!(doomed.len(), 2, "duplicate input CID doomed once");
+        let evicted = apply_rollback(&mut cache, doomed);
+        assert_eq!(evicted, 2);
+        assert!(cache.get(&l1).is_none());
+        assert!(cache.get(&l2).is_none());
     }
 }
 

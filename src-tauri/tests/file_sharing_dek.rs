@@ -66,6 +66,7 @@ async fn encrypted_ingest_dek_round_trip() {
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        None,
         &crdt_state,
         &std::sync::atomic::AtomicBool::new(false),
         &keytree,
@@ -125,6 +126,7 @@ async fn sealed_dek_at_rest_is_not_plaintext() {
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        None,
         &crdt_state,
         &std::sync::atomic::AtomicBool::new(false),
         &keytree,
@@ -178,6 +180,7 @@ async fn owner_encrypted_file_decrypts_to_plaintext() {
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        None,
         &crdt_state,
         &std::sync::atomic::AtomicBool::new(false),
         &keytree,
@@ -247,6 +250,7 @@ async fn received_grant_file_decrypts_to_plaintext() {
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        None,
         &owner_state,
         &std::sync::atomic::AtomicBool::new(false),
         &keytree,
@@ -358,6 +362,7 @@ async fn tampered_ciphertext_surfaces_error() {
     let result = harmony_app::ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,
+        None,
         &crdt_state,
         &std::sync::atomic::AtomicBool::new(false),
         &keytree,
@@ -387,6 +392,82 @@ async fn tampered_ciphertext_surfaces_error() {
     assert!(
         recovered.is_err(),
         "tampered ciphertext must surface a decrypt error, not silent corruption"
+    );
+}
+
+/// ZEB-1012: a post-ingest failure — here the ZEB-1011 detach-reject arm,
+/// forced deterministically via a pre-set detach flag — must best-effort
+/// evict EXACTLY the admitted set via `ContentVerbRequest::RollbackIngest`,
+/// and commit no DEK row. The capturing verb channel stands in for the event
+/// loop's rollback arm (whose cascade is unit-tested in
+/// `event_loop::pin_cascade_tests`); this test pins the caller half: which
+/// CIDs the failure arm names, and that it names them at all.
+#[tokio::test]
+async fn failed_ingest_rolls_back_admitted_cids() {
+    let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+    let content_index = fresh_content_index();
+    let (ingest_tx, store) = spawn_recording_store();
+
+    // Capturing verb channel: records each RollbackIngest's cid list and
+    // acks with the count, the way the real arm replies.
+    let (verb_tx, mut verb_rx) =
+        tokio::sync::mpsc::channel::<harmony_app::event_loop::ContentVerbRequest>(8);
+    let rollbacks: Arc<Mutex<Vec<Vec<[u8; 32]>>>> = Arc::new(Mutex::new(Vec::new()));
+    let rollbacks_c = rollbacks.clone();
+    tokio::spawn(async move {
+        while let Some(req) = verb_rx.recv().await {
+            if let harmony_app::event_loop::ContentVerbRequest::RollbackIngest { cids, reply } = req
+            {
+                let n = cids.len();
+                rollbacks_c.lock().unwrap().push(cids);
+                let _ = reply.send(Ok(n));
+            }
+        }
+    });
+
+    let (_dir, path) = write_temp(b"ZEB-1012 rollback on detach reject").await;
+    let reader = tokio::fs::File::open(&path).await.unwrap();
+
+    let result = harmony_app::ingest_content_encrypted_inner(
+        &ingest_tx,
+        &content_index,
+        Some(&verb_tx),
+        &crdt_state,
+        // Detached BEFORE the ingest: the ZEB-1011 guard must reject after
+        // the whole ciphertext tree was already admitted — a deterministic
+        // post-admission failure arm.
+        &std::sync::atomic::AtomicBool::new(true),
+        &keytree,
+        None,
+        reader,
+        "doomed.txt".to_string(),
+    )
+    .await;
+    let err = result.expect_err("detached owner-state must reject the ingest");
+    assert!(
+        err.contains("detached"),
+        "failure must be the detach rejection, got: {err}"
+    );
+
+    // The rollback names EXACTLY the set the recording store admitted.
+    // Scoped so the std-mutex guards drop before the tokio lock below
+    // (clippy::await_holding_lock).
+    {
+        let rollbacks = rollbacks.lock().unwrap();
+        assert_eq!(rollbacks.len(), 1, "exactly one rollback request");
+        let rolled: std::collections::HashSet<String> =
+            rollbacks[0].iter().map(hex::encode).collect();
+        let admitted: std::collections::HashSet<String> =
+            store.lock().unwrap().keys().cloned().collect();
+        assert!(!admitted.is_empty(), "sanity: chunks were admitted");
+        assert_eq!(rolled, admitted, "rollback covers the exact admitted set");
+    }
+
+    // No DEK row was committed (the detach guard fired before the insert).
+    assert!(
+        crdt_state.lock().await.file_deks.is_empty(),
+        "no file_deks row after a detach-rejected ingest"
     );
 }
 
