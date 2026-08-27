@@ -1386,6 +1386,18 @@ mod tests {
         // Long enough for the opener to reach the contended DDL on any
         // sane scheduler; far below the busy timeout it waits under.
         std::thread::sleep(std::time::Duration::from_millis(250));
+        // The opener cannot legitimately finish while the writer holds the
+        // write lock — apply_migrations must at least re-create the dropped
+        // index. A finished opener here means either it errored instead of
+        // waiting (busy-handler regression) or the open no longer performs
+        // a guaranteed write and this test has gone vacuous (CodeAnt,
+        // PR #766). A slow-scheduler start can still pass un-exercised —
+        // that needs an in-function sync seam — but decay of the test's
+        // premise is now loud instead of silent.
+        assert!(
+            !opener.is_finished(),
+            "opener finished while the writer still held the write lock"
+        );
         writer
             .execute_batch("COMMIT;")
             .expect("release the write lock");
