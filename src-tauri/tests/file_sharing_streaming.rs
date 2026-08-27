@@ -40,6 +40,7 @@ async fn round_trip(plaintext: Vec<u8>) {
         &ingest_tx,
         &content_index,
         &crdt_state,
+        &std::sync::atomic::AtomicBool::new(false),
         &keytree,
         None,
         reader,
