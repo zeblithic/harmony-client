@@ -67,6 +67,20 @@ pub fn serve_catalog_for_request(
     ))
 }
 
+/// ZEB-1008: the future a [`PeerIntroPolicyProvider`] call resolves to. Boxed
+/// so the composition root can hide a `spawn_blocking` (file read + JSON
+/// parse) behind the seam; the acceptor just awaits it. A sync `Fn ->
+/// PeerIntroPolicy` seam could not host `spawn_blocking` at all (nothing to
+/// await it from), which is why the seam is async-shaped rather than kept
+/// sync with `block_in_place` (panics on current-thread runtimes).
+pub type PeerIntroPolicyFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::friend_graph::PeerIntroPolicy> + Send>,
+>;
+
+/// ZEB-1008: the injected `PeerIntroPolicy` provider — called fresh per
+/// introduction (live-apply, no restart), resolved asynchronously.
+pub type PeerIntroPolicyProvider = Arc<dyn Fn() -> PeerIntroPolicyFuture + Send + Sync>;
+
 /// Inbound dispatcher for the `harmony/friend-pex/v1` ALPN. Holds the read-only
 /// handles the pure serve-decision needs plus the IO plumbing. Mirrors
 /// `iroh_friend_acceptor::IrohFriendHandshakeAcceptor` (same `crdt_state` type,
@@ -109,9 +123,10 @@ pub struct IrohFriendPexAcceptor {
     /// per introduction (live-apply, no restart) — the composition root
     /// injects a closure that re-loads the connectivity-settings JSON, so this
     /// acceptor never names the settings type. `None` (tests) → the documented
-    /// `FriendsOfFriends` default.
-    peer_intro_policy_provider:
-        Option<Arc<dyn Fn() -> crate::friend_graph::PeerIntroPolicy + Send + Sync>>,
+    /// `FriendsOfFriends` default. ZEB-1008: async-shaped so the composition
+    /// root can run the file read + parse via `spawn_blocking` instead of
+    /// inline on the tokio worker processing the introduction.
+    peer_intro_policy_provider: Option<PeerIntroPolicyProvider>,
     /// This node's IMMUTABLE self-handshake statics (identity pub + PQ keys) used
     /// to rebuild X's own dialer `SelfHandshakeReachability` fresh per dial (the
     /// volatile home relay is read fresh from `iroh_endpoint` at dial time — the
@@ -281,7 +296,7 @@ impl IrohFriendPexAcceptor {
     /// JSON on every call). Fluent setter (default `None`).
     pub fn with_peer_intro_policy_provider(
         mut self,
-        provider: Option<Arc<dyn Fn() -> crate::friend_graph::PeerIntroPolicy + Send + Sync>>,
+        provider: Option<PeerIntroPolicyProvider>,
     ) -> Self {
         self.peer_intro_policy_provider = provider;
         self
@@ -887,14 +902,14 @@ impl IrohFriendPexAcceptor {
 
                 // 4. Enforce policy — read FRESH via the injected provider
                 //    (live-apply, no restart: the composition root's closure
-                //    re-loads the settings file on every call). A missing
-                //    provider (tests) falls back to the documented default
-                //    rather than Open.
-                let policy = self
-                    .peer_intro_policy_provider
-                    .as_ref()
-                    .map(|provider| provider())
-                    .unwrap_or(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
+                //    re-loads the settings file on every call — ZEB-1008: via
+                //    `spawn_blocking`, awaited here, so the file I/O never
+                //    runs inline on this worker). A missing provider (tests)
+                //    falls back to the documented default rather than Open.
+                let policy = match self.peer_intro_policy_provider.as_ref() {
+                    Some(provider) => provider().await,
+                    None => crate::friend_graph::PeerIntroPolicy::FriendsOfFriends,
+                };
 
                 // 5. Decide + act. All three branches fall through to the ack.
                 match crate::friend_intro::decide_introduction(policy, voucher_is_active_friend) {

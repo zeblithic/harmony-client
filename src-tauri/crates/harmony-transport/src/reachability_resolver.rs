@@ -13,7 +13,7 @@
 //! comparator runs per-key, so each (owner, device) pair maintains its
 //! own latest record independently.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use harmony_reachability::{lww_newer as core_lww_newer, MultiDeviceMap};
@@ -206,6 +206,32 @@ fn source_rank(s: ReachabilitySource) -> u8 {
     }
 }
 
+/// The resolver's locked interior: the primary `(owner, node_id)` map PLUS the
+/// ZEB-1010 reverse index over its key set, under ONE lock so index/primary
+/// coherence is a per-write-guard local property — every write path that
+/// changes the key set updates `by_node` inside the same critical section
+/// (the two sites: `update_with_source` insert, `remove_owner` removal).
+/// Keeping them under separate locks would re-open the divergence the
+/// cache-key rule warns about (admission classification vs dial resolution).
+#[derive(Debug)]
+struct ResolverState {
+    map: MultiDeviceMap<OwnerAddr, ResolverSlots>,
+    /// node_id → owners currently asserting a row for it. Owner SETS, not a
+    /// single owner: under the ZEB-704 seed-owner split one node id can
+    /// legitimately live under multiple owners (beacon-seeded composite owner
+    /// + gossip master owner, fleet sibling + community co-member).
+    by_node: BTreeMap<[u8; 32], BTreeSet<OwnerAddr>>,
+}
+
+impl Default for ResolverState {
+    fn default() -> Self {
+        Self {
+            map: MultiDeviceMap::new(),
+            by_node: BTreeMap::new(),
+        }
+    }
+}
+
 /// ZEB-704: the globally freshest entry matching `node_id_bytes` ACROSS
 /// owners. The reverse lookups previously stopped at the FIRST
 /// `(owner, node_id)` key in owner-address order and only ran the slot pick
@@ -216,12 +242,29 @@ fn source_rank(s: ReachabilitySource) -> u8 {
 /// slot pick), remaining ties → the first owner in BTreeMap order (replace
 /// only on strictly-greater), keeping the degenerate all-tie case
 /// deterministic and identical to the old behavior.
+///
+/// ZEB-1010: candidates come from the `by_node` reverse index — an O(log n)
+/// hit plus one `map.get` per co-asserting owner (almost always exactly one)
+/// — instead of the old full-map `find_by_node_id` scan, whose cost grew with
+/// total resolver cardinality per accepted connection (the ZEB-996 admission
+/// gate calls this once per inbound conn). `BTreeSet<OwnerAddr>` iterates in
+/// the same owner order the scan visited, so the all-tie case still resolves
+/// to the first owner in BTreeMap order — byte-identical tie-breaks.
 fn freshest_across_owners<'a>(
-    map: &'a MultiDeviceMap<OwnerAddr, ResolverSlots>,
+    state: &'a ResolverState,
     node_id_bytes: &'a [u8; 32],
 ) -> Option<(OwnerAddr, &'a ResolverEntry)> {
-    map.find_by_node_id(node_id_bytes)
-        .filter_map(|((owner, _), v)| v.freshest().map(|e| (*owner, e)))
+    state
+        .by_node
+        .get(node_id_bytes)
+        .into_iter()
+        .flatten()
+        .filter_map(|owner| {
+            state
+                .map
+                .get(&(*owner, *node_id_bytes))
+                .and_then(|v| v.freshest().map(|e| (*owner, e)))
+        })
         .reduce(|best, cand| {
             let ord = cand
                 .1
@@ -237,7 +280,7 @@ fn freshest_across_owners<'a>(
 }
 
 pub struct ReachabilityResolver {
-    inner: Arc<RwLock<MultiDeviceMap<OwnerAddr, ResolverSlots>>>,
+    inner: Arc<RwLock<ResolverState>>,
     /// Wrapped in an outer `Arc` so that all clones share the same
     /// `RwLock` — wiring the fallback via `set_fallback_source` on any
     /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
@@ -302,7 +345,7 @@ impl std::fmt::Debug for ReachabilityResolver {
 impl Default for ReachabilityResolver {
     fn default() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(MultiDeviceMap::new())),
+            inner: Arc::new(RwLock::new(ResolverState::default())),
             fallback_source: Arc::new(RwLock::new(None)),
             supervisor: Arc::new(RwLock::new(None)),
             liveness: Arc::new(RwLock::new(None)),
@@ -494,8 +537,14 @@ impl ReachabilityResolver {
             source,
             effective_announced_at_ms,
         };
-        let mut map = self.inner.write().expect("resolver write lock");
-        let slots = map.entry(key).or_default();
+        let mut state = self.inner.write().expect("resolver write lock");
+        // ZEB-1010: the reverse index tracks the key SET, so it is updated for
+        // every write — including an LWW-rejected one, whose `or_default`
+        // below still materializes the (owner, node_id) row (a fresh key
+        // always installs at least one slot: `target` is None ⇒ do_replace).
+        // BTreeSet insert is idempotent, so the already-present case is free.
+        state.by_node.entry(node_id).or_default().insert(actor);
+        let slots = state.map.entry(key).or_default();
         // The reconnect-supervisor kick gate (ZEB-620/621) is evaluated against
         // the FRESHEST dial view, snapshotted before AND after the slot write:
         // `was_present` = any slot existed beforehand. Deriving `RecordChanged`
@@ -531,7 +580,7 @@ impl ReachabilityResolver {
         } else {
             before_view.clone()
         };
-        drop(map);
+        drop(state);
         // ZEB-620/621: reconnect-supervisor triggers (the successor to ZEB-373's
         // retired `DialHint` mpsc). A first-learn kicks `NewPeer`; a change in the
         // effective dial addressing on an already-known peer kicks
@@ -553,14 +602,16 @@ impl ReachabilityResolver {
     /// dial the owner should try each in turn (Phase 2 will add ranking
     /// based on heartbeat/liveness).
     pub fn resolve(&self, actor: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
-        let map = self.inner.read().expect("resolver read lock");
+        let state = self.inner.read().expect("resolver read lock");
+        let map = &state.map;
         map.range_owner(actor)
             .filter_map(|(_, v)| v.durable_preferred().map(|e| e.payload.clone()))
             .collect()
     }
 
     pub fn list_active_peers(&self) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload)> {
-        let map = self.inner.read().expect("resolver read lock");
+        let state = self.inner.read().expect("resolver read lock");
+        let map = &state.map;
         map.iter()
             .filter_map(|((owner, _node_id), v)| {
                 v.durable_preferred().map(|e| (*owner, e.payload.clone()))
@@ -577,7 +628,8 @@ impl ReachabilityResolver {
     pub fn list_active_peers_effective(
         &self,
     ) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload, u64)> {
-        let map = self.inner.read().expect("resolver read lock");
+        let state = self.inner.read().expect("resolver read lock");
+        let map = &state.map;
         map.iter()
             .filter_map(|((owner, _node_id), v)| {
                 v.durable_preferred()
@@ -593,7 +645,8 @@ impl ReachabilityResolver {
     pub fn list_active_peers_with_source(
         &self,
     ) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload, ReachabilitySource)> {
-        let map = self.inner.read().expect("resolver read lock");
+        let state = self.inner.read().expect("resolver read lock");
+        let map = &state.map;
         map.iter()
             .filter_map(|((owner, _node_id), v)| {
                 v.durable_preferred()
@@ -618,7 +671,8 @@ impl ReachabilityResolver {
     /// `list_active_peers` whose callers (dial-by-owner, diagnostics, e2e
     /// barriers) depend on durable/pkarr semantics. This view is additive.
     pub fn list_dialable_peers(&self) -> Vec<(OwnerAddr, ResolverEntry)> {
-        let map = self.inner.read().expect("resolver read lock");
+        let state = self.inner.read().expect("resolver read lock");
+        let map = &state.map;
         map.iter()
             .filter_map(|((owner, _node_id), v)| v.freshest().map(|e| (*owner, e.clone())))
             .collect()
@@ -631,11 +685,11 @@ impl ReachabilityResolver {
     /// where Zenoh hands us a locator carrying the iroh `EndpointId`
     /// (not the harmony `OwnerAddr`) — see spec §7.3.
     ///
-    /// Per PR #157 round 5: the composite-key map could enable an O(log N)
-    /// secondary-index lookup, but we keep the linear scan for now since
-    /// `N` (joined community member count × device count) is expected to
-    /// stay under ~10⁴ in Phase 1. Phase 2 should profile and add a
-    /// `BTreeMap<[u8; 32], OwnerAddr>` secondary index if hot.
+    /// ZEB-1010 (the "Phase 2" the PR #157 round-5 note deferred): backed by
+    /// the maintained `by_node` reverse index in [`ResolverState`], not a
+    /// full-map scan — O(log n) plus one slot pick per co-asserting owner,
+    /// so the per-accepted-connection cost (ZEB-996 admission gate) no
+    /// longer grows with total resolver cardinality.
     /// ZEB-704: when the same node-id exists under multiple owners, the
     /// globally freshest matching entry wins (see [`freshest_across_owners`]) —
     /// keeping this dial view consistent with the boot-seed recency ranking.
@@ -643,8 +697,8 @@ impl ReachabilityResolver {
         &self,
         node_id_bytes: &[u8; 32],
     ) -> Option<(OwnerAddr, ReachabilityAnnouncePayload)> {
-        let map = self.inner.read().expect("resolver read lock");
-        freshest_across_owners(&map, node_id_bytes).map(|(owner, e)| (owner, e.payload.clone()))
+        let state = self.inner.read().expect("resolver read lock");
+        freshest_across_owners(&state, node_id_bytes).map(|(owner, e)| (owner, e.payload.clone()))
     }
 
     /// Freshest-view reverse lookup for the DIAL path (ZEB-621; consumed by
@@ -660,8 +714,8 @@ impl ReachabilityResolver {
         &self,
         node_id_bytes: &[u8; 32],
     ) -> Option<(OwnerAddr, ResolverEntry)> {
-        let map = self.inner.read().expect("resolver read lock");
-        freshest_across_owners(&map, node_id_bytes).map(|(owner, e)| (owner, e.clone()))
+        let state = self.inner.read().expect("resolver read lock");
+        freshest_across_owners(&state, node_id_bytes).map(|(owner, e)| (owner, e.clone()))
     }
 
     /// ZEB-621: heal a stale dial route by kicking off an async pkarr
@@ -688,7 +742,8 @@ impl ReachabilityResolver {
     /// gossip master owner), and a fleet-sibling row for the same endpoint
     /// must not veto a community owner's pkarr refresh.
     fn resolve_entry_for(&self, owner: &OwnerAddr, node_id: &[u8; 32]) -> Option<ResolverEntry> {
-        let map = self.inner.read().expect("resolver read lock");
+        let state = self.inner.read().expect("resolver read lock");
+        let map = &state.map;
         let entry = map
             .range_owner(owner)
             .find(|(key, _)| key.1 == *node_id)
@@ -814,17 +869,27 @@ impl ReachabilityResolver {
     /// NewPeer kick of the uncaptured device). Callers evict supervisor
     /// slots from the returned set.
     pub fn remove_owner(&self, actor: &OwnerAddr) -> Vec<[u8; 32]> {
-        let mut map = self.inner.write().expect("resolver write lock");
-        let to_remove: Vec<ResolverKey> = map.range_owner(actor).map(|(k, _)| *k).collect();
+        let mut state = self.inner.write().expect("resolver write lock");
+        let to_remove: Vec<ResolverKey> = state.map.range_owner(actor).map(|(k, _)| *k).collect();
         for k in &to_remove {
-            map.remove(k);
+            state.map.remove(k);
+            // ZEB-1010: mirror the key-set removal into the reverse index —
+            // drop THIS owner from the node's owner set, and the set itself
+            // once empty (a node id co-asserted by another live owner keeps
+            // that owner's index entry, matching the oracle's CR-2 rule).
+            if let Some(owners) = state.by_node.get_mut(&k.1) {
+                owners.remove(actor);
+                if owners.is_empty() {
+                    state.by_node.remove(&k.1);
+                }
+            }
         }
         if !to_remove.is_empty() {
             // ZEB-627: departed devices left the derived views.
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-        drop(map);
+        drop(state);
         // Full per-owner eviction (ZEB-621): drop the stale-refresh cooldown
         // too, else the map grows monotonically with every stale-dispatched
         // owner over process lifetime.
@@ -844,6 +909,20 @@ impl ReachabilityResolver {
             o.unbind_owner(actor.0, &node_ids);
         }
         node_ids
+    }
+
+    /// ZEB-1010 test seam: recompute the reverse derivation from the primary
+    /// map's key set and compare it against the maintained `by_node` index.
+    /// Coherence here is the cache-key invariant the reverse lookups rely on;
+    /// a divergence means a key-set mutation path skipped the index.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn node_index_is_coherent(&self) -> bool {
+        let state = self.inner.read().expect("resolver read lock");
+        let mut derived: BTreeMap<[u8; 32], BTreeSet<OwnerAddr>> = BTreeMap::new();
+        for ((owner, node_id), _) in state.map.iter() {
+            derived.entry(*node_id).or_default().insert(*owner);
+        }
+        derived == state.by_node
     }
 
     /// Register a pkarr-backed fallback source. Called once at boot by
@@ -989,7 +1068,8 @@ impl ReachabilityResolver {
     /// "one pkarr fetch per owner per window" decisions.
     pub fn discover_record_less(&self, owner: OwnerAddr) {
         {
-            let map = self.inner.read().expect("resolver read lock");
+            let state = self.inner.read().expect("resolver read lock");
+            let map = &state.map;
             if map.range_owner(&owner).next().is_some() {
                 return; // any row at all ⇒ not record-less; the refresh path owns it
             }
@@ -1042,7 +1122,8 @@ impl ReachabilityResolver {
         &self,
         actor: &OwnerAddr,
     ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
-        let map = self.inner.read().expect("resolver read lock");
+        let state = self.inner.read().expect("resolver read lock");
+        let map = &state.map;
         map.range_owner(actor)
             .filter_map(|(_, v)| v.durable_preferred().map(|e| (e.payload.clone(), e.source)))
             .collect()
@@ -1172,6 +1253,47 @@ mod tests {
     /// `iroh_node_id: [b; 32]` convention so ids agree across helpers.
     fn node_id_bytes(b: u8) -> [u8; 32] {
         [b; 32]
+    }
+
+    /// ZEB-1010: the `by_node` reverse index tracks the primary map's key set
+    /// across every mutation path — insert, LWW-rejected update (row already
+    /// present), per-owner removal with a co-asserting owner surviving, and
+    /// re-add after removal. Coherence is checked by recomputing the reverse
+    /// derivation from the primary map (the cache-key rule made executable).
+    #[test]
+    fn node_index_stays_coherent_across_update_reject_remove_readd() {
+        let r = ReachabilityResolver::new();
+        let (a, b) = (OwnerAddr([0xAA; 16]), OwnerAddr([0xBB; 16]));
+        assert!(r.node_index_is_coherent(), "empty resolver");
+
+        // Inserts: owners A and B co-assert node 7; A alone asserts node 8.
+        r.update(a, make_payload(7, 2_000), make_hlc(2_000, 0, "d"));
+        r.update(b, make_payload(7, 3_000), make_hlc(3_000, 0, "d"));
+        r.update(a, make_payload(8, 2_500), make_hlc(2_500, 0, "d"));
+        assert!(r.node_index_is_coherent(), "after inserts");
+
+        // LWW-rejected update (older HLC): key set unchanged → index unchanged.
+        r.update(a, make_payload(7, 1_000), make_hlc(1_000, 0, "d"));
+        assert!(r.node_index_is_coherent(), "after LWW-rejected update");
+
+        // remove_owner(A): node 7 keeps owner B's rows (co-asserting owner
+        // survives, mirroring the oracle's CR-2 rule); node 8 fully evicts.
+        let removed = r.remove_owner(&a);
+        assert_eq!(removed.len(), 2, "A's two device rows removed");
+        assert!(r.node_index_is_coherent(), "after remove_owner");
+        let (owner, _) = r
+            .resolve_by_node_id(&node_id_bytes(7))
+            .expect("B's co-asserted row must survive A's removal");
+        assert_eq!(owner, b);
+        assert!(
+            r.resolve_by_node_id(&node_id_bytes(8)).is_none(),
+            "sole-owner node fully evicted from the reverse view"
+        );
+
+        // Re-add after removal: the index entry comes back with the row.
+        r.update(a, make_payload(8, 4_000), make_hlc(4_000, 0, "d"));
+        assert!(r.node_index_is_coherent(), "after re-add");
+        assert!(r.resolve_by_node_id(&node_id_bytes(8)).is_some());
     }
 
     /// ZEB-622: the liveness seam mirrors the supervisor seam — `liveness()` is

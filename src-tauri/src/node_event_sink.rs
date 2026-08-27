@@ -33,8 +33,16 @@ impl<R: tauri::Runtime> NodeEventSink for AppHandleSink<R> {
         // mirrored onto the WS broadcast here — at the sink, not per
         // wrapper — so no emission site (current or future) can miss the
         // stream. ApiHost is managed in both modes; `events` is None when
-        // the API is off, and try_state covers early emissions before
-        // setup manages it.
+        // the API is off, and try_state tolerates pre-manage emissions.
+        //
+        // ZEB-1007: the try_state-None drop is defense-in-depth, not a
+        // parity gap. This sink's emitters are IPC commands and node tasks
+        // they spawn, none of which can run before setup returns (the
+        // main-thread event loop isn't pumping IPC during setup) — and
+        // setup manages ApiHost before returning. The one path that CAN
+        // emit while ApiHost is still unmanaged — the GUI API server's own
+        // RPC dispatch, live a beat before `app.manage` — uses gui_host's
+        // `GuiApiServerSink`, which holds the broadcast handle directly.
         if let Some(host) = tauri::Manager::try_state::<crate::api::gui_host::ApiHost>(&self.0) {
             if let Some(events) = &host.events {
                 // `events` is `Arc<ApiEventSink>`; the sink impl is on the

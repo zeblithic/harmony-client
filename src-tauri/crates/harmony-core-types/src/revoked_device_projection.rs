@@ -8,6 +8,36 @@
 //! on `owner_state_types`) because its consumer is the DM receive path, not the
 //! network-health panel — co-locating in `network_health` would force the only
 //! `dm_* -> network_health` import edge (a layering inversion).
+//!
+//! ## Grow-only is a correctness property, not a leak (ZEB-1009)
+//!
+//! The projection is deliberately unbounded and never compacted. Evicting a
+//! key — by LRU, TTL, per-owner cap, anything — would **un-revoke** a device
+//! at the DM receive-path check site: `is_revoked` would return `false` for a
+//! key the community state still condemns, re-admitting a revoked device's
+//! traffic. That is the same reasoning that exempts tombstones from
+//! sync-ingest validation — monotone deny-state must always apply.
+//!
+//! The memory bound comes from what feeds it, not from a policy here:
+//!
+//! * **Rebuilt each boot.** This is an in-memory pure derivation, never
+//!   persisted. Boot re-derives it from the current community
+//!   materializations + the DM-CRDT revocation replay, so the only growth
+//!   beyond the CURRENT feed is intra-session leave-stickiness (keys retained
+//!   after leaving the community that carried them), and that surplus resets
+//!   at restart.
+//! * **Bounded by resident state.** Every key here is cloned from
+//!   `MemberState.revoked_device_keys` rows the node already holds in its
+//!   materialized views — the projection is at most a constant factor over
+//!   revoked-key data already resident, and introduces no new asymptotic
+//!   growth.
+//! * **Absolute sizing.** Entries are 32-byte keys under per-owner
+//!   `BTreeSet`s (order ~100 B/key with tree overhead). Revocations are rare,
+//!   per-owner lifetime events (device loss / retirement / compromise), not a
+//!   rate: even a node sharing communities with 10⁶ distinct owners at a 10%
+//!   lifetime-revocation incidence and ~2 keys each is ~2·10⁵ keys ≈ tens of
+//!   MB worst-case, with O(log n) lookups. Typical fleets are orders of
+//!   magnitude below that.
 
 use crate::owner_state_types::OwnerAddr;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +59,8 @@ impl RevokedDeviceProjection {
     /// Union each `(owner, revoked_keys)` into the projection. Sticky: existing
     /// keys are never removed, so an owner absent from `members` (node left the
     /// carrying community) or present with an empty set retains prior tombstones.
+    /// Grow-only by design — see the module docs (ZEB-1009) for why eviction
+    /// would be a correctness bug and why the size stays bounded anyway.
     pub fn union_from_members<'a, I>(&self, members: I)
     where
         I: IntoIterator<Item = (OwnerAddr, &'a BTreeSet<[u8; 32]>)>,
