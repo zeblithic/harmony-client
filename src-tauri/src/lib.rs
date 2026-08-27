@@ -27451,9 +27451,10 @@ pub(crate) async fn create_folder_nested_with_children(
     // the original root_old (intact). Bytes ingested before the
     // failure become orphans, but W-TinyLFU evicts them under cache
     // pressure since nothing pins them — recoverable, vs. data-loss
-    // for the user. ZEB-167 still tracks the rekey-rollback path for
-    // the residual rekey-OldMissing case (would leave orphans without
-    // user-visible damage).
+    // for the user. ZEB-1015 tracks adopting the ZEB-1012
+    // RollbackIngest machinery for this drain's orphans (KB-scale
+    // folder metadata; its predecessor ZEB-167 was canceled when this
+    // reorder removed the sidecar-corruption hazard it targeted).
     let new_bundle_size = last_bundle_size;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
