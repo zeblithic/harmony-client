@@ -178,6 +178,231 @@ fn grantee_ingest_no_matching_device_is_none() {
     );
 }
 
+// --- ZEB-994: replay idempotency of `ingest_grant_push`. -------------------
+//
+// The dm-inbox `ingested_by` ack and the owner-state grant record persist
+// through two independent debounced engines; a crash between the two flushes
+// replays the same deposit at the next startup sweep. An IDENTICAL re-apply
+// must be a no-op `Ok(None)` — no `received_at` refresh, no nondeterministic
+// re-seal churn — while a genuinely-changed grant (rotated DEK, different
+// granter, new metadata) must still replace. The self-heal test pins the
+// corrupt-stored-envelope edge: an unopenable `sealed_dek` counts as changed.
+
+/// Re-ingesting the SAME grant_push bytes is a no-op: `Ok(None)`, stored
+/// `received_at` and `sealed_dek` untouched, exactly one entry.
+#[test]
+fn reingest_identical_grant_is_noop_none() {
+    let (grantee_priv, grantee_pub) = make_x25519_keypair(0x61);
+    let inner = FileGrantInner {
+        cid: [0xE1u8; 32],
+        file_name: "replayed.md".to_string(),
+        file_size: 21,
+        mime: "text/markdown".to_string(),
+        dek: [0x6Bu8; 32],
+    };
+    let sealed = seal_grant_for_devices(&inner, &[grantee_pub]).expect("seal grant");
+    let grant_push = wrap_grant_push(&sealed);
+
+    let granter = OwnerAddr([0x31u8; 16]);
+    let keytree = test_keytree();
+    let mut state = OwnerState::default();
+
+    ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &grant_push)
+        .expect("first ingest ok")
+        .expect("first ingest records");
+
+    // Sentinel stamp: a no-op re-apply must NOT refresh `received_at` (the
+    // real first stamp is wall-clock; 12_345 can only survive if untouched).
+    let rec = state
+        .received_file_grants
+        .get_mut(&inner.cid)
+        .expect("entry recorded");
+    rec.received_at = 12_345;
+    let sealed_dek_before = rec.sealed_dek.clone();
+
+    let replay = ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &grant_push)
+        .expect("replay ingest ok");
+    assert_eq!(replay, None, "identical re-apply is a no-op `Ok(None)`");
+
+    let rec = state
+        .received_file_grants
+        .get(&inner.cid)
+        .expect("entry still recorded");
+    assert_eq!(rec.received_at, 12_345, "received_at untouched on no-op");
+    assert_eq!(
+        rec.sealed_dek, sealed_dek_before,
+        "sealed_dek not re-sealed on no-op (no CRDT value churn)"
+    );
+    assert_eq!(state.received_file_grants.len(), 1, "exactly one entry");
+}
+
+/// A re-grant of the same cid with a ROTATED DEK is a genuine change: `Some`,
+/// stored DEK replaced, `received_at` refreshed off the sentinel.
+#[test]
+fn reingest_rotated_dek_replaces() {
+    let (grantee_priv, grantee_pub) = make_x25519_keypair(0x62);
+    let cid = [0xE2u8; 32];
+    let mk_inner = |dek: [u8; 32]| FileGrantInner {
+        cid,
+        file_name: "rotated.md".to_string(),
+        file_size: 9,
+        mime: "text/markdown".to_string(),
+        dek,
+    };
+    let push_a = wrap_grant_push(
+        &seal_grant_for_devices(&mk_inner([0xA1u8; 32]), &[grantee_pub]).expect("seal a"),
+    );
+    let push_b = wrap_grant_push(
+        &seal_grant_for_devices(&mk_inner([0xB2u8; 32]), &[grantee_pub]).expect("seal b"),
+    );
+
+    let granter = OwnerAddr([0x32u8; 16]);
+    let keytree = test_keytree();
+    let mut state = OwnerState::default();
+
+    ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &push_a)
+        .expect("ingest a ok")
+        .expect("a records");
+    state
+        .received_file_grants
+        .get_mut(&cid)
+        .expect("entry")
+        .received_at = 12_345;
+
+    let out = ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &push_b)
+        .expect("ingest b ok");
+    assert!(out.is_some(), "a rotated DEK is a genuine change → `Some`");
+
+    let rec = state.received_file_grants.get(&cid).expect("entry");
+    let stored = open_dek_at_rest(&keytree, &rec.sealed_dek).expect("open replaced dek");
+    assert_eq!(
+        stored.as_bytes(),
+        &[0xB2u8; 32],
+        "stored DEK is the rotation"
+    );
+    assert_ne!(rec.received_at, 12_345, "received_at refreshed on change");
+}
+
+/// The same grant bytes re-deposited by a DIFFERENT authenticated granter is a
+/// genuine change (attribution matters): `Some`, granter-of-record replaced.
+#[test]
+fn reingest_different_granter_replaces() {
+    let (grantee_priv, grantee_pub) = make_x25519_keypair(0x63);
+    let inner = FileGrantInner {
+        cid: [0xE3u8; 32],
+        file_name: "reattributed.md".to_string(),
+        file_size: 5,
+        mime: "text/markdown".to_string(),
+        dek: [0x6Du8; 32],
+    };
+    let grant_push =
+        wrap_grant_push(&seal_grant_for_devices(&inner, &[grantee_pub]).expect("seal"));
+
+    let keytree = test_keytree();
+    let mut state = OwnerState::default();
+    ingest_grant_push(
+        &mut state,
+        &grantee_priv,
+        &keytree,
+        OwnerAddr([0x33u8; 16]),
+        &grant_push,
+    )
+    .expect("first ingest ok")
+    .expect("records");
+
+    let granter_b = OwnerAddr([0x44u8; 16]);
+    let out = ingest_grant_push(&mut state, &grantee_priv, &keytree, granter_b, &grant_push)
+        .expect("second ingest ok");
+    assert!(out.is_some(), "a different granter is a genuine change");
+    assert_eq!(
+        state
+            .received_file_grants
+            .get(&inner.cid)
+            .expect("entry")
+            .granter_owner,
+        granter_b,
+        "granter-of-record replaced"
+    );
+}
+
+/// Same DEK but changed display metadata (a re-share after rename) is a
+/// genuine change: `Some`, stored metadata replaced.
+#[test]
+fn reingest_changed_metadata_replaces() {
+    let (grantee_priv, grantee_pub) = make_x25519_keypair(0x64);
+    let cid = [0xE4u8; 32];
+    let dek = [0x6Eu8; 32];
+    let mk_inner = |name: &str| FileGrantInner {
+        cid,
+        file_name: name.to_string(),
+        file_size: 7,
+        mime: "text/markdown".to_string(),
+        dek,
+    };
+    let push_a =
+        wrap_grant_push(&seal_grant_for_devices(&mk_inner("old.md"), &[grantee_pub]).expect("a"));
+    let push_b =
+        wrap_grant_push(&seal_grant_for_devices(&mk_inner("new.md"), &[grantee_pub]).expect("b"));
+
+    let granter = OwnerAddr([0x35u8; 16]);
+    let keytree = test_keytree();
+    let mut state = OwnerState::default();
+    ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &push_a)
+        .expect("ingest a ok")
+        .expect("a records");
+
+    let out = ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &push_b)
+        .expect("ingest b ok");
+    assert!(out.is_some(), "changed metadata is a genuine change");
+    assert_eq!(
+        state
+            .received_file_grants
+            .get(&cid)
+            .expect("entry")
+            .file_name,
+        "new.md",
+        "stored metadata replaced"
+    );
+}
+
+/// A stored entry whose `sealed_dek` no longer opens (corruption) counts as
+/// CHANGED: the identical re-apply replaces it, self-healing the entry.
+#[test]
+fn reingest_unopenable_stored_dek_self_heals() {
+    let (grantee_priv, grantee_pub) = make_x25519_keypair(0x65);
+    let inner = FileGrantInner {
+        cid: [0xE5u8; 32],
+        file_name: "healed.md".to_string(),
+        file_size: 3,
+        mime: "text/markdown".to_string(),
+        dek: [0x6Fu8; 32],
+    };
+    let grant_push =
+        wrap_grant_push(&seal_grant_for_devices(&inner, &[grantee_pub]).expect("seal"));
+
+    let granter = OwnerAddr([0x36u8; 16]);
+    let keytree = test_keytree();
+    let mut state = OwnerState::default();
+    ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &grant_push)
+        .expect("first ingest ok")
+        .expect("records");
+
+    // Corrupt the stored envelope: the guard must treat "cannot open" as
+    // changed, not as identical (fail toward re-recording).
+    state
+        .received_file_grants
+        .get_mut(&inner.cid)
+        .expect("entry")
+        .sealed_dek = vec![0xFFu8; 60];
+
+    let out = ingest_grant_push(&mut state, &grantee_priv, &keytree, granter, &grant_push)
+        .expect("re-ingest ok");
+    assert!(out.is_some(), "unopenable stored envelope → re-record");
+    let rec = state.received_file_grants.get(&inner.cid).expect("entry");
+    let stored = open_dek_at_rest(&keytree, &rec.sealed_dek).expect("healed envelope opens");
+    assert_eq!(stored.as_bytes(), &inner.dek, "self-healed to the real DEK");
+}
+
 // --- ZEB-724 Task 3: grantee decrypt-on-read of a MULTI-FRAME v3 file. -----
 //
 // Everything below drives the real streaming ingest (`ingest_content_encrypted_inner`)

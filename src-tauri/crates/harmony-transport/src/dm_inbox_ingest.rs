@@ -122,10 +122,12 @@ pub trait DmInboxIngestCtx: Send + Sync {
     /// records it on `OwnerState.received_file_grants` — marking owner-state
     /// dirty when a new record lands (`received_file_grants` has no deposit-rung
     /// re-delivery backstop, the entry is GC'd once covered). `Ok(())` on a
-    /// recorded grant OR when no blob was sealed to this device (a sibling will
-    /// record it and replicate via Flow A — either way THIS device is done, so
-    /// the caller marks it ingested). An `Err` leaves the entry PENDING for retry
-    /// (the TTL GC is the safety valve), like the message/invite/revocation arms.
+    /// recorded grant, when no blob was sealed to this device (a sibling will
+    /// record it and replicate via Flow A), OR on an identical already-recorded
+    /// grant (ZEB-994 crash-window replay — a no-op) — in every case THIS
+    /// device is done, so the caller marks it ingested. An `Err` leaves the
+    /// entry PENDING for retry (the TTL GC is the safety valve), like the
+    /// message/invite/revocation arms.
     async fn apply_grant_push(&self, entry: &DmInboxEntry) -> Result<(), String>;
 
     /// ZEB-730: apply a deposited file-grant REVOKE entry (owner→grantee).
@@ -1035,8 +1037,13 @@ pub async fn ingest_dm_packet(
 pub trait FileGrantIngestor: Send + Sync {
     /// Open the per-device sealed grant blob, re-seal the DEK under the
     /// grantee's own `KeyTree`, and record it in `state.received_file_grants`.
-    /// Returns the recorded root [`ContentId`] (`Some`) iff a blob sealed to
-    /// this device was found and applied; `None` if nothing was ours.
+    /// Returns the recorded root [`ContentId`] (`Some`) iff owner-state
+    /// actually CHANGED — a blob sealed to this device was found and its
+    /// grant was newly recorded or genuinely replaced. `None` when nothing
+    /// was ours, or when an IDENTICAL grant is already recorded (ZEB-994
+    /// crash-window replay: same granter, metadata, and DEK material — the
+    /// re-apply mutates nothing, so the caller must not persist/replicate/
+    /// emit for it).
     fn ingest_grant_push(
         &self,
         state: &mut crate::owner_state_crdt::OwnerState,
@@ -1461,9 +1468,11 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         // `received_file_grants` lives in the owner-state CRDT and has NO
         // deposit-rung re-delivery backstop (the entry is GC'd once covered), so
         // persistence + sibling (Flow A) replication MUST come from notify_dirty
-        // here — ONLY when a grant was actually recorded (`Some`). A `None` (no
-        // blob sealed to this device) mutated nothing; a sibling records it and
-        // replicates it back to us, so we do not churn a persist.
+        // here — ONLY when a grant was actually recorded (`Some`). A `None`
+        // mutated nothing: either no blob was sealed to this device (a sibling
+        // records it and replicates it back to us) or an identical grant is
+        // already recorded (ZEB-994 crash-window replay) — neither churns a
+        // persist.
         if let Some(cid) = recorded {
             if let Some(mark) = &self.notify_owner_state_dirty {
                 mark();
