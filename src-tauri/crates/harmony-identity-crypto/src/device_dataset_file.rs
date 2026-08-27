@@ -39,7 +39,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use zeroize::Zeroizing;
 
 use harmony_core_types::owner_state_crypto::{
-    derive_device_dataset_key, open_device_file, seal_device_file, CryptoError,
+    derive_device_dataset_key, derive_mint_ledger_key, open_device_file, seal_device_file,
+    CryptoError,
 };
 
 /// Outer version byte for device-sealed files. No legacy first byte in
@@ -77,24 +78,80 @@ impl DeviceCipher {
     }
 }
 
+/// Raw SQLCipher key for `mint/ledger.db` (ZEB-985) — an HKDF sibling of
+/// the [`DeviceCipher`] key with its own info label, derived from the same
+/// master seed and memoized/invalidated alongside it. Cheap to clone; the
+/// key bytes are shared and zeroized on final drop.
+#[derive(Clone)]
+pub struct MintLedgerKey {
+    key: Arc<Zeroizing<[u8; 32]>>,
+}
+
+/// Redacting Debug: same rationale as [`DeviceCipher`].
+impl std::fmt::Debug for MintLedgerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MintLedgerKey(<redacted>)")
+    }
+}
+
+impl MintLedgerKey {
+    /// Derive from the node identity master seed.
+    pub fn derive(seed: &[u8; 32]) -> Result<Self, CryptoError> {
+        Ok(Self {
+            key: Arc::new(derive_mint_ledger_key(seed)?),
+        })
+    }
+
+    /// The raw 32-byte SQLCipher key (`PRAGMA key = "x'…'"` consumer).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
+
+/// Both seed-derived at-rest keys, memoized together so a single seed read
+/// (which can pay a keychain hit or an Argon2id derive) covers every
+/// consumer.
+#[derive(Clone)]
+struct DerivedKeys {
+    cipher: DeviceCipher,
+    mint_ledger: MintLedgerKey,
+}
+
+impl DerivedKeys {
+    fn derive(seed: &[u8; 32]) -> Result<Self, CryptoError> {
+        Ok(Self {
+            cipher: DeviceCipher::derive(seed)?,
+            mint_ledger: MintLedgerKey::derive(seed)?,
+        })
+    }
+}
+
 /// Deterministic cipher for tests (unit + integration via `test-fixtures`).
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn test_cipher() -> DeviceCipher {
     DeviceCipher::derive(&[7u8; 32]).expect("test device cipher derives")
 }
 
-/// Pre-populate the [`get_or_derive`] memo with [`test_cipher`] for
-/// `identity_dir`, so tests exercising the free-function owner-state paths
-/// (which derive lazily) neither need an identity store nor a real seed.
+/// Deterministic mint ledger key for tests, from the same `[7u8; 32]` seed
+/// as [`test_cipher`].
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn test_mint_ledger_key() -> MintLedgerKey {
+    MintLedgerKey::derive(&[7u8; 32]).expect("test mint ledger key derives")
+}
+
+/// Pre-populate the [`get_or_derive`] memo with [`test_cipher`] (and its
+/// sibling [`test_mint_ledger_key`]) for `identity_dir`, so tests
+/// exercising the free-function owner-state paths (which derive lazily)
+/// neither need an identity store nor a real seed.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn install_test_cipher(identity_dir: &Path) {
     let memo_key = identity_dir
         .canonicalize()
         .unwrap_or_else(|_| identity_dir.to_path_buf());
-    memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(memo_key, test_cipher());
+    memo().lock().unwrap_or_else(|p| p.into_inner()).insert(
+        memo_key,
+        DerivedKeys::derive(&[7u8; 32]).expect("test keys derive"),
+    );
 }
 
 /// Memoized derive for free-function call sites that cannot be threaded a
@@ -108,8 +165,8 @@ pub fn install_test_cipher(identity_dir: &Path) {
 /// Callers that must not create an identity as a side effect (the chain
 /// fresh-generates when no identity exists) should check their target
 /// file's existence FIRST and skip the derive when it is absent.
-fn memo() -> &'static Mutex<HashMap<PathBuf, DeviceCipher>> {
-    static MEMO: LazyLock<Mutex<HashMap<PathBuf, DeviceCipher>>> =
+fn memo() -> &'static Mutex<HashMap<PathBuf, DerivedKeys>> {
+    static MEMO: LazyLock<Mutex<HashMap<PathBuf, DerivedKeys>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     &MEMO
 }
@@ -122,17 +179,28 @@ fn memo() -> &'static Mutex<HashMap<PathBuf, DeviceCipher>> {
 static MEMO_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
+    get_or_derive_keys(identity_dir).map(|keys| keys.cipher)
+}
+
+/// Memoized derive of the ZEB-985 mint ledger SQLCipher key — same memo,
+/// seed chain, and invalidation discipline as [`get_or_derive`]; one seed
+/// read covers both keys.
+pub fn get_or_derive_mint_ledger_key(identity_dir: &Path) -> Result<MintLedgerKey, String> {
+    get_or_derive_keys(identity_dir).map(|keys| keys.mint_ledger)
+}
+
+fn get_or_derive_keys(identity_dir: &Path) -> Result<DerivedKeys, String> {
     let memo_key = identity_dir
         .canonicalize()
         .unwrap_or_else(|_| identity_dir.to_path_buf());
     loop {
         let generation = MEMO_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-        if let Some(cipher) = memo()
+        if let Some(keys) = memo()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&memo_key)
         {
-            return Ok(cipher.clone());
+            return Ok(keys.clone());
         }
         // Deliberately NOT holding the memo lock across the seed read: the
         // read can block on the identity flock, pay an Argon2id derive, or
@@ -143,7 +211,7 @@ pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
         // loser reads the winner's seed) and the second insert is an
         // identical overwrite.
         let seed = crate::identity::read_seed_from_disk(&identity_dir.join("identity.key"))?;
-        let cipher = DeviceCipher::derive(&seed).map_err(|e| e.to_string())?;
+        let keys = DerivedKeys::derive(&seed).map_err(|e| e.to_string())?;
         // Insert only if no invalidation happened since the snapshot — the
         // seed this cipher was derived from may have been replaced mid-read.
         // The re-check MUST happen UNDER the memo lock (Greptile, PR #728):
@@ -158,8 +226,8 @@ pub fn get_or_derive(identity_dir: &Path) -> Result<DeviceCipher, String> {
         {
             let mut memo = memo().lock().unwrap_or_else(|p| p.into_inner());
             if MEMO_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
-                memo.insert(memo_key.clone(), cipher.clone());
-                return Ok(cipher);
+                memo.insert(memo_key.clone(), keys.clone());
+                return Ok(keys);
             }
         }
     }

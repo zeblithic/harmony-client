@@ -38,7 +38,7 @@ harmony-identity-crypto = { path = "../harmony-identity-crypto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 chrono = "0.4"
 async-trait = "0.1"
 thiserror = "1"

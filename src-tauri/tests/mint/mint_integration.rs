@@ -9,6 +9,10 @@
 use harmony_app::mint::*;
 use rusqlite::Connection;
 
+// ZEB-985: on-disk ledgers are SQLCipher-encrypted; disk-backed tests key
+// their opens with a fixed test key.
+const TEST_LEDGER_KEY: [u8; 32] = [0x42; 32];
+
 fn fresh_in_memory_db() -> Connection {
     harmony_app::mint::open_in_memory().expect("open_in_memory")
 }
@@ -134,10 +138,10 @@ fn migration_idempotent_across_reopens() {
     let tmpdir = tempfile::tempdir().unwrap();
     let path = tmpdir.path().join("ledger.db");
     {
-        let conn = open_database(&path).unwrap();
+        let conn = open_database(&path, &TEST_LEDGER_KEY).unwrap();
         set_default_currency(&conn, "JPY").unwrap();
     }
-    let conn = open_database(&path).unwrap();
+    let conn = open_database(&path, &TEST_LEDGER_KEY).unwrap();
     assert_eq!(
         get_default_currency(&conn).unwrap(),
         Some("JPY".into()),
@@ -394,7 +398,7 @@ fn migration_v2_adds_columns_and_backfills() {
     // simulate rows that were written before the v2 backfill UPDATE ran (i.e.
     // rows that will have updated_at = '' until the next migration pass).
     {
-        let conn = harmony_app::mint::open_database(&db_path).unwrap();
+        let conn = harmony_app::mint::open_database(&db_path, &TEST_LEDGER_KEY).unwrap();
         harmony_app::mint::apply_migrations(&conn).unwrap();
         // Insert rows that intentionally omit the v2 columns (updated_at),
         // simulating pre-v2 row state to verify the backfill UPDATEs fire.
@@ -412,7 +416,7 @@ fn migration_v2_adds_columns_and_backfills() {
     // Second open: close and reopen the DB, then migrate again. This verifies
     // that the backfill UPDATEs in apply_migrations correctly handle rows that
     // were inserted with updated_at = '' (the DEFAULT for pre-v2 rows).
-    let conn = harmony_app::mint::open_database(&db_path).unwrap();
+    let conn = harmony_app::mint::open_database(&db_path, &TEST_LEDGER_KEY).unwrap();
     harmony_app::mint::apply_migrations(&conn).unwrap();
 
     // accounts now has updated_at, backfilled from created_at.

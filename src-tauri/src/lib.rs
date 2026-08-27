@@ -6494,7 +6494,27 @@ pub async fn start_node_inner(
                                         break 'mint_init;
                                     }
                                     let db_path = mint_dir.join("ledger.db");
-                                    let conn = match crate::mint::open_database(&db_path) {
+                                    // ZEB-985: memo hit — the DeviceCipher
+                                    // derive above already paid the seed read.
+                                    let ledger_key =
+                                        match crate::device_dataset_file::get_or_derive_mint_ledger_key(
+                                            &identity_dir,
+                                        ) {
+                                            Ok(k) => k,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    target: "mint_sync",
+                                                    error = %e,
+                                                    "failed to derive mint ledger key — mint sync \
+                                                     disabled for this session"
+                                                );
+                                                break 'mint_init;
+                                            }
+                                        };
+                                    let conn = match crate::mint::open_database(
+                                        &db_path,
+                                        ledger_key.as_bytes(),
+                                    ) {
                                         Ok(c) => c,
                                         Err(e) => {
                                             tracing::error!(
@@ -23735,7 +23755,12 @@ pub(crate) fn mint_db_handle(
     let mint_dir = app_data_dir.join("mint");
     std::fs::create_dir_all(&mint_dir).map_err(|e| format!("create_dir mint: {e}"))?;
     let db_path = mint_dir.join("ledger.db");
-    let conn = mint::open_database(&db_path).map_err(|e| e.to_string())?;
+    // ZEB-985: the ledger is SQLCipher-encrypted under a seed-derived key.
+    // Boot always derives the sibling DeviceCipher first, so this is a memo
+    // hit in practice; a cold derive pays one seed read.
+    let identity_dir = crate::owner_commands::resolve_identity_dir()?;
+    let ledger_key = crate::device_dataset_file::get_or_derive_mint_ledger_key(&identity_dir)?;
+    let conn = mint::open_database(&db_path, ledger_key.as_bytes()).map_err(|e| e.to_string())?;
     let new_arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
 
     // Re-lock briefly to install. Double-check first to handle a race
@@ -27448,52 +27473,75 @@ pub(crate) async fn create_folder_nested_with_children(
     // rendering the user's folder unreadable until manual burn.
     //
     // Reversed: an ingest failure now leaves the sidecar pointing at
-    // the original root_old (intact). Bytes ingested before the
-    // failure become orphans, but W-TinyLFU evicts them under cache
-    // pressure since nothing pins them — recoverable, vs. data-loss
-    // for the user. ZEB-1015 tracks adopting the ZEB-1012
-    // RollbackIngest machinery for this drain's orphans (KB-scale
-    // folder metadata; its predecessor ZEB-167 was canceled when this
-    // reorder removed the sidecar-corruption hazard it targeted).
+    // the original root_old (intact). Entries acknowledged before the
+    // failure are handed to the best-effort RollbackIngest machinery
+    // (ZEB-1012, adopted here by ZEB-1015; its predecessor ZEB-167 was
+    // canceled when this reorder removed the sidecar-corruption hazard
+    // it targeted); anything the rollback misses still falls back to
+    // W-TinyLFU eviction under cache pressure since nothing pins it.
     let new_bundle_size = last_bundle_size;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let mut drained: Vec<harmony_content::cid::ContentId> = Vec::new();
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(ingest_tx, cid_hex, bytes, false).await?;
+        // Locally produced by hex::encode above, so the parse cannot
+        // fail in practice; the arm still unwinds `drained` so no
+        // failure path skips the rollback.
+        let cid_bytes = match parse_cid_hex(&cid_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                rollback_ingested_cids(Some(verb_tx), &drained, "create_folder_nested drain").await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = send_ingest(ingest_tx, cid_hex, bytes, false).await {
+            rollback_ingested_cids(Some(verb_tx), &drained, "create_folder_nested drain").await;
+            return Err(e);
+        }
+        drained.push(harmony_content::cid::ContentId::from_bytes(cid_bytes));
     }
 
     // 4. Rekey the top-level sidecar entry. CAS-style: pass root_old
     // as the expected current CID. With ZEB-164 the CID-collision
     // branch is gone — multiple entries sharing a CID is legal —
-    // so OldMissing and Conflict are the only failure modes.
-    {
+    // so OldMissing and Conflict are the only failure modes. The
+    // result is captured so the lock is released before the failure
+    // arms' rollback await below.
+    let rekey_result = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        match idx.rekey(
+        idx.rekey(
             &parent_id,
             root_old,
             prev_new_cid,
             new_bundle_size,
             stored_at_ms,
-        ) {
-            Ok(()) => {}
-            Err(content_index::RekeyError::OldMissing) => {
-                return Err("parent_sidecar_id removed mid-flight — nothing to rekey".to_string());
-            }
-            Err(content_index::RekeyError::Conflict { actual }) => {
-                // A concurrent rekey on the same parent_sidecar_id
-                // landed between our verify and our rekey. The new
-                // bundle bytes we just ingested are orphans — W-TinyLFU
-                // will evict them under cache pressure. Surface the
-                // actual current CID so future retry logic could
-                // rebuild from it; for now the user re-issues the
-                // create from the refreshed UI state.
-                return Err(format!(
-                    "concurrent rekey on parent_sidecar_id (now at cid {}); retry from refreshed state",
-                    hex::encode(actual)
-                ));
-            }
+        )
+    };
+    match rekey_result {
+        Ok(()) => {}
+        Err(content_index::RekeyError::OldMissing) => {
+            // Nothing references the freshly-drained chain any more —
+            // hand the whole set to the best-effort rollback.
+            rollback_ingested_cids(Some(verb_tx), &drained, "create_folder_nested rekey").await;
+            return Err("parent_sidecar_id removed mid-flight — nothing to rekey".to_string());
+        }
+        Err(content_index::RekeyError::Conflict { actual }) => {
+            // A concurrent rekey on the same parent_sidecar_id landed
+            // between our verify and our rekey — our freshly-drained
+            // chain lost the CAS and nothing references it. Best-effort
+            // roll it back; if the winner happened to produce identical
+            // bytes for some entry, evicting the shared unpinned CID is
+            // the same accepted refetch-on-demand race as the ZEB-1012
+            // call sites. Surface the actual current CID so future
+            // retry logic could rebuild from it; for now the user
+            // re-issues the create from the refreshed UI state.
+            rollback_ingested_cids(Some(verb_tx), &drained, "create_folder_nested rekey").await;
+            return Err(format!(
+                "concurrent rekey on parent_sidecar_id (now at cid {}); retry from refreshed state",
+                hex::encode(actual)
+            ));
         }
     }
 
@@ -29373,6 +29421,217 @@ mod walk_and_rebuild_chain_tests {
             .build_with_flags(ContentFlags::default())
             .expect("bundle");
         assert_ne!(bundle_cid.to_bytes(), [0x11; 32]);
+    }
+}
+
+/// ZEB-1015: the nested-create drain hands its already-acknowledged
+/// entries to the best-effort RollbackIngest machinery on every failure
+/// arm (mid-drain NACK, rekey CAS loss) instead of leaving the orphans
+/// to W-TinyLFU pressure.
+#[cfg(test)]
+mod create_folder_nested_rollback_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Recorded `RollbackIngest` requests: one inner Vec per request.
+    type RollbackLog = Arc<Mutex<Vec<Vec<[u8; 32]>>>>;
+    /// Cids acknowledged (replied `Ok`) by the test ingest handler, in
+    /// admission order.
+    type AckedCids = Arc<Mutex<Vec<[u8; 32]>>>;
+    type VerbSender = tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>;
+    type IngestSender = tokio::sync::mpsc::Sender<event_loop::IngestRequest>;
+
+    /// Verb handler serving `ReadBytes` from a seeded store and recording
+    /// every `RollbackIngest` (ACKed with the evicted count). An optional
+    /// one-shot hook runs on the FIRST `ReadBytes` — i.e. after
+    /// `create_folder_nested_with_children`'s up-front verify but before
+    /// its drain + rekey, exactly where a concurrent create's rekey would
+    /// land.
+    fn spawn_nested_verb_handler(
+        store: HashMap<[u8; 32], Vec<u8>>,
+        on_first_read: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (VerbSender, RollbackLog) {
+        let rollbacks: RollbackLog = Arc::default();
+        let log = rollbacks.clone();
+        let (verb_tx, mut verb_rx) =
+            tokio::sync::mpsc::channel::<event_loop::ContentVerbRequest>(8);
+        tokio::spawn(async move {
+            let mut hook = on_first_read;
+            while let Some(req) = verb_rx.recv().await {
+                match req {
+                    event_loop::ContentVerbRequest::ReadBytes { cid, reply } => {
+                        if let Some(f) = hook.take() {
+                            f();
+                        }
+                        let _ = reply.send(store.get(&cid).cloned());
+                    }
+                    event_loop::ContentVerbRequest::RollbackIngest { cids, reply } => {
+                        let n = cids.len();
+                        log.lock().expect("rollback log").push(cids);
+                        let _ = reply.send(Ok(n));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (verb_tx, rollbacks)
+    }
+
+    /// Ingest handler that ACKs the first `fail_after` requests (recording
+    /// their cids) and NACKs the rest. `usize::MAX` = ack everything.
+    fn spawn_counting_ingest_handler(fail_after: usize) -> (IngestSender, AckedCids) {
+        let acked: AckedCids = Arc::default();
+        let log = acked.clone();
+        let (ingest_tx, mut ingest_rx) = tokio::sync::mpsc::channel::<event_loop::IngestRequest>(8);
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Some(req) = ingest_rx.recv().await {
+                seen += 1;
+                if seen <= fail_after {
+                    let mut cid = [0u8; 32];
+                    hex::decode_to_slice(&req.cid_hex, &mut cid).expect("cid hex");
+                    log.lock().expect("acked log").push(cid);
+                    let _ = req.reply.send(Ok(()));
+                } else {
+                    let _ = req.reply.send(Err("ingest rejected".to_string()));
+                }
+            }
+        });
+        (ingest_tx, acked)
+    }
+
+    type IndexHandle = Arc<Mutex<content_index::ContentIndex>>;
+    type SeededStore = HashMap<[u8; 32], Vec<u8>>;
+
+    /// Empty parent folder seeded into an index + verb store, ready for a
+    /// nested create underneath it.
+    fn seed_parent() -> (
+        folders::BuiltFolder,
+        SeededStore,
+        IndexHandle,
+        content_index::SidecarId,
+    ) {
+        let parent = folders::build_folder("", &[]).expect("build parent");
+        let mut store = HashMap::new();
+        store.insert(parent.bundle_cid.to_bytes(), parent.bundle_bytes.clone());
+        store.insert(
+            parent.manifest_cid.to_bytes(),
+            parent.manifest_bytes.clone(),
+        );
+
+        let index = Arc::new(Mutex::new(content_index::ContentIndex::load(
+            None,
+            std::path::Path::new(""),
+        )));
+        let parent_id = content_index::SidecarId::new();
+        index
+            .lock()
+            .expect("index")
+            .insert(content_index::ContentIndexEntry {
+                sidecar_id: parent_id,
+                cid: parent.bundle_cid.to_bytes(),
+                file_name: "parent".into(),
+                size_bytes: parent.bundle_bytes.len() as u64,
+                stored_at_ms: 0,
+                sensitivity: content_index::Sensitivity::Private,
+                replication_tier: content_index::ReplicationTier::Default,
+                licensed: false,
+                archived: false,
+                pinned: false,
+                backup: false,
+                origin: None,
+                kind: content_index::ContentKind::Folder,
+            });
+        (parent, store, index, parent_id)
+    }
+
+    #[tokio::test]
+    async fn nested_drain_failure_rolls_back_acked_prefix() {
+        let (parent, store, index, parent_id) = seed_parent();
+        let (verb_tx, rollbacks) = spawn_nested_verb_handler(store, None);
+        // First drained entry (the new child's manifest) ACKs; the rest NACK.
+        let (ingest_tx, acked) = spawn_counting_ingest_handler(1);
+
+        let err = create_folder_nested_with_children(
+            "newdir".into(),
+            Vec::new(),
+            parent_id.to_string(),
+            vec![hex::encode(parent.bundle_cid.to_bytes())],
+            &ingest_tx,
+            &verb_tx,
+            &index,
+        )
+        .await
+        .expect_err("mid-drain NACK must fail the create");
+        assert!(err.contains("ingest rejected"), "unexpected error: {err}");
+
+        // Exactly one rollback covering exactly the acknowledged prefix.
+        let acked = acked.lock().expect("acked").clone();
+        assert_eq!(acked.len(), 1, "only the first drain entry was ACKed");
+        let rb = rollbacks.lock().expect("rollbacks").clone();
+        assert_eq!(
+            rb.len(),
+            1,
+            "expected exactly one RollbackIngest, got {rb:?}"
+        );
+        assert_eq!(rb[0], acked);
+
+        // The sidecar still points at the original parent cid.
+        let idx = index.lock().expect("index");
+        assert_eq!(
+            idx.get(&parent_id).expect("entry").cid,
+            parent.bundle_cid.to_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_rekey_conflict_rolls_back_all_drained() {
+        let (parent, store, index, parent_id) = seed_parent();
+
+        // On the first ancestor read — after the up-front verify, before
+        // the drain + rekey — land a "concurrent" rekey so the final CAS
+        // sees Conflict.
+        let index_for_hook = index.clone();
+        let old_cid = parent.bundle_cid.to_bytes();
+        let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+            index_for_hook
+                .lock()
+                .expect("hook index")
+                .rekey(&parent_id, old_cid, [0xAA; 32], 1, 1)
+                .expect("hook rekey");
+        });
+        let (verb_tx, rollbacks) = spawn_nested_verb_handler(store, Some(hook));
+        let (ingest_tx, acked) = spawn_counting_ingest_handler(usize::MAX);
+
+        let err = create_folder_nested_with_children(
+            "newdir".into(),
+            Vec::new(),
+            parent_id.to_string(),
+            vec![hex::encode(parent.bundle_cid.to_bytes())],
+            &ingest_tx,
+            &verb_tx,
+            &index,
+        )
+        .await
+        .expect_err("CAS conflict must fail the create");
+        assert!(err.contains("concurrent rekey"), "unexpected error: {err}");
+
+        // Everything drained (child manifest + bundle, rebuilt parent
+        // manifest + bundle) was ACKed and is rolled back in one request.
+        let acked = acked.lock().expect("acked").clone();
+        assert_eq!(
+            acked.len(),
+            4,
+            "child + rebuilt parent, manifest + bundle each"
+        );
+        let rb = rollbacks.lock().expect("rollbacks").clone();
+        assert_eq!(
+            rb.len(),
+            1,
+            "expected exactly one RollbackIngest, got {rb:?}"
+        );
+        assert_eq!(rb[0], acked);
     }
 }
 

@@ -44,24 +44,110 @@ impl From<MintError> for String {
 
 // ── Database lifecycle ────────────────────────────────────────────────────────
 
-/// Open (or create) the Mint SQLite database at `path`.
+/// 16-byte header of a plaintext SQLite database file. An SQLCipher-
+/// encrypted database starts with its random per-file salt instead, so
+/// this magic doubles as the pre-ZEB-985 plaintext detector.
+const SQLITE_PLAINTEXT_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// Open (or create) the Mint SQLite database at `path`, encrypted at rest
+/// with SQLCipher under `key` (ZEB-985).
 ///
-/// Applies WAL journaling and foreign-key enforcement pragmas, then runs
-/// `apply_migrations` to ensure the schema is up to date.  The caller is
-/// responsible for placing the file inside the app-data directory; this
-/// function only requires that the *parent directory* already exists.
-pub fn open_database(path: &std::path::Path) -> Result<Connection, MintError> {
+/// The key is applied raw (`PRAGMA key = "x'…'"` — no PBKDF2 pass; the
+/// caller hands us uniformly random HKDF output, see
+/// `derive_mint_ledger_key`). A pre-ZEB-985 plaintext database found at
+/// `path` is migrated in place first (see
+/// [`migrate_plaintext_to_encrypted`]). Applies WAL journaling and
+/// foreign-key enforcement pragmas, then runs `apply_migrations` to ensure
+/// the schema is up to date.
+///
+/// A wrong key — or a corrupt file — surfaces as a `Sqlite` error from the
+/// first statement after keying (SQLCipher reports "file is not a
+/// database"); callers keep their existing disarm-don't-brick contract.
+pub fn open_database(path: &std::path::Path, key: &[u8; 32]) -> Result<Connection, MintError> {
     // Ensure parent directory exists (create_dir_all is a no-op if already
     // present, and propagates Io errors via the #[from] impl above).
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
+    if is_plaintext_sqlite(path)? {
+        migrate_plaintext_to_encrypted(path, key)?;
+    }
+
     let conn = Connection::open(path)?;
+    apply_sqlcipher_key(&conn, key)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     apply_migrations(&conn)?;
     Ok(conn)
+}
+
+/// Key a freshly opened connection with the raw SQLCipher key. MUST run
+/// before any other statement touches the file — SQLCipher only honours
+/// the key while the database is still unread.
+fn apply_sqlcipher_key(conn: &Connection, key: &[u8; 32]) -> Result<(), MintError> {
+    // Raw-key form (`x'…'` blob literal inside double quotes, per the
+    // SQLCipher docs): exactly 32 bytes of key material, no KDF.
+    conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex_lower(key)))?;
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Does the file at `path` start with the plaintext SQLite magic?
+/// A missing (or shorter-than-header) file is simply "no" — a fresh
+/// database is created encrypted directly.
+fn is_plaintext_sqlite(path: &std::path::Path) -> Result<bool, MintError> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut header = [0u8; 16];
+    match f.read_exact(&mut header) {
+        Ok(()) => Ok(&header == SQLITE_PLAINTEXT_MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// One-time ZEB-985 migration: rebuild the plaintext database at `path`
+/// into an SQLCipher-encrypted sibling via `sqlcipher_export`, then
+/// atomically swap it into place.
+///
+/// The plaintext connection's journal mode is flipped to DELETE first,
+/// which checkpoints and removes its `-wal` sidecar, so no plaintext rows
+/// outlive the swap in a journal file; the `-shm` index is removed
+/// defensively afterwards. The rename is the commit point — a crash
+/// before it leaves the plaintext database intact and the migration
+/// re-runs on next open; a stale temp file from an interrupted attempt is
+/// discarded up front.
+fn migrate_plaintext_to_encrypted(path: &std::path::Path, key: &[u8; 32]) -> Result<(), MintError> {
+    let tmp = path.with_extension("db.enc-migrate");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let plain = Connection::open(path)?;
+        plain.pragma_update(None, "journal_mode", "DELETE")?;
+        // Single-quote SQL string escaping for the temp path (app-data
+        // paths are tame, but tests run under arbitrary tempdirs).
+        let tmp_sql = tmp.to_string_lossy().replace('\'', "''");
+        plain.execute_batch(&format!(
+            "ATTACH DATABASE '{tmp_sql}' AS encrypted KEY \"x'{}'\";
+             SELECT sqlcipher_export('encrypted');
+             DETACH DATABASE encrypted;",
+            hex_lower(key)
+        ))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+    }
+    Ok(())
 }
 
 /// Opens a fresh in-memory SQLite database and applies all
@@ -995,6 +1081,107 @@ mod tests {
     /// Open a fresh in-memory database with migrations applied.
     fn fresh_db() -> Connection {
         super::open_in_memory().expect("open_in_memory")
+    }
+
+    // ── ZEB-985: SQLCipher at-rest encryption ────────────────────────────
+
+    const KEY_A: [u8; 32] = [0xA1; 32];
+    const KEY_B: [u8; 32] = [0xB2; 32];
+
+    fn read_header(path: &std::path::Path) -> [u8; 16] {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).expect("open db file");
+        let mut header = [0u8; 16];
+        f.read_exact(&mut header).expect("read header");
+        header
+    }
+
+    #[test]
+    fn encrypted_open_creates_ciphertext_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = open_database(&path, &KEY_A).expect("first open");
+            create_account(&conn, "groceries").expect("create account");
+        }
+        // At rest the file must NOT carry the plaintext SQLite magic.
+        assert_ne!(
+            &read_header(&path),
+            SQLITE_PLAINTEXT_MAGIC,
+            "ledger.db is plaintext on disk"
+        );
+        // Same key round-trips.
+        let conn = open_database(&path, &KEY_A).expect("reopen");
+        let accounts = list_accounts(&conn).expect("list");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "groceries");
+    }
+
+    #[test]
+    fn wrong_key_fails_open_without_damaging_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = open_database(&path, &KEY_A).expect("first open");
+            create_account(&conn, "savings").expect("create account");
+        }
+        assert!(
+            open_database(&path, &KEY_B).is_err(),
+            "wrong key must fail to open (disarm-mint contract)"
+        );
+        // The failed attempt must not have clobbered the file.
+        let conn = open_database(&path, &KEY_A).expect("correct key still opens");
+        assert_eq!(list_accounts(&conn).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn plaintext_database_migrates_preserving_rows_and_removing_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        // Build the database exactly as the pre-ZEB-985 open did: plain
+        // SQLite, WAL journaling, migrations, then a real row.
+        {
+            let conn = Connection::open(&path).expect("plain open");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("wal");
+            conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+            apply_migrations(&conn).expect("migrations");
+            create_account(&conn, "checking").expect("create account");
+        }
+        assert_eq!(
+            &read_header(&path),
+            SQLITE_PLAINTEXT_MAGIC,
+            "precondition: pre-migration file is plaintext"
+        );
+        // Stale sidecars from the plaintext era (zero-length WAL/SHM are
+        // valid-and-ignored by SQLite, so they don't perturb the open).
+        let wal = dir.path().join("ledger.db-wal");
+        let shm = dir.path().join("ledger.db-shm");
+        std::fs::write(&wal, b"").expect("stale wal");
+        std::fs::write(&shm, b"").expect("stale shm");
+
+        // Keyed open performs the one-time migration.
+        {
+            let conn = open_database(&path, &KEY_A).expect("migrating open");
+            let accounts = list_accounts(&conn).expect("list");
+            assert_eq!(accounts.len(), 1, "migrated rows survive");
+            assert_eq!(accounts[0].name, "checking");
+        }
+        assert_ne!(
+            &read_header(&path),
+            SQLITE_PLAINTEXT_MAGIC,
+            "post-migration file is still plaintext"
+        );
+        assert!(!wal.exists(), "stale plaintext -wal not removed");
+        assert!(!shm.exists(), "stale plaintext -shm not removed");
+        assert!(
+            !path.with_extension("db.enc-migrate").exists(),
+            "migration temp file left behind"
+        );
+
+        // Second open: migration is one-shot; data still there.
+        let conn = open_database(&path, &KEY_A).expect("post-migration reopen");
+        assert_eq!(list_accounts(&conn).expect("list").len(), 1);
     }
 
     #[test]
