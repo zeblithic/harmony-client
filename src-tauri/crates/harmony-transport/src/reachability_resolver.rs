@@ -414,15 +414,16 @@ impl ReachabilityResolver {
     /// admission). The owner scopes eviction so `remove_owner` never drops a co-resident owner's
     /// binding for a shared node_id.
     ///
-    /// `stamp_ms` (ZEB-995) is the record's clamped HLC wall time; the oracle LWWs on it per
-    /// `(owner, node_id)` so per-community ingest order can't install a globally superseded key.
-    /// Callers clamp to their site's skew tolerance before passing it in.
+    /// `stamp` (ZEB-995) is the record's HLC (wall time clamped by the caller to its site's
+    /// skew tolerance); the oracle LWWs on the full HLC per `(owner, node_id)` — the resolver's
+    /// exact "strictly newer" relation — so per-community ingest order can't install a globally
+    /// superseded key, and wall-millisecond ties break identically to the resolver's own LWW.
     pub fn note_enrolled_binding(
         &self,
         owner: [u8; 16],
         node_id: [u8; 32],
         enrolled_vk: [u8; 32],
-        stamp_ms: u64,
+        stamp: Hlc,
     ) {
         if let Some(o) = self
             .admission_oracle
@@ -430,7 +431,7 @@ impl ReachabilityResolver {
             .expect("admission_oracle lock")
             .as_ref()
         {
-            o.bind(owner, node_id, enrolled_vk, stamp_ms);
+            o.bind(owner, node_id, enrolled_vk, stamp);
         }
     }
 
@@ -915,9 +916,13 @@ impl ReachabilityResolver {
         // announced_at_ms`), clamped like `update_with_source` clamps it, so a
         // future-dated pkarr record can't squat the (owner, node_id) slot.
         if let Some(vk) = enrolled_vk {
-            let stamp = payload
-                .announced_at_ms
-                .min(self.now_ms().saturating_add(FUTURE_SKEW_TOLERANCE_MS));
+            let stamp = Hlc {
+                wall_ms: payload
+                    .announced_at_ms
+                    .min(self.now_ms().saturating_add(FUTURE_SKEW_TOLERANCE_MS)),
+                logical: 0,
+                device_id: String::new(),
+            };
             self.note_enrolled_binding(owner_addr.0, payload.iroh_node_id, vk, stamp);
         }
         let hlc = Hlc {
@@ -1202,7 +1207,7 @@ mod tests {
         let enrolled_vk = [0xBB; 32];
 
         // Ingest-seam order: bind first, then the update that would fire the kick.
-        r.note_enrolled_binding(actor.0, node_id, enrolled_vk, 1_000);
+        r.note_enrolled_binding(actor.0, node_id, enrolled_vk, make_hlc(1_000, 0, "d"));
         r.update(actor, make_payload(0x42, 1_000), make_hlc(1_000, 0, "d"));
 
         // Bound but nothing admitted → denied.

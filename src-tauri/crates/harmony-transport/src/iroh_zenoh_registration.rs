@@ -151,8 +151,10 @@ pub fn seed_boot_peers_into_supervisor(
 /// router-mode node finds its boot-seeded peers unbound, [`admit`] fails open,
 /// and it dials the full persisted roster instead of ~degree ring neighbors
 /// (the R4 fan-out storm). Each item is one TTL-fresh reachability binding
-/// `(community, actor, iroh_node_id, device)` so the boot-seed kicks classify
-/// against real bindings. Returns the number of bindings applied (for the boot log).
+/// `(community, actor, iroh_node_id, device, record stamp)` so the boot-seed kicks
+/// classify against real bindings. Returns the number of bindings actually installed
+/// (for the boot log) — a row the oracle rejects as stale (ZEB-995 freshness LWW) is
+/// not counted.
 ///
 /// Takes already-resolved bindings rather than the address book itself, so this
 /// transport-layer helper names no community wire type (ZEB-990 spine cut): the
@@ -184,7 +186,7 @@ pub fn backfill_admission_oracle_from_reachability(
             crate::owner_state_types::OwnerAddr, // actor
             [u8; 32],                            // iroh_node_id
             [u8; 32],                            // enrolled device key
-            u64,                                 // clamped record stamp (HLC wall ms)
+            crate::owner_state_types::Hlc,       // record stamp (wall clamped by caller)
         ),
     >,
     is_enrolled: impl Fn(
@@ -194,13 +196,15 @@ pub fn backfill_admission_oracle_from_reachability(
     ) -> bool,
 ) -> usize {
     let mut bound = 0usize;
-    for (community, actor, iroh_node_id, device, stamp_ms) in bindings {
+    for (community, actor, iroh_node_id, device, stamp) in bindings {
         if is_enrolled(&community, &actor, &device) {
             // ZEB-995: the stamp lets the oracle LWW-reconcile the same (owner, node_id)
             // asserted with divergent keys across communities — without it, community
-            // iteration order decided the winner here.
-            oracle.bind(actor.0, iroh_node_id, device, stamp_ms);
-            bound += 1;
+            // iteration order decided the winner here. Count only real installs, so the
+            // boot log doesn't report a freshness-rejected stale row as backfilled.
+            if oracle.bind(actor.0, iroh_node_id, device, stamp) {
+                bound += 1;
+            }
         }
     }
     bound
@@ -445,27 +449,32 @@ mod tests {
 
         // (community, actor, iroh_node_id, enrolled device key, record stamp)
         let community = SpaceId([0x77; 16]);
+        let stamp = |wall_ms: u64| crate::owner_state_types::Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: String::new(),
+        };
         let bindings = vec![
             (
                 community,
                 OwnerAddr([0x01; 16]),
                 [0x0A; 32],
                 [0xA1; 32],
-                1_000u64,
+                stamp(1_000),
             ), // ring neighbor (enrolled)
             (
                 community,
                 OwnerAddr([0x02; 16]),
                 [0x0B; 32],
                 [0xB2; 32],
-                1_000u64,
+                stamp(1_000),
             ), // non-neighbor (enrolled)
             (
                 community,
                 OwnerAddr([0x03; 16]),
                 [0x0C; 32],
                 [0xC3; 32],
-                1_000u64,
+                stamp(1_000),
             ), // departed member (NOT enrolled)
         ];
 
@@ -522,17 +531,31 @@ mod tests {
 
         let owner = OwnerAddr([0x01; 16]);
         let nid = [0x0A; 32];
-        let stale = (SpaceId([0xAA; 16]), owner, nid, [0xA1; 32], 100u64); // pre-recovery key
-        let fresh = (SpaceId([0xBB; 16]), owner, nid, [0xA2; 32], 200u64); // current key
+        let stamp = |wall_ms: u64| crate::owner_state_types::Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: String::new(),
+        };
+        let stale = (SpaceId([0xAA; 16]), owner, nid, [0xA1; 32], stamp(100)); // pre-recovery key
+        let fresh = (SpaceId([0xBB; 16]), owner, nid, [0xA2; 32], stamp(200)); // current key
 
-        for order in [vec![stale, fresh], vec![fresh, stale]] {
+        // Stale-first installs then is replaced (2 installs); fresh-first rejects the
+        // stale row outright (1 install) — the boot-log counter reports only real
+        // installs either way (CodeAnt PR #756 r1, Minor).
+        for (order, expect_bound) in [
+            (vec![stale.clone(), fresh.clone()], 2),
+            (vec![fresh, stale], 1),
+        ] {
             let oracle = AdmissionOracle::new(true);
             let bound = backfill_admission_oracle_from_reachability(
                 &oracle,
                 order,
                 |_cid, _actor, _device| true, // both rows enrollment-pass in their community
             );
-            assert_eq!(bound, 2, "both rows walked through the gate");
+            assert_eq!(
+                bound, expect_bound,
+                "counter reflects installs, not attempts"
+            );
 
             // Only the CURRENT key is a ring neighbor (the stale one is enrolled in a large
             // community but not on self's ring) — the exact wrong-denial window.

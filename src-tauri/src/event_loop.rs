@@ -1745,15 +1745,13 @@ pub async fn run(
                                 // decide which community's key wins the slot.
                                 crate::community_address_book::AddressBookEntry::Reachability(
                                     p,
-                                ) => Some((
-                                    cid,
-                                    row.actor,
-                                    p.iroh_node_id,
-                                    row.device,
-                                    row.at.wall_ms.min(now_ms.saturating_add(
+                                ) => {
+                                    let mut stamp = row.at.clone();
+                                    stamp.wall_ms = stamp.wall_ms.min(now_ms.saturating_add(
                                         crate::community_address_book::ADDRBOOK_SKEW_TOLERANCE_MS,
-                                    )),
-                                )),
+                                    ));
+                                    Some((cid, row.actor, p.iroh_node_id, row.device, stamp))
+                                }
                                 _ => None,
                             })
                     });

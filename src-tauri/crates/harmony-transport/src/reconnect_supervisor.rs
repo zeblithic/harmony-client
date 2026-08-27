@@ -1409,6 +1409,15 @@ mod tests {
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
     }
+    /// Fixed admission-oracle bind stamp — these tests exercise dial/admit flow,
+    /// not the ZEB-995 freshness LWW (pinned in `admission_oracle` tests).
+    fn test_stamp() -> crate::owner_state_types::Hlc {
+        crate::owner_state_types::Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: String::new(),
+        }
+    }
     fn rung_lo(nominal_ms: u64) -> Duration {
         ms((nominal_ms as f64 * JITTER_LO) as u64)
     }
@@ -2448,7 +2457,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk, 1_000);
+        oracle.bind([0u8; 16], p, dk, test_stamp());
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2507,7 +2516,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk, 1_000);
+        oracle.bind([0u8; 16], p, dk, test_stamp());
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied — and stays denied
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2555,7 +2564,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk, 1_000);
+        oracle.bind([0u8; 16], p, dk, test_stamp());
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2626,7 +2635,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk, 1_000);
+        oracle.bind([0u8; 16], p, dk, test_stamp());
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2702,7 +2711,7 @@ mod tests {
         let dk = [0x81u8; 32];
 
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.bind([0u8; 16], p, dk, 1_000);
+        oracle.bind([0u8; 16], p, dk, test_stamp());
         oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
@@ -2781,7 +2790,7 @@ mod tests {
                 let node_id = peer(i as u8);
                 let owner = [i as u8; 16];
                 seed_peer(&resolver, owner, node_id);
-                oracle.bind(owner, node_id, device_keys[i], 1_000);
+                oracle.bind(owner, node_id, device_keys[i], test_stamp());
                 node_id
             })
             .collect();

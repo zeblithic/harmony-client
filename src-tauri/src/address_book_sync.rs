@@ -231,20 +231,23 @@ pub fn ingest_verified_row(
                 // the admission oracle BEFORE the update fires the supervisor kick, so a
                 // just-resolved peer is classifiable the instant it is kicked. `row.device`
                 // is the enrolled key cryptographically verified against `p` at :215.
-                // ZEB-995: stamp with the record's clamped HLC wall time so the oracle can
+                // ZEB-995: stamp with the record's HLC (wall clamped) so the oracle can
                 // LWW-reconcile — this book's upsert is per-COMMUNITY LWW, so "Inserted/
                 // Replaced here" does not mean "globally freshest for (owner, node_id)":
                 // another community's book may hold a fresher record with a different
                 // (rotated-identity) key, and without the stamp this bind would clobber it.
+                // The full HLC (not just wall_ms) keeps wall-millisecond ties on the
+                // resolver's exact tie-break instead of delivery order.
+                let mut stamp = row.at.clone();
+                stamp.wall_ms = stamp.wall_ms.min(
+                    now_ms
+                        .saturating_add(crate::community_address_book::ADDRBOOK_SKEW_TOLERANCE_MS),
+                );
                 reachability_resolver.note_enrolled_binding(
                     row.actor.0,
                     p.iroh_node_id,
                     row.device,
-                    row.at.wall_ms.min(
-                        now_ms.saturating_add(
-                            crate::community_address_book::ADDRBOOK_SKEW_TOLERANCE_MS,
-                        ),
-                    ),
+                    stamp,
                 );
                 // `ReachabilityResolver` clamps forward skew internally
                 // (`FUTURE_SKEW_TOLERANCE_MS`), so the raw payload is safe.
