@@ -49,11 +49,12 @@ impl From<MintError> for String {
 /// this magic doubles as the pre-ZEB-985 plaintext detector.
 const SQLITE_PLAINTEXT_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
-/// Guards the detect→export→rename sequence in [`open_database`] so
-/// concurrent first opens serialize the one-time plaintext migration.
+/// Serializes [`open_database`] end to end — the one-time plaintext
+/// migration AND the keyed open / WAL conversion / first-open DDL that
+/// follow it (ZEB-1017; see the guard-lifetime comment in the function).
 /// Thread layer only — the fd-lock taken alongside it in `open_database`
 /// extends the same exclusion across processes.
-static MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Open (or create) the Mint SQLite database at `path`, encrypted at rest
 /// with SQLCipher under `key` (ZEB-985).
@@ -69,6 +70,11 @@ static MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A wrong key — or a corrupt file — surfaces as a `Sqlite` error from the
 /// first statement after keying (SQLCipher reports "file is not a
 /// database"); callers keep their existing disarm-don't-brick contract.
+///
+/// Concurrent opens are safe end to end: the whole function is serialized
+/// under [`OPEN_LOCK`] plus a cross-process fd-lock (ZEB-1017), and
+/// rusqlite's default 5 s busy timeout covers contention from established
+/// writer connections.
 pub fn open_database(path: &std::path::Path, key: &[u8; 32]) -> Result<Connection, MintError> {
     // Ensure parent directory exists (create_dir_all is a no-op if already
     // present, and propagates Io errors via the #[from] impl above).
@@ -76,40 +82,60 @@ pub fn open_database(path: &std::path::Path, key: &[u8; 32]) -> Result<Connectio
         std::fs::create_dir_all(parent)?;
     }
 
-    // Serialize the one-time migration across concurrent first opens:
-    // `mint_db_handle`'s documented double-checked slow path (and a boot
-    // racing an early mint command) can run two `open_database` calls at
-    // once, and unserialized both would detect the plaintext file, fight
-    // over the shared temp sibling, and race the final rename (PR #763
-    // review). The plaintext re-check happens UNDER the locks so the loser
-    // sees the winner's completed migration and proceeds straight to the
-    // keyed open. Two layers, always taken in this order (single site, no
-    // inversion): the std Mutex serializes threads in this process; the
-    // fd-lock below serializes PROCESSES — a plain GUI launch holds no
-    // profile lock (`api/serve.lock` is only taken by `serve` and
-    // GUI-with-API), so a plain GUI and a `serve` on the same profile can
-    // both reach a first open concurrently (PR #764 review). Blocking
-    // `write()` is deliberate: the loser waits out the winner's migration
-    // rather than erroring, and the re-check then routes it to the keyed
-    // open. The OS releases the lock on process death, so a crashed
-    // migrator never wedges later opens.
-    {
-        let _migration_guard = MIGRATION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(migration_lock_path(path))?;
-        let mut os_lock = fd_lock::RwLock::new(lock_file);
-        let _os_guard = os_lock.write()?;
-        if is_plaintext_sqlite(path)? {
-            migrate_plaintext_to_encrypted(path, key)?;
-        }
+    // Serialize the ENTIRE open — migration, keyed open, WAL conversion,
+    // first-open DDL — across concurrent callers: `mint_db_handle`'s
+    // documented double-checked slow path (and a boot racing an early mint
+    // command) can run two `open_database` calls at once, and unserialized
+    // both would detect the plaintext file, fight over the shared temp
+    // sibling, and race the final rename (PR #763 review). The plaintext
+    // re-check happens UNDER the locks so the loser sees the winner's
+    // completed migration and proceeds straight to the keyed open. Two
+    // layers, always taken in this order (single site, no inversion): the
+    // std Mutex serializes threads in this process; the fd-lock below
+    // serializes PROCESSES — a plain GUI launch holds no profile lock
+    // (`api/serve.lock` is only taken by `serve` and GUI-with-API), so a
+    // plain GUI and a `serve` on the same profile can both reach a first
+    // open concurrently (PR #764 review). Blocking `write()` is
+    // deliberate: the loser waits out the winner's migration rather than
+    // erroring, and the re-check then routes it to the keyed open. The OS
+    // releases the lock on process death, so a crashed migrator never
+    // wedges later opens.
+    //
+    // ZEB-1017: the guards deliberately live to the END of the function,
+    // not just over the migration. The post-migration file is in rollback
+    // (DELETE) journal mode, so the first keyed open performs the
+    // DELETE→WAL conversion — a write SQLite makes by upgrading a read
+    // transaction it already holds, which is exactly the lock-promotion
+    // case where the busy handler is BYPASSED (waiting would deadlock).
+    // Two unserialized openers racing that conversion therefore fail
+    // instantly with "database is locked" no matter what busy timeout is
+    // set (CI shard 2 flake on PR #765). Serializing whole opens closes
+    // it: conversion contention can only ever come from another opener,
+    // because an established connection implies a completed prior open,
+    // after which the file is already WAL and the conversion is a no-op
+    // read.
+    let _open_guard = OPEN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(migration_lock_path(path))?;
+    let mut os_lock = fd_lock::RwLock::new(lock_file);
+    let _os_guard = os_lock.write()?;
+    if is_plaintext_sqlite(path)? {
+        migrate_plaintext_to_encrypted(path, key)?;
     }
 
+    // No explicit busy_timeout here: rusqlite already installs a 5000 ms
+    // default on every connection it opens, which absorbs the fresh-
+    // transaction contention an ESTABLISHED writer can cause (first-open
+    // DDL, the settings INSERT apply_migrations runs every time) — pinned
+    // by `open_waits_out_an_established_writer_instead_of_erroring`. It
+    // cannot absorb the journal-mode conversion race; the guards above
+    // handle that.
     let conn = Connection::open(path)?;
     apply_sqlcipher_key(&conn, key)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -132,8 +158,11 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Sibling lock file (`ledger.db.migrate-lock`) guarding the one-time
-/// plaintext migration across PROCESSES. Kept permanently once created —
+/// Sibling lock file (`ledger.db.migrate-lock`) guarding the serialized
+/// open — originally just the one-time plaintext migration, since ZEB-1017
+/// the whole of [`open_database`] — across PROCESSES. The on-disk name
+/// predates the wider scope and stays for compatibility with existing
+/// installs. Kept permanently once created —
 /// unlinking a lock file another process holds (or is blocked on) silently
 /// breaks flock exclusion on Unix, the same rule the profile lock's
 /// `api/serve.lock` and `identity.enc.lock` follow.
@@ -1233,7 +1262,7 @@ mod tests {
     fn concurrent_first_opens_serialize_the_migration() {
         // PR #763 review: `mint_db_handle`'s double-checked slow path can
         // run two `open_database` calls at once. Both racing the one-time
-        // plaintext migration must serialize on MIGRATION_LOCK — each open
+        // plaintext migration must serialize on OPEN_LOCK — each open
         // succeeds and the migrated rows survive.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ledger.db");
@@ -1267,6 +1296,115 @@ mod tests {
             SQLITE_PLAINTEXT_MAGIC,
             "post-race file is still plaintext"
         );
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_delete_mode_db_all_succeed() {
+        // ZEB-1017 regression (CI shard 2 flake on PR #765): the freshly
+        // migrated file sqlcipher_export leaves behind is in rollback
+        // (DELETE) journal mode, so the first keyed open performs the
+        // DELETE→WAL conversion. SQLite makes that write by upgrading a
+        // read transaction the statement already holds — the lock-
+        // promotion case where the busy handler is BYPASSED — so two
+        // unserialized openers racing the conversion fail instantly with
+        // "database is locked" regardless of busy_timeout. open_database
+        // must therefore hold its locks across the WHOLE open, making this
+        // pass by mutual exclusion, not timing. Several racers × several
+        // rounds so a regression (guards dropped early again) is loud, not
+        // a once-a-month CI flake.
+        for round in 0..10 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("ledger.db");
+            drop(open_database(&path, &KEY_A).expect("create encrypted db"));
+            // Reproduce the exact post-migration file state: encrypted,
+            // schema present, rollback journaling.
+            {
+                let conn = Connection::open(&path).expect("reopen");
+                apply_sqlcipher_key(&conn, &KEY_A).expect("key");
+                conn.pragma_update(None, "journal_mode", "DELETE")
+                    .expect("back to rollback journaling");
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || -> Result<(), String> {
+                        barrier.wait();
+                        open_database(&path, &KEY_A)
+                            .map(drop)
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("thread")
+                    .unwrap_or_else(|e| panic!("round {round}: concurrent open failed: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn open_waits_out_an_established_writer_instead_of_erroring() {
+        // ZEB-1017: the open locks serialize opener-vs-opener, but an
+        // ESTABLISHED connection mid-write (mint_db_handle's conn in this
+        // or another process) contends with a new open's fresh-transaction
+        // writes — first-open DDL, the settings INSERT OR IGNORE
+        // apply_migrations runs every time. SQLite honours the busy
+        // handler for those, and open_database leans on rusqlite's 5 s
+        // default busy timeout to absorb them — this test pins that
+        // coverage (it fails instantly if a future change zeroes the
+        // timeout or a rusqlite bump drops the default). Deterministic:
+        // drop an index so the open has guaranteed DDL to redo, hold the
+        // WAL write lock on a raw connection, and require open_database to
+        // wait it out.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        drop(open_database(&path, &KEY_A).expect("create encrypted db"));
+        {
+            let conn = Connection::open(&path).expect("reopen");
+            apply_sqlcipher_key(&conn, &KEY_A).expect("key");
+            conn.execute_batch("DROP INDEX idx_tx_date;")
+                .expect("drop index so apply_migrations must write");
+        }
+        let writer = Connection::open(&path).expect("writer open");
+        apply_sqlcipher_key(&writer, &KEY_A).expect("key");
+        writer
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold the write lock");
+
+        let opener = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                open_database(&path, &KEY_A)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        };
+        // Long enough for the opener to reach the contended DDL on any
+        // sane scheduler; far below the busy timeout it waits under.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        // The opener cannot legitimately finish while the writer holds the
+        // write lock — apply_migrations must at least re-create the dropped
+        // index. A finished opener here means either it errored instead of
+        // waiting (busy-handler regression) or the open no longer performs
+        // a guaranteed write and this test has gone vacuous (CodeAnt,
+        // PR #766). A slow-scheduler start can still pass un-exercised —
+        // that needs an in-function sync seam — but decay of the test's
+        // premise is now loud instead of silent.
+        assert!(
+            !opener.is_finished(),
+            "opener finished while the writer still held the write lock"
+        );
+        writer
+            .execute_batch("COMMIT;")
+            .expect("release the write lock");
+        opener
+            .join()
+            .expect("thread")
+            .expect("open_database must wait out an established writer, not fail busy");
     }
 
     /// PR #764 review: a plain GUI launch holds no profile lock
