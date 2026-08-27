@@ -64,9 +64,13 @@ pub enum FlushOutcome {
     /// The engine receiver is gone (engine teardown); remaining payloads
     /// were dropped with it. Callers should exit their drive loop.
     ConsumerGone,
-    /// The closing flag was (or flipped) set while payloads remained;
-    /// they were abandoned, matching the pre-existing no-report shutdown
-    /// semantics of the drains this serves.
+    /// The closing flag was (or flipped) set before the flush completed;
+    /// any remaining payloads were abandoned, matching the pre-existing
+    /// no-report shutdown semantics of the drains this serves. ZEB-1003:
+    /// this fires even when the buffer was already empty — "delivered to
+    /// the bounded engine channel" is not "processed", and during teardown
+    /// the engine consumer may exit without draining, so a shutdown never
+    /// reports `Flushed` on any path.
     ShutdownAbandoned,
 }
 
@@ -175,14 +179,23 @@ impl ReplySpill {
     /// ONLY after the zenoh reply stream has closed — blocking on the engine
     /// here is harmless to the transport and is the intended request-level
     /// backpressure. The `closing` flag is honored at the top of every
-    /// iteration (a shutdown never reports `Flushed`, even when the
-    /// consumer has capacity — PR #559 review) and polled every 500ms while
+    /// iteration BEFORE the emptiness check (a shutdown never reports
+    /// `Flushed`: not with consumer capacity free — PR #559 review — and not
+    /// with an already-empty buffer — ZEB-1003) and polled every 500ms while
     /// parked: `reserve()` is a cancel-safe select arm, so no payload is
     /// lost when the poll arm wins.
     pub async fn flush(mut self, closing: &AtomicBool) -> FlushOutcome {
-        while !self.buf.is_empty() {
+        loop {
+            // ZEB-1003: closing precedes the emptiness check, so shutdown
+            // observed at ANY boundary — empty-at-entry (every drain whose
+            // consumer kept up) or right after the last send — abandons
+            // instead of letting a query driver report completion during
+            // teardown.
             if closing.load(Ordering::SeqCst) {
                 return FlushOutcome::ShutdownAbandoned;
+            }
+            if self.buf.is_empty() {
+                return FlushOutcome::Flushed;
             }
             tokio::select! {
                 biased;
@@ -195,13 +208,10 @@ impl ReplySpill {
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                    if closing.load(Ordering::SeqCst) {
-                        return FlushOutcome::ShutdownAbandoned;
-                    }
+                    // Loop top re-checks closing immediately.
                 }
             }
         }
-        FlushOutcome::Flushed
     }
 }
 
@@ -389,5 +399,30 @@ mod tests {
         assert_eq!(spill.flush(&closing).await, FlushOutcome::ShutdownAbandoned);
         // The buffered payload was abandoned, not delivered post-shutdown.
         assert!(rx.try_recv().is_err(), "no delivery after closing");
+    }
+
+    /// ZEB-1003: the PR #559 contract ("shutdown never reports `Flushed`")
+    /// must hold on the empty-buffer path too. A drain whose consumer kept up
+    /// arrives at `flush()` with nothing buffered — if `closing` flipped
+    /// between drain-end and the flush, reporting `Flushed` lets a query
+    /// driver report a completed request during transport teardown, even
+    /// though the engine consumer may exit without draining its channel.
+    #[tokio::test]
+    async fn flush_abandons_on_preset_closing_with_empty_buffer() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let spill = ReplySpill::new(tx, 64);
+        assert_eq!(spill.pending(), 0, "precondition: nothing buffered");
+        let closing = AtomicBool::new(true);
+        assert_eq!(spill.flush(&closing).await, FlushOutcome::ShutdownAbandoned);
+    }
+
+    /// ZEB-1003 guard-precision pin: without shutdown, an empty-buffer flush
+    /// still reports `Flushed` immediately.
+    #[tokio::test]
+    async fn flush_reports_flushed_on_empty_buffer_without_closing() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let spill = ReplySpill::new(tx, 64);
+        let closing = AtomicBool::new(false);
+        assert_eq!(spill.flush(&closing).await, FlushOutcome::Flushed);
     }
 }

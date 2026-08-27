@@ -785,7 +785,19 @@ impl IrohZenohLinkManager {
                             .send_async(LinkUnicast(NewLink::Single(link)))
                             .await
                         {
+                            // ZEB-1004: zenoh's link intake is gone (zenoh
+                            // teardown/restart) — the connection was already
+                            // registered + supervisor-marked above, and zenoh
+                            // will never service it. Close it (identity-guarded,
+                            // exactly like the accept_bi failure above) so the
+                            // drop watcher evicts the registry entry and kicks
+                            // the supervisor, instead of a live-but-unusable
+                            // connection occupying the peer's slot until the
+                            // remote notices.
                             tracing::warn!("zenoh new_link channel closed: {e}");
+                            if mgr.is_active_zenoh_conn(peer_id, conn_id) {
+                                conn.close(0u32.into(), b"zeb1004-new-link-closed");
+                            }
                         }
                     } else if alpn_used == alpn::HARMONY_HANDSHAKE_V1
                         || alpn_used == alpn::HARMONY_FRIEND_V1
@@ -1332,6 +1344,81 @@ mod tests {
         assert!(
             !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
             "watcher must evict the registry entry when the connection closes"
+        );
+
+        alice_ep.shutdown().await;
+        bob_ep.shutdown().await;
+    }
+
+    /// ZEB-1004: when delivery of an accepted link to zenoh fails (the
+    /// new-link channel is closed — zenoh teardown/restart), the accept loop
+    /// must close the already-registered connection like the accept_bi-failure
+    /// path does — letting the drop watcher evict it — instead of leaving a
+    /// live-but-unusable connection occupying the peer's registry slot (and
+    /// suppressing the reconnect supervisor) until the remote notices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_new_link_delivery_closes_and_evicts() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            failed_new_link_delivery_closes_and_evicts_inner(),
+        )
+        .await
+        .expect("test must finish within 60s");
+    }
+
+    async fn failed_new_link_delivery_closes_and_evicts_inner() {
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        // The receiver is DROPPED up front: the first `send_async` fails,
+        // deterministically modeling zenoh having torn down its link intake.
+        let (new_link_tx, rx) = flume::unbounded::<LinkUnicast>();
+        drop(rx);
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            ReachabilityResolver::new(),
+            new_link_tx,
+        ));
+        let _accept = alice_mgr.spawn_accept_loop();
+
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+        let bob_id = bob_ep.node_id();
+
+        let alice_socket = *alice_ep
+            .bound_sockets()
+            .first()
+            .expect("alice has a bound socket");
+        let alice_addr = EndpointAddr::new(alice_ep.node_id()).with_ip_addr(alice_socket);
+
+        let conn = bob_ep
+            .inner()
+            .connect(alice_addr, alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("bob dial alice on zenoh ALPN");
+        // Open + write a bi stream so alice's `accept_bi` completes and her
+        // accept task reaches the new-link delivery (QUIC streams are lazy —
+        // an unwritten `open_bi` is invisible to the acceptor).
+        let (mut send, _recv) = conn.open_bi().await.expect("bob open_bi");
+        send.write_all(b"zeb1004").await.expect("bob write");
+
+        // The failed delivery must CLOSE the registered connection — observed
+        // from bob's side, avoiding any race with how fast alice registers
+        // then evicts.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), conn.closed())
+                .await
+                .is_ok(),
+            "alice must close a connection whose link she cannot deliver to zenoh"
+        );
+        // ... and the drop watcher then evicts the registry entry.
+        for _ in 0..300 {
+            if !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !alice_mgr.zenoh_conns.lock().unwrap().contains_key(&bob_id),
+            "failed new-link delivery must evict the registered connection"
         );
 
         alice_ep.shutdown().await;

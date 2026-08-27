@@ -506,7 +506,7 @@ impl IrohFriendPexAcceptor {
             );
             return;
         };
-        pending.record_introduction_offer(
+        let recorded = pending.record_introduction_offer(
             intro.subject,
             // display: a UX hint only; the acceptor has no verified name for the
             // introducee here (mirrors the friend acceptor's production `None`).
@@ -518,6 +518,18 @@ impl IrohFriendPexAcceptor {
                 reachability: intro.reachability.clone(),
             },
         );
+        // ZEB-1001: a delayed offer for a subject the user already approved is
+        // ignored by the store — skip the prompt too (no `friend-request-
+        // received` for a row that doesn't exist; the approval stands and the
+        // pending Path-A link completes via `prior_accept`).
+        if !recorded {
+            tracing::debug!(
+                subject = %hex::encode(intro.subject.0),
+                "ZEB-1001: introduction offer for an already-approved subject \
+                 ignored; not emitting friend-request-received"
+            );
+            return;
+        }
         // Reuse the existing `friend-request-received` event (same one Path A
         // fires) via the acceptor's event sink — the SAME sink that emits
         // `friend-list-changed` on an auto-`Proceed` link.

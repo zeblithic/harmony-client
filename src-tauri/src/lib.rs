@@ -86946,15 +86946,18 @@ mod zeb694_accept_tests {
     }
 
     fn stage(store: &PendingFriendRequests, subj: OwnerAddr, received_at: u64) {
-        store.record_introduction_offer(
-            subj,
-            None,
-            received_at,
-            StoredIntroductionOffer {
-                voucher: OwnerAddr([9; 16]),
-                subject: subj,
-                reachability: fixture_reach(),
-            },
+        assert!(
+            store.record_introduction_offer(
+                subj,
+                None,
+                received_at,
+                StoredIntroductionOffer {
+                    voucher: OwnerAddr([9; 16]),
+                    subject: subj,
+                    reachability: fixture_reach(),
+                },
+            ),
+            "stage fixture: offer for a non-approved subject must record"
         );
     }
 
