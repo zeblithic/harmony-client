@@ -1241,6 +1241,13 @@ pub struct NodeState {
     /// `None` until start_node wires it; cleared in stop_inner.
     voting_log_adapter_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::VotingLogAdapterRequest>>,
+    /// ZEB-1018: per-community D-FROST committee-log adapter request
+    /// channel. `ensure_dfrost_engine_for` sends a `DfrostLogAdapterRequest`
+    /// here; event_loop::run drains it and calls
+    /// `spawn_dfrost_log_zenoh_adapter` against the live session.
+    /// `None` until start_node wires it; cleared in stop_inner.
+    dfrost_log_adapter_request_tx:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::DfrostLogAdapterRequest>>,
     /// ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle captured at
     /// `start_node` so IPC handlers (which are generic over
     /// `R: tauri::Runtime` and can't downcast `AppHandle<R>` to
@@ -1378,15 +1385,17 @@ pub struct NodeState {
         >,
     >,
     /// ZEB-301 Phase 4a-foundation: per-community D-FROST committee event
-    /// logs. Parallels `voting_logs`. Lazy-populated on first dfrost_* IPC
-    /// call for a community via a future `ensure_dfrost_log_for` helper
-    /// (introduced when the IPC layer lands in a follow-up PR — this PR
-    /// ships the data layer + tests only, no IPC wiring).
+    /// logs. Parallels `voting_logs`. Populated by the dfrost_* IPCs'
+    /// get-or-insert fast paths and by `ensure_dfrost_engine_for`
+    /// (ZEB-1018), which shares each community's log Arc with its
+    /// registered `DfrostLogEngine` so local IPC applies and peer inbound
+    /// applies converge on one log.
     ///
-    /// `DfrostLog` is in-memory only in this phase; no Zenoh sync wiring
-    /// and no stop_inner cleanup. Phase 4a-main adds the parallel sync
-    /// engine + IPC surface that turns this field into a live committee
-    /// event log mirroring the voting-log architecture.
+    /// `DfrostLog` is in-memory only: committee/ceremony state does not
+    /// survive a restart (durable committee state is ZEB-753's VerifiedLog
+    /// adoption). Engine + Zenoh-adapter teardown is owned by
+    /// `dfrost_log_registry` shutdown in stop_inner; this map itself is
+    /// not cleared there (same as `voting_logs`).
     pub dfrost_logs: std::sync::Arc<
         tokio::sync::Mutex<
             std::collections::HashMap<
@@ -2326,6 +2335,8 @@ impl Default for NodeState {
             transport_epoch_rx: None,
             // ZEB-298+ZEB-312 PR 1: cleared until start_node wires it.
             voting_log_adapter_request_tx: None,
+            // ZEB-1018: cleared until start_node wires it.
+            dfrost_log_adapter_request_tx: None,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle captured
             // at start_node for Tier 3 lifecycle emit.
             app_handle_wry: None,
@@ -3043,6 +3054,8 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // channel was unused so a restart's fresh Sender doesn't
         // collide with a leaked one.
         let _ = guard.voting_log_adapter_request_tx.take();
+        // ZEB-1018: same for the dfrost adapter-request sender.
+        let _ = guard.dfrost_log_adapter_request_tx.take();
         // ZEB-298+ZEB-312 PR 2 Task 2: drop the typed Wry AppHandle so
         // a subsequent start_node captures a fresh one for the new run.
         let _ = guard.app_handle_wry.take();
@@ -4670,6 +4683,8 @@ pub async fn start_node_inner(
         // request sender so it doesn't outlive the previous event loop.
         // A fresh channel pair is constructed below.
         let _ = guard.voting_log_adapter_request_tx.take();
+        // ZEB-1018: clear the prior dfrost adapter-request sender too.
+        let _ = guard.dfrost_log_adapter_request_tx.take();
         // ZEB-298+ZEB-312 PR 2 Task 2: clear the prior typed Wry
         // AppHandle so the restart captures a fresh one.
         let _ = guard.app_handle_wry.take();
@@ -5552,12 +5567,13 @@ pub async fn start_node_inner(
             std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
         > = None;
         // ZEB-307 Task 8 (R1 fix — wire registry): D-FROST log registry holder.
-        // The registry is the empty container; per-community engines get
-        // registered when the Zenoh adapter wiring ticket lands. Built
-        // unconditionally outside the owner-loaded branch so the 5 D-FROST
-        // IPCs can find a non-None registry even before any community has
-        // an engine (registry.get(space_id) returns None until an engine is
-        // registered, and the IPC broadcast sites already tolerate that).
+        // ZEB-1018: per-community engines are registered by
+        // `ensure_dfrost_engine_for` (invoked from `ensure_voting_engine_for`,
+        // so the boot sweep, join seams, and lazy voting IPC paths all cover
+        // it). Built unconditionally outside the owner-loaded branch so the
+        // 5 D-FROST IPCs can find a non-None registry even before any
+        // community has an engine (registry.get(space_id) returns None until
+        // then, and the IPC broadcast sites log + skip).
         let dfrost_log_registry_arc: std::sync::Arc<
             crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>,
         > = std::sync::Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::<
@@ -14162,6 +14178,10 @@ pub async fn start_node_inner(
                 // engine creation is always user-triggered via IPC, low burst rate.
                 let (voting_log_adapter_request_tx, voting_log_adapter_request_rx) =
                     tokio::sync::mpsc::channel::<crate::event_loop::VotingLogAdapterRequest>(32);
+                // ZEB-1018: matching channel for the D-FROST committee-log
+                // adapter bridge — same capacity + lifecycle as the voting one.
+                let (dfrost_log_adapter_request_tx, dfrost_log_adapter_request_rx) =
+                    tokio::sync::mpsc::channel::<crate::event_loop::DfrostLogAdapterRequest>(32);
                 // ZEB-262 Phase 4 Task 9: clone the community_registry handle
                 // for event_loop::run BEFORE the closure capture below moves
                 // `community_registry_arc` (the post-spawn `guard.community_registry`
@@ -14407,6 +14427,7 @@ pub async fn start_node_inner(
                                 community_adapter_requests_for_loop,
                                 community_adapter_request_rx,
                                 voting_log_adapter_request_rx,
+                                dfrost_log_adapter_request_rx,
                                 community_registry_for_loop,
                                 channel_log_adapter_request_rx_for_loop,
                                 library_directory_for_loop,
@@ -14674,6 +14695,9 @@ pub async fn start_node_inner(
                         // loop. The matching rx was moved into event_loop::run
                         // above.
                         guard.voting_log_adapter_request_tx = Some(voting_log_adapter_request_tx);
+                        // ZEB-1018: dfrost adapter-request sender, consumed by
+                        // ensure_dfrost_engine_for.
+                        guard.dfrost_log_adapter_request_tx = Some(dfrost_log_adapter_request_tx);
                         // ZEB-298+ZEB-312 PR 2 Task 2: capture the typed Wry
                         // AppHandle so IPC handlers (generic over R) can hand
                         // the voting engine a concrete `AppHandle<Wry>` for
@@ -14695,12 +14719,13 @@ pub async fn start_node_inner(
                         // handlers can reach it post-apply to broadcast each
                         // signed committee event. `Some(_)` while node is
                         // running; cleared in stop_inner / restart paths
-                        // alongside `channel_log_registry`. Per-community
-                        // engines are registered on-demand by the Zenoh
-                        // adapter wiring (deferred follow-up); the registry
-                        // itself is just an empty container until then —
-                        // `registry.get(space_id)` returning None is expected
-                        // and the IPC broadcast sites already log + skip.
+                        // alongside `channel_log_registry`. ZEB-1018:
+                        // per-community engines are registered by
+                        // `ensure_dfrost_engine_for` via the same boot-sweep/
+                        // join/lazy-IPC seams as the voting engines;
+                        // `registry.get(space_id)` returning None before the
+                        // first ensure is expected and the IPC broadcast
+                        // sites log + skip.
                         guard.dfrost_log_registry = Some(dfrost_log_registry_arc.clone());
                         // ZEB-309 Phase 4a-main Task 11: stash the beacon_requester
                         // closure so `ensure_voting_engine_for` can call
@@ -14939,6 +14964,9 @@ pub async fn start_node_inner(
                             let vd_dfrost = guard.dfrost_log_registry.clone();
                             let vd_beacon = guard.beacon_requester.clone();
                             let vd_identity_dir = guard.identity_dir.clone();
+                            // ZEB-1018: dfrost ensure handles for the sweep.
+                            let vd_dfrost_logs = std::sync::Arc::clone(&guard.dfrost_logs);
+                            let vd_dfrost_adapter_tx = guard.dfrost_log_adapter_request_tx.clone();
                             tokio::spawn(async move {
                                 let community_ids =
                                     vd_community_registry.spawned_community_ids().await;
@@ -14972,6 +15000,8 @@ pub async fn start_node_inner(
                                     vd_dfrost,
                                     vd_beacon,
                                     vd_identity_dir,
+                                    vd_dfrost_logs,
+                                    vd_dfrost_adapter_tx,
                                 )
                                 .await;
                             });
@@ -58849,6 +58879,18 @@ type VotingLogEnginesMap = std::sync::Arc<
     >,
 >;
 
+/// ZEB-1018: shorthand for `NodeState.dfrost_logs`' shape — the
+/// per-community D-FROST committee log map shared between the dfrost
+/// IPCs and each registered `DfrostLogEngine`.
+type DfrostLogsMap = std::sync::Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<
+            crate::owner_state_types::SpaceId,
+            std::sync::Arc<tokio::sync::Mutex<crate::community_dfrost_log::DfrostLog>>,
+        >,
+    >,
+>;
+
 /// Production `MembershipSnapshotResolver` that reads from the live
 /// `NodeState` handles (`community_registry` + `crdt_state`).
 ///
@@ -59137,6 +59179,11 @@ async fn ensure_voting_engines_for_all_joined(
     >,
     beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
     identity_dir: Option<std::path::PathBuf>,
+    // ZEB-1018: dfrost handles, passed through to ensure_voting_engine_for.
+    dfrost_logs: DfrostLogsMap,
+    dfrost_log_adapter_request_tx: Option<
+        tokio::sync::mpsc::Sender<crate::event_loop::DfrostLogAdapterRequest>,
+    >,
 ) {
     for community_id in community_ids {
         if let Err(e) = ensure_voting_engine_for(
@@ -59156,6 +59203,8 @@ async fn ensure_voting_engines_for_all_joined(
             dfrost_log_registry.clone(),
             beacon_requester.clone(),
             identity_dir.clone(),
+            &dfrost_logs,
+            dfrost_log_adapter_request_tx.clone(),
         )
         .await
         {
@@ -59429,6 +59478,10 @@ mod zeb718_voting_reconcile_tests {
             None, // dfrost registry
             None, // beacon requester
             Some(dir.path().to_path_buf()),
+            // ZEB-1018: dfrost ensure handles — registry is None above, so
+            // the dfrost ensure is skipped; empty map + no adapter channel.
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            None,
         )
         .await;
 
@@ -59468,6 +59521,111 @@ mod zeb718_voting_reconcile_tests {
             2,
             "exactly one adapter request per joined community — a duplicate \
              subscriber would push the count to 3"
+        );
+    }
+
+    /// ZEB-1018: the boot sweep must also register a D-FROST engine per
+    /// joined community (via the ensure_dfrost_engine_for hook inside
+    /// ensure_voting_engine_for) and enqueue exactly one
+    /// `DfrostLogAdapterRequest` each — and a second sweep must be a
+    /// no-op (no duplicate engines, no duplicate adapter subscribers).
+    #[tokio::test]
+    async fn boot_sweep_registers_dfrost_engine_and_enqueues_dfrost_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
+        let cid_a = SpaceId([0x93; 16]);
+        let cid_b = SpaceId([0x94; 16]);
+        let actor = OwnerAddr([0xee; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot { members },
+        });
+
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let voting_log_engines: VotingLogEnginesMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (adapter_tx, _adapter_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::VotingLogAdapterRequest>(64);
+        let hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("zeb1018-dev".to_string()),
+            ));
+        let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]));
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+
+        let dfrost_registry: Arc<
+            crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>,
+        > = Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::new());
+        let dfrost_logs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (dfrost_adapter_tx, mut dfrost_adapter_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::DfrostLogAdapterRequest>(64);
+
+        let sweep = || {
+            ensure_voting_engines_for_all_joined(
+                voting_logs.clone(),
+                voting_log_engines.clone(),
+                vec![cid_a, cid_b],
+                adapter_tx.clone(),
+                hlc_tracker.clone(),
+                adopt_floor.clone(),
+                "zeb1018-dev".to_string(),
+                signing_key.clone(),
+                actor,
+                resolver.clone(),
+                crdt_state.clone(),
+                [0u8; 64],
+                None, // app_handle — headless
+                Some(dfrost_registry.clone()),
+                None, // beacon requester
+                Some(dir.path().to_path_buf()),
+                dfrost_logs.clone(),
+                Some(dfrost_adapter_tx.clone()),
+            )
+        };
+        sweep().await;
+
+        // (1) A dfrost engine is registered per community, sharing the
+        //     community's DfrostLog Arc from the map.
+        assert!(
+            dfrost_registry.get(cid_a).await.is_some(),
+            "dfrost engine registered for community A"
+        );
+        assert!(
+            dfrost_registry.get(cid_b).await.is_some(),
+            "dfrost engine registered for community B"
+        );
+        assert!(
+            dfrost_logs.lock().await.contains_key(&cid_a),
+            "dfrost log inserted for community A"
+        );
+
+        // (2) Exactly one DfrostLogAdapterRequest per community.
+        let mut seen = Vec::new();
+        while let Ok(req) = dfrost_adapter_rx.try_recv() {
+            seen.push(req.community_id);
+        }
+        assert!(seen.contains(&cid_a), "dfrost adapter request for A");
+        assert!(seen.contains(&cid_b), "dfrost adapter request for B");
+        assert_eq!(seen.len(), 2, "one dfrost adapter request per community");
+
+        // (3) Idempotence: a second sweep registers nothing new and sends
+        //     no further adapter requests (a duplicate would double-
+        //     subscribe the community topic).
+        sweep().await;
+        assert!(
+            dfrost_adapter_rx.try_recv().is_err(),
+            "second sweep must not enqueue duplicate dfrost adapter requests"
         );
     }
 
@@ -60174,6 +60332,122 @@ mod zeb718_voting_reconcile_tests {
 /// re-arm for prompter reconnect recovery is a deferred enhancement.)
 const VOTING_BACKFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// ZEB-1018: lazily start + register the per-community D-FROST engine and
+/// wire its Zenoh adapter (`harmony/community/{id}/dfrost`). Mirrors
+/// `ensure_voting_engine_for`'s shape: fast-path when the registry already
+/// has an engine, get-or-insert the shared `DfrostLog` Arc, build the
+/// production `OwnerDeviceCacheResolver`, create the mpsc halves, then
+/// race-safely register via `DfrostLogRegistry::register_if_vacant` — only
+/// the creating caller sends the adapter request, so two concurrent
+/// ensures can never double-subscribe the community topic.
+///
+/// This closes the gap the ZEB-974 survey recorded as ZEB-976 item 7: the
+/// engine + registry shipped in ZEB-307 but nothing ever registered an
+/// engine in production, so `registry.get()` was always `None` —
+/// blocking every Tier-3 PollCreate on `DfrostNotReady` and leaving the
+/// 5 dfrost IPCs' broadcasts permanently skipped.
+///
+/// `dfrost_log_adapter_request_tx = None` (test contexts that bypass
+/// `start_node`) still registers the engine — local applies and the
+/// Tier-3 `DfrostNotReady` gate work — but the engine runs without
+/// Zenoh wiring, exactly like a voting engine whose adapter send failed.
+#[allow(clippy::too_many_arguments)]
+async fn ensure_dfrost_engine_for(
+    dfrost_logs: &DfrostLogsMap,
+    registry: &std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
+    community_id: crate::owner_state_types::SpaceId,
+    dfrost_log_adapter_request_tx: Option<
+        tokio::sync::mpsc::Sender<crate::event_loop::DfrostLogAdapterRequest>,
+    >,
+    local_signing_key: &ed25519_dalek::SigningKey,
+    local_owner: crate::owner_state_types::OwnerAddr,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    self_identity_pub_64: [u8; 64],
+    app_handle: Option<tauri::AppHandle<tauri::Wry>>,
+) -> Result<(), String> {
+    // Fast path: engine already registered for this community.
+    if registry.get(community_id).await.is_some() {
+        return Ok(());
+    }
+
+    // Get-or-insert the shared DfrostLog Arc — the same map the 5 dfrost
+    // IPCs apply against, so local IPC applies and peer inbound applies
+    // converge on one log.
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(community_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    // Production identity resolver — the same OwnerDeviceCacheResolver the
+    // voting/channel engines use (`process_inbound` resolves event.actor →
+    // 64-byte identity composite for signature verification).
+    let identity_resolver: std::sync::Arc<
+        dyn crate::community_state_sync::IdentityResolver + Send + Sync,
+    > = std::sync::Arc::new(crate::community_state_sync::OwnerDeviceCacheResolver::new(
+        crdt_state.clone(),
+        local_owner,
+        self_identity_pub_64,
+    ));
+
+    // X25519 decryption key for round-2 DKG shares addressed to self —
+    // same derivation the dfrost IPCs use for their local applies.
+    let self_x25519_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(local_signing_key);
+
+    let (publisher_tx, publisher_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    let params = crate::community_dfrost_log_engine::DfrostLogEngineParams {
+        community_id,
+        dfrost_log: log_arc,
+        publisher_tx,
+        subscriber_rx,
+        app_handle,
+        self_addr: local_owner,
+        self_x25519_priv,
+        identity_resolver,
+        // Injected by register_if_vacant.
+        registry_weak: None,
+    };
+
+    // Race-safe: only the caller that actually created the engine sends
+    // the adapter request; a loser's channel halves drop unused here.
+    let created =
+        crate::community_dfrost_log_engine::DfrostLogRegistry::register_if_vacant(registry, params)
+            .await
+            .is_some();
+    if !created {
+        return Ok(());
+    }
+
+    let Some(tx) = dfrost_log_adapter_request_tx else {
+        tracing::warn!(
+            ?community_id,
+            "dfrost engine registered without Zenoh wiring \
+             (no adapter-request channel — test context?)"
+        );
+        return Ok(());
+    };
+    // Same semantics as the voting path: a send failure (event loop
+    // shutting down) leaves the engine registered but unwired — only
+    // reachable during app shutdown.
+    tx.send(crate::event_loop::DfrostLogAdapterRequest {
+        id_hex: hex::encode(community_id.0),
+        community_id,
+        crdt_state,
+        publisher_rx,
+        subscriber_tx,
+    })
+    .await
+    .map_err(|e| format!("dfrost_log_adapter_request_tx send failed: {e}"))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ensure_voting_engine_for(
     voting_logs: &VotingLogsMap,
@@ -60214,7 +60488,44 @@ async fn ensure_voting_engine_for(
     // ZEB-718: identity_dir for on-disk voting-log persistence. `None` ⇒
     // the engine runs without persistence (test/headless bypass paths).
     identity_dir: Option<std::path::PathBuf>,
+    // ZEB-1018: dfrost-engine handles so ensuring a voting engine also
+    // ensures the community's D-FROST engine + Zenoh adapter. Both the
+    // boot sweep and the lazy IPC path flow through here, so the
+    // invariant "voting engine ⇒ dfrost engine" holds at every seam
+    // (Tier-3 PollCreate hard-rejects with DfrostNotReady otherwise).
+    dfrost_logs: &DfrostLogsMap,
+    dfrost_log_adapter_request_tx: Option<
+        tokio::sync::mpsc::Sender<crate::event_loop::DfrostLogAdapterRequest>,
+    >,
 ) -> Result<(), String> {
+    // ZEB-1018: ensure the dfrost engine BEFORE the voting fast path so a
+    // community whose voting engine already exists still self-heals a
+    // missing dfrost engine (ensure_dfrost_engine_for has its own cheap
+    // registry fast path). Warn-and-continue: a dfrost wiring failure
+    // must not take down voting-engine setup — Tier-3 simply stays
+    // gated on DfrostNotReady for this community until the next ensure.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        if let Err(e) = ensure_dfrost_engine_for(
+            dfrost_logs,
+            registry,
+            community_id,
+            dfrost_log_adapter_request_tx,
+            &local_signing_key,
+            local_owner,
+            crdt_state.clone(),
+            self_identity_pub_64,
+            app_handle.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                ?community_id,
+                err = %e,
+                "dfrost engine ensure failed; Tier-3 stays gated for this community"
+            );
+        }
+    }
+
     // Fast-path read under the std::Mutex (no awaits). Saves the
     // engine-construction cost when the engine already exists.
     {
@@ -60459,6 +60770,15 @@ struct VotingEngineNodeHandles {
     beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
     voting_log_adapter_request_tx:
         tokio::sync::mpsc::Sender<crate::event_loop::VotingLogAdapterRequest>,
+    // ZEB-1018: dfrost-engine ensure handles. The logs map is always
+    // present on NodeState; the adapter tx is `None` when the node is
+    // stopped or in test contexts that bypass `start_node` (the dfrost
+    // engine then registers without Zenoh wiring — soft, unlike the
+    // voting tx above, because voting's hard error already gates the
+    // stopped-node case for both).
+    dfrost_logs: DfrostLogsMap,
+    dfrost_log_adapter_request_tx_opt:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::DfrostLogAdapterRequest>>,
     self_identity_pub_64: [u8; 64],
     // ZEB-720: Optional so headless `serve` (no GUI AppHandle) can extract
     // voting handles. `None` ⇒ engine runs headless; Tier-3 + delegate-on-
@@ -60509,6 +60829,9 @@ impl VotingEngineNodeHandles {
                 .voting_log_adapter_request_tx
                 .clone()
                 .ok_or("voting_log_adapter_request_tx missing")?,
+            // ZEB-1018: dfrost ensure handles (tx soft — see field doc).
+            dfrost_logs: std::sync::Arc::clone(&g.dfrost_logs),
+            dfrost_log_adapter_request_tx_opt: g.dfrost_log_adapter_request_tx.clone(),
             // Needed to construct the production OwnerDeviceCacheResolver.
             self_identity_pub_64: g
                 .dm_identity_pub_64
@@ -60561,6 +60884,8 @@ impl VotingEngineNodeHandles {
             self.dfrost_log_registry.clone(),
             self.beacon_requester.clone(),
             self.identity_dir.clone(),
+            &self.dfrost_logs,
+            self.dfrost_log_adapter_request_tx_opt.clone(),
         )
         .await?;
         let engine_arc = {
@@ -62275,6 +62600,10 @@ mod voting_ipc_tests {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DfrostDkgProgressPayload {
+    /// ZEB-1018: hex `SpaceId` of the community the ceremony belongs to.
+    /// Now that the transport adapter feeds peer events into the same
+    /// Tauri emissions, a multi-community client needs a filter key.
+    pub community_id: String,
     pub ceremony_id: String,
     pub round_num: u8,
     pub participants_so_far: u8,
@@ -62290,6 +62619,8 @@ pub struct DfrostDkgProgressPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DfrostBeaconReadyPayload {
+    /// ZEB-1018: hex `SpaceId` filter key — see `DfrostDkgProgressPayload`.
+    pub community_id: String,
     pub ceremony_id: String,
     pub vrf_output: String, // 32 bytes → 64 hex chars
 }
@@ -62586,7 +62917,7 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
                 tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_initiate_dkg: no engine registered for community — \
-                     broadcast skipped (Zenoh adapter not yet wired)",
+                     broadcast skipped (engine not registered — boot/join ensure has not run for this community?)",
                 );
             }
         },
@@ -62605,6 +62936,7 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
     //     pending_dkg.round1_packages.
     let ceremony_id_hex = hex::encode(ceremony_id);
     let evt_payload = DfrostDkgProgressPayload {
+        community_id: hex::encode(space_id.0),
         ceremony_id: ceremony_id_hex.clone(),
         round_num: 1,
         participants_so_far: 1,
@@ -62918,7 +63250,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                         space_id = ?space_id,
                         "dfrost_contribute_dkg_round (rn=1): no engine \
                          registered for community — broadcast skipped \
-                         (Zenoh adapter not yet wired)",
+                         (engine not registered — boot/join ensure has not run for this community?)",
                     );
                 }
             },
@@ -62931,6 +63263,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         }
 
         let evt_payload = DfrostDkgProgressPayload {
+            community_id: hex::encode(space_id.0),
             ceremony_id: hex::encode(ceremony_bytes),
             round_num: 1,
             participants_so_far: u8::try_from(participants_after).unwrap_or(u8::MAX),
@@ -63379,7 +63712,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                     round_num = round_num,
                     "dfrost_contribute_dkg_round (rn=2/3): no engine \
                      registered for community — broadcast skipped \
-                     (Zenoh adapter not yet wired)",
+                     (engine not registered — boot/join ensure has not run for this community?)",
                 );
             }
         },
@@ -63425,6 +63758,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     };
 
     let evt_payload = DfrostDkgProgressPayload {
+        community_id: hex::encode(space_id.0),
         ceremony_id: hex::encode(ceremony_bytes),
         round_num,
         participants_so_far: participants_count,
@@ -63715,7 +64049,7 @@ pub(crate) async fn dfrost_request_vrf_beacon_inner(
                 tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_request_vrf_beacon: no engine registered for \
-                     community — broadcast skipped (Zenoh adapter not yet wired)",
+                     community — broadcast skipped (engine not registered — boot/join ensure has not run for this community?)",
                 );
             }
         },
@@ -64112,7 +64446,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                     space_id = ?space_id,
                     "dfrost_contribute_threshold_sign (ts share): no engine \
                      registered for community — broadcast skipped \
-                     (Zenoh adapter not yet wired)",
+                     (engine not registered — boot/join ensure has not run for this community?)",
                 );
             }
         },
@@ -64313,7 +64647,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                     space_id = ?space_id,
                     "dfrost_contribute_threshold_sign (vb aggregate): no engine \
                      registered for community — broadcast skipped \
-                     (Zenoh adapter not yet wired)",
+                     (engine not registered — boot/join ensure has not run for this community?)",
                 );
             }
         },
@@ -64343,6 +64677,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     }
 
     let evt = DfrostBeaconReadyPayload {
+        community_id: hex::encode(space_id.0),
         ceremony_id: hex::encode(ceremony_bytes),
         vrf_output: hex::encode(vrf_output),
     };
@@ -64362,6 +64697,8 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DfrostRefreshProgressPayload {
+    /// ZEB-1018: hex `SpaceId` filter key — see `DfrostDkgProgressPayload`.
+    pub community_id: String,
     pub ceremony_id: String,
     pub round_num: u8,
 }
@@ -64784,7 +65121,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
                 tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_propose_refresh: no engine registered for \
-                     community — broadcast skipped (Zenoh adapter not yet wired)",
+                     community — broadcast skipped (engine not registered — boot/join ensure has not run for this community?)",
                 );
             }
         },
@@ -64799,6 +65136,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     // 13. Emit progress event.
     let ceremony_id_hex = hex::encode(ceremony_id);
     let evt_payload = DfrostRefreshProgressPayload {
+        community_id: hex::encode(space_id.0),
         ceremony_id: ceremony_id_hex.clone(),
         round_num: 1,
     };
@@ -84089,6 +84427,7 @@ mod start_node_race_tests {
             community_adapter_request_tx: None,
             transport_epoch_rx: None,
             voting_log_adapter_request_tx: None,
+            dfrost_log_adapter_request_tx: None,
             app_handle_wry: None,
             channel_log_registry: None,
             dfrost_log_registry: None,

@@ -252,3 +252,59 @@ describe('VotingAdapter.listTier3Polls', () => {
     expect(invoke).toHaveBeenCalledWith('voting_list_tier3_polls', { communityId: '11' });
   });
 });
+
+// ── ZEB-1018: D-FROST ceremony event subscribers ────────────────────────────
+
+describe('VotingAdapter D-FROST event subscribers', () => {
+  it('delivers dfrost-dkg-progress payloads to subscribers', async () => {
+    const { adapter, emit } = makeMockAdapter();
+    const va = new VotingAdapter();
+    await va.connectAdapter(adapter);
+    const seen: Array<{ communityId: string; roundNum: number }> = [];
+    va.subscribeDfrostDkgProgress((p) => seen.push(p));
+    emit('dfrost-dkg-progress', {
+      communityId: 'bb'.repeat(16),
+      ceremonyId: 'aa'.repeat(32),
+      roundNum: 2,
+      participantsSoFar: 3,
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.communityId).toBe('bb'.repeat(16));
+    expect(seen[0]?.roundNum).toBe(2);
+  });
+
+  it('delivers dfrost-beacon-ready payloads to subscribers', async () => {
+    const { adapter, emit } = makeMockAdapter();
+    const va = new VotingAdapter();
+    await va.connectAdapter(adapter);
+    const seen: Array<{ vrfOutput: string }> = [];
+    va.subscribeDfrostBeaconReady((p) => seen.push(p));
+    emit('dfrost-beacon-ready', {
+      communityId: 'bb'.repeat(16),
+      ceremonyId: 'aa'.repeat(32),
+      vrfOutput: 'cd'.repeat(32),
+    });
+    expect(seen[0]?.vrfOutput).toBe('cd'.repeat(32));
+  });
+
+  it('delivers dfrost-refresh-progress payloads and honors unsubscribe', async () => {
+    const { adapter, emit } = makeMockAdapter();
+    const va = new VotingAdapter();
+    await va.connectAdapter(adapter);
+    const seen: Array<{ roundNum: number }> = [];
+    const unsub = va.subscribeDfrostRefreshProgress((p) => seen.push(p));
+    emit('dfrost-refresh-progress', {
+      communityId: 'bb'.repeat(16),
+      ceremonyId: 'aa'.repeat(32),
+      roundNum: 1,
+    });
+    expect(seen).toHaveLength(1);
+    unsub();
+    emit('dfrost-refresh-progress', {
+      communityId: 'bb'.repeat(16),
+      ceremonyId: 'aa'.repeat(32),
+      roundNum: 2,
+    });
+    expect(seen).toHaveLength(1);
+  });
+});

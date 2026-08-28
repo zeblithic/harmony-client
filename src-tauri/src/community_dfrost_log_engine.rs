@@ -1,9 +1,9 @@
 //! D-FROST per-community signed-event log engine. Mirrors the
 //! `community_voting_log_engine.rs` pattern: one topic per community
 //! at `harmony/community/{community_id}/dfrost`; mpsc-based publisher
-//! and subscriber channels bridged to Zenoh by the event-loop adapter
-//! (deferred — out of scope for ZEB-307; this ticket ships the engine,
-//! a follow-up ships the adapter).
+//! and subscriber channels bridged to Zenoh by
+//! `event_loop::spawn_dfrost_log_zenoh_adapter` (ZEB-1018), which
+//! `ensure_dfrost_engine_for` requests when it registers an engine.
 
 use crate::community_dfrost_log::{verify_signed_committee_event, DfrostLog};
 use crate::community_dfrost_types::{
@@ -107,7 +107,11 @@ pub struct DfrostLogEngineParams<R: tauri::Runtime> {
     pub dfrost_log: Arc<Mutex<DfrostLog>>,
     pub publisher_tx: mpsc::Sender<Vec<u8>>,
     pub subscriber_rx: mpsc::Receiver<Vec<u8>>,
-    pub app_handle: tauri::AppHandle<R>,
+    /// ZEB-1018: `Option` so headless `serve` (no GUI AppHandle) can run
+    /// the engine — mirrors `VotingLogEngineParams.app_handle` (ZEB-720).
+    /// `None` makes the inbound-progress Tauri emits no-op; everything
+    /// else (verify/dedup/apply/beacon fan-out) is GUI-independent.
+    pub app_handle: Option<tauri::AppHandle<R>>,
     pub self_addr: OwnerAddr,
     pub self_x25519_priv: [u8; 32],
     /// OwnerAddr → 64-byte identity composite (X25519 || Ed25519). Same
@@ -178,7 +182,7 @@ async fn process_inbound<R: tauri::Runtime>(
     community_id: SpaceId,
     dfrost_log: &Arc<Mutex<DfrostLog>>,
     tracker: &Arc<Mutex<DfrostReplayTracker>>,
-    app_handle: &tauri::AppHandle<R>,
+    app_handle: Option<&tauri::AppHandle<R>>,
     self_addr: &OwnerAddr,
     self_x25519_priv: &[u8; 32],
     identity_resolver: &Arc<dyn IdentityResolver + Send + Sync>,
@@ -286,16 +290,19 @@ async fn process_inbound<R: tauri::Runtime>(
                         u8::try_from(count).unwrap_or(u8::MAX)
                     };
                     let evt = DfrostDkgProgressPayload {
+                        community_id: hex::encode(community_id.0),
                         ceremony_id: hex::encode(payload.ceremony_id),
                         round_num: payload.round_num,
                         participants_so_far,
                     };
-                    if let Err(e) = app_handle.emit("dfrost-dkg-progress", &evt) {
-                        tracing::warn!(
-                            community_id = %hex::encode(community_id.0),
-                            error = %e,
-                            "dfrost-dkg-progress emit failed (inbound)",
-                        );
+                    if let Some(app) = app_handle {
+                        if let Err(e) = app.emit("dfrost-dkg-progress", &evt) {
+                            tracing::warn!(
+                                community_id = %hex::encode(community_id.0),
+                                error = %e,
+                                "dfrost-dkg-progress emit failed (inbound)",
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -311,15 +318,18 @@ async fn process_inbound<R: tauri::Runtime>(
             match ciborium::de::from_reader::<VrfBeaconPayload, _>(&event.payload[..]) {
                 Ok(payload) => {
                     let evt = DfrostBeaconReadyPayload {
+                        community_id: hex::encode(community_id.0),
                         ceremony_id: hex::encode(payload.ceremony_id),
                         vrf_output: hex::encode(payload.vrf_output),
                     };
-                    if let Err(e) = app_handle.emit("dfrost-beacon-ready", &evt) {
-                        tracing::warn!(
-                            community_id = %hex::encode(community_id.0),
-                            error = %e,
-                            "dfrost-beacon-ready emit failed (inbound)",
-                        );
+                    if let Some(app) = app_handle {
+                        if let Err(e) = app.emit("dfrost-beacon-ready", &evt) {
+                            tracing::warn!(
+                                community_id = %hex::encode(community_id.0),
+                                error = %e,
+                                "dfrost-beacon-ready emit failed (inbound)",
+                            );
+                        }
                     }
                     // Dispatch beacon callbacks to notify the VotingLogEngine
                     // so it can compute + publish kd=ss.
@@ -344,15 +354,18 @@ async fn process_inbound<R: tauri::Runtime>(
             match ciborium::de::from_reader::<RefreshRoundPayload, _>(&event.payload[..]) {
                 Ok(payload) => {
                     let evt = DfrostRefreshProgressPayload {
+                        community_id: hex::encode(community_id.0),
                         ceremony_id: hex::encode(payload.ceremony_id),
                         round_num: payload.round_num,
                     };
-                    if let Err(e) = app_handle.emit("dfrost-refresh-progress", &evt) {
-                        tracing::warn!(
-                            community_id = %hex::encode(community_id.0),
-                            error = %e,
-                            "dfrost-refresh-progress emit failed (inbound)",
-                        );
+                    if let Some(app) = app_handle {
+                        if let Err(e) = app.emit("dfrost-refresh-progress", &evt) {
+                            tracing::warn!(
+                                community_id = %hex::encode(community_id.0),
+                                error = %e,
+                                "dfrost-refresh-progress emit failed (inbound)",
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -478,7 +491,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                     community_id,
                     &log_for_loop,
                     &tracker_for_loop,
-                    &app_for_loop,
+                    app_for_loop.as_ref(),
                     &self_addr_for_loop,
                     &self_x_priv_for_loop,
                     &resolver_for_loop,
@@ -654,6 +667,34 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
         engines.get(&community_id).cloned()
     }
 
+    /// ZEB-1018: race-safe ensure — start + insert an engine only if the
+    /// community has none. Returns `Some(engine)` when this call created
+    /// it (the caller then owns sending the matching adapter request), or
+    /// `None` when an engine already existed (the caller's channel halves
+    /// drop unused — no task was ever spawned for the loser).
+    ///
+    /// Unlike `register` (replace + abort, used by tests that deliberately
+    /// swap engines), this is the production path: two concurrent
+    /// `ensure_dfrost_engine_for` calls must not double-subscribe the
+    /// community topic, and `register`'s replace semantics would abort the
+    /// winner's live engine. The engines lock is held across
+    /// `DfrostLogEngine::start` — start only spawns the receive task
+    /// (no I/O, no other locks), so the critical section stays short.
+    pub async fn register_if_vacant(
+        this: &Arc<Self>,
+        mut params: DfrostLogEngineParams<R>,
+    ) -> Option<Arc<DfrostLogEngine<R>>> {
+        let cid = params.community_id;
+        let mut engines = this.engines.lock().await;
+        if engines.contains_key(&cid) {
+            return None;
+        }
+        params.registry_weak = Some(Arc::downgrade(this));
+        let engine = DfrostLogEngine::start(params).await;
+        engines.insert(cid, Arc::clone(&engine));
+        Some(engine)
+    }
+
     /// Drop every engine. Each engine's receive task is explicitly
     /// aborted here, independent of `Drop`: external code that retained
     /// an `Arc` clone from a prior `registry.get(cid).await` would
@@ -819,7 +860,7 @@ mod tests {
             dfrost_log: log.clone(),
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: crate::owner_state_types::OwnerAddr([0u8; 16]),
             self_x25519_priv: [0u8; 32],
             identity_resolver: resolver,
@@ -949,7 +990,7 @@ mod tests {
             dfrost_log: log.clone(),
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: alice_addr,
             self_x25519_priv: alice_x_priv,
             identity_resolver: resolver,
@@ -1086,7 +1127,7 @@ mod tests {
             dfrost_log: log.clone(),
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: alice_addr,
             self_x25519_priv: alice_x_priv,
             identity_resolver: resolver,
@@ -1217,7 +1258,7 @@ mod tests {
             dfrost_log: log.clone(),
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: alice_addr,
             self_x25519_priv: alice_x_priv,
             identity_resolver: resolver,
@@ -1286,7 +1327,7 @@ mod tests {
             dfrost_log: log,
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: OwnerAddr([0u8; 16]),
             self_x25519_priv: [0u8; 32],
             identity_resolver: resolver,
@@ -1418,7 +1459,7 @@ mod tests {
             dfrost_log: log.clone(),
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: alice_addr,
             self_x25519_priv: alice_x_priv,
             identity_resolver: resolver,
@@ -1492,7 +1533,7 @@ mod tests {
             dfrost_log: log,
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: OwnerAddr([0u8; 16]),
             self_x25519_priv: [0u8; 32],
             identity_resolver: resolver,
@@ -1511,6 +1552,44 @@ mod tests {
             DfrostLogRegistry::register(&reg, registry_test_params(community_id, app_handle)).await;
         assert!(reg.get(community_id).await.is_some());
         assert!(reg.get(SpaceId([99u8; 16])).await.is_none());
+    }
+
+    /// ZEB-1018: `register_if_vacant` creates on vacancy and refuses on
+    /// occupancy WITHOUT aborting the incumbent — the production ensure
+    /// path must never let a losing concurrent caller kill the winner's
+    /// live engine (which `register`'s replace semantics would).
+    #[tokio::test]
+    async fn registry_register_if_vacant_creates_once_and_keeps_incumbent() {
+        let reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+        let cid = SpaceId([5u8; 16]);
+        let app = tauri::test::mock_app();
+
+        let first = DfrostLogRegistry::register_if_vacant(
+            &reg,
+            registry_test_params(cid, app.handle().clone()),
+        )
+        .await
+        .expect("vacant registry must create the engine");
+
+        let second = DfrostLogRegistry::register_if_vacant(
+            &reg,
+            registry_test_params(cid, app.handle().clone()),
+        )
+        .await;
+        assert!(second.is_none(), "occupied registry must refuse");
+
+        // The incumbent stays registered and its receive loop stays live
+        // (its channel peers in `first`'s params are held by nothing here,
+        // but the refusal path must not have aborted it).
+        assert!(
+            !first.receive_handle_is_finished(),
+            "incumbent's receive loop must not be aborted by a refused ensure"
+        );
+        let got = reg.get(cid).await.expect("engine still present");
+        assert!(
+            Arc::ptr_eq(&got, &first),
+            "registry must still hold the incumbent engine"
+        );
     }
 
     /// R2 fix: when `register()` replaces an existing engine, the OLD
@@ -1698,7 +1777,7 @@ mod tests {
                 dfrost_log: log,
                 publisher_tx: pub_tx,
                 subscriber_rx: sub_rx,
-                app_handle: app.handle().clone(),
+                app_handle: Some(app.handle().clone()),
                 self_addr: OwnerAddr([0u8; 16]),
                 self_x25519_priv: [0u8; 32],
                 identity_resolver: resolver,
@@ -1807,7 +1886,7 @@ mod tests {
                 dfrost_log,
                 publisher_tx: pub_tx,
                 subscriber_rx: sub_rx,
-                app_handle: app.handle().clone(),
+                app_handle: Some(app.handle().clone()),
                 self_addr: OwnerAddr([0u8; 16]),
                 self_x25519_priv: [0u8; 32],
                 identity_resolver: resolver,

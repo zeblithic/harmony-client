@@ -264,6 +264,30 @@ pub struct VotingLogAdapterRequest {
     pub rbsr_hooks: Option<VotingRbsrHooks>,
 }
 
+/// ZEB-1018: per-community D-FROST committee-log adapter request.
+/// Live pub/sub only — committee ceremonies (DKG / threshold-sign /
+/// proactive refresh) are interactive multi-party rounds, so there is
+/// no backfill or RBSR half: a node that missed a round cannot
+/// retroactively join the ceremony, and durable committee state is
+/// ZEB-753's VerifiedLog adoption, not a transport concern.
+pub struct DfrostLogAdapterRequest {
+    /// Hex-encoded community SpaceId — used to form
+    /// `harmony/community/{id_hex}/dfrost`.
+    pub id_hex: String,
+    /// Community SpaceId, for the epoch-key `Space` lookup in
+    /// `crdt_state` when the adapter encrypts/decrypts committee packets.
+    pub community_id: crate::owner_state_types::SpaceId,
+    /// Live owner CRDT state — the adapter reads the community's current
+    /// epoch key from here to encrypt outbound puts and current-epoch-only
+    /// decrypt inbound samples (wire = ciphertext, in-process = plaintext),
+    /// mirroring the voting plane (ZEB-717 semantics).
+    pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// Engine outbound → Zenoh `put`.
+    pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Zenoh subscriber → engine inbound.
+    pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// ZEB-270 Phase 3 Task 4.5: per-channel adapter request handed from
 /// `ChannelLogRegistry::spawn` (lib.rs / runtime IPC) into the event
 /// loop's Zenoh-session scope.
@@ -1110,6 +1134,13 @@ pub async fn run(
     // capacity 32 — same as `community_adapter_request_rx` (voting
     // engine creation is always user-triggered via IPC, low burst rate).
     mut voting_log_adapter_request_rx: mpsc::Receiver<VotingLogAdapterRequest>,
+    // ZEB-1018: on-demand D-FROST committee-log adapter request receiver.
+    // `ensure_dfrost_engine_for` sends a `DfrostLogAdapterRequest` here;
+    // the select! arm below drains it and calls
+    // `spawn_dfrost_log_zenoh_adapter` against the live session. Bounded
+    // capacity 32, same shape as the voting receiver above (engine
+    // creation is boot-sweep or IPC-triggered, low burst rate).
+    mut dfrost_log_adapter_request_rx: mpsc::Receiver<DfrostLogAdapterRequest>,
     // ZEB-262 Phase 4 Task 9: community sync registry. Used for community
     // CRDT sync and adapter spawning. `None` until the owner identity is
     // loaded — same gating shape as `dm_outbox` / `crdt_state`.
@@ -7537,6 +7568,23 @@ pub async fn run(
                 );
             }
 
+            // ── ZEB-1018: D-FROST committee-log adapter bridge ───────
+            // Drained whenever ensure_dfrost_engine_for enqueues an
+            // adapter request. Spawns the per-community Zenoh adapter
+            // (live pub/sub only) against the live session_arc. Same
+            // closing-flag plumbing as the voting arm above.
+            Some(req) = dfrost_log_adapter_request_rx.recv() => {
+                spawn_dfrost_log_zenoh_adapter(
+                    Arc::clone(&session_arc),
+                    req.id_hex,
+                    req.community_id,
+                    req.crdt_state,
+                    req.publisher_rx,
+                    req.subscriber_tx,
+                    Arc::clone(&closing),
+                );
+            }
+
             // ── ZEB-270 Phase 3 Task 4.5: channel-log adapter bridge ──
             // Drained whenever `ChannelLogRegistry::spawn` enqueues an
             // adapter request. Spawns the per-channel Zenoh adapter
@@ -11770,6 +11818,274 @@ pub fn spawn_voting_log_zenoh_adapter(
         if let Some(h) = rbsr_resp_handle {
             let _ = h.await;
         }
+    })
+}
+
+/// ZEB-1018: inbound size cap for D-FROST committee packets. A
+/// `SignedCommitteeEvent` is small CBOR — the largest kind is a DKG
+/// round-2 event carrying one `RecipientCiphertext` per committee
+/// member, still well under this bound for any realistic committee.
+/// Same value as `MAX_VOTING_PAYLOAD_BYTES`; capped before decode to
+/// prevent peer-controlled allocation.
+const MAX_DFROST_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// ZEB-1018: per-community Zenoh adapter for the D-FROST committee-log
+/// data plane. Topic: `harmony/community/{id_hex}/dfrost` (live pub/sub
+/// only — see `DfrostLogAdapterRequest` for why there is no backfill
+/// half). This is the "swap-in byte-relay glue" the ZEB-307 engine and
+/// its transport integration test were built against: outbound drains
+/// the engine's `publisher_rx` → epoch-encrypt (`DFROST_TOPIC_AAD`) →
+/// `put`; inbound subscribes, current-epoch-only decrypts, and forwards
+/// plaintext `SignedCommitteeEvent` CBOR into the engine's
+/// `subscriber_tx` (the engine's `process_inbound` owns verify / dedup /
+/// apply / emit).
+///
+/// Fire-and-forget like the voting adapter: `event_loop::run`'s select!
+/// arm calls it and drops the `JoinHandle`. Tasks exit when `closing`
+/// is set, when the engine drops its channel halves (registry teardown),
+/// or when Zenoh closes the subscriber.
+pub fn spawn_dfrost_log_zenoh_adapter(
+    session: Arc<zenoh::Session>,
+    community_id_hex: String,
+    community_id: crate::owner_state_types::SpaceId,
+    crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    closing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let topic = format!("harmony/community/{community_id_hex}/dfrost");
+
+    tokio::spawn(async move {
+        let key_expr = match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "community dfrost-log key_expr invalid; adapter skipped"
+                );
+                // publisher_rx and subscriber_tx drop on this arm's exit;
+                // the engine's receive loop sees end-of-stream and its
+                // publish_event sends fail — degraded, local-only mode.
+                return;
+            }
+        };
+
+        // Outbound: drain engine's publisher_rx → encrypt → Zenoh put.
+        let session_pub = Arc::clone(&session);
+        let key_pub = key_expr.clone();
+        let topic_pub = topic.clone();
+        let closing_pub = Arc::clone(&closing);
+        let crdt_state_pub = Arc::clone(&crdt_state);
+        let pub_handle = tokio::spawn(async move {
+            // Bounded-time shutdown: poll `closing` every second (same
+            // rationale as the voting publisher arm — the outer
+            // JoinHandle must resolve even if no bytes ever flow).
+            loop {
+                tokio::select! {
+                    // Data-flow arm first: when a byte is queued AND the
+                    // 1s timer fires on the same poll, the publish wins
+                    // (see the voting adapter for the biased-order
+                    // rationale).
+                    biased;
+                    maybe = publisher_rx.recv() => {
+                        let Some(plaintext) = maybe else { break; };
+                        // Encrypt the engine's plaintext SignedCommitteeEvent
+                        // CBOR under the community's current epoch key (+
+                        // dfrost AAD). Missing epoch state ⇒ drop the
+                        // outbound — a node without the key is not a
+                        // broadcasting member; the engine already applied
+                        // locally.
+                        let wire: Option<Vec<u8>> = {
+                            let st = crdt_state_pub.lock().await;
+                            match st.spaces.get(&community_id) {
+                                Some(space) => match crate::community_state_sync::encrypt_for_topic_with_aad(
+                                    space,
+                                    &plaintext,
+                                    crate::community_state_sync::DFROST_TOPIC_AAD,
+                                ) {
+                                    Ok(envelope) => {
+                                        let mut w = Vec::new();
+                                        match ciborium::into_writer(&envelope, &mut w) {
+                                            Ok(()) => Some(w),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    topic = %topic_pub,
+                                                    error = %e,
+                                                    "dfrost envelope encode failed; dropping outbound"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            topic = %topic_pub,
+                                            error = %e,
+                                            "dfrost encrypt failed; dropping outbound"
+                                        );
+                                        None
+                                    }
+                                },
+                                None => {
+                                    tracing::warn!(
+                                        topic = %topic_pub,
+                                        "no community space for dfrost encrypt; dropping outbound"
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(wire) = wire {
+                            if let Err(e) = session_pub.put(&key_pub, wire).await {
+                                if !closing_pub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_pub,
+                                        error = %e,
+                                        "community dfrost-log publish failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // Inbound: Zenoh subscriber → decrypt (current-epoch-only) →
+        // engine's subscriber_tx.
+        let session_sub = session;
+        let key_sub = key_expr;
+        let topic_sub = topic;
+        let closing_sub = Arc::clone(&closing);
+        let crdt_state_sub = crdt_state;
+        let sub_handle = tokio::spawn(async move {
+            let sub = match session_sub.declare_subscriber(&key_sub).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !closing_sub.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            topic = %topic_sub,
+                            error = %e,
+                            "failed to declare community dfrost-log subscriber"
+                        );
+                    }
+                    // subscriber_tx drops on this arm's exit; the engine's
+                    // receive loop sees end-of-stream and exits — the node
+                    // continues in local-apply-only mode.
+                    return;
+                }
+            };
+            // Loop-exit conditions mirror the voting subscriber arm:
+            // send failure (engine torn down, silent), recv error (warn
+            // gated on !closing), closing flag (bounded shutdown), and
+            // subscriber_tx.closed() (engine dropped its rx while idle —
+            // without this arm the JoinHandle hangs until the next
+            // sample).
+            loop {
+                tokio::select! {
+                    // Data-flow arm first (see the voting subscriber for
+                    // the teardown-race rationale on delivering a sample
+                    // that ties with closed()).
+                    biased;
+                    res = sub.recv_async() => {
+                        match res {
+                            Ok(sample) => {
+                                let payload_len = sample.payload().len();
+                                if payload_len > MAX_DFROST_PAYLOAD_BYTES {
+                                    if !closing_sub.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %topic_sub,
+                                            len = payload_len,
+                                            max = MAX_DFROST_PAYLOAD_BYTES,
+                                            "dfrost payload exceeds size cap; dropping"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                let raw: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                // Current-epoch-only cut, mirroring the voting
+                                // plane: a kicked-then-rotated member's stale-
+                                // epoch envelope is dropped here before any
+                                // engine work. debug-level drops throughout —
+                                // every branch is peer-controllable.
+                                let plaintext: Vec<u8> = {
+                                    let envelope: crate::community_state_sync::EncryptedEnvelope =
+                                        match ciborium::from_reader(raw.as_slice()) {
+                                            Ok(env) => env,
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    topic = %topic_sub,
+                                                    error = %e,
+                                                    "drop dfrost packet (envelope decode)"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                    let st = crdt_state_sub.lock().await;
+                                    let Some(space) = st.spaces.get(&community_id) else {
+                                        continue;
+                                    };
+                                    match space.current_epoch {
+                                        Some(cur) if cur == envelope.epoch => {}
+                                        _ => {
+                                            tracing::debug!(
+                                                topic = %topic_sub,
+                                                epoch = envelope.epoch,
+                                                "drop dfrost packet (stale/unknown epoch)"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    match crate::community_state_sync::decrypt_for_topic_with_aad(
+                                        space,
+                                        &envelope,
+                                        crate::community_state_sync::DFROST_TOPIC_AAD,
+                                    ) {
+                                        Ok(pt) => pt,
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                topic = %topic_sub,
+                                                error = %e,
+                                                "drop dfrost packet (decrypt)"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                };
+                                if subscriber_tx.send(plaintext).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !closing_sub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_sub,
+                                        error = %e,
+                                        "community dfrost-log subscriber closed unexpectedly"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = subscriber_tx.closed() => {
+                        // Engine dropped subscriber_rx — nothing to
+                        // forward to anymore. Silent exit.
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_sub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        let _ = pub_handle.await;
+        let _ = sub_handle.await;
     })
 }
 

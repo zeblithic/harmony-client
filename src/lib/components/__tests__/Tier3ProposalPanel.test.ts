@@ -69,6 +69,10 @@ function createAdapterMock(summaries: Tier3PollSummary[] = []) {
   vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3DraftCandidate').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3DraftApproval').mockReturnValue(() => {});
+  // ZEB-1018 — D-FROST ceremony event subscribers.
+  vi.spyOn(adapter, 'subscribeDfrostDkgProgress').mockReturnValue(() => {});
+  vi.spyOn(adapter, 'subscribeDfrostBeaconReady').mockReturnValue(() => {});
+  vi.spyOn(adapter, 'subscribeDfrostRefreshProgress').mockReturnValue(() => {});
   return adapter;
 }
 
@@ -183,6 +187,9 @@ describe('Tier3ProposalPanel', () => {
     vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3DraftCandidate').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3DraftApproval').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeDfrostDkgProgress').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeDfrostBeaconReady').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeDfrostRefreshProgress').mockReturnValue(() => {});
 
     const aSummary: Tier3PollSummary = {
       pollId: 'aa'.repeat(32),
@@ -356,6 +363,94 @@ describe('Tier3ProposalPanel', () => {
     await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
     expect(adapter.getTier3Poll).toHaveBeenCalledWith(TEST_POLL_ID);
     // Draft-approval does NOT trigger loadSummaries — only refetchSelected.
+    expect(adapter.listTier3Polls).not.toHaveBeenCalled();
+  });
+
+  // ── ZEB-1018: D-FROST ceremony event tests ───────────────────────────────
+
+  it('refetches list + detail and clears ceremony status on dfrost-beacon-ready for this community', async () => {
+    let dkgHandler: ((p: { communityId: string; ceremonyId: string; roundNum: number; participantsSoFar: number }) => void) | null = null;
+    let beaconHandler: ((p: { communityId: string; ceremonyId: string; vrfOutput: string }) => void) | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeDfrostDkgProgress').mockImplementation((h) => {
+      dkgHandler = h as typeof dkgHandler;
+      return () => {};
+    });
+    vi.spyOn(adapter, 'subscribeDfrostBeaconReady').mockImplementation((h) => {
+      beaconHandler = h as typeof beaconHandler;
+      return () => {};
+    });
+
+    const { findByText, queryByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(dkgHandler).not.toBeNull();
+    expect(beaconHandler).not.toBeNull();
+
+    // A DKG progress event surfaces the ceremony status line.
+    dkgHandler!({
+      communityId: TEST_COMMUNITY_ID,
+      ceremonyId: 'ab'.repeat(32),
+      roundNum: 2,
+      participantsSoFar: 3,
+    });
+    expect(
+      await findByText(/Committee key ceremony — round 2 \(3 contributions\)/),
+    ).toBeTruthy();
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    // Beacon lands: status clears, list + selected detail refetch.
+    beaconHandler!({
+      communityId: TEST_COMMUNITY_ID,
+      ceremonyId: 'ab'.repeat(32),
+      vrfOutput: 'cd'.repeat(32),
+    });
+
+    await waitFor(() => expect(adapter.listTier3Polls).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(queryByText(/Committee key ceremony/)).toBeNull();
+  });
+
+  it('ignores dfrost events for a different community', async () => {
+    let dkgHandler: ((p: { communityId: string; ceremonyId: string; roundNum: number; participantsSoFar: number }) => void) | null = null;
+    let beaconHandler: ((p: { communityId: string; ceremonyId: string; vrfOutput: string }) => void) | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeDfrostDkgProgress').mockImplementation((h) => {
+      dkgHandler = h as typeof dkgHandler;
+      return () => {};
+    });
+    vi.spyOn(adapter, 'subscribeDfrostBeaconReady').mockImplementation((h) => {
+      beaconHandler = h as typeof beaconHandler;
+      return () => {};
+    });
+
+    const { queryByText, findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+    await findByText('Existing proposal');
+    await waitFor(() => expect(dkgHandler).not.toBeNull());
+
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    dkgHandler!({
+      communityId: 'ff'.repeat(16),
+      ceremonyId: 'ab'.repeat(32),
+      roundNum: 1,
+      participantsSoFar: 1,
+    });
+    beaconHandler!({
+      communityId: 'ff'.repeat(16),
+      ceremonyId: 'ab'.repeat(32),
+      vrfOutput: 'cd'.repeat(32),
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(queryByText(/Committee key ceremony/)).toBeNull();
     expect(adapter.listTier3Polls).not.toHaveBeenCalled();
   });
 
