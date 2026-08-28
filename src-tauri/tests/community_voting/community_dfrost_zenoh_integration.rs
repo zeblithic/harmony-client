@@ -172,6 +172,9 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         self_x25519_priv: alice_x_priv,
         identity_resolver: alice_resolver,
         registry_weak: None,
+        driver: None,
+        membership_resolver: None,
+        orchestrator_config: Default::default(),
     })
     .await;
 
@@ -185,6 +188,9 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         self_x25519_priv: bob_x_priv,
         identity_resolver: bob_resolver,
         registry_weak: None,
+        driver: None,
+        membership_resolver: None,
+        orchestrator_config: Default::default(),
     })
     .await;
 

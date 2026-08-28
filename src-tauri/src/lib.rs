@@ -59777,6 +59777,7 @@ mod zeb718_voting_reconcile_tests {
             crdt_state.clone(),
             [0u8; 64],
             None,
+            None, // driver_wiring (ZEB-1022): ingest-only engine in this fixture
         )
         .await
         .expect_err("send on a dead adapter channel must surface as Err");
@@ -59802,6 +59803,7 @@ mod zeb718_voting_reconcile_tests {
             crdt_state,
             [0u8; 64],
             None,
+            None, // driver_wiring (ZEB-1022): ingest-only engine in this fixture
         )
         .await
         .expect("retry after rollback must succeed");
@@ -60538,6 +60540,23 @@ const VOTING_BACKFILL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// Tier-3 `DfrostNotReady` gate work — but the engine runs without
 /// Zenoh wiring, exactly like a voting engine whose adapter send failed.
 #[allow(clippy::too_many_arguments)]
+/// ZEB-1022: handles `ensure_dfrost_engine_for` needs to construct the
+/// engine's `ProductionDkgDriver` (auto-drive / re-broadcast /
+/// deadline-restart) and its membership validation. `None` ⇒ the engine
+/// runs ingest-only (no orchestration) — the pre-ZEB-1022 behaviour,
+/// kept for test shapes that don't carry HLC/signing handles.
+pub(crate) struct DfrostDriverWiring {
+    pub hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
+    >,
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    pub device_id: String,
+    pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    pub membership_resolver:
+        std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn ensure_dfrost_engine_for(
     dfrost_logs: &DfrostLogsMap,
     registry: &std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
@@ -60550,6 +60569,7 @@ async fn ensure_dfrost_engine_for(
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     self_identity_pub_64: [u8; 64],
     app_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    driver_wiring: Option<DfrostDriverWiring>,
 ) -> Result<(), String> {
     // Fast path: engine already registered for this community.
     if registry.get(community_id).await.is_some() {
@@ -60588,6 +60608,37 @@ async fn ensure_dfrost_engine_for(
     let (publisher_tx, publisher_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
+    // ZEB-1022: construct the orchestration driver + membership resolver
+    // when the caller supplied the wiring. The driver's handles are the
+    // SAME shape the dfrost IPC wrappers build from NodeState, so
+    // orchestrator-driven contributions and manual IPC contributions run
+    // identical code.
+    let (driver, membership_resolver): (
+        Option<std::sync::Arc<dyn crate::community_dfrost_log_engine::DkgDriver>>,
+        Option<std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
+    ) = match driver_wiring {
+        Some(w) => {
+            let driver_handles = DfrostCoreHandles {
+                hlc_tracker: w.hlc_tracker,
+                adopt_floor: w.adopt_floor,
+                device_id: w.device_id,
+                self_owner: local_owner,
+                signing_key: w.signing_key,
+                dfrost_logs: dfrost_logs.clone(),
+                identity_resolver: Some(identity_resolver.clone()),
+                dfrost_log_registry: Some(registry.clone()),
+            };
+            (
+                Some(std::sync::Arc::new(ProductionDkgDriver {
+                    handles: driver_handles,
+                    app_handle: app_handle.clone(),
+                })),
+                Some(w.membership_resolver),
+            )
+        }
+        None => (None, None),
+    };
+
     let params = crate::community_dfrost_log_engine::DfrostLogEngineParams {
         community_id,
         dfrost_log: log_arc,
@@ -60599,6 +60650,10 @@ async fn ensure_dfrost_engine_for(
         identity_resolver,
         // Injected by register_if_vacant.
         registry_weak: None,
+        driver,
+        membership_resolver,
+        orchestrator_config: crate::community_dfrost_log_engine::DfrostOrchestratorConfig::default(
+        ),
     };
 
     // Race-safe: only the caller that actually created the engine sends
@@ -60707,6 +60762,16 @@ async fn ensure_voting_engine_for(
             crdt_state.clone(),
             self_identity_pub_64,
             app_handle.clone(),
+            // ZEB-1022: every production seam reaches here with the full
+            // handle set, so the engine always gets its orchestration
+            // driver (auto-drive + re-broadcast + deadline restart).
+            Some(DfrostDriverWiring {
+                hlc_tracker: hlc_tracker.clone(),
+                adopt_floor: adopt_floor.clone(),
+                device_id: device_id.clone(),
+                signing_key: local_signing_key.clone(),
+                membership_resolver: membership_resolver.clone(),
+            }),
         )
         .await
         {
@@ -62801,6 +62866,23 @@ pub struct DfrostDkgProgressPayload {
     pub participants_so_far: u8,
 }
 
+/// Tauri event payload for `"dfrost-dkg-aborted"` (ZEB-1022). Fired by
+/// the engine's orchestrator when the initiator's quiet-deadline abort
+/// clears a stalled ceremony (`will_retry = true` — a replacement
+/// ceremony with a fresh id follows) or when the restart budget is
+/// exhausted (`will_retry = false` — manual `dfrost_initiate_dkg`
+/// required).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DfrostDkgAbortedPayload {
+    /// Hex `SpaceId` filter key — see `DfrostDkgProgressPayload`.
+    pub community_id: String,
+    pub ceremony_id: String,
+    /// 1-based count of deadline-driven re-initiations so far.
+    pub restart_attempt: u32,
+    pub will_retry: bool,
+}
+
 /// Tauri event payload for `"dfrost-beacon-ready"`. Fired by
 /// `dfrost_contribute_threshold_sign` on the node that observes the
 /// threshold-th `ts` share land (i.e. the one that successfully aggregates
@@ -62815,6 +62897,245 @@ pub struct DfrostBeaconReadyPayload {
     pub community_id: String,
     pub ceremony_id: String,
     pub vrf_output: String, // 32 bytes → 64 hex chars
+}
+
+/// ZEB-1022: handle bundle for the dfrost initiate/contribute cores.
+/// Built per-call by the IPC wrappers (from `NodeState`) and once at
+/// engine-ensure time for the long-lived `ProductionDkgDriver` — the
+/// cores themselves never touch `NodeState`, which is what lets the
+/// orchestration layer drive them from the engine (including in
+/// headless `serve`, where no Tauri managed-state exists).
+#[derive(Clone)]
+pub(crate) struct DfrostCoreHandles {
+    pub hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
+    >,
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    pub device_id: String,
+    pub self_owner: crate::owner_state_types::OwnerAddr,
+    pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    pub dfrost_logs: DfrostLogsMap,
+    /// Recipient X25519 lookup for sealing round-2 packages. `None`
+    /// until the community registry exists (owner not loaded) — only
+    /// the round-2 path needs it and errors cleanly without it.
+    pub identity_resolver:
+        Option<std::sync::Arc<dyn crate::community_state_sync::IdentityResolver>>,
+    /// Broadcast seam. `None` in test contexts that bypass `start_node`
+    /// — broadcasts are skipped (logged), local applies stand.
+    pub dfrost_log_registry:
+        Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>>,
+}
+
+/// ZEB-1022: extract `DfrostCoreHandles` from managed `NodeState` for
+/// the IPC wrappers. Mirrors the extraction blocks the dfrost IPCs
+/// used inline (std guard dropped before any await).
+async fn dfrost_core_handles_from_state(
+    state_lock: &tauri::State<'_, Mutex<NodeState>>,
+) -> Result<DfrostCoreHandles, String> {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        dm_outbox,
+        dfrost_logs,
+        dfrost_log_registry,
+        community_registry,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("dfrost: NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_adopt_floor.clone(),
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            std::sync::Arc::clone(&g.dfrost_logs),
+            g.dfrost_log_registry.clone(),
+            g.community_registry.clone(),
+        )
+    };
+    let signing_key = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    Ok(DfrostCoreHandles {
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        signing_key,
+        dfrost_logs,
+        identity_resolver: community_registry.map(|r| r.identity_resolver()),
+        dfrost_log_registry,
+    })
+}
+
+/// ZEB-1022: production `DkgDriver` — the engine orchestrator's bridge
+/// back to the initiate/contribute/re-broadcast cores. One per engine,
+/// built by `ensure_dfrost_engine_for` from the same handles the IPCs
+/// use, so orchestrator-driven and IPC-driven contributions are
+/// byte-for-byte the same code path.
+struct ProductionDkgDriver {
+    handles: DfrostCoreHandles,
+    app_handle: Option<tauri::AppHandle<tauri::Wry>>,
+}
+
+#[async_trait::async_trait]
+impl crate::community_dfrost_log_engine::DkgDriver for ProductionDkgDriver {
+    async fn contribute_round(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        ceremony_id: [u8; 32],
+        round_num: u8,
+    ) -> Result<(), String> {
+        dfrost_contribute_dkg_round_core::<tauri::Wry>(
+            &self.handles,
+            self.app_handle.as_ref(),
+            community_id,
+            ceremony_id,
+            round_num,
+        )
+        .await
+    }
+
+    async fn rebroadcast_pending(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        ceremony_id: [u8; 32],
+    ) -> Result<(), String> {
+        dfrost_rebroadcast_pending_core(&self.handles, community_id, ceremony_id).await
+    }
+
+    async fn reinitiate(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        members: Vec<crate::owner_state_types::OwnerAddr>,
+        threshold: u16,
+    ) -> Result<String, String> {
+        dfrost_initiate_dkg_core::<tauri::Wry>(
+            &self.handles,
+            self.app_handle.as_ref(),
+            community_id,
+            members,
+            threshold,
+        )
+        .await
+    }
+}
+
+/// ZEB-1022: re-mint (fresh HLC + signature, identical payloads) and
+/// re-publish this node's own latest contributions for the pending DKG
+/// ceremony — `di` (if we initiated), `dr` rn=1, `dr` rn=2, `dk` — in
+/// that order. Heals peers that missed the originals (boot-window loss,
+/// late subscriber): their replay tracker keys `(actor, device)` →
+/// max-HLC, so re-publishing ORIGINAL bytes would be dropped by any
+/// peer that already saw a newer event from this actor; a fresh HLC
+/// clears the tracker while first-wins apply semantics keep the
+/// re-application a no-op for peers that already have it. Never
+/// re-applies locally.
+async fn dfrost_rebroadcast_pending_core(
+    handles: &DfrostCoreHandles,
+    space_id: crate::owner_state_types::SpaceId,
+    ceremony_bytes: [u8; 32],
+) -> Result<(), String> {
+    use crate::community_dfrost_types::DfrostEventKind;
+
+    let Some(registry) = handles.dfrost_log_registry.as_ref() else {
+        // No broadcast plane — nothing to re-broadcast into.
+        return Ok(());
+    };
+    let Some(engine) = registry.get(space_id).await else {
+        return Ok(());
+    };
+    let log_arc = {
+        let map = handles.dfrost_logs.lock().await;
+        match map.get(&space_id) {
+            Some(l) => l.clone(),
+            None => return Ok(()),
+        }
+    };
+
+    // Collect the newest self-authored event per slot (di / dr1 / dr2 /
+    // dk) belonging to the pending ceremony, under one short log lock.
+    let to_remint: Vec<crate::community_dfrost_types::SignedCommitteeEvent> = {
+        let log = log_arc.lock().await;
+        let Some(p) = log.committee_state.pending_dkg.as_ref() else {
+            return Ok(());
+        };
+        if p.ceremony_id != ceremony_bytes {
+            return Ok(());
+        }
+        let mut best: [Option<&crate::community_dfrost_types::SignedCommitteeEvent>; 4] = [None; 4];
+        for ev in log.events.iter().filter(|e| e.actor == handles.self_owner) {
+            let slot: Option<usize> = match ev.kind {
+                DfrostEventKind::CeremonyInit => ciborium::de::from_reader::<
+                    crate::community_dfrost_types::CeremonyInitPayload,
+                    _,
+                >(&ev.payload[..])
+                .ok()
+                .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                .map(|_| 0),
+                DfrostEventKind::DkgRound => ciborium::de::from_reader::<
+                    crate::community_dfrost_types::DkgRoundPayload,
+                    _,
+                >(&ev.payload[..])
+                .ok()
+                .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                .map(|pl| if pl.round_num == 1 { 1 } else { 2 }),
+                DfrostEventKind::DkgComplete => ciborium::de::from_reader::<
+                    crate::community_dfrost_types::DkgCompletePayload,
+                    _,
+                >(&ev.payload[..])
+                .ok()
+                .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                .map(|_| 3),
+                _ => None,
+            };
+            if let Some(s) = slot {
+                let newer = best[s]
+                    .map(|b| (b.hlc.wall_ms, b.hlc.logical) < (ev.hlc.wall_ms, ev.hlc.logical))
+                    .unwrap_or(true);
+                if newer {
+                    best[s] = Some(ev);
+                }
+            }
+        }
+        best.iter().flatten().map(|e| (*e).clone()).collect()
+    };
+    if to_remint.is_empty() {
+        return Ok(());
+    }
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    for ev in to_remint {
+        let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &handles.hlc_tracker,
+            &handles.adopt_floor,
+            &handles.device_id,
+            wall_now_ms,
+        )
+        .await;
+        let fresh = crate::community_dfrost_log::resign_dfrost_event_with_fresh_hlc(
+            &ev,
+            hlc,
+            handles.signing_key.as_ref(),
+        )?;
+        // publish_event records the fresh HLC in the local tracker
+        // before sending, so the Zenoh self-loopback dedups as usual.
+        engine.publish_event(fresh).await?;
+    }
+    Ok(())
 }
 
 /// Tauri IPC: admin initiates a fresh D-FROST committee DKG ceremony.
@@ -62842,7 +63163,7 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
     members: Vec<String>,
     threshold: u16,
 ) -> Result<String, String> {
-    // 1. Decode community_id hex → SpaceId.
+    // Decode hex args (IPC-boundary concern); the core takes typed args.
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("dfrost_initiate_dkg: invalid community_id hex: {e}"))?
         .as_slice()
@@ -62852,13 +63173,7 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         })?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    // 2. Decode + sort members for deterministic Identifier assignment.
-    //    The sort is load-bearing: PendingCeremony.members must match the
-    //    sorted order that build_identifier_map uses, otherwise the
-    //    initiator's local FROST Identifier (computed below via
-    //    identifier_for_index(self_index)) won't match the identifier
-    //    that peers derive from PendingCeremony.members.
-    let mut member_addrs: Vec<crate::owner_state_types::OwnerAddr> = members
+    let member_addrs: Vec<crate::owner_state_types::OwnerAddr> = members
         .iter()
         .map(|hex_str| {
             let bytes: [u8; 16] = hex::decode(hex_str)
@@ -62871,6 +63186,31 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
             Ok(crate::owner_state_types::OwnerAddr(bytes))
         })
         .collect::<Result<Vec<_>, String>>()?;
+
+    let handles = dfrost_core_handles_from_state(&state_lock).await?;
+    dfrost_initiate_dkg_core::<R>(&handles, Some(&app), space_id, member_addrs, threshold).await
+}
+
+/// ZEB-1022: shared core of `dfrost_initiate_dkg` — callable from the
+/// IPC wrapper above and from the engine orchestrator's `reinitiate`
+/// (deadline-abort restart). Reworked for the `di` bootstrap flow: the
+/// initiator now mints TWO events — a `di` (CeremonyInit) carrying the
+/// committee shape, whose local apply seeds `pending_dkg`, then the
+/// `dr` rn=1 round-1 package — and broadcasts them in that order on the
+/// same publisher (Zenoh preserves per-publisher FIFO, so peers always
+/// see the seed before the round).
+async fn dfrost_initiate_dkg_core<R: tauri::Runtime>(
+    handles: &DfrostCoreHandles,
+    app: Option<&tauri::AppHandle<R>>,
+    space_id: crate::owner_state_types::SpaceId,
+    mut member_addrs: Vec<crate::owner_state_types::OwnerAddr>,
+    threshold: u16,
+) -> Result<String, String> {
+    // Sort + dedup for deterministic Identifier assignment. The sort is
+    // load-bearing: PendingCeremony.members must match the sorted order
+    // that build_identifier_map uses, otherwise the initiator's local
+    // FROST Identifier (identifier_for_index(self_index)) won't match
+    // the identifier peers derive from PendingCeremony.members.
     member_addrs.sort();
     member_addrs.dedup();
 
@@ -62885,41 +63225,16 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         ));
     }
 
-    // 3. Extract NodeState handles, drop the std::Mutex guard immediately
-    //    so subsequent async lock acquisitions can't deadlock on it.
-    //    `dfrost_log_registry` is `None` in tests that bypass `start_node`;
-    //    the broadcast call-site at the end of this function is a no-op in
-    //    that case so the IPC integration tests still pass.
-    let (
-        hlc_tracker,
-        adopt_floor,
-        device_id,
-        self_owner,
-        dm_outbox,
-        dfrost_logs,
-        dfrost_log_registry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("dfrost_initiate_dkg: NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.hlc_adopt_floor.clone(),
-            g.dm_device_id
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dm_outbox
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            std::sync::Arc::clone(&g.dfrost_logs),
-            g.dfrost_log_registry.clone(),
-        )
-    };
+    // Handle bindings (ZEB-1022: extracted by the wrapper / driver
+    // construction — the core never touches NodeState).
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
 
-    // 4. Find self in the (sorted) member list; compute local FROST
+    // Find self in the (sorted) member list; compute local FROST
     //    Identifier from that zero-based index. The initiator MUST be a
     //    committee member — without a share, it can't participate in
     //    DKG rounds 2-3.
@@ -62929,88 +63244,59 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         .ok_or("dfrost_initiate_dkg: initiator must be a committee member")?;
     let self_id = crate::community_dfrost_crypto::identifier_for_index(self_index);
 
-    // 5. Reserve the next HLC for this device. Same path the voting IPCs
-    //    take, so cross-kind events on the same device remain monotonic.
+    // Reserve TWO HLCs — one for the `di` (its HLC binds the
+    // ceremony_id), one for the `dr` rn=1 — through the same path the
+    // voting IPCs take, so cross-kind events on this device remain
+    // monotonic. Reserving both up-front keeps di.hlc < dr.hlc.
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
-        &hlc_tracker,
-        &adopt_floor,
-        &device_id,
+    let hlc_di = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        wall_now_ms,
+    )
+    .await;
+    let hlc_dr = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
         wall_now_ms,
     )
     .await;
 
-    // 6. Derive ceremony_id = blake3(sorted_members || threshold_le ||
-    //    hlc.wall_ms_le || hlc.logical_le || space_id). All inputs are
-    //    agreed-upon-by-construction between initiator and peers (peers
-    //    learn members/threshold from the dr rn=1 ceremony bootstrap once
-    //    Zenoh broadcast lands; the HLC is signed-into the event
-    //    envelope; space_id scopes the id out of any other community's
-    //    namespace). Deterministic so any two nodes computing it from
-    //    the same inputs land on the same 32-byte id.
-    //
-    //    R1 (round-1 bot-review MAJOR): hlc.logical + space_id were
-    //    previously omitted. Without hlc.logical, two ceremonies that
-    //    materialise at the same wall_ms but different HLC ticks
-    //    collide; without space_id, two ceremonies in different
-    //    communities at the same HLC collide cross-space.
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(member_addrs.len() * 16 + 2 + 8 + 4 + 16);
-    for a in &member_addrs {
-        hasher_input.extend_from_slice(&a.0);
-    }
-    hasher_input.extend_from_slice(&threshold.to_le_bytes());
-    hasher_input.extend_from_slice(&hlc.wall_ms.to_le_bytes());
-    hasher_input.extend_from_slice(&hlc.logical.to_le_bytes());
-    hasher_input.extend_from_slice(&space_id.0);
-    let ceremony_id: [u8; 32] = blake3::hash(&hasher_input).into();
+    // Ceremony id = blake3 over (sorted members || threshold || di-HLC ||
+    // space_id) — ZEB-1022 moved the derivation into
+    // `derive_dkg_ceremony_id` so the peer-side `di` ingest gate
+    // recomputes the exact same binding and rejects any di whose claimed
+    // shape doesn't hash to its claimed id.
+    let ceremony_id = crate::community_dfrost_types::derive_dkg_ceremony_id(
+        &member_addrs,
+        threshold,
+        &hlc_di,
+        &space_id,
+    );
 
-    // 7. Run DKG round 1 for self. The secret half stays on this node;
-    //    the public package bytes ride inside the dr rn=1 payload.
+    // Run DKG round 1 for self. The secret half stays on this node;
+    // the public package bytes ride inside the dr rn=1 payload.
     let (r1_secret, r1_pkg_bytes) =
         crate::community_dfrost_crypto::dkg_part1_local(self_id, max_signers, threshold)
             .map_err(|e| format!("dfrost_initiate_dkg: dkg::part1 failed: {e}"))?;
 
-    // 8. Build the dr rn=1 payload + sign the envelope. Lock the outbox
-    //    only as long as needed to access the signing key.
-    let payload = crate::community_dfrost_types::DkgRoundPayload {
-        ceremony_id,
-        round_num: 1,
-        round1_package: Some(r1_pkg_bytes),
-        recipient_ciphertexts: None,
-    };
-    let (event, self_x25519_priv) = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
-            signing_key,
-            self_owner,
-            crate::community_dfrost_types::DfrostEventKind::DkgRound,
-            &payload,
-            hlc,
-        )
-        .map_err(|e| format!("dfrost_initiate_dkg: build_signed: {e}"))?;
-        // Derive the X25519 private key while we still hold the outbox
-        // lock (avoids re-locking just to read the same Arc<SigningKey>).
-        // `Zeroizing` deref-copies the inner [u8;32] on `*` — the
-        // Zeroizing wrapper itself is dropped here so the heap-side
-        // bytes get zeroed.
-        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
-        (ev, x_priv)
-    };
+    let signing_key = handles.signing_key.as_ref();
+    // `Zeroizing` deref-copies the inner [u8;32] on `*` — the Zeroizing
+    // wrapper itself is dropped here so the heap-side bytes get zeroed.
+    let self_x25519_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
 
-    // 9. Seed pending_dkg + stash local_dkg_secret + apply locally.
-    //    `apply_dkg_round` requires `pending_dkg.ceremony_id ==
-    //    payload.ceremony_id` (returns UnknownCeremony otherwise), so
-    //    the initiator MUST pre-seed pending_dkg with the committee
-    //    shape before applying its own dr rn=1 event. The committee
-    //    shape (members / threshold / max_signers / proposed_epoch)
-    //    lives on PendingCeremony, NOT inside DkgRoundPayload — the
-    //    on-wire payload only carries ceremony_id + round-specific
-    //    package bytes.
-    {
+    // Build both events, seed via the di apply, stash the secret, apply
+    // the dr — all under one log lock. ZEB-1022: `apply_ceremony_init`
+    // now performs the pending_dkg seeding the old code did by hand, so
+    // the initiator and every peer share ONE seeding code path; the
+    // committee shape still lives on PendingCeremony (never in
+    // DkgRoundPayload), it just arrives via the signed `di` event.
+    let (di_event, dr_event) = {
         let log_arc = {
             let mut map = dfrost_logs.lock().await;
             map.entry(space_id)
@@ -63025,7 +63311,9 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
 
         // Reject if there's already an in-flight DKG for this community —
         // concurrent ceremonies on the same log would race on
-        // pending_dkg and produce non-deterministic finalization.
+        // pending_dkg and produce non-deterministic finalization. (A
+        // stalled ceremony is no longer a dead end: the orchestrator's
+        // deadline abort / stale-replace clears it — ZEB-1022.)
         if let Some(existing) = log.committee_state.pending_dkg.as_ref() {
             return Err(format!(
                 "dfrost_initiate_dkg: ceremony already in flight ({})",
@@ -63043,66 +63331,77 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
             );
         }
 
-        // R5-1 (HIGH): snapshot prior pending_dkg + local_dkg_secret so
-        // an apply failure below can roll back the pre-mutation. Without
-        // rollback, a transient apply error leaves a phantom in-flight
-        // ceremony — every subsequent `dfrost_initiate_dkg` then bails on
-        // the "ceremony already in flight" guard above, locking the
-        // community out of DKG via IPC. Both fields are pre-apply
-        // invariants of this function, so snapshotting them here covers
-        // every mutation that needs to be reversed.
-        let prior_pending_dkg = log.committee_state.pending_dkg.clone();
-        let prior_local_dkg_secret = log.local_dkg_secret.clone();
-
-        log.committee_state.pending_dkg = Some(crate::community_dfrost_log::PendingCeremony {
+        let di_payload = crate::community_dfrost_types::CeremonyInitPayload {
             ceremony_id,
             members: member_addrs.clone(),
             threshold,
             max_signers,
-            // First DKG advances epoch 0 → 1 on completion; the
-            // pending ceremony's proposed_epoch is the post-DKG epoch.
-            proposed_epoch: log.committee_state.current_epoch + 1,
-            ..Default::default()
-        });
-        // Stash the round-1 secret so the round-2 path (Task 3+) can
-        // recover it. Never persisted (see DfrostLog::local_dkg_secret
-        // doc-comment).
+            // First DKG advances epoch 0 → 1 on completion; the pending
+            // ceremony's proposed_epoch is the post-DKG epoch.
+            epoch: log.committee_state.current_epoch + 1,
+        };
+        let di_event = crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::CeremonyInit,
+            &di_payload,
+            hlc_di,
+        )
+        .map_err(|e| format!("dfrost_initiate_dkg: build_signed(di): {e}"))?;
+        let dr_payload = crate::community_dfrost_types::DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(r1_pkg_bytes),
+            recipient_ciphertexts: None,
+        };
+        let dr_event = crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::DkgRound,
+            &dr_payload,
+            hlc_dr,
+        )
+        .map_err(|e| format!("dfrost_initiate_dkg: build_signed(dr): {e}"))?;
+
+        // Apply di — seeds pending_dkg with initiator = self. No prior
+        // state to roll back: the guards above proved the slot empty.
+        if let Err(e) = log.apply_with_identity(di_event.clone(), &self_owner, &self_x25519_priv) {
+            return Err(format!("dfrost_initiate_dkg: apply(di): {e:?}"));
+        }
+        // Stash the round-1 secret so the round-2 path can recover it.
+        // Never persisted (see DfrostLog::local_dkg_secret doc-comment).
         log.local_dkg_secret = Some(r1_secret);
 
-        // Apply through apply_with_identity for shape parity with the
-        // remote-receive path. For rn=1 it delegates to `apply` (no
-        // decrypt path), so behaviour is identical to calling `apply`
-        // directly — using apply_with_identity here keeps a single
-        // local-node apply call-site so future rn=2 IPCs can mirror it
-        // verbatim.
-        // R/T8: clone the event so the original binding survives `apply_with_identity`
-        // (which consumes the event) and is available for the post-lock broadcast below.
-        if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
-            // R5-1: restore pre-mutation state so the next initiate
-            // attempt can proceed. Without this, the phantom pending_dkg
-            // from the failed attempt would trip the "already in flight"
-            // guard on retry.
-            log.committee_state.pending_dkg = prior_pending_dkg;
-            log.local_dkg_secret = prior_local_dkg_secret;
-            return Err(format!("dfrost_initiate_dkg: apply: {e:?}"));
+        // Apply the dr rn=1 through apply_with_identity for shape parity
+        // with the remote-receive path (rn=1 delegates to `apply`).
+        if let Err(e) = log.apply_with_identity(dr_event.clone(), &self_owner, &self_x25519_priv) {
+            // Roll back to the pre-initiate state: abort clears the
+            // just-seeded pending slot AND the just-stashed secret, so
+            // the next initiate attempt starts clean (the old phantom-
+            // pending lockout, R5-1, cannot recur).
+            log.abort_pending_dkg();
+            return Err(format!("dfrost_initiate_dkg: apply(dr): {e:?}"));
         }
-    }
+        (di_event, dr_event)
+    };
 
-    // T8: broadcast the dr rn=1 event over Zenoh (best-effort; local apply
-    // already succeeded above). Lock ordering: this runs OUTSIDE the log
-    // lock scope closed above (R8 + R10 from PR #143). Broadcast failure
-    // logs + continues so a transient transport hiccup never reverses the
-    // local-apply success. Skipped entirely if `dfrost_log_registry` is
-    // `None` (test contexts that bypass `start_node`).
+    // Broadcast di THEN dr over Zenoh (best-effort; local applies already
+    // succeeded — lock ordering: outside the log lock scope, R8 + R10
+    // from PR #143). Same publisher ⇒ per-publisher FIFO ⇒ peers always
+    // seed from the di before they see the round. A missed broadcast is
+    // healed by the orchestrator's periodic re-broadcast (ZEB-1022).
     match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
             Some(engine) => {
-                if let Err(e) = engine.publish_event(event).await {
-                    tracing::warn!(
-                        space_id = ?space_id,
-                        error = %e,
-                        "dfrost_initiate_dkg: broadcast failed (local apply succeeded)",
-                    );
+                for (label, ev) in [("di", di_event), ("dr", dr_event)] {
+                    if let Err(e) = engine.publish_event(ev).await {
+                        tracing::warn!(
+                            space_id = ?space_id,
+                            event = label,
+                            error = %e,
+                            "dfrost_initiate_dkg: broadcast failed (local apply succeeded)",
+                        );
+                    }
                 }
             }
             None => {
@@ -63123,19 +63422,21 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         }
     }
 
-    // 10. Emit progress event. participants_so_far = 1 because the
-    //     initiator's own round-1 package just landed in
-    //     pending_dkg.round1_packages.
+    // Emit progress event. participants_so_far = 1 because the
+    // initiator's own round-1 package just landed in
+    // pending_dkg.round1_packages.
     let ceremony_id_hex = hex::encode(ceremony_id);
-    let evt_payload = DfrostDkgProgressPayload {
-        community_id: hex::encode(space_id.0),
-        ceremony_id: ceremony_id_hex.clone(),
-        round_num: 1,
-        participants_so_far: 1,
-    };
-    if let Err(e) = app.emit("dfrost-dkg-progress", &evt_payload) {
-        // Non-fatal: state is already mutated; the emit is a UI hint.
-        tracing::warn!(error = %e, "dfrost-dkg-progress emit failed");
+    if let Some(app) = app {
+        let evt_payload = DfrostDkgProgressPayload {
+            community_id: hex::encode(space_id.0),
+            ceremony_id: ceremony_id_hex.clone(),
+            round_num: 1,
+            participants_so_far: 1,
+        };
+        if let Err(e) = app.emit("dfrost-dkg-progress", &evt_payload) {
+            // Non-fatal: state is already mutated; the emit is a UI hint.
+            tracing::warn!(error = %e, "dfrost-dkg-progress emit failed");
+        }
     }
 
     Ok(ceremony_id_hex)
@@ -63193,13 +63494,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     ceremony_id: String,
     round_num: u8,
 ) -> Result<(), String> {
-    if !matches!(round_num, 1..=3) {
-        return Err(format!(
-            "dfrost_contribute_dkg_round: round_num must be 1, 2, or 3, got {round_num}"
-        ));
-    }
-
-    // 1. Decode hex args.
+    // Decode hex args (IPC-boundary concern); the core takes typed args.
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("dfrost_contribute_dkg_round: invalid community_id hex: {e}"))?
         .as_slice()
@@ -63217,52 +63512,36 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             "dfrost_contribute_dkg_round: ceremony_id must be 32 bytes (64 hex chars)".to_string()
         })?;
 
-    // 2. Extract NodeState handles. R5-4 (MEDIUM): community_registry is
-    //    needed ONLY for the OwnerAddr → identity_pub_64 → X25519 pubkey
-    //    lookup used to seal each round-2 package to its recipient
-    //    (round_num=2 only — round_num=3 reads pending state populated by
-    //    apply, not the registry). round_num=1 (peer submission) doesn't
-    //    use it either. Extracting up-front blocked multi-member DKG
-    //    whenever the community_registry hadn't been initialised yet —
-    //    even though round-1 peers strictly don't need it. Hoisted into
-    //    the round-2/3 (else) branch below; the round-1 path now
-    //    proceeds without requiring registry initialisation.
-    //
-    //    NodeState (std::Mutex) and community_registry's std::Mutex aren't
-    //    the same lock, so deferring the registry pull until after the
-    //    round-1 branch doesn't change locking semantics — it just narrows
-    //    the precondition for the round-1 IPC.
-    // T8: also pull `dfrost_log_registry` here (Option, None in test
-    // contexts that bypass `start_node`). Broadcast call-sites below skip
-    // if it's None so the IPC integration tests remain pass-through.
-    let (
-        hlc_tracker,
-        adopt_floor,
-        device_id,
-        self_owner,
-        dm_outbox,
-        dfrost_logs,
-        dfrost_log_registry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.hlc_adopt_floor.clone(),
-            g.dm_device_id
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dm_outbox
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            std::sync::Arc::clone(&g.dfrost_logs),
-            g.dfrost_log_registry.clone(),
-        )
-    };
+    let handles = dfrost_core_handles_from_state(&state_lock).await?;
+    dfrost_contribute_dkg_round_core::<R>(&handles, Some(&app), space_id, ceremony_bytes, round_num)
+        .await
+}
+
+/// ZEB-1022: shared core of `dfrost_contribute_dkg_round` — callable
+/// from the IPC wrapper above and from the engine orchestrator's
+/// auto-drive (`DkgDriver::contribute_round`), so peer contributions no
+/// longer require a manual IPC on every node. Behaviour is unchanged
+/// from the pre-refactor IPC body; only the handle plumbing moved
+/// (NodeState extraction → `DfrostCoreHandles`).
+async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime>(
+    handles: &DfrostCoreHandles,
+    app: Option<&tauri::AppHandle<R>>,
+    space_id: crate::owner_state_types::SpaceId,
+    ceremony_bytes: [u8; 32],
+    round_num: u8,
+) -> Result<(), String> {
+    if !matches!(round_num, 1..=3) {
+        return Err(format!(
+            "dfrost_contribute_dkg_round: round_num must be 1, 2, or 3, got {round_num}"
+        ));
+    }
+
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
 
     // 3. Get the per-community DfrostLog Arc.
     let log_arc = {
@@ -63317,18 +63596,14 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         // `or_insert` kept `pkg_A` in `round1_packages`, breaking the
         // round-2 invariant (stashed secret must match broadcast pkg).
         //
-        // R8 (Cursor MEDIUM "Nested locks invert ordering"): clone the
-        // `Arc<SigningKey>` out of `dm_outbox` BEFORE acquiring the log
-        // lock, so the critical section uses the local clone and never
-        // nests outbox under log. Other dfrost IPCs acquire outbox THEN
-        // (release-then) log; if R7's log-then-outbox-nested ordering
-        // stayed, two concurrent tasks could deadlock. Cloning the Arc
-        // is cheap (refcount bump) and lets us hold the log lock across
-        // build_signed without holding the outbox lock at all.
-        let signing_key_arc: std::sync::Arc<ed25519_dalek::SigningKey> = {
-            let outbox_g = dm_outbox.lock().await;
-            std::sync::Arc::clone(&outbox_g.signing_key)
-        };
+        // R8 (Cursor MEDIUM "Nested locks invert ordering") lineage: the
+        // signing key is cloned OUTSIDE the log lock so the critical
+        // section never nests another lock under log. ZEB-1022: the
+        // handles carry the `Arc<SigningKey>` directly (extracted from
+        // the outbox once, at wrapper/driver construction), so no outbox
+        // lock exists on this path at all any more.
+        let signing_key_arc: std::sync::Arc<ed25519_dalek::SigningKey> =
+            std::sync::Arc::clone(&handles.signing_key);
 
         // T8: return BOTH the post-apply participants count AND a clone of
         // the applied event so the post-lock broadcast block has access to
@@ -63454,15 +63729,17 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             }
         }
 
-        let evt_payload = DfrostDkgProgressPayload {
-            community_id: hex::encode(space_id.0),
-            ceremony_id: hex::encode(ceremony_bytes),
-            round_num: 1,
-            participants_so_far: u8::try_from(participants_after).unwrap_or(u8::MAX),
-        };
-        if let Err(e) = app.emit("dfrost-dkg-progress", &evt_payload) {
-            // Non-fatal: state is already mutated; the emit is a UI hint.
-            tracing::warn!(error = %e, "dfrost-dkg-progress emit failed");
+        if let Some(app) = app {
+            let evt_payload = DfrostDkgProgressPayload {
+                community_id: hex::encode(space_id.0),
+                ceremony_id: hex::encode(ceremony_bytes),
+                round_num: 1,
+                participants_so_far: u8::try_from(participants_after).unwrap_or(u8::MAX),
+            };
+            if let Err(e) = app.emit("dfrost-dkg-progress", &evt_payload) {
+                // Non-fatal: state is already mutated; the emit is a UI hint.
+                tracing::warn!(error = %e, "dfrost-dkg-progress emit failed");
+            }
         }
 
         return Ok(());
@@ -63497,20 +63774,14 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     ) = if round_num == 2 {
         // ─── ROUND 2 ──────────────────────────────────────────────────
         //
-        // R5-4 (MEDIUM): pull community_registry HERE — round-2 is the
-        // only branch that needs it (X25519 lookup for sealing per-
-        // recipient round-2 packages). Round-1 and round-3 don't touch
-        // the registry, so the early extraction in step 2 used to block
-        // round-1 peer submissions whenever the registry wasn't yet
-        // initialised.
-        let community_registry = {
-            let g = state_lock
-                .lock()
-                .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
-            g.community_registry
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?
-        };
+        // R5-4 (MEDIUM) lineage: the identity resolver is needed ONLY by
+        // round-2 (X25519 lookup for sealing per-recipient round-2
+        // packages), so its absence must not block rounds 1/3 — hence
+        // the Option on the handles, unwrapped only here.
+        let resolver = handles.identity_resolver.clone().ok_or(
+            "dfrost_contribute_dkg_round: identity resolver unavailable \
+             (community registry not initialised — owner not loaded?)",
+        )?;
 
         // Snapshot pending state: members (for OwnerAddr↔Identifier
         // mapping), the round-1 packages every peer (NOT self) broadcast,
@@ -63600,7 +63871,6 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         // Ed25519 pub; ed25519_pub_to_x25519 maps to X25519 via the
         // standard RFC 7748 §5 birational map). This is the same
         // pattern build_sealed_epoch_recipients uses.
-        let resolver = community_registry.identity_resolver();
         let mut recipient_ciphertexts: Vec<crate::community_membership::RecipientCiphertext> =
             Vec::with_capacity(r2_packages_by_id.len());
         for (recipient_id, r2_pkg_bytes) in &r2_packages_by_id {
@@ -63659,17 +63929,15 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         // stuck in DKG. Thread r2_secret through the if-else and let the
         // common apply site stash on success only.
         //
-        // Build the dr rn=2 payload + sign the envelope. R4-2: consolidate
-        // outbox lock — produce signed event + self's X25519 priv (needed
-        // by apply_with_identity below) in a single lock acquisition.
+        // Build the dr rn=2 payload + sign the envelope (ZEB-1022: the
+        // signing key comes straight from the handles — no outbox lock).
         let payload = crate::community_dfrost_types::DkgRoundPayload {
             ceremony_id: ceremony_bytes,
             round_num: 2,
             round1_package: None,
             recipient_ciphertexts: Some(recipient_ciphertexts),
         };
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        let signing_key = handles.signing_key.as_ref();
         let ev = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key,
             self_owner,
@@ -63829,13 +64097,10 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             threshold,
             max_signers,
         };
-        // R4-2 (Greptile P2): consolidate the outbox lock for the dk
-        // event path — one acquisition produces both the signed event
-        // AND self's X25519 priv (used by apply_with_identity below).
-        // Both reads access the same `Arc<SigningKey>` and neither
-        // mutates the outbox.
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // R4-2 (Greptile P2) lineage: one signing-key read produces both
+        // the signed event AND self's X25519 priv (used by
+        // apply_with_identity below). ZEB-1022: straight from handles.
+        let signing_key = handles.signing_key.as_ref();
         let ev = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key,
             self_owner,
@@ -63949,15 +64214,17 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         }
     };
 
-    let evt_payload = DfrostDkgProgressPayload {
-        community_id: hex::encode(space_id.0),
-        ceremony_id: hex::encode(ceremony_bytes),
-        round_num,
-        participants_so_far: participants_count,
-    };
-    if let Err(e) = app.emit("dfrost-dkg-progress", &evt_payload) {
-        // Non-fatal: state is already mutated; the emit is a UI hint.
-        tracing::warn!(error = %e, "dfrost-dkg-progress emit failed");
+    if let Some(app) = app {
+        let evt_payload = DfrostDkgProgressPayload {
+            community_id: hex::encode(space_id.0),
+            ceremony_id: hex::encode(ceremony_bytes),
+            round_num,
+            participants_so_far: participants_count,
+        };
+        if let Err(e) = app.emit("dfrost-dkg-progress", &evt_payload) {
+            // Non-fatal: state is already mutated; the emit is a UI hint.
+            tracing::warn!(error = %e, "dfrost-dkg-progress emit failed");
+        }
     }
 
     Ok(())

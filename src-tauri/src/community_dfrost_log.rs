@@ -185,6 +185,15 @@ impl CommitteeState {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PendingCeremony {
     pub ceremony_id: [u8; 32],
+    /// ZEB-1022: the actor whose `di` (CeremonyInit) event seeded this
+    /// ceremony. The orchestration layer uses it to decide which node
+    /// owns the deadline-abort + re-initiate responsibility (only the
+    /// initiator restarts a stalled ceremony; peers wait for a
+    /// replacement `di`). `None` for ceremonies seeded by legacy /
+    /// test paths that set `pending_dkg` directly, and for
+    /// `pending_refresh` (refresh has no initiator-driven recovery).
+    #[serde(default)]
+    pub initiator: Option<OwnerAddr>,
     /// Round-1 package bytes per actor (broadcast-shaped). Public —
     /// these are commitments to the secret polynomial, not the
     /// secrets themselves; safe to persist.
@@ -276,6 +285,12 @@ pub enum ApplyError {
     /// envelope tag (`tg != 'd'`) or whose `committee_tier` field is
     /// non-zero. Defence-in-depth — peers should not produce these.
     UnexpectedEnvelope,
+    /// ZEB-1022: a `di` (CeremonyInit) event arrived while a DIFFERENT
+    /// ceremony already occupies the `pending_dkg` slot. The log never
+    /// replaces an in-flight ceremony on its own — the engine's
+    /// stale-replace policy decides whether to `abort_pending_dkg()`
+    /// first (quiet ceremony) or drop the newcomer (fresh ceremony).
+    CeremonyInFlight,
 }
 
 /// Errors surfaced by `verify_signed_committee_event`. Mirrors the
@@ -418,6 +433,7 @@ impl DfrostLog {
         }
 
         let result = match event.kind {
+            DfrostEventKind::CeremonyInit => self.apply_ceremony_init(&event),
             DfrostEventKind::DkgRound => self.apply_dkg_round(&event),
             DfrostEventKind::DkgComplete => self.apply_dkg_complete(&event),
             DfrostEventKind::ThresholdSign => self.apply_threshold_sign(&event),
@@ -428,6 +444,103 @@ impl DfrostLog {
 
         self.events.push(event);
         Ok(())
+    }
+
+    /// ZEB-1022: apply a `di` (CeremonyInit) event — seed `pending_dkg`
+    /// with the committee shape the initiator announced.
+    ///
+    /// Structural validation only (this log is sans-I/O): the engine's
+    /// ingest layer is responsible for the ceremony-id binding recompute
+    /// (`derive_dkg_ceremony_id` needs the community's `SpaceId`, which
+    /// the log does not hold) and for membership-snapshot validation
+    /// (async resolver). What IS enforced here:
+    ///
+    /// * committee not already `active` (a fresh DKG on an active
+    ///   committee would mint a new joint VK; the forward path is
+    ///   proactive refresh — same rule as `dfrost_initiate_dkg`).
+    /// * members sorted bytewise ascending + deduplicated (load-bearing
+    ///   for `build_identifier_map` determinism), at least 2 of them,
+    ///   `max_signers == members.len()`, `2 <= threshold <= max_signers`.
+    /// * the initiator (`event.actor`) is itself a committee member.
+    /// * `epoch == current_epoch + 1` (the one epoch a fresh DKG may
+    ///   propose from this replica's view).
+    ///
+    /// Slot semantics: empty slot → seed (`initiator = Some(actor)`);
+    /// same `ceremony_id` already pending → idempotent no-op (re-mint /
+    /// re-broadcast tolerance); DIFFERENT ceremony pending →
+    /// `CeremonyInFlight` (the engine's stale-replace policy calls
+    /// `abort_pending_dkg()` first when it decides to admit the newcomer).
+    fn apply_ceremony_init(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+        use crate::community_dfrost_types::CeremonyInitPayload;
+
+        let payload: CeremonyInitPayload =
+            ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
+
+        if self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        // Shape validation.
+        let mut sorted = payload.members.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted != payload.members || payload.members.len() < 2 {
+            return Err(ApplyError::InvariantViolation);
+        }
+        let member_count =
+            u16::try_from(payload.members.len()).map_err(|_| ApplyError::InvariantViolation)?;
+        if payload.max_signers != member_count {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if payload.threshold < 2 || payload.threshold > payload.max_signers {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if !payload.members.contains(&event.actor) {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if payload.epoch != self.committee_state.current_epoch + 1 {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        match self.committee_state.pending_dkg.as_ref() {
+            None => {
+                self.committee_state.pending_dkg = Some(PendingCeremony {
+                    ceremony_id: payload.ceremony_id,
+                    initiator: Some(event.actor),
+                    members: payload.members,
+                    threshold: payload.threshold,
+                    max_signers: payload.max_signers,
+                    proposed_epoch: payload.epoch,
+                    ..Default::default()
+                });
+                Ok(())
+            }
+            Some(p) if p.ceremony_id == payload.ceremony_id => {
+                // Idempotent re-application (initiator re-mint with a
+                // fresh HLC, or a duplicate delivery). No state change —
+                // in particular the accumulated round1_packages /
+                // dk_confirmations survive.
+                Ok(())
+            }
+            Some(_) => Err(ApplyError::CeremonyInFlight),
+        }
+    }
+
+    /// ZEB-1022: abort the in-flight DKG ceremony, clearing the pending
+    /// slot AND this node's in-memory ceremony secrets (which are bound
+    /// to the aborted ceremony's polynomial and MUST NOT leak into a
+    /// successor ceremony's part2/part3 inputs — FROST would reject the
+    /// mismatched transcript, but only after wasted rounds).
+    ///
+    /// Returns the aborted `ceremony_id`, or `None` if no DKG was
+    /// pending. Callers: the engine's initiator deadline-abort, its
+    /// peer-side stale-replace admission, and the initiate path's
+    /// rollback-on-apply-failure.
+    pub fn abort_pending_dkg(&mut self) -> Option<[u8; 32]> {
+        let aborted = self.committee_state.pending_dkg.take()?;
+        self.local_dkg_secret = None;
+        self.local_dkg_secret2 = None;
+        Some(aborted.ceremony_id)
     }
 
     /// Apply a `dr` event (DKG round 1 broadcast or round 2 encrypted shares).
@@ -1084,6 +1197,31 @@ pub fn build_signed_dfrost_event<P: serde::Serialize>(
         payload: payload_bytes,
         sig: vec![0u8; 64],
     };
+    let sb = ev
+        .signing_bytes()
+        .map_err(|e| format!("signing_bytes: {e}"))?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// ZEB-1022: re-mint an existing self-authored event with a fresh HLC +
+/// signature, leaving the payload bytes untouched. Used by the ceremony
+/// re-broadcast path: peers' `DfrostReplayTracker` keys `(actor,
+/// device_id) → max HLC`, so re-publishing the ORIGINAL bytes is dropped
+/// as a replay by any peer that has already seen a newer event from this
+/// actor — exactly the late-subscriber case re-broadcast exists to heal.
+/// A fresh HLC clears the tracker while the structural first-wins maps
+/// (`round1_packages` `.or_insert`, `dk_confirmations` insert, `di`
+/// same-id no-op) keep the re-application idempotent on peers that
+/// already applied the original.
+pub fn resign_dfrost_event_with_fresh_hlc(
+    event: &crate::community_dfrost_types::SignedCommitteeEvent,
+    fresh_hlc: crate::owner_state_types::Hlc,
+    keypair: &ed25519_dalek::SigningKey,
+) -> Result<crate::community_dfrost_types::SignedCommitteeEvent, String> {
+    use ed25519_dalek::Signer;
+    let mut ev = event.clone();
+    ev.hlc = fresh_hlc;
     let sb = ev
         .signing_bytes()
         .map_err(|e| format!("signing_bytes: {e}"))?;

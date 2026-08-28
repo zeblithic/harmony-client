@@ -5232,6 +5232,9 @@ mod tests {
                     self_x25519_priv: [0u8; 32],
                     identity_resolver: Arc::new(NoopResolver),
                     registry_weak: None,
+                    driver: None,
+                    membership_resolver: None,
+                    orchestrator_config: Default::default(),
                 },
             )
             .await;

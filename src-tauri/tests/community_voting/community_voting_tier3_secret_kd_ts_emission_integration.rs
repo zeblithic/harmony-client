@@ -198,6 +198,9 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
                 self_x25519_priv: [0u8; 32],
                 identity_resolver: Arc::new(NoopResolver),
                 registry_weak: None,
+                driver: None,
+                membership_resolver: None,
+                orchestrator_config: Default::default(),
             },
         )
         .await;
@@ -517,6 +520,9 @@ async fn no_kd_ts_emission_when_not_committee_member() {
                 self_x25519_priv: [0u8; 32],
                 identity_resolver: Arc::new(NoopResolver),
                 registry_weak: None,
+                driver: None,
+                membership_resolver: None,
+                orchestrator_config: Default::default(),
             },
         )
         .await;
