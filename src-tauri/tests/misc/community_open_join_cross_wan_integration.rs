@@ -1278,6 +1278,7 @@ async fn bob_open_join_redeem_spawns_channel_log_engine_in_session() {
                 }),
                 ..Default::default()
             },
+            None, // sync_engine (ZEB-1020): no owner-state engine in this harness
         )
         .await
         .expect("open-join redeem must Ok");

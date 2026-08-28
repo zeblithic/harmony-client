@@ -3075,6 +3075,7 @@ async fn redeem_invite_only_commits_pending_join_when_inviter_unreachable() {
             redeem_timeout: Some(std::time::Duration::from_secs(2)),
             ..Default::default()
         },
+        None, // sync_engine (ZEB-1020): no owner-state engine in this harness
     )
     .await;
 
@@ -3161,6 +3162,7 @@ async fn redeem_invite_only_rolls_back_owner_state_on_fence_failure() {
             redeem_timeout: Some(std::time::Duration::from_secs(2)),
             ..Default::default()
         },
+        None, // sync_engine (ZEB-1020): no owner-state engine in this harness
     )
     .await;
 

@@ -815,6 +815,14 @@ pub async fn fork_community(
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
             return Err(format!("apply_space rejected fork community: {outcome:?}"));
         }
+        // ZEB-1020: arm the dirty signal AT the commit, under the state
+        // guard — the fence below also notifies, but only after this block
+        // exits; a concurrent un-vouched persist snapshotting in that gap
+        // is the ZEB-710 tripwire fire observed on CI in create_community's
+        // twin of this block. Mirrors create_community_inner exactly.
+        if let Some(engine) = sync_engine.as_ref() {
+            engine.notify_dirty();
+        }
     }
 
     // ZEB-709 (audit A1): durable-on-commit for the fork's owner-state Space
