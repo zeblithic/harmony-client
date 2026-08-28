@@ -107,6 +107,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -179,6 +180,7 @@ async fn flush_now_publishes_one_root_publish() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -378,6 +380,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -420,6 +423,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -675,6 +679,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -728,6 +733,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -838,6 +844,7 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -992,6 +999,7 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
     engine.shutdown().await.expect("shutdown");
@@ -1073,6 +1081,7 @@ async fn publish_carries_valid_publisher_sig() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -1298,6 +1307,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -1536,6 +1546,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -1752,6 +1763,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -1900,6 +1912,7 @@ async fn a_failed_community_publish_retries_itself_on_a_quiescent_community_zeb7
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -2007,6 +2020,7 @@ async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -2147,6 +2161,7 @@ async fn a_burst_of_mutations_collapses_into_one_publish_zeb750() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 

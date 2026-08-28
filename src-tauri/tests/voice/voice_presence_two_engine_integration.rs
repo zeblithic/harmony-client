@@ -120,6 +120,7 @@ async fn seeded_registry(
         signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

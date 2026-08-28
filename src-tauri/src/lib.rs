@@ -8329,6 +8329,23 @@ pub async fn start_node_inner(
                                     );
                                 }
                             })),
+                            // ZEB-1016: applied-membership-events signal so the
+                            // moderation panels (PendingJoinsPanel /
+                            // PendingAdminProposalsPanel) refetch. Fired by the
+                            // engines once per local apply and once per incoming
+                            // publish batch that inserted events.
+                            membership_updated_emitter: Some(std::sync::Arc::new({
+                                let sink_for_emitter = app.clone();
+                                move |community_id: crate::owner_state_types::SpaceId| {
+                                    crate::node_event_sink::emit_ser(
+                                        sink_for_emitter.as_ref(),
+                                        "community-membership-updated",
+                                        &CommunityMembershipUpdatedPayload {
+                                            community_id: hex::encode(community_id.0),
+                                        },
+                                    );
+                                }
+                            })),
                             // ZEB-618: presence-driven reachability kick for
                             // every spawned engine's root-fetch driver — the
                             // same watch the channel-log backfill drivers get
@@ -39140,6 +39157,7 @@ mod create_community_inner_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                membership_updated_emitter: None,
                 presence_resync_rx: None,
             }));
 
@@ -41878,6 +41896,7 @@ mod zeb_315_membership_at_event_hlc_tests {
             signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             presence_resync_rx: None,
         }));
         let (pub_tx, _pub_rx) = mpsc::channel(8);
@@ -42108,6 +42127,7 @@ mod list_bootstrap_hint_tests {
             signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             presence_resync_rx: None,
         }));
 
@@ -42760,6 +42780,19 @@ pub struct NavUpdatedPayload {
     /// state just cleared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending: Option<bool>,
+}
+
+/// Wire shape of the `community-membership-updated` IPC event (ZEB-1016).
+/// Emitted once per applied local membership insert and once per incoming
+/// publish batch that inserted at least one event — an "applied, refetch"
+/// signal for the moderation panels (`PendingJoinsPanel`,
+/// `PendingAdminProposalsPanel`), NOT a convergence claim. `community_id`
+/// is the hex-encoded `SpaceId`, matching the `communityId` prop the
+/// panels already carry.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityMembershipUpdatedPayload {
+    pub community_id: String,
 }
 
 /// Joiner-side extraction of the community epoch key from an invite payload.
@@ -45218,6 +45251,7 @@ mod redeem_invite_inner_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                membership_updated_emitter: None,
                 presence_resync_rx: None,
             }));
 
@@ -46818,6 +46852,7 @@ mod zeb436_orphan_adoption_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                membership_updated_emitter: None,
                 presence_resync_rx: None,
             }));
 
@@ -50255,6 +50290,7 @@ mod zeb268_leave_detach_fence_tests {
             signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
             nav_emitter: None,
+            membership_updated_emitter: None,
             presence_resync_rx: None,
         }));
 
@@ -86780,6 +86816,7 @@ mod owner_loaded_tests {
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
                 nav_emitter: None,
+                membership_updated_emitter: None,
                 presence_resync_rx: None,
             }));
 

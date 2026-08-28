@@ -1,5 +1,9 @@
 <script lang="ts">
     import { invoke } from '@tauri-apps/api/core';
+    // ZEB-1016: live refresh on membership sync activity via the
+    // `community-membership-updated` Tauri event (emitted by the community
+    // sync engines once per applied local insert / incoming publish batch).
+    import { listen, type UnlistenFn } from '@tauri-apps/api/event';
     import CountChip from './governance/CountChip.svelte';
     import PeerName from './PeerName.svelte';
     // ZEB-946: the "since …" HLC timestamp honors the owner's time-format prefs.
@@ -44,8 +48,23 @@
     // R4-7: latestCallId is captured at the start of each refresh(); out-of-order
     // async responses must not overwrite the results of the latest refresh.
     let latestCallId = 0;
+    // ZEB-1016 (CodeAnt #767): coalesce refreshes. A burst of membership
+    // events (each backend apply emits once) must not stack overlapping
+    // IPC list requests — while one refresh is in flight, further calls
+    // fold into ONE trailing re-run that fetches the freshest state.
+    let refreshInFlight = false;
+    let refreshQueued = false;
 
     async function refresh() {
+        if (refreshInFlight) {
+            // Invalidate the in-flight pass's results (it may be fetching
+            // for a stale communityId after a switch) and let the trailing
+            // run below fetch fresh.
+            ++latestCallId;
+            refreshQueued = true;
+            return;
+        }
+        refreshInFlight = true;
         // R3 (M4): reset loading state at the start of every refresh so
         // subsequent fetches (kickJoiner-then-refresh) also surface a
         // transient loading indicator. Without this, after the first load
@@ -87,6 +106,16 @@
             if (myCallId === latestCallId) {
                 loading = false;
             }
+            refreshInFlight = false;
+            if (refreshQueued) {
+                refreshQueued = false;
+                // Trailing coalesced run. Gate on the live prop — a
+                // canModerate flip mid-flight already cleared the panel
+                // and must not refetch.
+                if (canModerate) {
+                    void refresh();
+                }
+            }
         }
     }
 
@@ -116,14 +145,27 @@
     // manual `lastWatched*` dedup. The stale-guard token above preserves the
     // original R4-7 race protection.
     //
-    // ZEB-976: this effect previously also registered a listener for a
-    // `community-state-sync-converged` Tauri event, but no Rust code has ever
-    // emitted it — refresh happens on mount, on prop changes, and after
-    // kickJoiner(). Live refresh on sync activity is tracked separately.
+    // ZEB-1016: the effect also registers a `community-membership-updated`
+    // listener so a moderator sitting on this panel sees newly synced
+    // PendingJoin / JoinCountersign events without re-opening it. (ZEB-976
+    // removed a listener for `community-state-sync-converged` here because
+    // nothing ever emitted it; this one is backed by real emit sites in
+    // community_state_sync.rs.) The effect cleanup handles both the
+    // community-switch re-run and unmount; the `cancelled` flag covers the
+    // window where the async `listen` registration resolves after cleanup.
+    //
+    // Subscription BEFORE snapshot (Greptile/Qodo, PR #767): the initial
+    // refresh only starts once `listen` has resolved. Fetching first would
+    // leave a gap where an update applied after the list snapshot but before
+    // registration is in neither — Tauri events are not replayed — leaving
+    // the panel stale. An event arriving during the initial fetch instead
+    // coalesces into the trailing re-run. If registration rejects (non-Tauri
+    // harnesses: vitest/jsdom have no event bridge), the panel degrades to
+    // mount/prop/action-only refresh — the initial fetch still runs.
     $effect(() => {
         // Read deps synchronously so the effect re-runs when they change.
         const canMod = canModerate;
-        void communityId;
+        const cid = communityId;
 
         if (!canMod) {
             // Non-moderator path: clear any prior data and skip the fetch.
@@ -139,7 +181,39 @@
             return;
         }
 
-        void refresh();
+        let cancelled = false;
+        let unlisten: UnlistenFn | undefined;
+        void listen<{ communityId: string }>('community-membership-updated', (event) => {
+            // Events for other communities are not ours to refetch.
+            if (event.payload.communityId === cid) {
+                void refresh();
+            }
+        })
+            .then((fn) => {
+                if (cancelled) {
+                    // Cleaned up before registration resolved: the
+                    // replacement effect run (or nothing, on unmount) owns
+                    // the fetch.
+                    fn();
+                    return;
+                }
+                unlisten = fn;
+                void refresh();
+            })
+            .catch((e) => {
+                const msg = e instanceof Error ? e.message : String(e);
+                console.warn(
+                    'PendingJoinsPanel: failed to subscribe to membership updates',
+                    msg
+                );
+                if (!cancelled) {
+                    void refresh();
+                }
+            });
+        return () => {
+            cancelled = true;
+            unlisten?.();
+        };
     });
 </script>
 

@@ -153,6 +153,7 @@ async fn pending_join_accepted_via_engine_insert_without_admin_pub_bind() {
         crdt_state: None,
         inviter_identity_pub: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 
@@ -291,6 +292,7 @@ fn build_engine_with_resolver(
         crdt_state: None,
         inviter_identity_pub: admin_pub,
         nav_emitter: None,
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
     engine
@@ -702,6 +704,7 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
         crdt_state: Some(Arc::clone(&crdt_state)),
         inviter_identity_pub: Some(admin_pub),
         nav_emitter: Some(Arc::clone(&nav_cb)),
+        membership_updated_emitter: None,
         root_serve_rx: None,
     });
 

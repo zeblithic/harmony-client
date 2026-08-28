@@ -1,5 +1,9 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  // ZEB-1016: live refresh on membership sync activity via the
+  // `community-membership-updated` Tauri event (emitted by the community
+  // sync engines once per applied local insert / incoming publish batch).
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
   type ProposalKindDto =
     | { kind: 'SetPower'; target_addr: string; target_display_name: string | null; level: number }
@@ -42,8 +46,22 @@
   let loading = $state(false);
   let errorMessage: string | null = $state(null);
   let latestCallId = 0;
+  // ZEB-1016 (CodeAnt #767): coalesce refreshes. A burst of membership
+  // events (each backend apply emits once) must not stack overlapping IPC
+  // list requests — while one refresh is in flight, further calls fold
+  // into ONE trailing re-run that fetches the freshest state.
+  let refreshInFlight = false;
+  let refreshQueued = false;
 
   async function refresh() {
+    if (refreshInFlight) {
+      // Invalidate the in-flight pass's results (it may be fetching for a
+      // stale communityId after a switch) and let the trailing run below
+      // fetch fresh. The trailing run re-evaluates canAdmin itself.
+      ++latestCallId;
+      refreshQueued = true;
+      return;
+    }
     if (!canAdmin) {
       // Bump latestCallId so any in-flight refresh from before canAdmin
       // flipped to false is discarded.
@@ -51,6 +69,7 @@
       proposals = [];
       return;
     }
+    refreshInFlight = true;
     const myCallId = ++latestCallId;
     loading = true;
     errorMessage = null;
@@ -67,6 +86,13 @@
       errorMessage = msg;
     } finally {
       if (myCallId === latestCallId) loading = false;
+      refreshInFlight = false;
+      if (refreshQueued) {
+        refreshQueued = false;
+        // Trailing coalesced run; refresh() itself no-ops (and clears)
+        // when canAdmin flipped false mid-flight.
+        void refresh();
+      }
     }
   }
 
@@ -84,16 +110,68 @@
     }
   }
 
-  // ZEB-976: this effect previously also registered a listener for a
-  // `community-state-sync-converged` Tauri event, but no Rust code has ever
-  // emitted it — refresh happens on mount, on prop changes, and after
-  // countersign(). Live refresh on sync activity is tracked separately.
+  // ZEB-1016: the effect also registers a `community-membership-updated`
+  // listener so an admin sitting on this panel sees newly synced proposals
+  // and countersigns without re-opening it. (ZEB-976 removed a listener for
+  // `community-state-sync-converged` here because nothing ever emitted it;
+  // this one is backed by real emit sites in community_state_sync.rs.) The
+  // effect cleanup handles both the community-switch re-run and unmount;
+  // the `cancelled` flag covers the window where the async `listen`
+  // registration resolves after cleanup. refresh() itself no-ops (and
+  // clears) when canAdmin is false, so the listener is only registered on
+  // the admin path.
+  //
+  // Subscription BEFORE snapshot (Greptile/Qodo, PR #767): on the admin
+  // path the initial refresh only starts once `listen` has resolved.
+  // Fetching first would leave a gap where an update applied after the list
+  // snapshot but before registration is in neither — Tauri events are not
+  // replayed — leaving the panel stale. An event arriving during the
+  // initial fetch instead coalesces into the trailing re-run. If
+  // registration rejects (non-Tauri harnesses: vitest/jsdom have no event
+  // bridge), the panel degrades to mount/prop/action-only refresh — the
+  // initial fetch still runs.
   $effect(() => {
     // Track reactive dependencies so the effect re-runs when they change.
-    void communityId;
-    void canAdmin;
+    const cid = communityId;
+    const isAdmin = canAdmin;
 
-    void refresh();
+    if (!isAdmin) {
+      // refresh() no-ops (and clears any prior data) on the non-admin path.
+      void refresh();
+      return;
+    }
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    void listen<{ communityId: string }>('community-membership-updated', (event) => {
+      // Events for other communities are not ours to refetch.
+      if (event.payload.communityId === cid) {
+        void refresh();
+      }
+    })
+      .then((fn) => {
+        if (cancelled) {
+          // Cleaned up before registration resolved: the replacement effect
+          // run (or nothing, on unmount) owns the fetch.
+          fn();
+          return;
+        }
+        unlisten = fn;
+        void refresh();
+      })
+      .catch((e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn(
+          'PendingAdminProposalsPanel: failed to subscribe to membership updates',
+          msg
+        );
+        if (!cancelled) {
+          void refresh();
+        }
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   });
 
   // Bucket sort: pending → effective → expired.

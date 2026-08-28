@@ -838,6 +838,7 @@ async fn click_to_join_redeem_invite_smoke() {
         signing_key: Arc::clone(&joiner_signing_key),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

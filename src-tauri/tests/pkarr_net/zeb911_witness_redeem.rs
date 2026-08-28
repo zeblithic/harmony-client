@@ -254,6 +254,7 @@ async fn spawn_witness_node(s: &TwoPartySetup) -> WitnessNode {
         signing_key: Arc::new(comm.device_key.clone()),
         crdt_state: None,
         nav_emitter: None,
+        membership_updated_emitter: None,
         presence_resync_rx: None,
     }));
 

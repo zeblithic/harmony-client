@@ -11,6 +11,10 @@ import { formatFullTimestamp } from '../../time-format';
 vi.mock('@tauri-apps/api/core', () => ({
     invoke: vi.fn(),
 }));
+// ZEB-1016: the panel listens for `community-membership-updated`.
+vi.mock('@tauri-apps/api/event', () => ({
+    listen: vi.fn().mockResolvedValue(() => {}),
+}));
 
 describe('PendingJoinsPanel', () => {
     beforeEach(() => {
@@ -138,6 +142,104 @@ describe('PendingJoinsPanel', () => {
             expect(chip?.classList.contains('neutral')).toBe(true);
             expect(chip?.querySelector('.cc-value')?.textContent).toBe('2');
         });
+    });
+
+    test('membership_updated_event_triggers_refresh (ZEB-1016)', async () => {
+        const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+        const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
+
+        let capturedHandler:
+            | ((event: { payload: { communityId: string } }) => void)
+            | null = null;
+        listen.mockImplementation(((_event: string, handler: unknown) => {
+            capturedHandler = handler as (event: {
+                payload: { communityId: string };
+            }) => void;
+            return Promise.resolve(() => {});
+        }) as typeof listen);
+        invoke.mockResolvedValue([]);
+
+        render(PendingJoinsPanel, {
+            props: { communityId: 'abc', canModerate: true },
+        });
+
+        // Initial refresh makes two IPCs (pending + recent) and registers
+        // the listener.
+        await waitFor(() => {
+            expect(invoke).toHaveBeenCalledTimes(2);
+            expect(listen).toHaveBeenCalledWith(
+                'community-membership-updated',
+                expect.any(Function)
+            );
+            expect(capturedHandler).not.toBeNull();
+        });
+
+        // A membership event applied for THIS community → refetch (two more
+        // IPCs); a different community's event is ignored.
+        capturedHandler!({ payload: { communityId: 'other' } });
+        await new Promise((r) => setTimeout(r, 0));
+        expect(invoke).toHaveBeenCalledTimes(2);
+
+        capturedHandler!({ payload: { communityId: 'abc' } });
+        await waitFor(() => {
+            expect(invoke).toHaveBeenCalledTimes(4);
+            expect(invoke).toHaveBeenNthCalledWith(
+                3,
+                'list_pending_joins',
+                expect.objectContaining({ communityId: 'abc' })
+            );
+        });
+    });
+
+    test('initial_fetch_waits_for_listener_registration (PR #767)', async () => {
+        const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+        const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
+
+        // Subscription-before-snapshot: an update applied after the list
+        // snapshot but before registration would be in neither (Tauri events
+        // are not replayed), so the fetch must not start until the
+        // subscription is live.
+        let resolveListen: ((fn: () => void) => void) | null = null;
+        listen.mockImplementation(((_event: string, _handler: unknown) =>
+            new Promise<() => void>((res) => (resolveListen = res))) as typeof listen);
+        invoke.mockResolvedValue([]);
+
+        render(PendingJoinsPanel, {
+            props: { communityId: 'abc', canModerate: true },
+        });
+
+        await new Promise((r) => setTimeout(r, 0));
+        expect(listen).toHaveBeenCalledTimes(1);
+        expect(invoke).not.toHaveBeenCalled();
+
+        resolveListen!(() => {});
+        await waitFor(() => {
+            expect(invoke).toHaveBeenCalledTimes(2);
+        });
+    });
+
+    test('failed_listener_registration_still_runs_initial_fetch (PR #767)', async () => {
+        const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+        const { listen } = vi.mocked(await import('@tauri-apps/api/event'));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        listen.mockRejectedValue(new Error('no event bridge'));
+        invoke.mockResolvedValue([]);
+
+        render(PendingJoinsPanel, {
+            props: { communityId: 'abc', canModerate: true },
+        });
+
+        // Degraded path (non-Tauri harness): the mount fetch still happens...
+        await waitFor(() => {
+            expect(invoke).toHaveBeenCalledTimes(2);
+        });
+        // ...and the rejection is logged as a normalized message, not raw `e`.
+        expect(warn).toHaveBeenCalledWith(
+            'PendingJoinsPanel: failed to subscribe to membership updates',
+            'no event bridge'
+        );
+        warn.mockRestore();
     });
 
     describe('honors the time-format preference (ZEB-946)', () => {
