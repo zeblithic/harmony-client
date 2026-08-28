@@ -23,6 +23,14 @@
  */
 
 import type { TauriAdapter } from './zenoh-service';
+import {
+  DFROST_BEACON_READY,
+  DFROST_DKG_PROGRESS,
+  DFROST_REFRESH_PROGRESS,
+  type DfrostBeaconReadyPayload,
+  type DfrostDkgProgressPayload,
+  type DfrostRefreshProgressPayload,
+} from './types/dfrost-events';
 import type {
   AutoExecAction,
   BridgingScoreExport,
@@ -155,6 +163,16 @@ export class VotingAdapter {
   > = [];
   private tier3DraftApprovalSubs: Array<
     (p: Tier3DraftApprovalPayload) => void
+  > = [];
+
+  // ZEB-1018 — D-FROST committee ceremony event subscribers. These fire
+  // on BOTH local IPC-driven applies and (now that the transport is
+  // wired) inbound peer events, so the panel's ceremony status reflects
+  // multi-node progress.
+  private dfrostDkgProgressSubs: Array<(p: DfrostDkgProgressPayload) => void> = [];
+  private dfrostBeaconReadySubs: Array<(p: DfrostBeaconReadyPayload) => void> = [];
+  private dfrostRefreshProgressSubs: Array<
+    (p: DfrostRefreshProgressPayload) => void
   > = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
@@ -358,6 +376,37 @@ export class VotingAdapter {
     return () => {
       const i = this.tier3DraftApprovalSubs.indexOf(handler);
       if (i >= 0) this.tier3DraftApprovalSubs.splice(i, 1);
+    };
+  }
+
+  // ─── ZEB-1018 — D-FROST committee ceremony subscribers ──────────────
+  subscribeDfrostDkgProgress(
+    handler: (p: DfrostDkgProgressPayload) => void,
+  ): () => void {
+    this.dfrostDkgProgressSubs.push(handler);
+    return () => {
+      const i = this.dfrostDkgProgressSubs.indexOf(handler);
+      if (i >= 0) this.dfrostDkgProgressSubs.splice(i, 1);
+    };
+  }
+
+  subscribeDfrostBeaconReady(
+    handler: (p: DfrostBeaconReadyPayload) => void,
+  ): () => void {
+    this.dfrostBeaconReadySubs.push(handler);
+    return () => {
+      const i = this.dfrostBeaconReadySubs.indexOf(handler);
+      if (i >= 0) this.dfrostBeaconReadySubs.splice(i, 1);
+    };
+  }
+
+  subscribeDfrostRefreshProgress(
+    handler: (p: DfrostRefreshProgressPayload) => void,
+  ): () => void {
+    this.dfrostRefreshProgressSubs.push(handler);
+    return () => {
+      const i = this.dfrostRefreshProgressSubs.indexOf(handler);
+      if (i >= 0) this.dfrostRefreshProgressSubs.splice(i, 1);
     };
   }
 
@@ -582,6 +631,36 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenTier3DraftApproval);
+
+        // ZEB-1018 — D-FROST committee ceremony events. Emitted by the
+        // engine on inbound peer applies and by the IPC layer on local
+        // applies; same copy-then-iterate delivery as every block above.
+        const unlistenDfrostDkgProgress = await adapter.listen(
+          DFROST_DKG_PROGRESS,
+          (event) => {
+            const payload = event.payload as DfrostDkgProgressPayload;
+            for (const sub of [...this.dfrostDkgProgressSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenDfrostDkgProgress);
+
+        const unlistenDfrostBeaconReady = await adapter.listen(
+          DFROST_BEACON_READY,
+          (event) => {
+            const payload = event.payload as DfrostBeaconReadyPayload;
+            for (const sub of [...this.dfrostBeaconReadySubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenDfrostBeaconReady);
+
+        const unlistenDfrostRefreshProgress = await adapter.listen(
+          DFROST_REFRESH_PROGRESS,
+          (event) => {
+            const payload = event.payload as DfrostRefreshProgressPayload;
+            for (const sub of [...this.dfrostRefreshProgressSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenDfrostRefreshProgress);
 
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);

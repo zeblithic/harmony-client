@@ -226,7 +226,7 @@ async fn install_beacon_oracle_for(
             dfrost_log: Arc::clone(&dfrost_log),
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
-            app_handle,
+            app_handle: Some(app_handle),
             self_addr: OwnerAddr([0u8; 16]),
             self_x25519_priv: [0u8; 32],
             identity_resolver: Arc::new(StaticIdentityResolver(HashMap::new())),

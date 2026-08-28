@@ -5227,7 +5227,7 @@ mod tests {
                     dfrost_log,
                     publisher_tx: dtx,
                     subscriber_rx: dsrx,
-                    app_handle,
+                    app_handle: Some(app_handle),
                     self_addr: OwnerAddr([0u8; 16]),
                     self_x25519_priv: [0u8; 32],
                     identity_resolver: Arc::new(NoopResolver),

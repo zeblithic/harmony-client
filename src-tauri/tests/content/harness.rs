@@ -236,6 +236,14 @@ pub async fn spawn_test_runtime_with_pins(
                         >(1);
                         rx
                     },
+                    {
+                        // ZEB-1018: dfrost-log adapter request channel; not
+                        // exercised in these tests, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::DfrostLogAdapterRequest,
+                        >(1);
+                        rx
+                    },
                     None,
                     {
                         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<

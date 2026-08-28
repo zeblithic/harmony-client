@@ -245,6 +245,14 @@ fn spawn_event_loop(
                         >(1);
                         rx
                     },
+                    {
+                        // ZEB-1018: dfrost-log adapter request channel; not
+                        // exercised in this test, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::DfrostLogAdapterRequest,
+                        >(1);
+                        rx
+                    },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                     {
                         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<

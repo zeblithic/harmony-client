@@ -422,6 +422,16 @@ pub const VOTING_TOPIC_AAD: &[u8] = b"harmony-voting-v1";
 /// `Have` event body (VOTING_TOPIC_AAD) purely by which AAD opens the frame.
 pub const VOTING_RBSR_AAD: &[u8] = b"harmony-voting-rbsr-v1";
 
+/// ZEB-1018: AAD for the D-FROST committee-log Zenoh topic
+/// (`harmony/community/{id}/dfrost`). Same epoch key as the voting and
+/// state-root planes, so this distinct AAD makes a cross-plane
+/// ciphertext fail the AEAD tag rather than merely a downstream
+/// deserialize. Committee ceremony traffic is epoch-encrypted for the
+/// same containment reason as voting: a kicked-then-rotated member
+/// holds only a stale epoch key and must not read (or replay into)
+/// in-flight DKG/refresh/threshold-sign rounds.
+pub const DFROST_TOPIC_AAD: &[u8] = b"harmony-dfrost-v1";
+
 /// Encrypt `plaintext` under the community's current epoch key,
 /// wrapping the AEAD output in an `EncryptedEnvelope` that tags the
 /// epoch for receiver-side key selection.

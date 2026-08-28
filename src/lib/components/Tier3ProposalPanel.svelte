@@ -82,6 +82,15 @@
   let detailRequestSeq = 0;
   let summariesRequestSeq = 0;
 
+  // ZEB-1018: transient D-FROST committee-ceremony status line. Set by
+  // dkg/refresh progress events (which now arrive from PEERS too — the
+  // transport adapter feeds the same Tauri events the local IPC layer
+  // emits), cleared when the SAME ceremony's beacon lands or on
+  // community switch. The ceremonyId is tracked so a delayed beacon
+  // from an older ceremony can't blank the status of the one currently
+  // in flight (CodeAnt PR #768).
+  let ceremonyStatus = $state<{ ceremonyId: string; text: string } | null>(null);
+
   let unsubscribers: Array<() => void> = [];
 
   async function loadSummaries() {
@@ -223,6 +232,7 @@
     selectedDetail = null;
     detailError = null;
     listError = null;
+    ceremonyStatus = null;
 
     loadSummaries();
     unsubscribers.push(adapter.subscribeTier3PollCreated(() => loadSummaries()));
@@ -289,6 +299,42 @@
         if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
       }),
     );
+    // ZEB-1018 — D-FROST committee ceremony events. A completed beacon
+    // drives stage transitions (sortition reveal, se-mode tally reveal),
+    // so it refetches list + detail like the stage events above; the
+    // round-progress events only update the transient status line.
+    unsubscribers.push(
+      adapter.subscribeDfrostDkgProgress((p) => {
+        if (p.communityId !== communityId) return;
+        ceremonyStatus = {
+          ceremonyId: p.ceremonyId,
+          text:
+            `Committee key ceremony — round ${p.roundNum}` +
+            ` (${p.participantsSoFar} contribution${p.participantsSoFar === 1 ? '' : 's'})`,
+        };
+      }),
+    );
+    unsubscribers.push(
+      adapter.subscribeDfrostRefreshProgress((p) => {
+        if (p.communityId !== communityId) return;
+        ceremonyStatus = {
+          ceremonyId: p.ceremonyId,
+          text: `Committee key refresh — round ${p.roundNum}`,
+        };
+      }),
+    );
+    unsubscribers.push(
+      adapter.subscribeDfrostBeaconReady((p) => {
+        if (p.communityId !== communityId) return;
+        // Clear only the ceremony this beacon concluded — a delayed
+        // beacon from an older ceremony must not blank the in-flight
+        // one's status. The refetch stays unconditional: any beacon in
+        // this community can drive sortition/tally stage transitions.
+        if (ceremonyStatus?.ceremonyId === p.ceremonyId) ceremonyStatus = null;
+        loadSummaries();
+        refetchSelected();
+      }),
+    );
   });
 
   onDestroy(() => {
@@ -299,6 +345,10 @@
 
 <section class="tier3-panel">
   <h2>Constitutional Decisions (Tier 3)</h2>
+
+  {#if ceremonyStatus}
+    <p class="ceremony-status" role="status">{ceremonyStatus.text}</p>
+  {/if}
 
   <form
     class="create-form"
@@ -564,6 +614,11 @@
 <style>
   .tier3-panel { padding: 1rem; max-width: 880px; margin: 0 auto; }
   h2 { font-family: var(--font-display); font-weight: 500; }
+  .ceremony-status {
+    font-size: 0.85rem;
+    opacity: 0.75;
+    margin: 0 0 0.75rem;
+  }
   .create-form {
     display: flex;
     flex-direction: column;

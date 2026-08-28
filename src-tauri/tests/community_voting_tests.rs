@@ -38,6 +38,8 @@ mod community_dfrost_integration;
 mod community_dfrost_ipc_integration;
 #[path = "community_voting/community_dfrost_transport_integration.rs"]
 mod community_dfrost_transport_integration;
+#[path = "community_voting/community_dfrost_zenoh_integration.rs"]
+mod community_dfrost_zenoh_integration;
 #[path = "community_voting/community_voting_tier2_delegate_on_behalf_integration.rs"]
 mod community_voting_tier2_delegate_on_behalf_integration;
 #[path = "community_voting/community_voting_tier3_deliberation_ipc_integration.rs"]

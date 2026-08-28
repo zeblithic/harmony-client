@@ -12,6 +12,7 @@
 
 /** Fires on every `dr` (DkgRound) event apply. `roundNum` is 1, 2, or 3. */
 export interface DfrostDkgProgressPayload {
+  communityId: string;      // hex(SpaceId), 32 chars — ZEB-1018 filter key
   ceremonyId: string;       // hex(ceremony_id), 64 chars
   roundNum: number;
   participantsSoFar: number;
@@ -19,12 +20,14 @@ export interface DfrostDkgProgressPayload {
 
 /** Fires when a `vb` (VrfBeacon) event is applied — threshold sig aggregated. */
 export interface DfrostBeaconReadyPayload {
+  communityId: string;      // hex(SpaceId), 32 chars — ZEB-1018 filter key
   ceremonyId: string;       // hex(ceremony_id), 64 chars
   vrfOutput: string;        // hex(vrf_output), 64 chars
 }
 
 /** Fires on every `rf` (ProactiveRefresh) event apply. */
 export interface DfrostRefreshProgressPayload {
+  communityId: string;      // hex(SpaceId), 32 chars — ZEB-1018 filter key
   ceremonyId: string;       // hex(ceremony_id), 64 chars
   roundNum: number;
 }
