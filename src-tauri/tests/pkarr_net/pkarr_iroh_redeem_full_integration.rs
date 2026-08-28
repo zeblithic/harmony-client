@@ -2599,6 +2599,7 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
                 redeem_timeout: Some(Duration::from_secs(1)),
                 ..Default::default()
             },
+            None, // sync_engine (ZEB-1020): no owner-state engine in this harness
         )
         .await
         .expect("ZEB-899: the latch seed must commit a pending Space, not Err");
@@ -2823,6 +2824,7 @@ async fn zeb903_reattempt_driver_converges_latched_join_on_epoch_bump() {
                 redeem_timeout: Some(Duration::from_secs(1)),
                 ..Default::default()
             },
+            None, // sync_engine (ZEB-1020): no owner-state engine in this harness
         )
         .await
         .expect("the latch seed must commit a pending Space, not Err");
@@ -3072,6 +3074,7 @@ async fn zeb903_reattempt_driver_collapses_on_registry_shutdown() {
                 redeem_timeout: Some(Duration::from_secs(1)),
                 ..Default::default()
             },
+            None, // sync_engine (ZEB-1020): no owner-state engine in this harness
         )
         .await
         .expect("the latch seed must commit a pending Space, not Err");
@@ -3203,6 +3206,7 @@ async fn zeb903_reattempt_driver_respects_left_community() {
                 redeem_timeout: Some(Duration::from_secs(1)),
                 ..Default::default()
             },
+            None, // sync_engine (ZEB-1020): no owner-state engine in this harness
         )
         .await
         .expect("the latch seed must commit a pending Space, not Err");

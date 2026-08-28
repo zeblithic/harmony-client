@@ -18800,6 +18800,16 @@ pub(crate) async fn add_space_impl(
             tracker_g.observe_local(stamped.clone());
         }
 
+        // ZEB-1020: arm the dirty signal AT the commit, while the state
+        // guard is still held — the ZEB-709 fence at the bottom of this fn
+        // also notifies, but only after the tunnel fan-out awaits; a
+        // concurrent un-vouched persist snapshotting in that window is the
+        // ZEB-710 tripwire fire observed on CI in create_community's twin
+        // of this pattern. Mirrors create_community_inner exactly.
+        if let Some(engine) = sync_engine.as_ref() {
+            engine.notify_dirty();
+        }
+
         (canonical_id, fanout, stamped)
     };
     let _ = new_hlc; // borrowed only to pin the tracker update timing
@@ -38698,17 +38708,22 @@ pub async fn create_community_inner(
         GenerationChanged(u64),
         RegistryGone,
     }
-    let verdict = {
+    // ZEB-1020: the owner-state engine handle is snapshotted alongside the
+    // verdict so the commit block below can arm the dirty signal at the
+    // mutation itself (see the comment there). `None` pre-start_node, where
+    // the caller's fence is skipped for the same reason.
+    let (verdict, sync_engine_for_commit) = {
         let g = node_state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        if g.generation != snapshot_generation {
+        let verdict = if g.generation != snapshot_generation {
             FenceVerdict::GenerationChanged(g.generation)
         } else if g.community_registry.is_none() {
             FenceVerdict::RegistryGone
         } else {
             FenceVerdict::Ok
-        }
+        };
+        (verdict, g.sync_engine.clone())
     }; // std lock guard dropped here before any .await.
     match verdict {
         FenceVerdict::Ok => {}
@@ -38747,6 +38762,22 @@ pub async fn create_community_inner(
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
             // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(format!("apply_space rejected new community: {outcome:?}"));
+        }
+        // ZEB-1020: arm the dirty signal AT the commit, while the state
+        // guard is still held. The caller's `fence_owner_state_flush` also
+        // notifies, but only AFTER this function's remaining awaits
+        // (channel-log commit + the bounded community-CRDT fence) — an
+        // un-notified window the ZEB-710 tripwire legitimately flagged when
+        // a concurrent un-vouched persist (the trailing debounce wakeup a
+        // previous fence leaves armed) snapshotted mid-window on a loaded
+        // CI runner. Notifying under the guard makes mutation + accounting
+        // atomic w.r.t. persist snapshots (which take this same lock), and
+        // it also closes the durability gap: a crash inside the window now
+        // leaves the debounce armed instead of silently dropping the Space.
+        // `notify_dirty` is sync + non-blocking (atomic stores + a Notify
+        // wake), so holding the guard across it is safe.
+        if let Some(engine) = sync_engine_for_commit.as_ref() {
+            engine.notify_dirty();
         }
         // ZEB-267: tracker advance no longer needed here — the two
         // reservations above (bootstrap_join + default-channel)
@@ -43339,6 +43370,13 @@ pub async fn redeem_invite_inner<F>(
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
     identity_dir: Option<std::path::PathBuf>,
+    // ZEB-1020: owner-state engine handle so the Space commit can arm its
+    // dirty signal AT the mutation (see the commit block in
+    // `redeem_invite_inner_with_overrides`). Production callers pass the
+    // NodeState-held clone; tests that don't exercise persistence timing
+    // pass `None` (the caller-side fence's own notify then remains the
+    // only accounting, as before).
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
 ) -> Result<RedeemInviteResultDto, RedeemInviteError>
 where
     F: Fn() -> Result<(), RedeemInviteError>,
@@ -43360,6 +43398,7 @@ where
         fence_check,
         identity_dir,
         RedeemInviteOverrides::default(),
+        sync_engine,
     )
     .await
 }
@@ -43412,6 +43451,9 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     // ZEB-325 Phase 2c option A: pre-minted artifacts + pre-delivered
     // counter-sign event. See `RedeemInviteOverrides` docs.
     overrides: RedeemInviteOverrides,
+    // ZEB-1020: owner-state engine handle for the commit-point dirty signal
+    // (see the Space commit block below). `None` = tests / pre-start_node.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
 ) -> Result<RedeemInviteResultDto, RedeemInviteError>
 where
     F: Fn() -> Result<(), RedeemInviteError>,
@@ -44337,6 +44379,15 @@ where
                 format!("apply_space rejected redemption Space: {outcome:?}"),
             ));
         }
+        // ZEB-1020: arm the dirty signal AT the commit, under the state
+        // guard — the caller-side `fence_owner_state_flush` notify only
+        // lands after this function's remaining awaits, an un-notified
+        // window a concurrent un-vouched persist can snapshot (the ZEB-710
+        // tripwire fire observed on CI in create_community's twin of this
+        // block). Mirrors create_community_inner exactly.
+        if let Some(engine) = sync_engine.as_ref() {
+            engine.notify_dirty();
+        }
         // ZEB-267: tracker advance no longer needed here — the
         // reservation at step 4 already bumped the tracker atomically.
         // state_g drops at scope end.
@@ -44764,6 +44815,7 @@ pub(crate) async fn redeem_invite_impl(
         channel_log_registry,
         fence_check,
         crate::owner_commands::resolve_identity_dir().ok(),
+        sync_engine.clone(),
     )
     .await?;
 
@@ -44914,6 +44966,10 @@ async fn join_open_community_inner<F>(
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
+    // ZEB-1020: owner-state engine handle, forwarded to
+    // `redeem_invite_inner` for the commit-point dirty signal. `None` in
+    // unit tests that fabricate a snapshot without a running engine.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
 ) -> Result<RedeemInviteResultDto, String>
 where
     F: Fn() -> Result<(), RedeemInviteError>,
@@ -44939,6 +44995,7 @@ where
         channel_log_registry,
         fence_check,
         crate::owner_commands::resolve_identity_dir().ok(),
+        sync_engine,
     )
     .await
     // ZEB-885: join_open_community is a separate command (directory-join UI,
@@ -45083,6 +45140,7 @@ pub(crate) async fn join_open_community_impl(
         dm_outbox,
         channel_log_registry,
         fence_check,
+        sync_engine.clone(),
     )
     .await?;
 
@@ -45507,6 +45565,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             None, // identity_dir
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await
         .expect_err("a forged invite token must fail the redeem");
@@ -45577,6 +45636,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             None, // identity_dir: no fork fields in this test
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await;
 
@@ -45750,6 +45810,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await;
 
@@ -45900,6 +45961,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await;
 
@@ -46017,6 +46079,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await;
 
@@ -46555,6 +46618,7 @@ mod zeb436_orphan_adoption_tests {
                 }
             },
             None,
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await
     }
@@ -47140,6 +47204,7 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&rig.channel_log_registry),
             || Ok(()),
             None,
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await;
 
@@ -47339,6 +47404,7 @@ mod zeb436_orphan_adoption_tests {
             std::sync::Arc::clone(&rig.channel_log_registry),
             || Ok(()),
             None,
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await;
 
@@ -47479,6 +47545,7 @@ mod join_open_community_tests {
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
+            None, // sync_engine (ZEB-1020): no engine in this fixture
         )
         .await
         .expect("happy path must succeed");
@@ -49506,13 +49573,25 @@ async fn persist_community_left_at(
     let community_id_hex = hex::encode(space_id.0);
     {
         let mut state_g = crdt_state.lock().await;
-        if let Err(e) = mark_community_space_left(&mut state_g, space_id, wall_now_ms, device_id) {
-            tracing::warn!(
-                community_id = %community_id_hex,
-                error = %e,
-                "leave_community: owner-state left_at write failed — community \
-                 will resurrect in nav at next boot (ZEB-427)"
-            );
+        match mark_community_space_left(&mut state_g, space_id, wall_now_ms, device_id) {
+            Ok(_) => {
+                // ZEB-1020: arm the dirty signal AT the commit, under the
+                // state guard — the fence below also notifies, but in the
+                // gap a concurrent un-vouched persist would observe an
+                // un-notified mutation window (the ZEB-710 tripwire fire
+                // seen on CI in create_community's twin of this pattern).
+                if let Some(engine) = sync_engine.as_ref() {
+                    engine.notify_dirty();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    community_id = %community_id_hex,
+                    error = %e,
+                    "leave_community: owner-state left_at write failed — community \
+                     will resurrect in nav at next boot (ZEB-427)"
+                );
+            }
         }
     }
     match sync_engine {
@@ -65982,6 +66061,7 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
             }),
             ..Default::default()
         },
+        sync_engine.clone(),
     )
     // ZEB-885: connectivity_open_join_iroh is a separate open/tokenless
     // directory-join verb, not the redeem dialog's path — flatten the
@@ -66059,10 +66139,19 @@ pub(crate) async fn fence_owner_state_flush(
     // publish (best-effort propagation of the owner-state root to sibling
     // devices — what the old synchronous `flush_now` did; never blocks
     // durability) AND accounts the fenced mutation for the ZEB-710
-    // dirty-window tripwire, so callers that mutate-then-fence without
-    // their own notify (e.g. fork_community) don't trip it. `persist_now`
-    // never consumes `has_pending_dirty`, so the debounce stays armed
-    // across every arm below — including error/timeout.
+    // dirty-window tripwire. `persist_now` never consumes
+    // `has_pending_dirty`, so the debounce stays armed across every arm
+    // below — including error/timeout.
+    //
+    // ZEB-1020: this notify is a BACKSTOP, not the primary accounting.
+    // Callers must ALSO call `notify_dirty()` at the mutation itself,
+    // under the state guard — relying on this one leaves an un-notified
+    // window from the commit to here (spanning any awaits in between),
+    // which a concurrent un-vouched persist can snapshot: that is exactly
+    // the ZEB-710 tripwire fire observed on CI (create_community's commit
+    // → fence window, hit by the trailing debounce wakeup a previous
+    // fence's notify leaves armed). Every current caller's commit site
+    // notifies at the mutation; keep new ones to that pattern.
     engine.notify_dirty();
     match tokio::time::timeout(timeout, engine.persist_now()).await {
         Ok(Ok(())) => {}
@@ -66947,6 +67036,7 @@ where
             channel_log_registry,
             fence_check,
             identity_dir,
+            sync_engine.clone(),
         )
         .await;
         return match result {
@@ -68009,6 +68099,7 @@ where
         fence_check,
         identity_dir,
         overrides,
+        sync_engine.clone(),
     )
     .await;
 

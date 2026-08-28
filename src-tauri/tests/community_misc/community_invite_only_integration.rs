@@ -535,6 +535,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         bob_channel_log_registry,
         || Ok(()),
         None, // ZEB-325: invite-only integration test uses Reticulum-required semantics.
+        None, // sync_engine (ZEB-1020): no owner-state engine in this harness
     )
     .await;
 

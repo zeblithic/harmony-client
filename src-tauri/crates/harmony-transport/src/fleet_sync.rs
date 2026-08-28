@@ -407,32 +407,52 @@ pub struct FleetSyncConfig<S> {
 /// `debug_assert!`. Production carries only the (never-read) bookkeeping
 /// stores. The per-site dirty-count pins from ZEB-709/PR #487 guard the
 /// CURRENT mutation surface; this guards FUTURE sites generically.
+/// ZEB-1020: all three bookkeeping fields live under ONE std mutex so an
+/// accounting stamp is serialized against the persist path's check +
+/// boundary advance — the old split (two atomics + a hash mutex) let an
+/// `account()` interleave between a persist's check and its epoch bump,
+/// stamping an epoch that was about to close and mis-attributing the
+/// signal. Every lock of this mutex recovers from poisoning
+/// (`PoisonError::into_inner`): the bookkeeping is a monotone scratchpad
+/// whose worst inconsistency is one spurious/missed debug fire, while a
+/// propagated poison panic killed the whole engine (the ZEB-1020 CI
+/// cascade).
 struct PersistTripwire {
+    inner: std::sync::Mutex<TripwireInner>,
+}
+
+#[derive(Default)]
+struct TripwireInner {
     /// Monotone persist-boundary counter — bumped by EVERY persist
     /// (changed or not), under the sink lock. A signal only vouches for
     /// persists in the epoch it was issued in, so a stale signal (from
     /// before the last persist boundary) can never mask a later
     /// un-notified mutation (PR #493 R1, CodeRabbit).
-    epoch: AtomicU64,
+    epoch: u64,
     /// Epoch observed at the most recent accounting event: `notify_dirty()`,
     /// the engine's own inbound-merge path (remote merges are exempt from
     /// the notify discipline — the task persists them right where they
     /// apply), or an explicit `flush_now` (which publishes the very state
     /// it persists, so the ZEB-703 harm cannot occur through it).
-    /// `u64::MAX` = never signalled.
-    notified_epoch: AtomicU64,
+    /// `None` = never signalled.
+    notified_epoch: Option<u64>,
     /// Canonical-CBOR hash of the last persisted state snapshot. `None`
-    /// until the first persist (the baseline never fires).
+    /// until the first persist (the baseline never fires). Only touched by
+    /// the test-build check block — production persists never touch this
+    /// struct beyond `account()`.
     #[cfg_attr(not(any(test, feature = "test-fixtures")), allow(dead_code))]
-    last_hash: std::sync::Mutex<Option<u64>>,
+    last_hash: Option<u64>,
 }
 
 impl PersistTripwire {
     /// Record an accounting event: signals vouch only for the CURRENT
     /// persist epoch (see the field docs).
     fn account(&self) {
-        self.notified_epoch
-            .store(self.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.notified_epoch = Some(g.epoch);
     }
 }
 
@@ -528,9 +548,7 @@ where
         // direct) — see the field doc on the handle.
         let persist_sink = Arc::new(tokio::sync::Mutex::new(()));
         let tripwire = Arc::new(PersistTripwire {
-            epoch: AtomicU64::new(0),
-            notified_epoch: AtomicU64::new(u64::MAX),
-            last_hash: std::sync::Mutex::new(None),
+            inner: std::sync::Mutex::new(TripwireInner::default()),
         });
         // ZEB-705: bounded fetch-retry re-injection. Capacity matches the
         // in-flight permit cap so a full sleeper set never overflows it.
@@ -1153,14 +1171,35 @@ where
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             bytes.hash(&mut hasher);
             let hash = hasher.finish();
-            let mut last_g = tripwire.last_hash.lock().expect("tripwire hash mutex");
-            let cur_epoch = tripwire.epoch.load(Ordering::SeqCst);
-            let changed = last_g.is_some_and(|prev| prev != hash);
-            // A signal vouches ONLY for persists in the epoch it was issued
-            // in — a signal from before the last persist boundary is stale
-            // and cannot mask a later un-notified mutation.
-            if changed && tripwire.notified_epoch.load(Ordering::SeqCst) != cur_epoch {
+            // ZEB-1020: ALL bookkeeping happens first, under a
+            // poison-recovering lock, and the guard is dropped BEFORE the
+            // assert. The old shape asserted while still holding the hash
+            // guard, so one tripwire hit poisoned the mutex and every later
+            // persist panicked at the lock (`PoisonError`) — cascading a
+            // single debug signal into a dead engine and an opaque
+            // transport error on whatever IPC fenced next. Advancing
+            // `last_hash` before asserting also makes the signal
+            // single-shot: the next persist compares against the updated
+            // hash instead of re-firing on the same delta.
+            let fired = {
+                let mut g = tripwire
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let changed = g.last_hash.is_some_and(|prev| prev != hash);
+                // A signal vouches ONLY for persists in the epoch it was
+                // issued in — a signal from before the last persist boundary
+                // is stale and cannot mask a later un-notified mutation.
+                let vouched = g.notified_epoch == Some(g.epoch);
+                // Advance the persist boundary: any signal issued before
+                // this point is now stale.
+                g.epoch += 1;
+                g.last_hash = Some(hash);
+                changed && !vouched
+            };
+            if fired {
                 tracing::error!(
+                    engine_state = std::any::type_name::<S>(),
                     "ZEB-710 dirty-window tripwire: state hash changed since the last \
                      persist with NO notify_dirty() observed in this persist epoch — an \
                      un-notified mutation window (the ZEB-703 bug class). Find the \
@@ -1169,13 +1208,11 @@ where
                 debug_assert!(
                     false,
                     "un-notified owner-state mutation window (ZEB-710 tripwire): state \
-                     hash changed since the last persist without notify_dirty()"
+                     hash changed since the last persist without notify_dirty() \
+                     [engine state type: {}]",
+                    std::any::type_name::<S>()
                 );
             }
-            // Advance the persist boundary: any signal issued before this
-            // point is now stale.
-            tripwire.epoch.store(cur_epoch + 1, Ordering::SeqCst);
-            *last_g = Some(hash);
         }
     }
     #[cfg(not(any(test, feature = "test-fixtures")))]
@@ -2695,6 +2732,97 @@ mod engine_tests {
 
         // The tripwire fires here (debug_assert in test builds).
         let _ = built.engine.persist_now().await;
+    }
+
+    /// ZEB-1020: one tripwire hit must be ONE signal, never a cascade. The
+    /// pre-fix shape ran the `debug_assert!` while still holding the hash
+    /// mutex, so the first fire poisoned it and EVERY subsequent persist
+    /// panicked at the lock (`tripwire hash mutex: PoisonError`) — one
+    /// un-notified mutation window killed the whole engine and surfaced as
+    /// an opaque transport error on whatever IPC fenced next (observed on
+    /// CI: `serve_core_drives_full_flow_over_http_and_ws` dying inside
+    /// `POST /v1/rpc/create_community`). Pins the repaired contract:
+    /// (1) the fire itself still panics, naming the engine's state type;
+    /// (2) the NEXT persist succeeds — no poison panic, and no repeat fire
+    ///     off the same delta (the boundary hash advanced at fire time);
+    /// (3) the notify → persist discipline still works afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tripwire_fire_is_single_shot_and_does_not_poison_zeb1020() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let BuiltInspectable {
+            engine,
+            state,
+            persist: _persist,
+            out_rx: _out_rx,
+            out_tx: _out_tx,
+            in_tx: _in_tx,
+        } = build_engine_inspectable("dev-tripwire-poison", Arc::clone(&cas), 8);
+        let engine = Arc::new(engine);
+
+        // Baseline: first persist records the hash (never fires).
+        engine.persist_now().await.expect("baseline persist");
+
+        // Mutate WITHOUT notify_dirty — the discipline violation.
+        {
+            let mut doc = state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "un-notified".into(),
+                },
+            );
+        }
+
+        // (1) Fire, contained in a spawned task so the panic is observable
+        // instead of killing the test.
+        let fire_engine = Arc::clone(&engine);
+        let fire = tokio::spawn(async move { fire_engine.persist_now().await });
+        let err = fire
+            .await
+            .expect_err("the tripwire fire must panic the persisting task");
+        assert!(err.is_panic(), "expected a panic, got cancellation");
+        let payload = err.into_panic();
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .expect("panic payload is a string");
+        assert!(
+            msg.contains("un-notified owner-state mutation window"),
+            "panic must be the tripwire fire, got: {msg}"
+        );
+        assert!(
+            msg.contains("ToyDoc"),
+            "fire must name the engine's state type so a shared-engine \
+             failure is attributable, got: {msg}"
+        );
+
+        // (2) The very next persist must NOT hit a poisoned mutex, and must
+        // not re-fire on the delta the fire already recorded.
+        engine
+            .persist_now()
+            .await
+            .expect("post-fire persist must succeed (no poison cascade, single-shot signal)");
+
+        // (3) The discipline still works: a notified mutation persists clean.
+        {
+            let mut doc = state.lock().await;
+            doc.entries.insert(
+                "k2".into(),
+                ToyEntry {
+                    ctr: 2,
+                    val: "notified".into(),
+                },
+            );
+        }
+        engine.notify_dirty();
+        engine
+            .persist_now()
+            .await
+            .expect("notified mutation persists without firing");
+
+        engine.shutdown().await.ok();
     }
 
     /// ZEB-710 R1 (CodeRabbit Critical): cancelling a persist mid-write
