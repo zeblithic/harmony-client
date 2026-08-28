@@ -404,15 +404,28 @@ describe('Tier3ProposalPanel', () => {
     vi.mocked(adapter.getTier3Poll).mockClear();
     vi.mocked(adapter.listTier3Polls).mockClear();
 
-    // Beacon lands: status clears, list + selected detail refetch.
+    // A delayed beacon from an OLDER ceremony still refetches (any
+    // beacon can drive stage transitions) but must NOT blank the
+    // in-flight ceremony's status (CodeAnt PR #768).
+    beaconHandler!({
+      communityId: TEST_COMMUNITY_ID,
+      ceremonyId: 'ee'.repeat(32),
+      vrfOutput: 'cd'.repeat(32),
+    });
+    await waitFor(() => expect(adapter.listTier3Polls).toHaveBeenCalledTimes(1));
+    expect(
+      await findByText(/Committee key ceremony — round 2 \(3 contributions\)/),
+    ).toBeTruthy();
+
+    // The matching ceremony's beacon clears the status and refetches.
     beaconHandler!({
       communityId: TEST_COMMUNITY_ID,
       ceremonyId: 'ab'.repeat(32),
       vrfOutput: 'cd'.repeat(32),
     });
 
-    await waitFor(() => expect(adapter.listTier3Polls).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(adapter.listTier3Polls).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(2));
     expect(queryByText(/Committee key ceremony/)).toBeNull();
   });
 

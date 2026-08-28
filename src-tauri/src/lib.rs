@@ -1394,8 +1394,11 @@ pub struct NodeState {
     /// `DfrostLog` is in-memory only: committee/ceremony state does not
     /// survive a restart (durable committee state is ZEB-753's VerifiedLog
     /// adoption). Engine + Zenoh-adapter teardown is owned by
-    /// `dfrost_log_registry` shutdown in stop_inner; this map itself is
-    /// not cleared there (same as `voting_logs`).
+    /// `dfrost_log_registry` shutdown in stop_inner / the start_node
+    /// restart path, and BOTH clear this map right after the engines stop
+    /// (PR #768 review) — retaining it would leak pending ceremonies and
+    /// local DKG secrets into the next run, worst case across an identity
+    /// switch, while fresh engines start with empty replay trackers.
     pub dfrost_logs: std::sync::Arc<
         tokio::sync::Mutex<
             std::collections::HashMap<
@@ -2844,6 +2847,13 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let dfrost_log_registry_for_shutdown: Option<
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
     >;
+    // ZEB-1018 (PR #768 review): the dfrost log map is cleared after the
+    // registry's engines shut down, so no ceremony state — pending
+    // ceremonies, local DKG secrets, key packages, committee epochs —
+    // survives into the next node run (an in-process restart or an
+    // identity switch would otherwise attach fresh engines with empty
+    // replay trackers to stale logs).
+    let dfrost_logs_for_shutdown: DfrostLogsMap;
     // Mint Phase 2 sync: taken outside the lock so shutdown() can be
     // awaited on an ephemeral runtime after the MutexGuard is dropped.
     let mint_sync_for_shutdown: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>;
@@ -3072,6 +3082,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // can run on an ephemeral runtime (the std `MutexGuard` is
         // `!Send`). Mirrors `channel_log_registry`'s take pattern.
         dfrost_log_registry_for_shutdown = guard.dfrost_log_registry.take();
+        // ZEB-1018: clone the log-map Arc so it can be cleared on the
+        // ephemeral runtime after the engines shut down (below).
+        dfrost_logs_for_shutdown = std::sync::Arc::clone(&guard.dfrost_logs);
         // ZEB-309 Task 11: clear the beacon_requester before voting engines
         // are dropped (below) so no in-flight beacon spawn can race with
         // teardown. Dropping the Arc here reduces the refcount; any spawned
@@ -3430,7 +3443,17 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                     .build()
                 {
                     Ok(rt) => {
-                        rt.block_on(registry.shutdown());
+                        rt.block_on(async {
+                            registry.shutdown().await;
+                            // ZEB-1018 (PR #768 review): drop all ceremony
+                            // state AFTER the engines stop consuming it.
+                            // DfrostLog is in-memory-only by contract; a
+                            // retained map would leak pending ceremonies +
+                            // local DKG secrets into the next run (worst
+                            // case across an identity switch) while fresh
+                            // engines start with empty replay trackers.
+                            dfrost_logs_for_shutdown.lock().await.clear();
+                        });
                     }
                     Err(e) => {
                         tracing::error!(
@@ -4528,6 +4551,10 @@ pub async fn start_node_inner(
     let old_dfrost_log_registry: Option<
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
     >;
+    // ZEB-1018 (PR #768 review): the prior identity's dfrost log map,
+    // cleared after its engines shut down so no ceremony state (incl.
+    // local DKG secrets) leaks into the new identity's run.
+    let old_dfrost_logs: DfrostLogsMap;
     // ZEB-281 Sub-D Phase 4: outer-scope binding for the previous
     // identity's profile-broadcast publisher. Awaited outside the std
     // `MutexGuard` scope (the guard is `!Send`) — mirrors
@@ -4701,6 +4728,9 @@ pub async fn start_node_inner(
         // identity's D-FROST registry into the outer-scope binding;
         // shutdown runs below outside the std `MutexGuard`.
         old_dfrost_log_registry = guard.dfrost_log_registry.take();
+        // ZEB-1018: clone the log-map Arc; cleared below after the old
+        // registry's engines stop consuming it.
+        old_dfrost_logs = std::sync::Arc::clone(&guard.dfrost_logs);
         // ZEB-309 Task 11: drop the prior identity's beacon_requester so
         // the new identity gets a fresh closure (captures the same AppHandle
         // but the new start_node call constructs a brand-new one for clarity).
@@ -4838,6 +4868,12 @@ pub async fn start_node_inner(
     if let Some(registry) = old_dfrost_log_registry {
         registry.shutdown().await;
     }
+    // ZEB-1018 (PR #768 review): drop the prior identity's ceremony state
+    // once its engines are down — DfrostLog is in-memory-only by contract,
+    // and retaining it would hand the new identity's freshly-registered
+    // engines stale pending ceremonies + local DKG secrets while their
+    // replay trackers start empty. Mirrors the stop_inner clear.
+    old_dfrost_logs.lock().await.clear();
     // ZEB-217 Sub-C Phase 2: explicitly await the previous community
     // engine pool's shutdown BEFORE the owner SyncEngine. Mirrors
     // stop_inner's ordering — community engines need their final
