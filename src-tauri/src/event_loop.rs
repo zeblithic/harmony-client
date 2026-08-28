@@ -2253,41 +2253,47 @@ pub async fn run(
                 ));
 
                 // Inbound: Zenoh subscriber → SyncEngine subscriber_rx.
+                // ZEB-1023: on transient recv_async errors, re-declare the
+                // subscriber with exponential backoff — the mint / notes /
+                // dataset-root "MAJOR 8" pattern; this arm was the family's
+                // one holdout (a dead subscriber meant owner multi-device
+                // state sync stayed inbound-deaf until restart). The only
+                // terminal conditions are `closing` becoming true (node
+                // shutdown) or `inbound_tx.send` failing (engine dropped
+                // its receiver). The degraded emit is kept on every
+                // mid-session death so the frontend surfaces the outage
+                // even while the retry loop works on curing it.
                 match session.declare_subscriber(&key_expr).await {
                     Ok(sub) => {
                         let inbound_tx = handles.inbound_tx;
                         let closing_sub = Arc::clone(&closing);
                         let app_late = app.clone();
                         let topic_late = topic.clone();
+                        let session_sub = session.clone();
+                        let key_expr_sub = key_expr.clone();
                         tokio::spawn(async move {
-                            // Two ways the loop ends:
-                            //   1. `inbound_tx.send` fails — the engine
-                            //      dropped its subscriber_rx, i.e. the
-                            //      engine cleanly shut down. The engine
-                            //      logs its own shutdown trace; we stay
-                            //      silent here to avoid a spurious
-                            //      "subscriber closed unexpectedly" on
-                            //      every routine stop_node.
-                            //   2. `sub.recv_async` returns Err — the
-                            //      Zenoh session/subscriber died on us.
-                            //      Warn AND emit the same degraded
-                            //      event used at install-time so the
-                            //      frontend can surface the failure
-                            //      consistently regardless of WHEN it
-                            //      happens. Skip both if the event
-                            //      loop is already shutting down.
-                            loop {
-                                match sub.recv_async().await {
-                                    Ok(sample) => {
-                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                        if inbound_tx.send(bytes).await.is_err() {
-                                            break;
+                            let mut current_sub = sub;
+                            let mut backoff_ms: u64 = 100;
+                            'outer: loop {
+                                loop {
+                                    match current_sub.recv_async().await {
+                                        Ok(sample) => {
+                                            backoff_ms = 100; // reset on success
+                                            let bytes: Vec<u8> =
+                                                sample.payload().to_bytes().to_vec();
+                                            if inbound_tx.send(bytes).await.is_err() {
+                                                // Engine dropped its receiver — clean shutdown.
+                                                break 'outer;
+                                            }
                                         }
-                                    }
-                                    Err(_) => {
-                                        if !closing_sub.load(Ordering::SeqCst) {
+                                        Err(_) => {
+                                            if closing_sub.load(Ordering::SeqCst) {
+                                                break 'outer;
+                                            }
                                             tracing::warn!(
-                                                "state-root subscriber closed unexpectedly"
+                                                backoff_ms,
+                                                "state-root subscriber closed unexpectedly; \
+                                                 will re-declare after backoff"
                                             );
                                             crate::node_event_sink::emit_ser(
                                                 app_late.as_ref(),
@@ -2297,8 +2303,30 @@ pub async fn run(
                                                     "topic": &topic_late,
                                                 }),
                                             );
+                                            break; // break inner, retry outer
                                         }
-                                        break;
+                                    }
+                                }
+                                if closing_sub.load(Ordering::SeqCst) {
+                                    break 'outer;
+                                }
+                                // Exponential backoff before re-declaring.
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(30_000);
+                                match session_sub.declare_subscriber(&key_expr_sub).await {
+                                    Ok(new_sub) => {
+                                        tracing::info!(
+                                            "state-root subscriber re-declared successfully"
+                                        );
+                                        current_sub = new_sub;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            backoff_ms,
+                                            "state-root subscriber re-declare failed; retrying"
+                                        );
+                                        // Don't reset backoff — keep backing off.
                                     }
                                 }
                             }
@@ -10520,9 +10548,11 @@ mod root_reply_bounded_tests {
 // `state-root-sync-degraded` emit removed. Per the Phase 2 design, transport
 // degradation flows through the engine's `error_tx` channel; the registry's
 // drain task (Task 13) converts those reports into the
-// `community-state-sync-degraded` Tauri event. So this adapter logs+lets
-// the channel close on transport failure and trusts the engine's
-// `subscriber_channel_closed` degraded report to surface it.
+// `community-state-sync-degraded` Tauri event. So this adapter logs on
+// transport failure and trusts the engine's degraded reports for surfacing.
+// (Since ZEB-1023 a subscriber failure no longer closes the inbound channel
+// — the subscriber arm retries — so `subscriber_channel_closed` now only
+// fires on genuine engine/adapter teardown.)
 
 /// Spawn a Zenoh publisher + subscriber + queryable + root-fetch driver
 /// for one community's state-root topic
@@ -10549,6 +10579,10 @@ mod root_reply_bounded_tests {
 /// logs and returns a JoinHandle that resolves immediately — both
 /// `publisher_rx` and `subscriber_tx` drop here, which the engine sees as
 /// transport-closed (publish-only / fully-degraded mode).
+///
+/// A failed or dying Zenoh subscriber, by contrast, is NOT terminal: the
+/// subscriber arm re-declares with backoff (ZEB-1023), because this task
+/// is the registered engine's only transport attach.
 pub fn spawn_community_state_zenoh_adapter(
     session: Arc<zenoh::Session>,
     community_id_hex: String,
@@ -10803,85 +10837,108 @@ pub fn spawn_community_state_zenoh_adapter(
         });
 
         // Inbound: Zenoh subscriber → engine's subscriber_tx.
+        //
+        // ZEB-1023: the subscriber is declared inside a retry loop
+        // (voice-signal backoff pattern: 5s → ×2 → 60s cap), NOT
+        // one-shot: the engine registration is the ensure path's
+        // idempotency token, so this task is the registered engine's
+        // ONLY transport attach — a one-shot declare failure would
+        // leave the community's state-root plane (membership/epoch
+        // sync) permanently inbound-deaf until restart. Mid-session
+        // subscriber death re-declares through the same loop.
         let session_sub = session;
         let key_sub = key_expr;
         let topic_sub = topic;
         let closing_sub = Arc::clone(&closing);
         let sub_handle = tokio::spawn(async move {
-            let sub = match session_sub.declare_subscriber(&key_sub).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if !closing_sub.load(Ordering::SeqCst) {
-                        tracing::error!(
-                            topic = %topic_sub,
-                            error = %e,
-                            "failed to declare community state-root subscriber"
-                        );
-                    }
-                    // subscriber_tx drops on this arm's exit; engine's
-                    // subscriber_rx hits None and latches inbound_closed,
-                    // continuing in publish-only mode.
-                    return;
+            let mut backoff = std::time::Duration::from_secs(5);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+            'outer: loop {
+                if closing_sub.load(Ordering::SeqCst) {
+                    break;
                 }
-            };
-            // Three ways the loop ends:
-            //   1. `subscriber_tx.send` fails — engine cleanly shut down
-            //      (registry tore the engine down). Stay silent so a
-            //      routine community-leave / shutdown doesn't log.
-            //   2. `sub.recv_async` returns Err — Zenoh session/subscriber
-            //      died. Warn (gated on !closing) and exit; the engine's
-            //      own subscriber_channel_closed degraded report covers
-            //      surface-level visibility.
-            //   3. `closing` flag flips — bounded-time shutdown, mirrors
-            //      the publisher arm above.
-            //   4. `subscriber_tx.closed()` resolves — the engine
-            //      dropped its subscriber_rx (e.g., registry.stop_engine
-            //      tore down a community while no inbound was flowing).
-            //      Without this arm the loop stays blocked on
-            //      `sub.recv_async` until the next sample arrives,
-            //      leaving the JoinHandle unresolved indefinitely.
-            loop {
-                tokio::select! {
-                    // Data-flow arm first (see publisher loop above
-                    // for rationale). If `subscriber_tx.closed()`
-                    // resolves on the same poll as an inbound sample,
-                    // delivering the sample is harmless: the
-                    // subsequent `subscriber_tx.send` returns Err and
-                    // breaks the loop on the next iteration. Putting
-                    // `closed()` first instead would silently discard
-                    // that sample — contradicting the documented
-                    // intent and masking edge-case message loss
-                    // during teardown.
-                    biased;
-                    res = sub.recv_async() => {
-                        match res {
-                            Ok(sample) => {
-                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                if subscriber_tx.send(bytes).await.is_err() {
+                let sub = match session_sub.declare_subscriber(&key_sub).await {
+                    Ok(s) => {
+                        backoff = std::time::Duration::from_secs(5);
+                        s
+                    }
+                    Err(e) => {
+                        if !closing_sub.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                topic = %topic_sub,
+                                error = %e,
+                                backoff_s = backoff.as_secs(),
+                                "community state-root declare_subscriber failed; \
+                                 retrying after backoff"
+                            );
+                        }
+                        // Race the backoff against engine teardown so a
+                        // registry shutdown mid-retry resolves this task
+                        // promptly instead of after up to MAX_BACKOFF.
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = subscriber_tx.closed() => break 'outer,
+                        }
+                        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                        continue;
+                    }
+                };
+                // Inner-loop exits: send failure / subscriber_tx.closed()
+                // (engine torn down — exit the task, silent), closing flag
+                // (bounded shutdown — exit the task), recv error (subscriber
+                // died mid-session — break to the outer loop and re-declare).
+                loop {
+                    tokio::select! {
+                        // Data-flow arm first (see publisher loop above
+                        // for rationale). If `subscriber_tx.closed()`
+                        // resolves on the same poll as an inbound sample,
+                        // delivering the sample is harmless: the
+                        // subsequent `subscriber_tx.send` returns Err and
+                        // breaks the loop on the next iteration. Putting
+                        // `closed()` first instead would silently discard
+                        // that sample — contradicting the documented
+                        // intent and masking edge-case message loss
+                        // during teardown.
+                        biased;
+                        res = sub.recv_async() => {
+                            match res {
+                                Ok(sample) => {
+                                    let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                    if subscriber_tx.send(bytes).await.is_err() {
+                                        break 'outer;
+                                    }
+                                }
+                                Err(e) => {
+                                    if !closing_sub.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %topic_sub,
+                                            error = %e,
+                                            "community state-root subscriber closed; \
+                                             reconnecting"
+                                        );
+                                    }
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                if !closing_sub.load(Ordering::SeqCst) {
-                                    tracing::warn!(
-                                        topic = %topic_sub,
-                                        error = %e,
-                                        "community state-root subscriber closed unexpectedly"
-                                    );
-                                }
-                                break;
-                            }
+                        }
+                        _ = subscriber_tx.closed() => {
+                            // Engine dropped subscriber_rx — nothing to
+                            // forward to anymore. Silent exit; engine
+                            // owns the shutdown trace if relevant.
+                            break 'outer;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if closing_sub.load(Ordering::SeqCst) { break 'outer; }
                         }
                     }
-                    _ = subscriber_tx.closed() => {
-                        // Engine dropped subscriber_rx — nothing to
-                        // forward to anymore. Silent exit; engine
-                        // owns the shutdown trace if relevant.
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if closing_sub.load(Ordering::SeqCst) { break; }
-                    }
+                }
+                // Mid-session subscriber death (recv Err): pace the
+                // re-declare so a subscriber that dies immediately after
+                // declaring can't busy-loop (voice-signal pattern), while
+                // still resolving promptly on engine teardown.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    _ = subscriber_tx.closed() => break 'outer,
                 }
             }
         });
@@ -11226,9 +11283,12 @@ async fn drive_voting_rbsr(
 ///
 /// The function is fire-and-forget: `event_loop::run`'s select! arm
 /// calls it and drops the `JoinHandle`. The spawned tasks exit when
-/// `closing` is set, when the engine drops its publisher_tx, or when
-/// Zenoh closes the subscriber. Engine teardown is driven by the
-/// `VotingLogEnginesMap` lock in stop_inner (same as state-root v1).
+/// `closing` is set or when the engine drops its channel halves.
+/// A failed or dying Zenoh subscriber is NOT an exit: the inbound arm
+/// re-declares with backoff (ZEB-1023), because this task is the
+/// registered engine's only transport attach. Engine teardown is
+/// driven by the `VotingLogEnginesMap` lock in stop_inner (same as
+/// state-root v1).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_voting_log_zenoh_adapter(
     session: Arc<zenoh::Session>,
@@ -11651,162 +11711,187 @@ pub fn spawn_voting_log_zenoh_adapter(
         });
 
         // Inbound: Zenoh subscriber → decrypt (current-epoch-only) → engine's subscriber_tx.
+        //
+        // ZEB-1023: the subscriber is declared inside a retry loop
+        // (voice-signal backoff pattern: 5s → ×2 → 60s cap), NOT
+        // one-shot: the engine registration is the ensure path's
+        // idempotency token, so this task is the registered engine's
+        // ONLY transport attach — a one-shot declare failure would
+        // leave live voting inbound permanently deaf until restart
+        // (the periodic backfill requester above softens but does not
+        // cure that: minutes-stale tallies, and no RBSR deltas).
+        // Mid-session subscriber death re-declares through the same
+        // loop.
         let session_sub = session;
         let key_sub = key_expr;
         let topic_sub = topic;
         let closing_sub = Arc::clone(&closing);
         let crdt_state_sub = crdt_state;
         let sub_handle = tokio::spawn(async move {
-            let sub = match session_sub.declare_subscriber(&key_sub).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if !closing_sub.load(Ordering::SeqCst) {
-                        tracing::error!(
-                            topic = %topic_sub,
-                            error = %e,
-                            "failed to declare community voting-log subscriber"
-                        );
-                    }
-                    // subscriber_tx drops on this arm's exit; engine's
-                    // subscriber_rx hits None and latches inbound_closed,
-                    // continuing in publish-only mode.
-                    return;
+            let mut backoff = std::time::Duration::from_secs(5);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+            'outer: loop {
+                if closing_sub.load(Ordering::SeqCst) {
+                    break;
                 }
-            };
-            // Three ways the loop ends:
-            //   1. `subscriber_tx.send` fails — engine cleanly shut down
-            //      (registry tore the engine down). Stay silent so a
-            //      routine community-leave / shutdown doesn't log.
-            //   2. `sub.recv_async` returns Err — Zenoh session/subscriber
-            //      died. Warn (gated on !closing) and exit; the engine's
-            //      own subscriber_channel_closed degraded report covers
-            //      surface-level visibility.
-            //   3. `closing` flag flips — bounded-time shutdown, mirrors
-            //      the publisher arm above.
-            //   4. `subscriber_tx.closed()` resolves — the engine
-            //      dropped its subscriber_rx (e.g., registry.stop_engine
-            //      tore down a community while no inbound was flowing).
-            //      Without this arm the loop stays blocked on
-            //      `sub.recv_async` until the next sample arrives,
-            //      leaving the JoinHandle unresolved indefinitely.
-            loop {
-                tokio::select! {
-                    // Data-flow arm first (see publisher loop above
-                    // for rationale). If `subscriber_tx.closed()`
-                    // resolves on the same poll as an inbound sample,
-                    // delivering the sample is harmless: the
-                    // subsequent `subscriber_tx.send` returns Err and
-                    // breaks the loop on the next iteration. Putting
-                    // `closed()` first instead would silently discard
-                    // that sample — contradicting the documented
-                    // intent and masking edge-case message loss
-                    // during teardown.
-                    biased;
-                    res = sub.recv_async() => {
-                        match res {
-                            Ok(sample) => {
-                                // Size cap: voting events are small CBOR envelopes
-                                // (typically <2 KiB). Cap inbound payloads to prevent
-                                // peer-controlled allocation attacks before we even
-                                // decode for verification.
-                                let payload_len = sample.payload().len();
-                                if payload_len > MAX_VOTING_PAYLOAD_BYTES {
-                                    if !closing_sub.load(Ordering::SeqCst) {
-                                        tracing::warn!(
-                                            topic = %topic_sub,
-                                            len = payload_len,
-                                            max = MAX_VOTING_PAYLOAD_BYTES,
-                                            "voting payload exceeds size cap; dropping"
-                                        );
+                let sub = match session_sub.declare_subscriber(&key_sub).await {
+                    Ok(s) => {
+                        backoff = std::time::Duration::from_secs(5);
+                        s
+                    }
+                    Err(e) => {
+                        if !closing_sub.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                topic = %topic_sub,
+                                error = %e,
+                                backoff_s = backoff.as_secs(),
+                                "community voting-log declare_subscriber failed; \
+                                 retrying after backoff"
+                            );
+                        }
+                        // Race the backoff against engine teardown so a
+                        // registry shutdown mid-retry resolves this task
+                        // promptly instead of after up to MAX_BACKOFF.
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = subscriber_tx.closed() => break 'outer,
+                        }
+                        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                        continue;
+                    }
+                };
+                // Inner-loop exits: send failure / subscriber_tx.closed()
+                // (engine torn down — exit the task, silent), closing flag
+                // (bounded shutdown — exit the task), recv error (subscriber
+                // died mid-session — break to the outer loop and re-declare).
+                loop {
+                    tokio::select! {
+                        // Data-flow arm first (see publisher loop above
+                        // for rationale). If `subscriber_tx.closed()`
+                        // resolves on the same poll as an inbound sample,
+                        // delivering the sample is harmless: the
+                        // subsequent `subscriber_tx.send` returns Err and
+                        // breaks the loop on the next iteration. Putting
+                        // `closed()` first instead would silently discard
+                        // that sample — contradicting the documented
+                        // intent and masking edge-case message loss
+                        // during teardown.
+                        biased;
+                        res = sub.recv_async() => {
+                            match res {
+                                Ok(sample) => {
+                                    // Size cap: voting events are small CBOR envelopes
+                                    // (typically <2 KiB). Cap inbound payloads to prevent
+                                    // peer-controlled allocation attacks before we even
+                                    // decode for verification.
+                                    let payload_len = sample.payload().len();
+                                    if payload_len > MAX_VOTING_PAYLOAD_BYTES {
+                                        if !closing_sub.load(Ordering::SeqCst) {
+                                            tracing::warn!(
+                                                topic = %topic_sub,
+                                                len = payload_len,
+                                                max = MAX_VOTING_PAYLOAD_BYTES,
+                                                "voting payload exceeds size cap; dropping"
+                                            );
+                                        }
+                                        continue;
                                     }
-                                    continue;
-                                }
-                                let raw: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                // ZEB-717: decrypt at the wire boundary with the
-                                // current-epoch-only cut (spec §3 D3). A kicked-then-
-                                // rotated member holds only a stale epoch key, so its
-                                // envelope's epoch != current_epoch and is dropped here —
-                                // even though this node still retains that old key in
-                                // old_epoch_keys. The engine downstream sees plaintext
-                                // SignedVotingEvent CBOR exactly as before.
-                                let plaintext: Vec<u8> = {
-                                    let envelope: crate::community_state_sync::EncryptedEnvelope =
-                                        match ciborium::from_reader(raw.as_slice()) {
-                                            Ok(env) => env,
-                                            Err(e) => {
-                                                // debug, not warn: a mesh peer (incl. the kicked
-                                                // member this change contains) can spam malformed
-                                                // envelopes — one warn/packet would flood logs.
+                                    let raw: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                    // ZEB-717: decrypt at the wire boundary with the
+                                    // current-epoch-only cut (spec §3 D3). A kicked-then-
+                                    // rotated member holds only a stale epoch key, so its
+                                    // envelope's epoch != current_epoch and is dropped here —
+                                    // even though this node still retains that old key in
+                                    // old_epoch_keys. The engine downstream sees plaintext
+                                    // SignedVotingEvent CBOR exactly as before.
+                                    let plaintext: Vec<u8> = {
+                                        let envelope: crate::community_state_sync::EncryptedEnvelope =
+                                            match ciborium::from_reader(raw.as_slice()) {
+                                                Ok(env) => env,
+                                                Err(e) => {
+                                                    // debug, not warn: a mesh peer (incl. the kicked
+                                                    // member this change contains) can spam malformed
+                                                    // envelopes — one warn/packet would flood logs.
+                                                    tracing::debug!(
+                                                        topic = %topic_sub,
+                                                        error = %e,
+                                                        "drop voting packet (envelope decode)"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                        let st = crdt_state_sub.lock().await;
+                                        let Some(space) = st.spaces.get(&community_id) else {
+                                            continue;
+                                        };
+                                        match space.current_epoch {
+                                            Some(cur) if cur == envelope.epoch => {}
+                                            _ => {
+                                                // debug, not warn: stale-epoch drops are both the
+                                                // attack-containment path AND expected for legit votes
+                                                // in flight across a rotation — warn would flood.
                                                 tracing::debug!(
                                                     topic = %topic_sub,
-                                                    error = %e,
-                                                    "drop voting packet (envelope decode)"
+                                                    epoch = envelope.epoch,
+                                                    "drop voting packet (stale/unknown epoch)"
                                                 );
                                                 continue;
                                             }
-                                        };
-                                    let st = crdt_state_sub.lock().await;
-                                    let Some(space) = st.spaces.get(&community_id) else {
-                                        continue;
+                                        }
+                                        match crate::community_state_sync::decrypt_for_topic_with_aad(
+                                            space,
+                                            &envelope,
+                                            crate::community_state_sync::VOTING_TOPIC_AAD,
+                                        ) {
+                                            Ok(pt) => pt,
+                                            Err(e) => {
+                                                // debug, not warn: tag mismatch = tamper / cross-plane
+                                                // replay from a peer — attacker-controllable, so one
+                                                // warn/packet would flood.
+                                                tracing::debug!(
+                                                    topic = %topic_sub,
+                                                    error = %e,
+                                                    "drop voting packet (decrypt)"
+                                                );
+                                                continue;
+                                            }
+                                        }
                                     };
-                                    match space.current_epoch {
-                                        Some(cur) if cur == envelope.epoch => {}
-                                        _ => {
-                                            // debug, not warn: stale-epoch drops are both the
-                                            // attack-containment path AND expected for legit votes
-                                            // in flight across a rotation — warn would flood.
-                                            tracing::debug!(
-                                                topic = %topic_sub,
-                                                epoch = envelope.epoch,
-                                                "drop voting packet (stale/unknown epoch)"
-                                            );
-                                            continue;
-                                        }
+                                    if subscriber_tx.send(plaintext).await.is_err() {
+                                        break 'outer;
                                     }
-                                    match crate::community_state_sync::decrypt_for_topic_with_aad(
-                                        space,
-                                        &envelope,
-                                        crate::community_state_sync::VOTING_TOPIC_AAD,
-                                    ) {
-                                        Ok(pt) => pt,
-                                        Err(e) => {
-                                            // debug, not warn: tag mismatch = tamper / cross-plane
-                                            // replay from a peer — attacker-controllable, so one
-                                            // warn/packet would flood.
-                                            tracing::debug!(
-                                                topic = %topic_sub,
-                                                error = %e,
-                                                "drop voting packet (decrypt)"
-                                            );
-                                            continue;
-                                        }
+                                }
+                                Err(e) => {
+                                    if !closing_sub.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %topic_sub,
+                                            error = %e,
+                                            "community voting-log subscriber closed; \
+                                             reconnecting"
+                                        );
                                     }
-                                };
-                                if subscriber_tx.send(plaintext).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                if !closing_sub.load(Ordering::SeqCst) {
-                                    tracing::warn!(
-                                        topic = %topic_sub,
-                                        error = %e,
-                                        "community voting-log subscriber closed unexpectedly"
-                                    );
-                                }
-                                break;
-                            }
+                        }
+                        _ = subscriber_tx.closed() => {
+                            // Engine dropped subscriber_rx — nothing to
+                            // forward to anymore. Silent exit; engine
+                            // owns the shutdown trace if relevant.
+                            break 'outer;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if closing_sub.load(Ordering::SeqCst) { break 'outer; }
                         }
                     }
-                    _ = subscriber_tx.closed() => {
-                        // Engine dropped subscriber_rx — nothing to
-                        // forward to anymore. Silent exit; engine
-                        // owns the shutdown trace if relevant.
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if closing_sub.load(Ordering::SeqCst) { break; }
-                    }
+                }
+                // Mid-session subscriber death (recv Err): pace the
+                // re-declare so a subscriber that dies immediately after
+                // declaring can't busy-loop (voice-signal pattern), while
+                // still resolving promptly on engine teardown.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    _ = subscriber_tx.closed() => break 'outer,
                 }
             }
         });
@@ -11961,9 +12046,10 @@ pub fn spawn_dfrost_log_zenoh_adapter(
         // engine's subscriber_tx.
         //
         // The subscriber is declared inside a retry loop (voice-signal
-        // backoff pattern: 5s → ×2 → 60s cap), NOT one-shot like the
-        // voting/state-root arms: the engine registration is the ensure
-        // path's idempotency token, so this task is the engine's ONLY
+        // backoff pattern: 5s → ×2 → 60s cap; the voting/state-root/
+        // channel-log arms adopted the same shape in ZEB-1023), NOT
+        // one-shot: the engine registration is the ensure path's
+        // idempotency token, so this task is the engine's ONLY
         // transport attach — a one-shot declare failure would leave the
         // node permanently unable to receive peer DKG/refresh/signing
         // contributions until restart (Greptile P1 on #768). Mid-session
@@ -12137,6 +12223,10 @@ pub fn spawn_dfrost_log_zenoh_adapter(
 /// The `read_for_query` callback is what the queryable handler uses
 /// to fetch events for a backfill request — passed in to avoid
 /// the engine ↔ adapter circular dep (per spec §8.1).
+///
+/// A failed or dying live-events subscriber is NOT terminal: the
+/// subscriber arm re-declares with backoff (ZEB-1023), because this
+/// task is the registered engine's only live-events attach.
 #[allow(clippy::too_many_arguments)] // Signature locked by spec §8 + plan Task 3.
 pub fn spawn_channel_log_zenoh_adapter<F>(
     session: Arc<zenoh::Session>,
@@ -12252,52 +12342,93 @@ where
         });
 
         // ── Subscriber task ────────────────────────────────────────
+        //
+        // ZEB-1023: the subscriber is declared inside a retry loop
+        // (voice-signal backoff pattern: 5s → ×2 → 60s cap), NOT
+        // one-shot: the engine registration is the ensure path's
+        // idempotency token, so this task is the registered engine's
+        // ONLY live-events attach — a one-shot declare failure would
+        // leave this (community, channel) receiving nothing but
+        // backfill replies until restart. Mid-session subscriber
+        // death re-declares through the same loop.
         let session_sub = Arc::clone(&session);
         let key_sub = events_key.clone();
         let topic_sub = events_topic.clone();
         let subscriber_tx_sub = subscriber_tx.clone();
         let closing_sub = Arc::clone(&closing);
         let sub_handle = tokio::spawn(async move {
-            let sub = match session_sub.declare_subscriber(&key_sub).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if !closing_sub.load(Ordering::SeqCst) {
-                        tracing::error!(
-                            topic = %topic_sub,
-                            error = %e,
-                            "failed to declare channel-log subscriber"
-                        );
-                    }
-                    return;
+            let mut backoff = std::time::Duration::from_secs(5);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+            'outer: loop {
+                if closing_sub.load(Ordering::SeqCst) {
+                    break;
                 }
-            };
-            loop {
-                tokio::select! {
-                    biased;
-                    res = sub.recv_async() => {
-                        match res {
-                            Ok(sample) => {
-                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                if subscriber_tx_sub.send(bytes).await.is_err() {
+                let sub = match session_sub.declare_subscriber(&key_sub).await {
+                    Ok(s) => {
+                        backoff = std::time::Duration::from_secs(5);
+                        s
+                    }
+                    Err(e) => {
+                        if !closing_sub.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                topic = %topic_sub,
+                                error = %e,
+                                backoff_s = backoff.as_secs(),
+                                "channel-log declare_subscriber failed; \
+                                 retrying after backoff"
+                            );
+                        }
+                        // Race the backoff against engine teardown so a
+                        // registry shutdown mid-retry resolves this task
+                        // promptly instead of after up to MAX_BACKOFF.
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = subscriber_tx_sub.closed() => break 'outer,
+                        }
+                        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                        continue;
+                    }
+                };
+                // Inner-loop exits: send failure / subscriber_tx.closed()
+                // (engine torn down — exit the task, silent), closing flag
+                // (bounded shutdown — exit the task), recv error (subscriber
+                // died mid-session — break to the outer loop and re-declare).
+                loop {
+                    tokio::select! {
+                        biased;
+                        res = sub.recv_async() => {
+                            match res {
+                                Ok(sample) => {
+                                    let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                    if subscriber_tx_sub.send(bytes).await.is_err() {
+                                        break 'outer;
+                                    }
+                                }
+                                Err(e) => {
+                                    if !closing_sub.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %topic_sub,
+                                            error = %e,
+                                            "channel-log subscriber closed; reconnecting"
+                                        );
+                                    }
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                if !closing_sub.load(Ordering::SeqCst) {
-                                    tracing::warn!(
-                                        topic = %topic_sub,
-                                        error = %e,
-                                        "channel-log subscriber closed unexpectedly"
-                                    );
-                                }
-                                break;
-                            }
+                        }
+                        _ = subscriber_tx_sub.closed() => break 'outer,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if closing_sub.load(Ordering::SeqCst) { break 'outer; }
                         }
                     }
-                    _ = subscriber_tx_sub.closed() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if closing_sub.load(Ordering::SeqCst) { break; }
-                    }
+                }
+                // Mid-session subscriber death (recv Err): pace the
+                // re-declare so a subscriber that dies immediately after
+                // declaring can't busy-loop (voice-signal pattern), while
+                // still resolving promptly on engine teardown.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    _ = subscriber_tx_sub.closed() => break 'outer,
                 }
             }
         });
@@ -13411,6 +13542,98 @@ mod channel_log_adapter_tests {
         // doesn't latch the receiver-closed branch before closing
         // is observed.
         drop(qreq_tx);
+    }
+
+    /// ZEB-1023: a mid-session Zenoh subscriber death must NOT kill the
+    /// adapter (the inbound arm re-declares with backoff), and an engine
+    /// teardown that lands while that arm is parked in a backoff sleep
+    /// must still resolve the adapter promptly (every retry sleep races
+    /// `subscriber_tx.closed()`).
+    ///
+    /// A closed session can't be revived in-process, so the
+    /// retry-success leg is covered by the live round-trip test above;
+    /// what this pins is the teardown-responsiveness of the retry
+    /// machinery itself — the new risk the retry loop introduced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_log_subscriber_retry_resolves_promptly_on_engine_teardown() {
+        let cfg = hermetic_zenoh_config();
+        let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
+
+        let (pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, mut sub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (qreq_tx, qreq_rx) =
+            mpsc::channel::<crate::community_channel_log_engine::BackfillQueryRequest>(2);
+
+        let read_for_query = Arc::new(
+            |_since: Option<crate::owner_state_types::Hlc>,
+             _limit: usize,
+             _watermark: Option<Vec<u8>>| {
+                Box::pin(async move { Vec::<Vec<u8>>::new() })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+            },
+        );
+
+        let closing = Arc::new(AtomicBool::new(false));
+        let emit_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
+            Arc::new(|_, _| {});
+        let adapter = spawn_channel_log_zenoh_adapter(
+            Arc::clone(&session),
+            "aabb".repeat(8),
+            "ccdd".repeat(8),
+            pub_rx,
+            sub_tx,
+            qreq_rx,
+            read_for_query,
+            emit_progress,
+            16,
+            CHANNEL_BACKFILL_DEFAULT_LIMIT,
+            Arc::clone(&closing),
+            None,
+        );
+
+        // Wait for the subscriber to come online (same warmup shape as
+        // the round-trip test above).
+        let warmup_payload = b"__warmup__".to_vec();
+        let warmup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= warmup_deadline {
+                panic!("subscriber didn't come online within 2s");
+            }
+            pub_tx
+                .send(warmup_payload.clone())
+                .await
+                .expect("publish warmup");
+            match tokio::time::timeout(std::time::Duration::from_millis(50), sub_rx.recv()).await {
+                Ok(Some(received)) if received == warmup_payload => break,
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        // Kill the transport out from under the adapter: the subscriber's
+        // recv_async errors and the inbound arm parks in its re-declare
+        // backoff (declaring on a closed session keeps failing).
+        session.close().await.expect("session close");
+
+        // The adapter task family must survive subscriber death.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !adapter.is_finished(),
+            "adapter resolved on subscriber death — inbound arm should be retrying"
+        );
+
+        // Engine teardown mid-backoff: drop every engine-side half with
+        // `closing` still false. The sub arm's backoff/pacing sleeps race
+        // `subscriber_tx.closed()`, so the whole adapter must resolve in
+        // well under one 5s backoff period.
+        drop(pub_tx);
+        drop(sub_rx);
+        drop(qreq_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(3), adapter)
+            .await
+            .expect("adapter did not resolve within 3s of engine teardown")
+            .expect("adapter task panicked");
     }
 
     /// ZEB-418 P3a Task 3: after a backfill query's reply stream
