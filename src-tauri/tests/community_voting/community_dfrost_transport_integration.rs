@@ -831,3 +831,392 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
     drop(alice_engine);
     drop(bob_engine);
 }
+
+// ─── ZEB-1022: auto-orchestrated ceremonies (di bootstrap + DkgDriver) ─────
+//
+// The test above drives every protocol step by hand and hand-seeds Bob's
+// `pending_dkg` — exactly the gap ZEB-1022 closes. The tests below wire
+// the PRODUCTION `DkgDriver` (via `production_dkg_driver` over
+// `DfrostCoreHandles`) into both engines and assert that a single
+// `dfrost_initiate_dkg_core` call on Alice converges BOTH engines to an
+// active committee with zero manual seeding and zero manual peer
+// contributions: Bob seeds from the broadcast `di`, and every remaining
+// round fires from the engines' orchestration layer through the same
+// core code the IPCs run.
+
+use harmony_app::community_dfrost_log_engine::{DfrostLogRegistry, DfrostOrchestratorConfig};
+use harmony_app::{
+    dfrost_initiate_dkg_core, production_dkg_driver, DfrostCoreHandles, DfrostLogsMap,
+};
+
+type MockRt = tauri::test::MockRuntime;
+
+/// Per-node harness for the orchestrated tests: shared log + logs-map +
+/// registry + the production driver's handle bundle.
+struct OrchestratedNode {
+    log: Arc<Mutex<DfrostLog>>,
+    registry: Arc<DfrostLogRegistry<MockRt>>,
+    handles: DfrostCoreHandles<MockRt>,
+}
+
+fn orchestrated_node(
+    community_id: SpaceId,
+    device_id: &str,
+    self_addr: OwnerAddr,
+    signing_key: &ed25519_dalek::SigningKey,
+    resolver_map: &HashMap<OwnerAddr, [u8; 64]>,
+) -> OrchestratedNode {
+    let log = Arc::new(Mutex::new(DfrostLog::new()));
+    let dfrost_logs: DfrostLogsMap = Arc::new(Mutex::new(HashMap::new()));
+    // The map MUST hold the same Arc the engine applies into — the
+    // cores get-or-insert from this map.
+    {
+        let log = log.clone();
+        let map = dfrost_logs.clone();
+        // No await context here; try_lock on a fresh mutex cannot fail.
+        map.try_lock().expect("fresh map").insert(community_id, log);
+    }
+    let registry: Arc<DfrostLogRegistry<MockRt>> = Arc::new(DfrostLogRegistry::new());
+    let identity_resolver: Arc<dyn IdentityResolver + Send + Sync> =
+        Arc::new(StaticResolver(resolver_map.clone()));
+    let handles = DfrostCoreHandles::<MockRt> {
+        hlc_tracker: Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            device_id.to_string(),
+        ))),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        device_id: device_id.to_string(),
+        self_owner: self_addr,
+        signing_key: Arc::new(signing_key.clone()),
+        dfrost_logs,
+        identity_resolver: Some(identity_resolver),
+        dfrost_log_registry: Some(registry.clone()),
+    };
+    OrchestratedNode {
+        log,
+        registry,
+        handles,
+    }
+}
+
+/// Fast orchestration timers for tests: 25ms ticks, 150ms re-broadcast,
+/// deadlines far out of frame so no abort fires mid-test.
+fn test_orchestrator_config() -> DfrostOrchestratorConfig {
+    DfrostOrchestratorConfig {
+        tick_interval: std::time::Duration::from_millis(25),
+        rebroadcast_interval: std::time::Duration::from_millis(150),
+        initiator_quiet_deadline: std::time::Duration::from_secs(60),
+        stale_replace_threshold: std::time::Duration::from_secs(60),
+        max_restart_attempts: 3,
+    }
+}
+
+async fn start_orchestrated(
+    node: &OrchestratedNode,
+    community_id: SpaceId,
+    self_addr: OwnerAddr,
+    self_x_priv: [u8; 32],
+    resolver_map: &HashMap<OwnerAddr, [u8; 64]>,
+    publisher_tx: mpsc::Sender<Vec<u8>>,
+    subscriber_rx: mpsc::Receiver<Vec<u8>>,
+) -> Arc<DfrostLogEngine<MockRt>> {
+    let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+        Arc::new(StaticResolver(resolver_map.clone()));
+    let driver = production_dkg_driver::<MockRt>(node.handles.clone(), None);
+    DfrostLogRegistry::register(
+        &node.registry,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: node.log.clone(),
+            publisher_tx,
+            subscriber_rx,
+            app_handle: None,
+            self_addr,
+            self_x25519_priv: self_x_priv,
+            identity_resolver: resolver,
+            registry_weak: None,
+            driver: Some(driver),
+            membership_resolver: None,
+            orchestrator_config: test_orchestrator_config(),
+        },
+    )
+    .await
+}
+
+/// Bounded convergence wait (10s — the orchestrated flow includes tick
+/// cadences, not just inbound latency).
+async fn wait_for_10s<F>(
+    label: &'static str,
+    log: &Arc<Mutex<DfrostLog>>,
+    predicate: F,
+) -> Result<(), String>
+where
+    F: Fn(&DfrostLog) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        {
+            let guard = log.lock().await;
+            if predicate(&guard) {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("wait_for_10s({label}) timed out"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn assert_converged_active(la: &DfrostLog, lb: &DfrostLog) {
+    let vk_a = la
+        .committee_state
+        .joint_verifying_key
+        .expect("alice joint_vk present");
+    let vk_b = lb
+        .committee_state
+        .joint_verifying_key
+        .expect("bob joint_vk present");
+    assert_eq!(vk_a, vk_b, "joint VK converges");
+    assert!(la.committee_state.active && lb.committee_state.active);
+    assert_eq!(la.committee_state.current_epoch, 1);
+    assert_eq!(lb.committee_state.current_epoch, 1);
+    assert_eq!(
+        la.committee_state.verifying_shares,
+        lb.committee_state.verifying_shares
+    );
+    assert!(la.committee_state.pending_dkg.is_none());
+    assert!(lb.committee_state.pending_dkg.is_none());
+    assert!(
+        la.local_key_package.is_some(),
+        "alice materialised her signing share"
+    );
+    assert!(
+        lb.local_key_package.is_some(),
+        "bob materialised his signing share"
+    );
+}
+
+/// ZEB-1022 headline: one `dfrost_initiate_dkg_core` call on Alice →
+/// both engines converge to an active 2-of-2 committee. NO manual
+/// pending_dkg seeding anywhere, NO manual peer contributions — Bob
+/// bootstraps from the broadcast `di` and the engines' orchestration
+/// auto-drives rounds 1-3 through the production cores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dkg_two_engine_auto_orchestrated_from_initiate_no_manual_seeding() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xC5);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xC6);
+    let alice_x_priv = *dm_signing::ed25519_priv_to_x25519(&alice_sk);
+    let bob_x_priv = *dm_signing::ed25519_priv_to_x25519(&bob_sk);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+
+    let community_id = SpaceId([0xCE; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+    let bob = orchestrated_node(community_id, "bob-dev", bob_addr, &bob_sk, &resolver_map);
+
+    // Bridge: alice.pub → bob.sub, bob.pub → alice.sub.
+    let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_pub_tx, mut bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let _a2b = tokio::spawn(async move {
+        while let Some(p) = alice_pub_rx.recv().await {
+            if bob_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _b2a = tokio::spawn(async move {
+        while let Some(p) = bob_pub_rx.recv().await {
+            if alice_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let alice_engine = start_orchestrated(
+        &alice,
+        community_id,
+        alice_addr,
+        alice_x_priv,
+        &resolver_map,
+        alice_pub_tx,
+        alice_sub_rx,
+    )
+    .await;
+    let bob_engine = start_orchestrated(
+        &bob,
+        community_id,
+        bob_addr,
+        bob_x_priv,
+        &resolver_map,
+        bob_pub_tx,
+        bob_sub_rx,
+    )
+    .await;
+
+    // THE single manual step: Alice initiates.
+    let ceremony_hex = dfrost_initiate_dkg_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        vec![alice_addr, bob_addr],
+        2,
+    )
+    .await
+    .expect("alice initiates");
+    assert_eq!(ceremony_hex.len(), 64);
+
+    wait_for_10s("alice converges to active", &alice.log, |l| {
+        l.committee_state.active
+    })
+    .await
+    .expect("alice active");
+    wait_for_10s("bob converges to active", &bob.log, |l| {
+        l.committee_state.active
+    })
+    .await
+    .expect("bob active");
+
+    let la = alice.log.lock().await;
+    let lb = bob.log.lock().await;
+    assert_converged_active(&la, &lb);
+    assert!(
+        lb.events
+            .iter()
+            .any(|e| e.kind == DfrostEventKind::CeremonyInit),
+        "bob's log must contain the (re-minted) di that seeded him"
+    );
+    drop(la);
+    drop(lb);
+    drop(alice_engine);
+    drop(bob_engine);
+}
+
+/// ZEB-1022 facet B: the initiator's first broadcasts (`di` + `dr` rn=1)
+/// are LOST on the wire (boot-window loss / late subscriber). The
+/// orchestrator's periodic re-broadcast re-mints them with fresh HLCs
+/// (original bytes would be dedup-dropped once Bob has seen any newer
+/// alice event) and the ceremony still converges end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dkg_recovers_when_initial_di_and_round1_are_lost() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xC7);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xC8);
+    let alice_x_priv = *dm_signing::ed25519_priv_to_x25519(&alice_sk);
+    let bob_x_priv = *dm_signing::ed25519_priv_to_x25519(&bob_sk);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+
+    let community_id = SpaceId([0xCF; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+    let bob = orchestrated_node(community_id, "bob-dev", bob_addr, &bob_sk, &resolver_map);
+
+    let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_pub_tx, mut bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Lossy alice→bob leg: the FIRST TWO packets (di + dr rn=1 from the
+    // initiate call) vanish. Everything after is delivered.
+    let _a2b = tokio::spawn(async move {
+        let mut dropped = 0u32;
+        while let Some(p) = alice_pub_rx.recv().await {
+            if dropped < 2 {
+                dropped += 1;
+                continue;
+            }
+            if bob_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _b2a = tokio::spawn(async move {
+        while let Some(p) = bob_pub_rx.recv().await {
+            if alice_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let alice_engine = start_orchestrated(
+        &alice,
+        community_id,
+        alice_addr,
+        alice_x_priv,
+        &resolver_map,
+        alice_pub_tx,
+        alice_sub_rx,
+    )
+    .await;
+    let bob_engine = start_orchestrated(
+        &bob,
+        community_id,
+        bob_addr,
+        bob_x_priv,
+        &resolver_map,
+        bob_pub_tx,
+        bob_sub_rx,
+    )
+    .await;
+
+    dfrost_initiate_dkg_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        vec![alice_addr, bob_addr],
+        2,
+    )
+    .await
+    .expect("alice initiates");
+
+    // Bob missed the originals; only the re-mints can seed him. The
+    // pending slot may already have been promoted away by the time we
+    // poll (a 2-of-2 ceremony completes in single-digit milliseconds
+    // once seeded), so accept either state — the di-in-log assertion
+    // below pins that the seed really came through the wire.
+    wait_for_10s("bob seeds from re-minted di", &bob.log, |l| {
+        l.committee_state.pending_dkg.is_some() || l.committee_state.active
+    })
+    .await
+    .expect("bob seeded via re-broadcast");
+
+    wait_for_10s("alice converges to active (lossy start)", &alice.log, |l| {
+        l.committee_state.active
+    })
+    .await
+    .expect("alice active");
+    wait_for_10s("bob converges to active (lossy start)", &bob.log, |l| {
+        l.committee_state.active
+    })
+    .await
+    .expect("bob active");
+
+    let la = alice.log.lock().await;
+    let lb = bob.log.lock().await;
+    assert_converged_active(&la, &lb);
+    assert!(
+        lb.events
+            .iter()
+            .any(|e| e.kind == DfrostEventKind::CeremonyInit),
+        "bob's log must contain the re-minted di that seeded him"
+    );
+    drop(la);
+    drop(lb);
+    drop(alice_engine);
+    drop(bob_engine);
+}

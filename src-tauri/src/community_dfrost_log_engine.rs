@@ -455,9 +455,11 @@ async fn process_inbound<R: tauri::Runtime>(
     //     validation the sans-I/O log cannot perform. Three checks, all
     //     warn-and-drop on failure:
     //     * ceremony-id binding: the claimed id must recompute from the
-    //       claimed shape + the event's signed HLC + this community's id
-    //       (`derive_dkg_ceremony_id`) — a `di` cannot pair someone
-    //       else's ceremony id with a substituted committee.
+    //       claimed shape + the payload-carried mint stamp + this
+    //       community's id (`derive_dkg_ceremony_id`) — a `di` cannot
+    //       pair someone else's ceremony id with a substituted
+    //       committee. (Stamp lives in the payload, not the envelope
+    //       HLC, so re-minted re-broadcasts still validate.)
     //     * membership: every claimed member must exist in the
     //       community's membership snapshot at the event's HLC (skipped
     //       when no resolver is configured — test engines).
@@ -481,7 +483,8 @@ async fn process_inbound<R: tauri::Runtime>(
         let expected_id = derive_dkg_ceremony_id(
             &payload.members,
             payload.threshold,
-            &event.hlc,
+            payload.minted_wall_ms,
+            payload.minted_logical,
             &community_id,
         );
         if expected_id != payload.ceremony_id {
@@ -2713,5 +2716,684 @@ mod tests {
             Some(vrf_output),
             "oracle must return vrf_output after beacon is indexed"
         );
+    }
+
+    // ─── ZEB-1022: ceremony orchestration ───────────────────────────────
+
+    use crate::community_dfrost_log_engine::{DfrostOrchestratorConfig, DkgDriver};
+    use crate::community_voting_log::MembershipSnapshotResolver;
+    use std::time::Duration;
+
+    /// Recording mock driver: every orchestrator call lands in a vec the
+    /// test polls. All operations succeed.
+    #[derive(Default)]
+    struct RecordingDriver {
+        contributions: tokio::sync::Mutex<Vec<(SpaceId, [u8; 32], u8)>>,
+        rebroadcasts: tokio::sync::Mutex<Vec<[u8; 32]>>,
+        reinitiates: tokio::sync::Mutex<Vec<(Vec<OwnerAddr>, u16)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DkgDriver for RecordingDriver {
+        async fn contribute_round(
+            &self,
+            community_id: SpaceId,
+            ceremony_id: [u8; 32],
+            round_num: u8,
+        ) -> Result<(), String> {
+            self.contributions
+                .lock()
+                .await
+                .push((community_id, ceremony_id, round_num));
+            Ok(())
+        }
+        async fn rebroadcast_pending(
+            &self,
+            _community_id: SpaceId,
+            ceremony_id: [u8; 32],
+        ) -> Result<(), String> {
+            self.rebroadcasts.lock().await.push(ceremony_id);
+            Ok(())
+        }
+        async fn reinitiate(
+            &self,
+            _community_id: SpaceId,
+            members: Vec<OwnerAddr>,
+            threshold: u16,
+        ) -> Result<String, String> {
+            self.reinitiates.lock().await.push((members, threshold));
+            Ok("replacement".into())
+        }
+    }
+
+    /// Static membership resolver: a fixed member set for every query.
+    struct StaticMembership(Vec<OwnerAddr>);
+
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for StaticMembership {
+        async fn snapshot_at(
+            &self,
+            _community_id: SpaceId,
+            _hlc: &Hlc,
+        ) -> Result<
+            crate::community_voting_core::MembershipSnapshot,
+            crate::community_voting_log::SnapshotResolverError,
+        > {
+            let members = self
+                .0
+                .iter()
+                .map(|a| {
+                    (
+                        *a,
+                        crate::community_voting_core::MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .collect();
+            Ok(crate::community_voting_core::MembershipSnapshot { members })
+        }
+    }
+
+    /// Build a properly-signed `di` event. `ceremony_override` forges a
+    /// non-recomputing ceremony_id for the binding-gate test; `None`
+    /// derives the honest id from the event's own HLC.
+    fn signed_di(
+        sk: &ed25519_dalek::SigningKey,
+        actor: OwnerAddr,
+        members: Vec<OwnerAddr>,
+        threshold: u16,
+        epoch: u64,
+        community_id: &SpaceId,
+        wall_ms: u64,
+        ceremony_override: Option<[u8; 32]>,
+    ) -> (SignedCommitteeEvent, [u8; 32]) {
+        use crate::community_dfrost_types::{derive_dkg_ceremony_id, CeremonyInitPayload};
+        let hlc = Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "dev-a".into(),
+        };
+        let ceremony_id = ceremony_override.unwrap_or_else(|| {
+            derive_dkg_ceremony_id(&members, threshold, wall_ms, 0, community_id)
+        });
+        let payload = CeremonyInitPayload {
+            ceremony_id,
+            members: members.clone(),
+            threshold,
+            max_signers: members.len() as u16,
+            epoch,
+            minted_wall_ms: wall_ms,
+            minted_logical: 0,
+        };
+        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
+            sk,
+            actor,
+            DfrostEventKind::CeremonyInit,
+            &payload,
+            hlc,
+        )
+        .expect("build di");
+        (ev, ceremony_id)
+    }
+
+    fn encode_packet(ev: &SignedCommitteeEvent) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        ciborium::ser::into_writer(ev, &mut pkt).unwrap();
+        pkt
+    }
+
+    /// Start a MockRuntime engine with orchestration knobs. Returns the
+    /// engine, the shared log, and the subscriber sender that injects
+    /// inbound packets.
+    #[allow(clippy::type_complexity)]
+    async fn start_orchestrated_engine(
+        community_id: SpaceId,
+        self_addr: OwnerAddr,
+        self_x25519_priv: [u8; 32],
+        resolver: Arc<dyn IdentityResolver + Send + Sync>,
+        driver: Option<Arc<dyn DkgDriver>>,
+        membership_resolver: Option<Arc<dyn MembershipSnapshotResolver>>,
+        orchestrator_config: DfrostOrchestratorConfig,
+    ) -> (
+        Arc<DfrostLogEngine<tauri::test::MockRuntime>>,
+        Arc<tokio::sync::Mutex<crate::community_dfrost_log::DfrostLog>>,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log.clone(),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr,
+            self_x25519_priv,
+            identity_resolver: resolver,
+            registry_weak: None,
+            driver,
+            membership_resolver,
+            orchestrator_config,
+        })
+        .await;
+        (engine, log, sub_tx)
+    }
+
+    /// Poll an async predicate at 5ms intervals up to 2s.
+    async fn wait_until<F, Fut>(label: &str, mut f: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if f().await {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("wait_until({label}) timed out after 2s");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_di_seeds_pending_on_inbound_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xB1);
+        let (_bob_sk, bob_addr, _bob_pub64) = fixture_identity(0xB2);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xD1; 16]);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            None,
+            Default::default(),
+        )
+        .await;
+
+        let (di, ceremony_id) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&di)).await.unwrap();
+
+        wait_for_log("di seeds pending on peer", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id == ceremony_id && p.initiator == Some(alice_addr))
+                .unwrap_or(false)
+        })
+        .await;
+        let guard = log.lock().await;
+        let p = guard.committee_state.pending_dkg.as_ref().unwrap();
+        assert_eq!(p.members, members);
+        assert_eq!(p.threshold, 2);
+    }
+
+    #[tokio::test]
+    async fn engine_di_forged_ceremony_id_dropped_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xB3);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xB4);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xD2; 16]);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            None,
+            Default::default(),
+        )
+        .await;
+
+        // Forged: claimed ceremony_id does not recompute from the shape.
+        let (forged, _fid) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            1_000,
+            Some([0xEE; 32]),
+        );
+        sub_tx.send(encode_packet(&forged)).await.unwrap();
+        // Honest follow-up on the same FIFO channel — once IT has
+        // applied, the forged one has provably been processed (and
+        // dropped) first.
+        let (honest, honest_id) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members,
+            2,
+            1,
+            &community_id,
+            2_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&honest)).await.unwrap();
+
+        wait_for_log("honest di applied", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id == honest_id)
+                .unwrap_or(false)
+        })
+        .await;
+        let guard = log.lock().await;
+        assert_eq!(
+            guard.events.len(),
+            1,
+            "forged di must have been dropped before apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_di_nonmember_committee_dropped_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xB5);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xB6);
+        let (_mallory_sk, mallory_addr, _m) = fixture_identity(0xB7);
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        // Community membership: alice + bob only. Mallory is NOT Joined.
+        let membership: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(StaticMembership(vec![alice_addr, bob_addr]));
+
+        let community_id = SpaceId([0xD3; 16]);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            Some(membership),
+            Default::default(),
+        )
+        .await;
+
+        // di naming a non-member (mallory) in the committee — dropped.
+        let mut bad_members = vec![alice_addr, mallory_addr];
+        bad_members.sort();
+        let (bad, _) = signed_di(
+            &alice_sk,
+            alice_addr,
+            bad_members,
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&bad)).await.unwrap();
+
+        // Honest di with only Joined members — accepted (FIFO sentinel).
+        let mut good_members = vec![alice_addr, bob_addr];
+        good_members.sort();
+        let (good, good_id) = signed_di(
+            &alice_sk,
+            alice_addr,
+            good_members,
+            2,
+            1,
+            &community_id,
+            2_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&good)).await.unwrap();
+
+        wait_for_log("membership-valid di applied", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id == good_id)
+                .unwrap_or(false)
+        })
+        .await;
+        let guard = log.lock().await;
+        assert_eq!(
+            guard.events.len(),
+            1,
+            "non-member di must have been dropped before apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_auto_drives_round1_contribution_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xB8);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xB9);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xD4; 16]);
+        let (_engine, _log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                // Long timers: this test exercises the APPLY-triggered
+                // drive, not the tick.
+                tick_interval: Duration::from_secs(30),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (di, ceremony_id) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members,
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&di)).await.unwrap();
+
+        wait_until("auto-drive fires bob's rn=1", || async {
+            driver
+                .contributions
+                .lock()
+                .await
+                .iter()
+                .any(|(cid, cer, rn)| *cid == community_id && *cer == ceremony_id && *rn == 1)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn engine_tick_rebroadcasts_pending_zeb1022() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xBA);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xD5; 16]);
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            alice_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_millis(10),
+                // Keep the deadline far away so this test sees only
+                // re-broadcasts.
+                initiator_quiet_deadline: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Hand-seed a pending ceremony (observer shape: no initiator).
+        let ceremony_id = [0x77u8; 32];
+        {
+            let mut guard = log.lock().await;
+            guard.committee_state.pending_dkg =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id,
+                    members: vec![alice_addr],
+                    threshold: 2,
+                    max_signers: 2,
+                    proposed_epoch: 1,
+                    ..Default::default()
+                });
+        }
+
+        wait_until("tick re-broadcasts the pending ceremony", || async {
+            driver
+                .rebroadcasts
+                .lock()
+                .await
+                .iter()
+                .any(|c| *c == ceremony_id)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn engine_initiator_deadline_aborts_and_reinitiates_zeb1022() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xBB);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xBC);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xD6; 16]);
+        // Self = alice = the ceremony's initiator.
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            alice_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_millis(40),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let ceremony_id = [0x78u8; 32];
+        {
+            let mut guard = log.lock().await;
+            guard.committee_state.pending_dkg =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id,
+                    initiator: Some(alice_addr),
+                    members: members.clone(),
+                    threshold: 2,
+                    max_signers: 2,
+                    proposed_epoch: 1,
+                    ..Default::default()
+                });
+        }
+
+        wait_until("deadline abort re-initiates with same shape", || async {
+            driver
+                .reinitiates
+                .lock()
+                .await
+                .iter()
+                .any(|(m, t)| *m == members && *t == 2)
+        })
+        .await;
+        wait_for_log("aborted pending slot cleared", &log, |l| {
+            l.committee_state.pending_dkg.is_none()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn engine_fresh_pending_resists_replacement_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xBD);
+        let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xBE);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        resolver_map.insert(bob_addr, bob_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xD7; 16]);
+        // Observer engine (self = a third party address, not a member).
+        let (_c_sk, observer_addr, _c) = fixture_identity(0xBF);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            observer_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            None,
+            DfrostOrchestratorConfig {
+                // A pending ceremony stays "fresh" for a minute.
+                stale_replace_threshold: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (di1, id1) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&di1)).await.unwrap();
+        wait_for_log("first di seeds", &log, |l| {
+            l.committee_state.pending_dkg.is_some()
+        })
+        .await;
+
+        // Bob tries to clobber the LIVE ceremony with his own di.
+        let (di2, _id2) = signed_di(
+            &bob_sk,
+            bob_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            2_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&di2)).await.unwrap();
+        // FIFO sentinel: a re-minted di1 (fresh envelope HLC, identical
+        // payload) — the production re-broadcast shape, which doubles as
+        // a regression check that re-mints still pass the ceremony-id
+        // binding gate (stamp is payload-carried, not envelope-HLC).
+        // Once it has applied, di2 was provably processed (and dropped).
+        let sentinel = crate::community_dfrost_log::resign_dfrost_event_with_fresh_hlc(
+            &di1,
+            Hlc {
+                wall_ms: 3_000,
+                logical: 0,
+                device_id: "dev-a".into(),
+            },
+            &alice_sk,
+        )
+        .expect("re-mint di1");
+        sub_tx.send(encode_packet(&sentinel)).await.unwrap();
+
+        wait_for_log("sentinel processed", &log, |l| l.events.len() >= 2).await;
+        let guard = log.lock().await;
+        assert_eq!(
+            guard
+                .committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id),
+            Some(id1),
+            "a live ceremony must not be replaced by a newer di"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_stale_pending_replaced_by_newer_di_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xC1);
+        let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xC2);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        resolver_map.insert(bob_addr, bob_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xD8; 16]);
+        let (_c_sk, observer_addr, _c) = fixture_identity(0xC3);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            observer_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            None,
+            DfrostOrchestratorConfig {
+                // Everything counts as stale immediately.
+                stale_replace_threshold: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (di1, _id1) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&di1)).await.unwrap();
+        wait_for_log("first di seeds", &log, |l| {
+            l.committee_state.pending_dkg.is_some()
+        })
+        .await;
+
+        let (di2, id2) = signed_di(&bob_sk, bob_addr, members, 2, 1, &community_id, 2_000, None);
+        sub_tx.send(encode_packet(&di2)).await.unwrap();
+        wait_for_log("stale pending replaced", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id == id2 && p.initiator == Some(bob_addr))
+                .unwrap_or(false)
+        })
+        .await;
     }
 }

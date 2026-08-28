@@ -138,11 +138,20 @@ impl SignedCommitteeEvent {
 /// deliberately NOT inside `DkgRoundPayload`: round events reference the
 /// ceremony only by id, so a round publisher can never redefine the
 /// committee mid-ceremony. Peers additionally validate at ingest (engine
-/// layer) that `ci` recomputes from `derive_dkg_ceremony_id(mb, th,
-/// event.hlc, community_id)` — binding the claimed shape to the id — and
-/// that every member is present in the community membership snapshot.
+/// layer) that `ci` recomputes from `derive_dkg_ceremony_id(mb, th, wm,
+/// lg, community_id)` — binding the claimed shape to the id — and that
+/// every member is present in the community membership snapshot.
 ///
-/// All 5 keys are 2 characters (same-length-keys invariant).
+/// The mint stamp (`wm`/`lg`) lives in the PAYLOAD, not the envelope
+/// HLC, deliberately: the orchestrator re-broadcasts a pending
+/// ceremony's `di` by re-minting it with a fresh envelope HLC (replay
+/// trackers key on max-HLC, so original bytes would be dropped by any
+/// peer that saw a newer event from the initiator). Payload-carried
+/// stamps keep the ceremony-id binding stable across re-mints; an
+/// envelope-HLC binding would make every re-minted `di` fail its own
+/// validation on exactly the peers re-broadcast exists to heal.
+///
+/// All 7 keys are 2 characters (same-length-keys invariant).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CeremonyInitPayload {
     #[serde(rename = "ci", with = "serde_bytes")]
@@ -161,6 +170,14 @@ pub struct CeremonyInitPayload {
     /// `committee_state.current_epoch + 1` at apply time.
     #[serde(rename = "ep")]
     pub epoch: u64,
+    /// Mint stamp, wall half — the `wall_ms` of the HLC the initiator
+    /// reserved when first minting this ceremony. Feeds
+    /// `derive_dkg_ceremony_id`; stable across re-mints.
+    #[serde(rename = "wm")]
+    pub minted_wall_ms: u64,
+    /// Mint stamp, logical half.
+    #[serde(rename = "lg")]
+    pub minted_logical: u32,
 }
 
 /// Payload for `DfrostEventKind::DkgRound` (`dr`). Carries either the
@@ -280,21 +297,24 @@ pub struct RefreshRoundPayload {
 
 /// ZEB-1022: deterministic DKG ceremony-ID derivation, shared by the
 /// initiator (`dfrost_initiate_dkg`) and the peer-side `di` ingest
-/// validation: `blake3(sorted_members || threshold_le2 || hlc.wall_ms_le8
-/// || hlc.logical_le4 || space_id)`.
+/// validation: `blake3(sorted_members || threshold_le2 ||
+/// minted_wall_ms_le8 || minted_logical_le4 || space_id)`.
 ///
-/// Binding the id to the committee shape + the `di` event's own signed
-/// HLC + the community means a peer can recompute the id from the
-/// `CeremonyInitPayload` and reject any `di` whose claimed shape does
-/// not hash to its claimed `ceremony_id` (shape/id substitution).
+/// Every input is carried inside `CeremonyInitPayload` (the mint stamp
+/// is the `wm`/`lg` pair, NOT the envelope HLC — see the payload doc
+/// for why re-minting forces that), so a peer can recompute the id
+/// from the payload alone + its own community id, and reject any `di`
+/// whose claimed shape does not hash to its claimed `ceremony_id`
+/// (shape/id substitution).
 ///
-/// R1 lineage (from the original in-IPC derivation): `hlc.logical`
+/// R1 lineage (from the original in-IPC derivation): the logical half
 /// disambiguates two ceremonies minted at the same wall_ms; `space_id`
 /// scopes the id out of any other community's namespace.
 pub fn derive_dkg_ceremony_id(
     members: &[OwnerAddr],
     threshold: u16,
-    hlc: &Hlc,
+    minted_wall_ms: u64,
+    minted_logical: u32,
     space_id: &SpaceId,
 ) -> [u8; 32] {
     let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 2 + 8 + 4 + 16);
@@ -302,8 +322,8 @@ pub fn derive_dkg_ceremony_id(
         hasher_input.extend_from_slice(&a.0);
     }
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
-    hasher_input.extend_from_slice(&hlc.wall_ms.to_le_bytes());
-    hasher_input.extend_from_slice(&hlc.logical.to_le_bytes());
+    hasher_input.extend_from_slice(&minted_wall_ms.to_le_bytes());
+    hasher_input.extend_from_slice(&minted_logical.to_le_bytes());
     hasher_input.extend_from_slice(&space_id.0);
     blake3::hash(&hasher_input).into()
 }
@@ -444,47 +464,24 @@ mod tests {
 
     #[test]
     fn derive_dkg_ceremony_id_binds_all_inputs() {
-        use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+        use crate::owner_state_types::{OwnerAddr, SpaceId};
         let members = [OwnerAddr([0x11; 16]), OwnerAddr([0x22; 16])];
-        let hlc = Hlc {
-            wall_ms: 1_000,
-            logical: 0,
-            device_id: "dev".into(),
-        };
         let space = SpaceId([0xaa; 16]);
-        let base = derive_dkg_ceremony_id(&members, 2, &hlc, &space);
-        assert_eq!(base, derive_dkg_ceremony_id(&members, 2, &hlc, &space));
+        let base = derive_dkg_ceremony_id(&members, 2, 1_000, 0, &space);
+        assert_eq!(base, derive_dkg_ceremony_id(&members, 2, 1_000, 0, &space));
         // Every input perturbs the id.
         let other_members = [OwnerAddr([0x11; 16]), OwnerAddr([0x33; 16])];
         assert_ne!(
             base,
-            derive_dkg_ceremony_id(&other_members, 2, &hlc, &space)
+            derive_dkg_ceremony_id(&other_members, 2, 1_000, 0, &space)
         );
-        let hlc_logical = Hlc {
-            logical: 1,
-            ..hlc.clone()
-        };
+        assert_ne!(base, derive_dkg_ceremony_id(&members, 3, 1_000, 0, &space));
+        assert_ne!(base, derive_dkg_ceremony_id(&members, 2, 1_001, 0, &space));
+        assert_ne!(base, derive_dkg_ceremony_id(&members, 2, 1_000, 1, &space));
         assert_ne!(
             base,
-            derive_dkg_ceremony_id(&members, 2, &hlc_logical, &space)
+            derive_dkg_ceremony_id(&members, 2, 1_000, 0, &SpaceId([0xbb; 16]))
         );
-        let hlc_wall = Hlc {
-            wall_ms: 1_001,
-            ..hlc.clone()
-        };
-        assert_ne!(base, derive_dkg_ceremony_id(&members, 2, &hlc_wall, &space));
-        assert_ne!(
-            base,
-            derive_dkg_ceremony_id(&members, 2, &hlc, &SpaceId([0xbb; 16]))
-        );
-        // device_id is deliberately NOT bound (only wall_ms + logical are):
-        // the id must be recomputable from the payload + signed HLC fields
-        // that participate in `derive`.
-        let hlc_dev = Hlc {
-            device_id: "other".into(),
-            ..hlc.clone()
-        };
-        assert_eq!(base, derive_dkg_ceremony_id(&members, 2, &hlc_dev, &space));
     }
 
     #[test]

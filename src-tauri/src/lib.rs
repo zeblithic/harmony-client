@@ -58997,7 +58997,7 @@ type VotingLogEnginesMap = std::sync::Arc<
 /// ZEB-1018: shorthand for `NodeState.dfrost_logs`' shape — the
 /// per-community D-FROST committee log map shared between the dfrost
 /// IPCs and each registered `DfrostLogEngine`.
-type DfrostLogsMap = std::sync::Arc<
+pub type DfrostLogsMap = std::sync::Arc<
     tokio::sync::Mutex<
         std::collections::HashMap<
             crate::owner_state_types::SpaceId,
@@ -60629,10 +60629,7 @@ async fn ensure_dfrost_engine_for(
                 dfrost_log_registry: Some(registry.clone()),
             };
             (
-                Some(std::sync::Arc::new(ProductionDkgDriver {
-                    handles: driver_handles,
-                    app_handle: app_handle.clone(),
-                })),
+                Some(production_dkg_driver(driver_handles, app_handle.clone())),
                 Some(w.membership_resolver),
             )
         }
@@ -62901,12 +62898,16 @@ pub struct DfrostBeaconReadyPayload {
 
 /// ZEB-1022: handle bundle for the dfrost initiate/contribute cores.
 /// Built per-call by the IPC wrappers (from `NodeState`) and once at
-/// engine-ensure time for the long-lived `ProductionDkgDriver` — the
+/// engine-ensure time for the long-lived production `DkgDriver` — the
 /// cores themselves never touch `NodeState`, which is what lets the
 /// orchestration layer drive them from the engine (including in
 /// headless `serve`, where no Tauri managed-state exists).
-#[derive(Clone)]
-pub(crate) struct DfrostCoreHandles {
+///
+/// Runtime-generic (`Wry` in production, `MockRuntime` in integration
+/// tests) and `pub` so the transport-bridge tests can wire the REAL
+/// driver over mock engines — orchestrated test ceremonies then run the
+/// production contribution code, not a test re-implementation.
+pub struct DfrostCoreHandles<R: tauri::Runtime> {
     pub hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
@@ -62923,7 +62924,24 @@ pub(crate) struct DfrostCoreHandles {
     /// Broadcast seam. `None` in test contexts that bypass `start_node`
     /// — broadcasts are skipped (logged), local applies stand.
     pub dfrost_log_registry:
-        Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>>,
+        Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<R>>>,
+}
+
+// Manual Clone: `derive(Clone)` would demand `R: Clone`, but `R` only
+// appears inside `Arc<DfrostLogRegistry<R>>` (Clone for any R).
+impl<R: tauri::Runtime> Clone for DfrostCoreHandles<R> {
+    fn clone(&self) -> Self {
+        Self {
+            hlc_tracker: self.hlc_tracker.clone(),
+            adopt_floor: self.adopt_floor.clone(),
+            device_id: self.device_id.clone(),
+            self_owner: self.self_owner,
+            signing_key: self.signing_key.clone(),
+            dfrost_logs: self.dfrost_logs.clone(),
+            identity_resolver: self.identity_resolver.clone(),
+            dfrost_log_registry: self.dfrost_log_registry.clone(),
+        }
+    }
 }
 
 /// ZEB-1022: extract `DfrostCoreHandles` from managed `NodeState` for
@@ -62931,7 +62949,7 @@ pub(crate) struct DfrostCoreHandles {
 /// used inline (std guard dropped before any await).
 async fn dfrost_core_handles_from_state(
     state_lock: &tauri::State<'_, Mutex<NodeState>>,
-) -> Result<DfrostCoreHandles, String> {
+) -> Result<DfrostCoreHandles<tauri::Wry>, String> {
     let (
         hlc_tracker,
         adopt_floor,
@@ -62982,21 +63000,35 @@ async fn dfrost_core_handles_from_state(
 /// back to the initiate/contribute/re-broadcast cores. One per engine,
 /// built by `ensure_dfrost_engine_for` from the same handles the IPCs
 /// use, so orchestrator-driven and IPC-driven contributions are
-/// byte-for-byte the same code path.
-struct ProductionDkgDriver {
-    handles: DfrostCoreHandles,
-    app_handle: Option<tauri::AppHandle<tauri::Wry>>,
+/// byte-for-byte the same code path. Constructed via
+/// [`production_dkg_driver`].
+struct ProductionDkgDriver<R: tauri::Runtime> {
+    handles: DfrostCoreHandles<R>,
+    app_handle: Option<tauri::AppHandle<R>>,
+}
+
+/// ZEB-1022: build the production `DkgDriver` over the given handles.
+/// `pub` so transport-bridge integration tests can orchestrate real
+/// ceremonies through the production contribution code.
+pub fn production_dkg_driver<R: tauri::Runtime>(
+    handles: DfrostCoreHandles<R>,
+    app_handle: Option<tauri::AppHandle<R>>,
+) -> std::sync::Arc<dyn crate::community_dfrost_log_engine::DkgDriver> {
+    std::sync::Arc::new(ProductionDkgDriver {
+        handles,
+        app_handle,
+    })
 }
 
 #[async_trait::async_trait]
-impl crate::community_dfrost_log_engine::DkgDriver for ProductionDkgDriver {
+impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for ProductionDkgDriver<R> {
     async fn contribute_round(
         &self,
         community_id: crate::owner_state_types::SpaceId,
         ceremony_id: [u8; 32],
         round_num: u8,
     ) -> Result<(), String> {
-        dfrost_contribute_dkg_round_core::<tauri::Wry>(
+        dfrost_contribute_dkg_round_core::<R, _>(
             &self.handles,
             self.app_handle.as_ref(),
             community_id,
@@ -63020,7 +63052,7 @@ impl crate::community_dfrost_log_engine::DkgDriver for ProductionDkgDriver {
         members: Vec<crate::owner_state_types::OwnerAddr>,
         threshold: u16,
     ) -> Result<String, String> {
-        dfrost_initiate_dkg_core::<tauri::Wry>(
+        dfrost_initiate_dkg_core::<R, _>(
             &self.handles,
             self.app_handle.as_ref(),
             community_id,
@@ -63041,8 +63073,8 @@ impl crate::community_dfrost_log_engine::DkgDriver for ProductionDkgDriver {
 /// clears the tracker while first-wins apply semantics keep the
 /// re-application a no-op for peers that already have it. Never
 /// re-applies locally.
-async fn dfrost_rebroadcast_pending_core(
-    handles: &DfrostCoreHandles,
+pub async fn dfrost_rebroadcast_pending_core<R: tauri::Runtime>(
+    handles: &DfrostCoreHandles<R>,
     space_id: crate::owner_state_types::SpaceId,
     ceremony_bytes: [u8; 32],
 ) -> Result<(), String> {
@@ -63188,7 +63220,7 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         .collect::<Result<Vec<_>, String>>()?;
 
     let handles = dfrost_core_handles_from_state(&state_lock).await?;
-    dfrost_initiate_dkg_core::<R>(&handles, Some(&app), space_id, member_addrs, threshold).await
+    dfrost_initiate_dkg_core::<R, _>(&handles, Some(&app), space_id, member_addrs, threshold).await
 }
 
 /// ZEB-1022: shared core of `dfrost_initiate_dkg` — callable from the
@@ -63199,8 +63231,8 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
 /// `dr` rn=1 round-1 package — and broadcasts them in that order on the
 /// same publisher (Zenoh preserves per-publisher FIFO, so peers always
 /// see the seed before the round).
-async fn dfrost_initiate_dkg_core<R: tauri::Runtime>(
-    handles: &DfrostCoreHandles,
+pub async fn dfrost_initiate_dkg_core<R: tauri::Runtime, H: tauri::Runtime>(
+    handles: &DfrostCoreHandles<H>,
     app: Option<&tauri::AppHandle<R>>,
     space_id: crate::owner_state_types::SpaceId,
     mut member_addrs: Vec<crate::owner_state_types::OwnerAddr>,
@@ -63267,15 +63299,18 @@ async fn dfrost_initiate_dkg_core<R: tauri::Runtime>(
     )
     .await;
 
-    // Ceremony id = blake3 over (sorted members || threshold || di-HLC ||
-    // space_id) — ZEB-1022 moved the derivation into
+    // Ceremony id = blake3 over (sorted members || threshold || mint
+    // stamp || space_id) — ZEB-1022 moved the derivation into
     // `derive_dkg_ceremony_id` so the peer-side `di` ingest gate
     // recomputes the exact same binding and rejects any di whose claimed
-    // shape doesn't hash to its claimed id.
+    // shape doesn't hash to its claimed id. The mint stamp is the di
+    // HLC's (wall_ms, logical) pair, carried INSIDE the payload so
+    // re-minted re-broadcasts keep validating (see CeremonyInitPayload).
     let ceremony_id = crate::community_dfrost_types::derive_dkg_ceremony_id(
         &member_addrs,
         threshold,
-        &hlc_di,
+        hlc_di.wall_ms,
+        hlc_di.logical,
         &space_id,
     );
 
@@ -63339,6 +63374,8 @@ async fn dfrost_initiate_dkg_core<R: tauri::Runtime>(
             // First DKG advances epoch 0 → 1 on completion; the pending
             // ceremony's proposed_epoch is the post-DKG epoch.
             epoch: log.committee_state.current_epoch + 1,
+            minted_wall_ms: hlc_di.wall_ms,
+            minted_logical: hlc_di.logical,
         };
         let di_event = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key,
@@ -63513,8 +63550,14 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         })?;
 
     let handles = dfrost_core_handles_from_state(&state_lock).await?;
-    dfrost_contribute_dkg_round_core::<R>(&handles, Some(&app), space_id, ceremony_bytes, round_num)
-        .await
+    dfrost_contribute_dkg_round_core::<R, _>(
+        &handles,
+        Some(&app),
+        space_id,
+        ceremony_bytes,
+        round_num,
+    )
+    .await
 }
 
 /// ZEB-1022: shared core of `dfrost_contribute_dkg_round` — callable
@@ -63523,8 +63566,8 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
 /// longer require a manual IPC on every node. Behaviour is unchanged
 /// from the pre-refactor IPC body; only the handle plumbing moved
 /// (NodeState extraction → `DfrostCoreHandles`).
-async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime>(
-    handles: &DfrostCoreHandles,
+pub async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime, H: tauri::Runtime>(
+    handles: &DfrostCoreHandles<H>,
     app: Option<&tauri::AppHandle<R>>,
     space_id: crate::owner_state_types::SpaceId,
     ceremony_bytes: [u8; 32],

@@ -1289,6 +1289,235 @@ mod tests {
         assert_eq!(log.apply(ev), Err(ApplyError::UnknownCeremony));
     }
 
+    /// ZEB-1022 helper: build a `di` (CeremonyInit) event with a fake
+    /// signature (apply does not verify — that's the engine's job).
+    fn di_event(
+        actor: OwnerAddr,
+        members: Vec<OwnerAddr>,
+        threshold: u16,
+        epoch: u64,
+        ceremony_id: [u8; 32],
+        wall_ms: u64,
+    ) -> crate::community_dfrost_types::SignedCommitteeEvent {
+        use crate::community_dfrost_types::{
+            CeremonyInitPayload, DfrostEventKind, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+        let max_signers = members.len() as u16;
+        let payload = CeremonyInitPayload {
+            ceremony_id,
+            members,
+            threshold,
+            max_signers,
+            epoch,
+            minted_wall_ms: wall_ms,
+            minted_logical: 0,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::CeremonyInit,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor,
+            payload: pd,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    #[test]
+    fn di_seeds_pending_dkg_zeb1022() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let mut log = DfrostLog::new();
+        log.apply(di_event(alice, vec![alice, bob], 2, 1, ceremony_id, 1_000))
+            .expect("di seeds");
+        let p = log.committee_state.pending_dkg.as_ref().expect("pending");
+        assert_eq!(p.ceremony_id, ceremony_id);
+        assert_eq!(p.initiator, Some(alice));
+        assert_eq!(p.members, vec![alice, bob]);
+        assert_eq!(p.threshold, 2);
+        assert_eq!(p.max_signers, 2);
+        assert_eq!(p.proposed_epoch, 1);
+        assert!(p.round1_packages.is_empty());
+        assert_eq!(log.events.len(), 1);
+    }
+
+    #[test]
+    fn di_same_id_is_idempotent_zeb1022() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let mut log = DfrostLog::new();
+        log.apply(di_event(alice, vec![alice, bob], 2, 1, ceremony_id, 1_000))
+            .expect("di seeds");
+        // Accumulate a round-1 package, then re-apply the (re-minted) di.
+        log.committee_state
+            .pending_dkg
+            .as_mut()
+            .unwrap()
+            .round1_packages
+            .insert(alice, vec![0xde]);
+        log.apply(di_event(alice, vec![alice, bob], 2, 1, ceremony_id, 2_000))
+            .expect("same-id di is an idempotent no-op");
+        let p = log.committee_state.pending_dkg.as_ref().unwrap();
+        assert!(
+            p.round1_packages.contains_key(&alice),
+            "re-applied di must not reset accumulated round-1 packages"
+        );
+    }
+
+    #[test]
+    fn di_different_id_rejected_ceremony_in_flight_zeb1022() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let mut log = DfrostLog::new();
+        log.apply(di_event(alice, vec![alice, bob], 2, 1, [0x42; 32], 1_000))
+            .expect("first di seeds");
+        assert_eq!(
+            log.apply(di_event(bob, vec![alice, bob], 2, 1, [0x43; 32], 2_000)),
+            Err(ApplyError::CeremonyInFlight),
+            "the log never replaces an in-flight ceremony on its own"
+        );
+    }
+
+    #[test]
+    fn di_on_active_committee_rejected_zeb1022() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        assert_eq!(
+            log.apply(di_event(alice, vec![alice, bob], 2, 2, [0x42; 32], 1_000)),
+            Err(ApplyError::InvariantViolation),
+            "fresh DKG on an active committee is refresh's job"
+        );
+    }
+
+    #[test]
+    fn di_shape_violations_rejected_zeb1022() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let cid = [0x42u8; 32];
+
+        // Unsorted member list.
+        let mut log = DfrostLog::new();
+        assert_eq!(
+            log.apply(di_event(alice, vec![bob, alice], 2, 1, cid, 1_000)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Duplicate member.
+        assert_eq!(
+            log.apply(di_event(alice, vec![alice, alice, bob], 2, 1, cid, 1_000)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // threshold < 2.
+        assert_eq!(
+            log.apply(di_event(alice, vec![alice, bob], 1, 1, cid, 1_000)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // threshold > max_signers.
+        assert_eq!(
+            log.apply(di_event(alice, vec![alice, bob], 3, 1, cid, 1_000)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Initiator not a committee member.
+        assert_eq!(
+            log.apply(di_event(carol, vec![alice, bob], 2, 1, cid, 1_000)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Wrong proposed epoch (current is 0 ⇒ only 1 is valid).
+        assert_eq!(
+            log.apply(di_event(alice, vec![alice, bob], 2, 2, cid, 1_000)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Nothing seeded by any of the rejects.
+        assert!(log.committee_state.pending_dkg.is_none());
+        assert!(log.events.is_empty());
+    }
+
+    #[test]
+    fn abort_pending_dkg_clears_pending_and_secrets_zeb1022() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let mut log = DfrostLog::new();
+        assert_eq!(log.abort_pending_dkg(), None, "no-op on empty slot");
+
+        log.apply(di_event(alice, vec![alice, bob], 2, 1, ceremony_id, 1_000))
+            .expect("di seeds");
+        let id = crate::community_dfrost_crypto::identifier_for_index(0);
+        let (secret, _pkg) =
+            crate::community_dfrost_crypto::dkg_part1_local(id, 2, 2).expect("part1");
+        log.local_dkg_secret = Some(secret);
+
+        assert_eq!(log.abort_pending_dkg(), Some(ceremony_id));
+        assert!(log.committee_state.pending_dkg.is_none());
+        assert!(
+            log.local_dkg_secret.is_none(),
+            "aborted ceremony's secrets must not leak into a successor"
+        );
+        assert!(log.local_dkg_secret2.is_none());
+    }
+
+    #[test]
+    fn resign_with_fresh_hlc_preserves_payload_and_verifies_zeb1022() {
+        use crate::owner_state_types::Hlc;
+        use ed25519_dalek::Verifier;
+
+        let keypair = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let actor = OwnerAddr([0x01; 16]);
+        let payload = crate::community_dfrost_types::CeremonyInitPayload {
+            ceremony_id: [0x42; 32],
+            members: vec![actor],
+            threshold: 2,
+            max_signers: 2,
+            epoch: 1,
+            minted_wall_ms: 1_000,
+            minted_logical: 0,
+        };
+        let original = build_signed_dfrost_event(
+            &keypair,
+            actor,
+            crate::community_dfrost_types::DfrostEventKind::CeremonyInit,
+            &payload,
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("build");
+
+        let fresh_hlc = Hlc {
+            wall_ms: 5_000,
+            logical: 3,
+            device_id: "d".into(),
+        };
+        let reminted = resign_dfrost_event_with_fresh_hlc(&original, fresh_hlc.clone(), &keypair)
+            .expect("resign");
+
+        assert_eq!(reminted.payload, original.payload, "payload untouched");
+        assert_eq!(reminted.hlc, fresh_hlc);
+        assert_ne!(reminted.sig, original.sig, "fresh HLC ⇒ fresh signature");
+        // The new signature verifies over the new signing bytes.
+        let sb = reminted.signing_bytes().unwrap();
+        let sig_bytes: [u8; 64] = reminted.sig.as_slice().try_into().unwrap();
+        keypair
+            .verifying_key()
+            .verify(&sb, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+            .expect("re-minted signature verifies");
+    }
+
     #[test]
     fn full_1of1_dkg_ceremony_finalizes() {
         // 1-of-1 committee: single member posts dr(rn=1) then dk → committee active.
