@@ -695,6 +695,26 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
         Some(engine)
     }
 
+    /// ZEB-1018 (Qodo on #768): rollback seam for `ensure_dfrost_engine_for`.
+    /// Remove + abort `engine` only while it is still the registered entry
+    /// for `community_id` (Arc identity, not value equality). Used when the
+    /// adapter request could not be enqueued after a successful
+    /// `register_if_vacant`: the registration is the ensure path's
+    /// idempotency token, so leaving the unwired engine in place would make
+    /// every later ensure take the fast path and never retry the Zenoh
+    /// wiring. Pointer comparison means a caller holding a stale Arc can
+    /// never remove a concurrent replacement.
+    pub async fn remove_if_same(&self, community_id: SpaceId, engine: &Arc<DfrostLogEngine<R>>) {
+        let mut engines = self.engines.lock().await;
+        if engines
+            .get(&community_id)
+            .is_some_and(|cur| Arc::ptr_eq(cur, engine))
+        {
+            engine.abort();
+            engines.remove(&community_id);
+        }
+    }
+
     /// Drop every engine. Each engine's receive task is explicitly
     /// aborted here, independent of `Drop`: external code that retained
     /// an `Arc` clone from a prior `registry.get(cid).await` would
@@ -1590,6 +1610,57 @@ mod tests {
             Arc::ptr_eq(&got, &first),
             "registry must still hold the incumbent engine"
         );
+    }
+
+    /// ZEB-1018 (Qodo on #768): `remove_if_same` is the ensure path's
+    /// rollback when the adapter request can't be enqueued after a won
+    /// `register_if_vacant`. It must vacate + abort ONLY the exact engine
+    /// the caller registered — a stale Arc must never evict a concurrent
+    /// replacement.
+    #[tokio::test]
+    async fn registry_remove_if_same_rolls_back_own_engine_only() {
+        let reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+        let cid = SpaceId([6u8; 16]);
+        let app = tauri::test::mock_app();
+
+        let engine = DfrostLogRegistry::register_if_vacant(
+            &reg,
+            registry_test_params(cid, app.handle().clone()),
+        )
+        .await
+        .expect("vacant registry must create the engine");
+
+        // A replacement races in (test-only `register` swap semantics).
+        let replacement =
+            DfrostLogRegistry::register(&reg, registry_test_params(cid, app.handle().clone()))
+                .await;
+
+        // Stale rollback: pointer mismatch ⇒ no-op, replacement survives.
+        reg.remove_if_same(cid, &engine).await;
+        let got = reg
+            .get(cid)
+            .await
+            .expect("replacement must survive a stale caller's rollback");
+        assert!(Arc::ptr_eq(&got, &replacement));
+        assert!(
+            !replacement.receive_handle_is_finished(),
+            "stale rollback must not abort the replacement's receive loop"
+        );
+
+        // Matching rollback: vacates the slot (a later ensure can retry
+        // the wiring) and aborts the engine's receive task.
+        reg.remove_if_same(cid, &replacement).await;
+        assert!(
+            reg.get(cid).await.is_none(),
+            "matching rollback must vacate the registry slot"
+        );
+        for _ in 0..50 {
+            if replacement.receive_handle_is_finished() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("rolled-back engine's receive task did not abort within deadline");
     }
 
     /// R2 fix: when `register()` replaces an existing engine, the OLD

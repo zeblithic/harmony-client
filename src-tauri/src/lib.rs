@@ -59665,6 +59665,77 @@ mod zeb718_voting_reconcile_tests {
         );
     }
 
+    /// ZEB-1018 (Qodo on #768): an adapter-request send failure must roll
+    /// the engine registration back — otherwise the unwired engine
+    /// fast-paths every later ensure and the Zenoh wiring is never
+    /// retried. The retry (here: an ensure with a live channel) must then
+    /// succeed and enqueue its adapter request.
+    #[tokio::test]
+    async fn ensure_dfrost_engine_rolls_back_registration_on_dead_adapter_channel() {
+        let cid = SpaceId([0x95; 16]);
+        let actor = OwnerAddr([0xef; 16]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let dfrost_registry: Arc<
+            crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>,
+        > = Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::new());
+        let dfrost_logs: DfrostLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Dead channel: rx dropped immediately (the event loop is gone).
+        let (dead_tx, dead_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::DfrostLogAdapterRequest>(64);
+        drop(dead_rx);
+
+        let err = ensure_dfrost_engine_for(
+            &dfrost_logs,
+            &dfrost_registry,
+            cid,
+            Some(dead_tx),
+            &signing_key,
+            actor,
+            crdt_state.clone(),
+            [0u8; 64],
+            None,
+        )
+        .await
+        .expect_err("send on a dead adapter channel must surface as Err");
+        assert!(
+            err.contains("dfrost_log_adapter_request_tx send failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            dfrost_registry.get(cid).await.is_none(),
+            "failed wiring must vacate the registry so a later ensure retries"
+        );
+
+        // Retry with a live channel: registers and enqueues the request.
+        let (live_tx, mut live_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::DfrostLogAdapterRequest>(64);
+        ensure_dfrost_engine_for(
+            &dfrost_logs,
+            &dfrost_registry,
+            cid,
+            Some(live_tx),
+            &signing_key,
+            actor,
+            crdt_state,
+            [0u8; 64],
+            None,
+        )
+        .await
+        .expect("retry after rollback must succeed");
+        assert!(
+            dfrost_registry.get(cid).await.is_some(),
+            "retry must register the engine"
+        );
+        let req = live_rx
+            .try_recv()
+            .expect("retry must enqueue exactly one adapter request");
+        assert_eq!(req.community_id, cid);
+    }
+
     #[tokio::test]
     async fn reconcile_replays_persisted_voting_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -60453,13 +60524,12 @@ async fn ensure_dfrost_engine_for(
 
     // Race-safe: only the caller that actually created the engine sends
     // the adapter request; a loser's channel halves drop unused here.
-    let created =
+    let Some(engine) =
         crate::community_dfrost_log_engine::DfrostLogRegistry::register_if_vacant(registry, params)
             .await
-            .is_some();
-    if !created {
+    else {
         return Ok(());
-    }
+    };
 
     let Some(tx) = dfrost_log_adapter_request_tx else {
         tracing::warn!(
@@ -60469,18 +60539,25 @@ async fn ensure_dfrost_engine_for(
         );
         return Ok(());
     };
-    // Same semantics as the voting path: a send failure (event loop
-    // shutting down) leaves the engine registered but unwired — only
-    // reachable during app shutdown.
-    tx.send(crate::event_loop::DfrostLogAdapterRequest {
-        id_hex: hex::encode(community_id.0),
-        community_id,
-        crdt_state,
-        publisher_rx,
-        subscriber_tx,
-    })
-    .await
-    .map_err(|e| format!("dfrost_log_adapter_request_tx send failed: {e}"))?;
+    // A send failure means the event loop's receiver is gone (shutdown /
+    // restart teardown racing this ensure). Unlike the voting path's
+    // accepted orphan, roll the registration back (Qodo on #768): the
+    // registration is this path's idempotency token, so an unwired engine
+    // left in the registry would fast-path every later ensure and the
+    // Zenoh wiring would never be retried.
+    if let Err(e) = tx
+        .send(crate::event_loop::DfrostLogAdapterRequest {
+            id_hex: hex::encode(community_id.0),
+            community_id,
+            crdt_state,
+            publisher_rx,
+            subscriber_tx,
+        })
+        .await
+    {
+        registry.remove_if_same(community_id, &engine).await;
+        return Err(format!("dfrost_log_adapter_request_tx send failed: {e}"));
+    }
     Ok(())
 }
 

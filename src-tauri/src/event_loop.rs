@@ -11842,8 +11842,10 @@ const MAX_DFROST_PAYLOAD_BYTES: usize = 64 * 1024;
 ///
 /// Fire-and-forget like the voting adapter: `event_loop::run`'s select!
 /// arm calls it and drops the `JoinHandle`. Tasks exit when `closing`
-/// is set, when the engine drops its channel halves (registry teardown),
-/// or when Zenoh closes the subscriber.
+/// is set or when the engine drops its channel halves (registry
+/// teardown). A failed or dying Zenoh subscriber is NOT an exit: the
+/// inbound arm re-declares with backoff, because this task is the
+/// registered engine's only transport attach (see the inbound arm).
 pub fn spawn_dfrost_log_zenoh_adapter(
     session: Arc<zenoh::Session>,
     community_id_hex: String,
@@ -11957,129 +11959,162 @@ pub fn spawn_dfrost_log_zenoh_adapter(
 
         // Inbound: Zenoh subscriber → decrypt (current-epoch-only) →
         // engine's subscriber_tx.
+        //
+        // The subscriber is declared inside a retry loop (voice-signal
+        // backoff pattern: 5s → ×2 → 60s cap), NOT one-shot like the
+        // voting/state-root arms: the engine registration is the ensure
+        // path's idempotency token, so this task is the engine's ONLY
+        // transport attach — a one-shot declare failure would leave the
+        // node permanently unable to receive peer DKG/refresh/signing
+        // contributions until restart (Greptile P1 on #768). Mid-session
+        // subscriber death re-declares through the same loop.
         let session_sub = session;
         let key_sub = key_expr;
         let topic_sub = topic;
         let closing_sub = Arc::clone(&closing);
         let crdt_state_sub = crdt_state;
         let sub_handle = tokio::spawn(async move {
-            let sub = match session_sub.declare_subscriber(&key_sub).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if !closing_sub.load(Ordering::SeqCst) {
-                        tracing::error!(
-                            topic = %topic_sub,
-                            error = %e,
-                            "failed to declare community dfrost-log subscriber"
-                        );
-                    }
-                    // subscriber_tx drops on this arm's exit; the engine's
-                    // receive loop sees end-of-stream and exits — the node
-                    // continues in local-apply-only mode.
-                    return;
+            let mut backoff = std::time::Duration::from_secs(5);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+            'outer: loop {
+                if closing_sub.load(Ordering::SeqCst) {
+                    break;
                 }
-            };
-            // Loop-exit conditions mirror the voting subscriber arm:
-            // send failure (engine torn down, silent), recv error (warn
-            // gated on !closing), closing flag (bounded shutdown), and
-            // subscriber_tx.closed() (engine dropped its rx while idle —
-            // without this arm the JoinHandle hangs until the next
-            // sample).
-            loop {
-                tokio::select! {
-                    // Data-flow arm first (see the voting subscriber for
-                    // the teardown-race rationale on delivering a sample
-                    // that ties with closed()).
-                    biased;
-                    res = sub.recv_async() => {
-                        match res {
-                            Ok(sample) => {
-                                let payload_len = sample.payload().len();
-                                if payload_len > MAX_DFROST_PAYLOAD_BYTES {
-                                    if !closing_sub.load(Ordering::SeqCst) {
-                                        tracing::warn!(
-                                            topic = %topic_sub,
-                                            len = payload_len,
-                                            max = MAX_DFROST_PAYLOAD_BYTES,
-                                            "dfrost payload exceeds size cap; dropping"
-                                        );
+                let sub = match session_sub.declare_subscriber(&key_sub).await {
+                    Ok(s) => {
+                        backoff = std::time::Duration::from_secs(5);
+                        s
+                    }
+                    Err(e) => {
+                        if !closing_sub.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                topic = %topic_sub,
+                                error = %e,
+                                backoff_s = backoff.as_secs(),
+                                "community dfrost-log declare_subscriber failed; \
+                                 retrying after backoff"
+                            );
+                        }
+                        // Race the backoff against engine teardown so a
+                        // registry shutdown mid-retry resolves this task
+                        // promptly instead of after up to MAX_BACKOFF.
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = subscriber_tx.closed() => break 'outer,
+                        }
+                        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                        continue;
+                    }
+                };
+                // Inner-loop exits: send failure / subscriber_tx.closed()
+                // (engine torn down — exit the task, silent), closing flag
+                // (bounded shutdown — exit the task), recv error (subscriber
+                // died mid-session — break to the outer loop and re-declare).
+                loop {
+                    tokio::select! {
+                        // Data-flow arm first (see the voting subscriber for
+                        // the teardown-race rationale on delivering a sample
+                        // that ties with closed()).
+                        biased;
+                        res = sub.recv_async() => {
+                            match res {
+                                Ok(sample) => {
+                                    let payload_len = sample.payload().len();
+                                    if payload_len > MAX_DFROST_PAYLOAD_BYTES {
+                                        if !closing_sub.load(Ordering::SeqCst) {
+                                            tracing::warn!(
+                                                topic = %topic_sub,
+                                                len = payload_len,
+                                                max = MAX_DFROST_PAYLOAD_BYTES,
+                                                "dfrost payload exceeds size cap; dropping"
+                                            );
+                                        }
+                                        continue;
                                     }
-                                    continue;
-                                }
-                                let raw: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                // Current-epoch-only cut, mirroring the voting
-                                // plane: a kicked-then-rotated member's stale-
-                                // epoch envelope is dropped here before any
-                                // engine work. debug-level drops throughout —
-                                // every branch is peer-controllable.
-                                let plaintext: Vec<u8> = {
-                                    let envelope: crate::community_state_sync::EncryptedEnvelope =
-                                        match ciborium::from_reader(raw.as_slice()) {
-                                            Ok(env) => env,
+                                    let raw: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                    // Current-epoch-only cut, mirroring the voting
+                                    // plane: a kicked-then-rotated member's stale-
+                                    // epoch envelope is dropped here before any
+                                    // engine work. debug-level drops throughout —
+                                    // every branch is peer-controllable.
+                                    let plaintext: Vec<u8> = {
+                                        let envelope: crate::community_state_sync::EncryptedEnvelope =
+                                            match ciborium::from_reader(raw.as_slice()) {
+                                                Ok(env) => env,
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        topic = %topic_sub,
+                                                        error = %e,
+                                                        "drop dfrost packet (envelope decode)"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                        let st = crdt_state_sub.lock().await;
+                                        let Some(space) = st.spaces.get(&community_id) else {
+                                            continue;
+                                        };
+                                        match space.current_epoch {
+                                            Some(cur) if cur == envelope.epoch => {}
+                                            _ => {
+                                                tracing::debug!(
+                                                    topic = %topic_sub,
+                                                    epoch = envelope.epoch,
+                                                    "drop dfrost packet (stale/unknown epoch)"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                        match crate::community_state_sync::decrypt_for_topic_with_aad(
+                                            space,
+                                            &envelope,
+                                            crate::community_state_sync::DFROST_TOPIC_AAD,
+                                        ) {
+                                            Ok(pt) => pt,
                                             Err(e) => {
                                                 tracing::debug!(
                                                     topic = %topic_sub,
                                                     error = %e,
-                                                    "drop dfrost packet (envelope decode)"
+                                                    "drop dfrost packet (decrypt)"
                                                 );
                                                 continue;
                                             }
-                                        };
-                                    let st = crdt_state_sub.lock().await;
-                                    let Some(space) = st.spaces.get(&community_id) else {
-                                        continue;
+                                        }
                                     };
-                                    match space.current_epoch {
-                                        Some(cur) if cur == envelope.epoch => {}
-                                        _ => {
-                                            tracing::debug!(
-                                                topic = %topic_sub,
-                                                epoch = envelope.epoch,
-                                                "drop dfrost packet (stale/unknown epoch)"
-                                            );
-                                            continue;
-                                        }
+                                    if subscriber_tx.send(plaintext).await.is_err() {
+                                        break 'outer;
                                     }
-                                    match crate::community_state_sync::decrypt_for_topic_with_aad(
-                                        space,
-                                        &envelope,
-                                        crate::community_state_sync::DFROST_TOPIC_AAD,
-                                    ) {
-                                        Ok(pt) => pt,
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                topic = %topic_sub,
-                                                error = %e,
-                                                "drop dfrost packet (decrypt)"
-                                            );
-                                            continue;
-                                        }
+                                }
+                                Err(e) => {
+                                    if !closing_sub.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %topic_sub,
+                                            error = %e,
+                                            "community dfrost-log subscriber closed; \
+                                             reconnecting"
+                                        );
                                     }
-                                };
-                                if subscriber_tx.send(plaintext).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                if !closing_sub.load(Ordering::SeqCst) {
-                                    tracing::warn!(
-                                        topic = %topic_sub,
-                                        error = %e,
-                                        "community dfrost-log subscriber closed unexpectedly"
-                                    );
-                                }
-                                break;
-                            }
+                        }
+                        _ = subscriber_tx.closed() => {
+                            // Engine dropped subscriber_rx — nothing to
+                            // forward to anymore. Silent exit.
+                            break 'outer;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if closing_sub.load(Ordering::SeqCst) { break 'outer; }
                         }
                     }
-                    _ = subscriber_tx.closed() => {
-                        // Engine dropped subscriber_rx — nothing to
-                        // forward to anymore. Silent exit.
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if closing_sub.load(Ordering::SeqCst) { break; }
-                    }
+                }
+                // Mid-session subscriber death (recv Err): pace the
+                // re-declare so a subscriber that dies immediately after
+                // declaring can't busy-loop (voice-signal pattern), while
+                // still resolving promptly on engine teardown.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    _ = subscriber_tx.closed() => break 'outer,
                 }
             }
         });
