@@ -1316,6 +1316,19 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         log.committee_state.current_epoch
     }
 
+    /// ZEB-1024: readiness probe for the Tier-3 PollCreate gate.
+    /// `Some(current_epoch)` only when a completed DKG has activated the
+    /// committee. `active` and `current_epoch` are read under ONE log
+    /// lock so the epoch the gate stores via `set_tier3_poll_epoch` can
+    /// never belong to a different committee generation than the
+    /// `active` verdict it rode in on (a refresh promotion between two
+    /// separate reads would produce exactly that skew).
+    pub async fn active_epoch(&self) -> Option<u64> {
+        let log = self.dfrost_log.lock().await;
+        let cs = &log.committee_state;
+        cs.active.then_some(cs.current_epoch)
+    }
+
     /// ZEB-295 Phase 6 Task 8: snapshot the committee state at a given
     /// epoch as the read-only triple the voting-side `CommitteeOracle`
     /// trait needs. Returns `(joint_verifying_key, verifying_shares,
