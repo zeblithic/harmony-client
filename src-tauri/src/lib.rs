@@ -65731,9 +65731,10 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
     // gate → part1 → build → stash → apply so concurrent calls can
     // never double-mint round-1 material (publish_order already
     // serializes production callers; this keeps the invariant local).
-    let (ceremony_id, event_for_broadcast): (
+    let (ceremony_id, event_for_broadcast, prior_secret): (
         [u8; 32],
         crate::community_dfrost_types::SignedCommitteeEvent,
+        Option<frost_ristretto255::keys::dkg::round1::SecretPackage>,
     ) = {
         let mut log = log_arc.lock().await;
 
@@ -65829,43 +65830,67 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
         let self_x25519_priv: [u8; 32] =
             *crate::dm_signing::ed25519_priv_to_x25519(signing_key_arc.as_ref());
 
-        // Stash + apply with rollback (R5-1 lineage).
+        // Stash + apply with rollback (R5-1 lineage). `prior_secret`
+        // rides out of this block so the broadcast-failure path below
+        // can restore it too.
         let prior_secret = log.local_dkg_secret.take();
         log.local_dkg_secret = Some(r1_secret);
         if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
             log.local_dkg_secret = prior_secret;
             return Err(format!("dfrost_propose_refresh: apply: {e:?}"));
         }
-        (ceremony_id, event)
+        (ceremony_id, event, prior_secret)
     };
 
-    // Broadcast (best-effort; local apply already succeeded), outside
-    // the log lock (R8/R10 ordering).
-    match dfrost_log_registry.as_ref() {
+    // Broadcast, outside the log lock (R8/R10 ordering). Qodo #4 (#775
+    // round 2): a round-1 package peers never receive must not latch
+    // the already-submitted marker (`round1_packages[self]`) — every
+    // retry would then bounce off the guard while peers wait forever
+    // for this member's commitment. A registry-less context (tests) is
+    // still best-effort; a present registry with a missing engine, or a
+    // failed publish, rolls back and errors so the drive/caller can
+    // retry (the ceremony id is deterministic, so the retry re-joins
+    // the same ceremony).
+    let broadcast_err: Option<String> = match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
-            Some(engine) => {
-                if let Err(e) = engine.publish_event(event_for_broadcast).await {
-                    tracing::warn!(
-                        space_id = ?space_id,
-                        error = %e,
-                        "dfrost_propose_refresh: broadcast failed (local apply succeeded)",
-                    );
-                }
-            }
-            None => {
-                tracing::debug!(
-                    space_id = ?space_id,
-                    "dfrost_propose_refresh: no engine registered for \
-                     community — broadcast skipped (engine not registered — boot/join ensure has not run for this community?)",
-                );
-            }
+            Some(engine) => engine
+                .publish_event(event_for_broadcast)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            None => Some(
+                "no engine registered for community (boot/join ensure has not run?)".to_string(),
+            ),
         },
         None => {
             tracing::debug!(
                 "dfrost_propose_refresh: dfrost_log_registry is None — \
                  broadcast skipped (test context?)",
             );
+            None
         }
+    };
+    if let Some(err) = broadcast_err {
+        let mut log = log_arc.lock().await;
+        let clear_slot = match log.committee_state.pending_refresh.as_mut() {
+            Some(pr) if pr.ceremony_id == ceremony_id => {
+                pr.round1_packages.remove(&self_owner);
+                // If this call seeded the slot and no peer has
+                // contributed yet, drop it entirely — an empty phantom
+                // slot would block repair requests (mutual exclusion)
+                // on this node for no reason.
+                pr.round1_packages.is_empty()
+            }
+            _ => false,
+        };
+        if clear_slot {
+            log.committee_state.pending_refresh = None;
+        }
+        log.local_dkg_secret = prior_secret;
+        return Err(format!(
+            "dfrost_propose_refresh: broadcast failed after local apply — rolled back for \
+             retry: {err}"
+        ));
     }
 
     let ceremony_id_hex = hex::encode(ceremony_id);
@@ -66353,11 +66378,12 @@ pub async fn dfrost_contribute_refresh_round_core<R: tauri::Runtime, H: tauri::R
     };
 
     // Apply locally. Round 2 stashes the round-2 secret in the same
-    // lock window (R6 rollback pattern); round 3 installs the ROTATED
-    // key material and rolls it back if its own dk fails to apply —
-    // signing at the still-current epoch with an already-rotated share
-    // would poison every contribution this node makes.
-    {
+    // lock window (R6 rollback pattern); round 3 STAGES the rotated
+    // key material in `pending_rotated` — promotion installs it (Qodo
+    // #8, #775 round 2), so the old, still-valid share keeps serving
+    // threshold-sign until the epoch actually advances. `prior_secret2`
+    // rides out of the block for the broadcast-failure rollback below.
+    let prior_secret2: Option<Option<frost_ristretto255::keys::dkg::round2::SecretPackage>> = {
         let mut log = log_arc.lock().await;
         let prior_secret2 = if r2_secret_to_stash.is_some() {
             let prior = log.local_dkg_secret2.take();
@@ -66366,54 +66392,45 @@ pub async fn dfrost_contribute_refresh_round_core<R: tauri::Runtime, H: tauri::R
         } else {
             None
         };
-        let prior_rotated = if let Some((kp, pkp)) = rotated_to_stash {
-            let prior = (
-                log.local_key_package.take(),
-                log.local_pub_key_package.take(),
-            );
-            log.local_key_package = Some(kp);
-            log.local_pub_key_package = Some(pkp);
-            Some(prior)
-        } else {
-            None
-        };
+        let staged_rotation = rotated_to_stash.is_some();
+        if let Some((kp, pkp)) = rotated_to_stash {
+            log.pending_rotated = Some((kp, pkp));
+        }
         if let Err(e) =
             log.apply_with_identity(event_to_apply.clone(), &self_owner, &self_x25519_priv)
         {
             if let Some(prior) = prior_secret2 {
                 log.local_dkg_secret2 = prior;
             }
-            if let Some((prior_kp, prior_pkp)) = prior_rotated {
-                log.local_key_package = prior_kp;
-                log.local_pub_key_package = prior_pkp;
+            if staged_rotation {
+                log.pending_rotated = None;
             }
             return Err(format!("dfrost_contribute_refresh_round: apply: {e:?}"));
         }
-    }
+        prior_secret2
+    };
 
-    // Broadcast (best-effort), outside the log lock.
-    match dfrost_log_registry.as_ref() {
+    // Broadcast, outside the log lock. Qodo #5 (#775 round 2): a
+    // failed round-2 publish must not leave `local_dkg_secret2` set —
+    // it is itself the double-submit guard, so every retry would bounce
+    // while peers wait forever for this member's packages. Roll it back
+    // and error; the drive re-decides rn=2 on the next tick. Round 3 is
+    // different: its dk is already IN the local log (not rollbackable)
+    // and `pending_rotated` must stay staged — a peer-driven quorum can
+    // still promote this node correctly. The error reports the partial
+    // state; with more live members than threshold the ceremony
+    // completes without this node's confirmation, otherwise it stalls
+    // until re-broadcast machinery exists (ZEB-1028).
+    let broadcast_err: Option<String> = match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
-            Some(engine) => {
-                if let Err(e) = engine.publish_event(event_to_apply).await {
-                    tracing::warn!(
-                        space_id = ?space_id,
-                        round_num = round_num,
-                        error = %e,
-                        "dfrost_contribute_refresh_round: broadcast failed \
-                         (local apply succeeded)",
-                    );
-                }
-            }
-            None => {
-                tracing::debug!(
-                    space_id = ?space_id,
-                    round_num = round_num,
-                    "dfrost_contribute_refresh_round: no engine registered for community — \
-                     broadcast skipped \
-                     (engine not registered — boot/join ensure has not run for this community?)",
-                );
-            }
+            Some(engine) => engine
+                .publish_event(event_to_apply)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            None => Some(
+                "no engine registered for community (boot/join ensure has not run?)".to_string(),
+            ),
         },
         None => {
             tracing::debug!(
@@ -66421,7 +66438,23 @@ pub async fn dfrost_contribute_refresh_round_core<R: tauri::Runtime, H: tauri::R
                 "dfrost_contribute_refresh_round: dfrost_log_registry is None — \
                  broadcast skipped (test context?)",
             );
+            None
         }
+    };
+    if let Some(err) = broadcast_err {
+        if round_num == 2 {
+            let mut log = log_arc.lock().await;
+            log.local_dkg_secret2 = prior_secret2.flatten();
+            return Err(format!(
+                "dfrost_contribute_refresh_round: round-2 broadcast failed after local apply \
+                 — round-2 secret rolled back for retry: {err}"
+            ));
+        }
+        return Err(format!(
+            "dfrost_contribute_refresh_round: round-3 dk broadcast failed AFTER the dk applied \
+             locally — rotated material stays staged for promotion; peers are missing this \
+             node's confirmation (quorum may still complete via other members): {err}"
+        ));
     }
 
     if let Some(app) = app {
@@ -66664,53 +66697,54 @@ pub async fn dfrost_request_share_repair_core<R: tauri::Runtime, H: tauri::Runti
         (ceremony_id, event)
     };
 
-    match dfrost_log_registry.as_ref() {
+    // CodeAnt (#775 round 1) + Qodo #7 (round 2): a request no helper
+    // ever hears must not squat the singleton repair slot — it would
+    // suppress the automatic retry (the drive gates on
+    // `pending_repair.is_none()`) until a manual re-request or restart.
+    // Both a failed publish AND a present registry with no engine for
+    // this community get the same treatment: clear our own slot and
+    // surface the failure; the recovery drive re-arms its request latch
+    // on a driver error, so the next tick retries with a fresh ceremony
+    // id. (The applied rn=1 event stays in the log — it is a valid,
+    // signed request that simply never travelled; a retry outranks it
+    // on every peer.) A registry-less context (tests) stays
+    // best-effort.
+    let broadcast_err: Option<String> = match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
-            Some(engine) => {
-                if let Err(e) = engine.publish_event(event_for_broadcast).await {
-                    // CodeAnt (#775 round 1): a request no helper ever
-                    // hears must not squat the singleton repair slot —
-                    // it would suppress the automatic retry (the drive
-                    // gates on `pending_repair.is_none()`) until a
-                    // manual re-request or restart. Clear our own slot
-                    // and surface the failure; the recovery drive
-                    // re-arms its request latch on a driver error, so
-                    // the next tick retries with a fresh ceremony id.
-                    // (The applied rn=1 event stays in the log — it is
-                    // a valid, signed request that simply never
-                    // travelled; a retry supersedes it on every peer.)
-                    {
-                        let mut log = log_arc.lock().await;
-                        if log
-                            .committee_state
-                            .pending_repair
-                            .as_ref()
-                            .map(|p| p.ceremony_id)
-                            == Some(ceremony_id)
-                        {
-                            log.committee_state.pending_repair = None;
-                        }
-                    }
-                    return Err(format!(
-                        "dfrost_request_share_repair: broadcast failed after local apply —                          pending repair cleared for retry: {e}"
-                    ));
-                }
-            }
-            None => {
-                tracing::debug!(
-                    space_id = ?space_id,
-                    "dfrost_request_share_repair: no engine registered for community — \
-                     broadcast skipped \
-                     (engine not registered — boot/join ensure has not run for this community?)",
-                );
-            }
+            Some(engine) => engine
+                .publish_event(event_for_broadcast)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            None => Some(
+                "no engine registered for community (boot/join ensure has not run?)".to_string(),
+            ),
         },
         None => {
             tracing::debug!(
                 "dfrost_request_share_repair: dfrost_log_registry is None — \
                  broadcast skipped (test context?)",
             );
+            None
         }
+    };
+    if let Some(err) = broadcast_err {
+        {
+            let mut log = log_arc.lock().await;
+            if log
+                .committee_state
+                .pending_repair
+                .as_ref()
+                .map(|p| p.ceremony_id)
+                == Some(ceremony_id)
+            {
+                log.committee_state.pending_repair = None;
+            }
+        }
+        return Err(format!(
+            "dfrost_request_share_repair: broadcast failed after local apply — pending repair \
+             cleared for retry: {err}"
+        ));
     }
 
     let ceremony_id_hex = hex::encode(ceremony_id);
@@ -67033,28 +67067,27 @@ pub async fn dfrost_contribute_repair_round_core<R: tauri::Runtime, H: tauri::Ru
         }
     }
 
-    match dfrost_log_registry.as_ref() {
+    // Qodo #6 (#775 round 2): a helper round peers never receive must
+    // not leave `roundN_seen[self]` set — the duplicate guards above
+    // would refuse every retry while the participant waits forever for
+    // material that never travelled. Roll back this helper's own
+    // progress markers and error; the drive re-decides the round on the
+    // next tick. Residual gap: if this node's rn=3 was the LAST sigma,
+    // its own apply already ran the non-participant settlement and
+    // cleared the slot — nothing to roll back, and the participant
+    // stalls exactly like any other lost round until re-broadcast
+    // machinery exists (ZEB-1028). A registry-less context (tests)
+    // stays best-effort.
+    let broadcast_err: Option<String> = match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
-            Some(engine) => {
-                if let Err(e) = engine.publish_event(event).await {
-                    tracing::warn!(
-                        space_id = ?space_id,
-                        round_num = round_num,
-                        error = %e,
-                        "dfrost_contribute_repair_round: broadcast failed \
-                         (local apply succeeded)",
-                    );
-                }
-            }
-            None => {
-                tracing::debug!(
-                    space_id = ?space_id,
-                    round_num = round_num,
-                    "dfrost_contribute_repair_round: no engine registered for community — \
-                     broadcast skipped \
-                     (engine not registered — boot/join ensure has not run for this community?)",
-                );
-            }
+            Some(engine) => engine
+                .publish_event(event)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            None => Some(
+                "no engine registered for community (boot/join ensure has not run?)".to_string(),
+            ),
         },
         None => {
             tracing::debug!(
@@ -67062,7 +67095,27 @@ pub async fn dfrost_contribute_repair_round_core<R: tauri::Runtime, H: tauri::Ru
                 "dfrost_contribute_repair_round: dfrost_log_registry is None — \
                  broadcast skipped (test context?)",
             );
+            None
         }
+    };
+    if let Some(err) = broadcast_err {
+        {
+            let mut log = log_arc.lock().await;
+            if let Some(p) = log.committee_state.pending_repair.as_mut() {
+                if p.ceremony_id == ceremony_bytes {
+                    if round_num == 2 {
+                        p.round2_seen.remove(&self_owner);
+                        p.deltas.remove(&self_owner);
+                    } else {
+                        p.round3_seen.remove(&self_owner);
+                    }
+                }
+            }
+        }
+        return Err(format!(
+            "dfrost_contribute_repair_round: broadcast failed after local apply — round \
+             progress rolled back for retry: {err}"
+        ));
     }
 
     if let Some(app) = app {

@@ -1808,11 +1808,14 @@ async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
     };
     // CR-6 (#775 round 1): re-stash round secrets immediately before the
     // dk events so the post-promotion assertion below proves PROMOTION
-    // (not the test's own `.take()` during rn=2) cleared them.
-    for (log, id) in [(&mut log_a, id_alice), (&mut log_b, id_bob)] {
+    // (not the test's own `.take()` during rn=2) cleared them. Both
+    // secrets (#775 round 2 follow-up): `local_dkg_secret2` must be
+    // populated too, or its half of the assertion can never fail.
+    for (log, id, me) in [(&mut log_a, id_alice, ALICE), (&mut log_b, id_bob, BOB)] {
         let (r1_secret, _) =
             refresh_part1_local(id, max_signers, threshold).expect("re-stash r1 secret");
         log.local_dkg_secret = Some(r1_secret);
+        log.local_dkg_secret2 = Some(r2_secrets.get(&me).unwrap().clone());
     }
     for (actor, sk, wall) in [(ALICE, &alice_sk, 7_400u64), (BOB, &bob_sk, 7_500)] {
         let dk = build_signed_dfrost_event(

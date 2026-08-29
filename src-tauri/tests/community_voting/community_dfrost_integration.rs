@@ -767,7 +767,7 @@ fn dk_rejected_after_active_with_pending_dkg_slot() {
 #[test]
 fn refresh_two_engine_preserves_joint_vk() {
     let mut c = dkg_2of2_setup();
-    let (alice_priv, alice_pub) = alice_x25519();
+    let (alice_priv, _alice_pub) = alice_x25519();
     let (bob_priv, bob_pub) = bob_x25519();
 
     let refresh_ceremony_id: [u8; 32] = [0xee; 32];
@@ -804,9 +804,9 @@ fn refresh_two_engine_preserves_joint_vk() {
     }
 
     // ── rf rn=2: sealed per-recipient round-2 packages (here: alice's
-    //    only, targeting bob — plus a sealed-to-self entry, matching the
-    //    production core's uniform distribution).
-    let synthetic_share_for_alice = vec![0xa1; 64];
+    //    only, targeting bob — refresh part2 produces packages for every
+    //    OTHER member, never self, and the apply path enforces exactly
+    //    that recipient set since #775 round 2).
     let synthetic_share_for_bob = vec![0xb1; 64];
     let rf2 = build_rf_event(
         ALICE,
@@ -815,18 +815,11 @@ fn refresh_two_engine_preserves_joint_vk() {
         RefreshRoundPayload {
             ceremony_id: refresh_ceremony_id,
             round_num: 2,
-            recipient_ciphertexts: Some(vec![
-                RecipientCiphertext {
-                    recipient: ALICE,
-                    sealed: dm_signing::seal_to_owner(&alice_pub, &synthetic_share_for_alice)
-                        .expect("seal alice"),
-                },
-                RecipientCiphertext {
-                    recipient: BOB,
-                    sealed: dm_signing::seal_to_owner(&bob_pub, &synthetic_share_for_bob)
-                        .expect("seal bob"),
-                },
-            ]),
+            recipient_ciphertexts: Some(vec![RecipientCiphertext {
+                recipient: BOB,
+                sealed: dm_signing::seal_to_owner(&bob_pub, &synthetic_share_for_bob)
+                    .expect("seal bob"),
+            }]),
             package: None,
         },
     );
@@ -860,23 +853,18 @@ fn refresh_two_engine_preserves_joint_vk() {
     assert_eq!(pr_b.round1_packages.get(&ALICE), Some(&alice_r1_pkg));
     assert_eq!(pr_b.round1_packages.get(&BOB), Some(&bob_r1_pkg));
 
-    // R4 (CodeRabbit) lineage: each engine must have decrypted the rn=2
-    // ciphertext addressed to it (keyed by sender = ALICE).
-    assert_eq!(
-        pr_a.round2_packages.get(&ALICE),
-        Some(&synthetic_share_for_alice),
-        "engine A must have decrypted refresh share targeted at ALICE"
-    );
+    // R4 (CodeRabbit) lineage: the recipient engine must have decrypted
+    // the rn=2 ciphertext addressed to it (keyed by sender = ALICE);
+    // the sender stores nothing from its own event (no self-addressed
+    // ciphertext exists — part2 seals to OTHER members only).
     assert_eq!(
         pr_b.round2_packages.get(&ALICE),
         Some(&synthetic_share_for_bob),
         "engine B must have decrypted refresh share targeted at BOB"
     );
-    // Each engine stored exactly one entry (only one sender's rf rn=2).
-    assert_eq!(
-        pr_a.round2_packages.len(),
-        1,
-        "engine A round2_packages must have exactly one entry"
+    assert!(
+        pr_a.round2_packages.is_empty(),
+        "engine A (the sender) must have no self-addressed r2 decrypt"
     );
     assert_eq!(
         pr_b.round2_packages.len(),

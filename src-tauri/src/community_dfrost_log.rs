@@ -165,6 +165,20 @@ pub struct DfrostLog {
     /// verifying shares). Materialised alongside `local_key_package`.
     pub local_pub_key_package: Option<PublicKeyPackage>,
 
+    /// ZEB-1027 (#775 round 2, Qodo #8): ROTATED key material produced
+    /// by refresh finalization (part 3), staged here until the
+    /// ceremony's `dk` quorum PROMOTES the new epoch
+    /// (`apply_dkg_complete` installs it after the consensus check).
+    /// Installing at promotion — not at part 3 — keeps the old,
+    /// still-valid share in `local_key_package` through the dk-quorum
+    /// window: a rotated share only matches the POST-promotion
+    /// verifying shares, so installing it early would poison every
+    /// threshold-sign contribution this node makes in that window.
+    /// SECRET (contains the rotated signing share); in-memory only,
+    /// never serialized — a crash in the window loses it, and share
+    /// repair is the standing recovery.
+    pub pending_rotated: Option<(KeyPackage, PublicKeyPackage)>,
+
     /// Active threshold-sign nonce material, keyed by signing-ceremony
     /// id. Each `(nonces, commitments)` pair MUST be used exactly once
     /// (re-use leaks the signing share — see FROST spec §6.2). Cleared
@@ -464,6 +478,17 @@ pub struct PendingRepair {
     /// threshold). RTS Lagrange coefficients are computed over exactly
     /// this set, so EVERY listed helper must contribute rounds 2–3.
     pub helpers: Vec<OwnerAddr>,
+    /// Payload-carried mint stamp (wall half). Together with
+    /// `minted_logical` this feeds the COMMUTATIVE arbitration between
+    /// racing rn=1 requests (see `apply_repair_round`): the winner must
+    /// be a pure function of the request SET, never of arrival order,
+    /// or replicas diverge on which ceremony helpers should serve.
+    /// Public data (already broadcast in the rn=1 payload).
+    #[serde(default)]
+    pub minted_wall_ms: u64,
+    /// Payload-carried mint stamp (logical half). See `minted_wall_ms`.
+    #[serde(default)]
+    pub minted_logical: u32,
     /// Helpers whose rn=2 (delta distribution) has been observed.
     /// Public protocol progress — safe to persist (though restarts
     /// clear the whole slot via `from_restored`).
@@ -489,17 +514,45 @@ impl PendingRepair {
         participant: OwnerAddr,
         epoch: u64,
         helpers: Vec<OwnerAddr>,
+        minted_wall_ms: u64,
+        minted_logical: u32,
     ) -> Self {
         Self {
             ceremony_id,
             participant,
             epoch,
             helpers,
+            minted_wall_ms,
+            minted_logical,
             round2_seen: Default::default(),
             round3_seen: Default::default(),
             deltas: Default::default(),
             sigmas: Default::default(),
         }
+    }
+
+    /// Total-order rank for rn=1 arbitration (#775 round 2 —
+    /// Greptile P1 / Qodo #1). Smaller rank wins. The order is
+    /// (participant ASC, mint stamp DESC, ceremony id ASC):
+    ///
+    /// * participant first — racing requests from DIFFERENT members
+    ///   resolve to the smaller address on every replica, so helpers
+    ///   can never split between two ceremonies that then both starve;
+    /// * newer mint stamp beats older for the SAME participant — a
+    ///   retry (fresh stamp) supersedes the participant's own earlier
+    ///   request no matter which order the two arrive in;
+    /// * ceremony id last, purely to make the order total.
+    ///
+    /// Because the winner over any request SET is its rank-minimum —
+    /// independent of arrival order — replicas that see the same
+    /// requests converge on the same incumbent (min is commutative,
+    /// associative, and idempotent).
+    fn rank(&self) -> (OwnerAddr, std::cmp::Reverse<(u64, u32)>, [u8; 32]) {
+        (
+            self.participant,
+            std::cmp::Reverse((self.minted_wall_ms, self.minted_logical)),
+            self.ceremony_id,
+        )
     }
 }
 
@@ -1185,6 +1238,41 @@ impl DfrostLog {
             // polynomial; its deltas/sigmas must never finalize. The
             // participant re-requests at the new epoch.
             self.committee_state.pending_repair = None;
+            // Qodo #8 (#775 round 2): install the STAGED rotated key
+            // material exactly at promotion (see `pending_rotated`'s
+            // doc — the old share stays valid until the epoch actually
+            // advances). Identity is checked the same way as the
+            // staleness check below, because this plain-apply path has
+            // no self address: the staged package's verifying share
+            // must equal the promoted consensus entry for its
+            // identifier. A mismatch (this promotion belongs to a
+            // different ceremony than the one that staged it) discards
+            // the stage; the staleness check below then routes the
+            // node to repair if its ACTIVE share is also stale.
+            if let Some((kp, pkp)) = self.pending_rotated.take() {
+                let matches_consensus =
+                    self.committee_state
+                        .identifier_map
+                        .iter()
+                        .any(|(addr, id)| {
+                            id == kp.identifier()
+                                && self.committee_state.verifying_shares.get(addr)
+                                    == Some(
+                                        &crate::community_dfrost_crypto::verifying_share_to_bytes(
+                                            kp.verifying_share(),
+                                        ),
+                                    )
+                        });
+                if matches_consensus {
+                    self.local_key_package = Some(kp);
+                    self.local_pub_key_package = Some(pkp);
+                } else {
+                    tracing::warn!(
+                        "dfrost promotion discarded staged rotated key material that does not \
+                         match the promoted consensus verifying shares (ZEB-1027)"
+                    );
+                }
+            }
             // CR-2 (#775 round 1): a held signing share that does not
             // match the PROMOTED consensus verifying shares is STALE —
             // this node contributed refresh rounds but peer dks reached
@@ -1193,8 +1281,9 @@ impl DfrostLog {
             // shares that can never aggregate under the new committee
             // package and (b) make `has_key_package` block the automatic
             // repair that is exactly this node's recovery path. The
-            // node that DID finalize installed the rotated package
-            // BEFORE applying its dk, so its share matches and is kept.
+            // node that DID finalize had its rotated package installed
+            // from `pending_rotated` just above, so its share matches
+            // and is kept.
             // Cryptographic identity (verifying share == consensus
             // entry) is the discriminator because this plain-apply path
             // has no self address to compare against.
@@ -1513,7 +1602,32 @@ impl DfrostLog {
                 if pr.ceremony_id != payload.ceremony_id {
                     return Err(ApplyError::UnknownCeremony);
                 }
-                if payload.recipient_ciphertexts.is_none() {
+                let cts = payload
+                    .recipient_ciphertexts
+                    .as_ref()
+                    .ok_or(ApplyError::InvariantViolation)?;
+                // Qodo #2 (#775 round 2): the recipient set must cover
+                // EVERY other ceremony member exactly once — no
+                // missing, duplicate, self, or non-member entries. An
+                // accepted rn=2 whose omitted recipient can never store
+                // this sender's package would stall the singleton
+                // refresh permanently (finalization needs packages from
+                // ALL other members); rejecting up front keeps the
+                // event out of every replica's progress accounting.
+                let mut recipients: std::collections::BTreeSet<OwnerAddr> =
+                    std::collections::BTreeSet::new();
+                for ct in cts {
+                    if !recipients.insert(ct.recipient) {
+                        return Err(ApplyError::InvariantViolation);
+                    }
+                }
+                let expected: std::collections::BTreeSet<OwnerAddr> = pr
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|m| *m != event.actor)
+                    .collect();
+                if recipients != expected {
                     return Err(ApplyError::InvariantViolation);
                 }
             }
@@ -1532,11 +1646,16 @@ impl DfrostLog {
     ///   the threshold, which also makes a t-of-n committee with
     ///   t == n structurally unrepairable), the payload mint stamp, and
     ///   epoch == current_epoch. Seeds `pending_repair`. A same-id
-    ///   re-mint is an idempotent no-op; a DIFFERENT ceremony from the
-    ///   SAME participant supersedes its own earlier request (the
-    ///   participant is the sole authority on its own repair — this is
-    ///   the retry path after a failed/stalled ceremony); anyone else's
-    ///   request while one is in flight is `CeremonyInFlight`.
+    ///   re-mint is an idempotent no-op. COMPETING ceremonies (any
+    ///   different id — the participant's own retry included) are
+    ///   arbitrated by `PendingRepair::rank`: the rank-minimum request
+    ///   wins on every replica REGARDLESS of arrival order (#775
+    ///   round 2, Greptile P1 / Qodo #1 — an order-dependent rule here
+    ///   lets replicas lock onto different ceremonies and reject each
+    ///   other's helper rounds as `UnknownCeremony`, starving both
+    ///   participants). A displaced ceremony's progress is discarded
+    ///   with its slot; the displaced participant's automatic request
+    ///   re-arms once the winner settles.
     /// rn=2 (helper deltas): records the helper in `round2_seen`.
     /// rn=3 (helper sigma): records the helper in `round3_seen`.
     fn apply_repair_round(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
@@ -1579,9 +1698,11 @@ impl DfrostLog {
                 if helpers.len() < self.committee_state.threshold as usize {
                     return Err(ApplyError::InvariantViolation);
                 }
-                if payload.minted_wall_ms.is_none() || payload.minted_logical.is_none() {
+                let (Some(minted_wall_ms), Some(minted_logical)) =
+                    (payload.minted_wall_ms, payload.minted_logical)
+                else {
                     return Err(ApplyError::InvariantViolation);
-                }
+                };
                 // Mutual exclusion with share-mutating ceremonies: a
                 // repair reconstructs a point on the CURRENT polynomial;
                 // running it concurrently with a DKG/refresh transcript
@@ -1592,60 +1713,54 @@ impl DfrostLog {
                 {
                     return Err(ApplyError::CeremonyInFlight);
                 }
+                let candidate = PendingRepair::new(
+                    payload.ceremony_id,
+                    event.actor,
+                    payload.epoch,
+                    helpers.clone(),
+                    minted_wall_ms,
+                    minted_logical,
+                );
                 match self.committee_state.pending_repair.as_ref() {
                     None => {
-                        self.committee_state.pending_repair = Some(PendingRepair::new(
-                            payload.ceremony_id,
-                            event.actor,
-                            payload.epoch,
-                            helpers,
-                        ));
+                        self.committee_state.pending_repair = Some(candidate);
                     }
                     Some(p) if p.ceremony_id == payload.ceremony_id => {
                         // Idempotent re-mint: same participant, same
                         // shape, or it's a forged/colliding request.
+                        // (The stamp halves are inputs to
+                        // `derive_repair_ceremony_id`, so a same-id
+                        // event claiming different stamps is forged.)
                         if p.participant != event.actor
                             || p.helpers != helpers
                             || p.epoch != payload.epoch
+                            || p.minted_wall_ms != minted_wall_ms
+                            || p.minted_logical != minted_logical
                         {
                             return Err(ApplyError::InvariantViolation);
                         }
                     }
-                    Some(p) if p.participant == event.actor => {
-                        // Participant supersedes its own earlier
-                        // ceremony (retry with a fresh mint stamp or a
-                        // smaller responsive helper set).
-                        self.committee_state.pending_repair = Some(PendingRepair::new(
-                            payload.ceremony_id,
-                            event.actor,
-                            payload.epoch,
-                            helpers,
-                        ));
+                    Some(p) => {
+                        // COMMUTATIVE arbitration (#775 round 2,
+                        // Greptile P1 / Qodo #1): the rank-minimum
+                        // request wins, full stop — the winner over a
+                        // request set is then independent of arrival
+                        // order, so replicas converge on the same
+                        // incumbent. Deliberately NOT gated on incumbent
+                        // progress (`round2_seen`): protecting an
+                        // in-flight ceremony would reintroduce exactly
+                        // the order dependence being removed (a replica
+                        // that saw helper progress first keeps the
+                        // incumbent; one that saw the challenger first
+                        // replaces it). Rank covers the participant's
+                        // own retry too: a newer mint stamp outranks its
+                        // older ceremony in both arrival orders.
+                        if candidate.rank() < p.rank() {
+                            self.committee_state.pending_repair = Some(candidate);
+                        } else {
+                            return Err(ApplyError::CeremonyInFlight);
+                        }
                     }
-                    Some(p)
-                        if p.round2_seen.is_empty()
-                            && (event.actor, payload.ceremony_id)
-                                < (p.participant, p.ceremony_id) =>
-                    {
-                        // Deterministic tie-break for RACING requests
-                        // from different participants (two members
-                        // restarting together): while NO helper has
-                        // progressed the incumbent, the smaller
-                        // (participant, ceremony_id) wins on every
-                        // replica — without this, helpers could split
-                        // between the two ceremonies and both would
-                        // starve (each needs its full declared helper
-                        // set). The displaced participant's automatic
-                        // request re-arms once the winner's ceremony
-                        // settles and clears the slot.
-                        self.committee_state.pending_repair = Some(PendingRepair::new(
-                            payload.ceremony_id,
-                            event.actor,
-                            payload.epoch,
-                            helpers,
-                        ));
-                    }
-                    Some(_) => return Err(ApplyError::CeremonyInFlight),
                 }
             }
             2 | 3 => {
@@ -1662,12 +1777,38 @@ impl DfrostLog {
                 if !p.helpers.contains(&event.actor) {
                     return Err(ApplyError::InvariantViolation);
                 }
-                if payload.recipient_ciphertexts.is_none() {
-                    return Err(ApplyError::InvariantViolation);
-                }
+                let cts = payload
+                    .recipient_ciphertexts
+                    .as_ref()
+                    .ok_or(ApplyError::InvariantViolation)?;
+                // Qodo #3 (#775 round 2): a round may only mark public
+                // progress (`roundN_seen`) if it actually carries the
+                // sealed material the protocol needs — otherwise a
+                // malformed event permanently satisfies the seen-set
+                // while the required delta/sigma never arrives, and the
+                // ceremony (or a non-participant's slot cleanup, which
+                // gates on `round3_seen` alone) runs on a lie.
                 if payload.round_num == 2 {
+                    // Exactly one delta per DECLARED helper, the sender
+                    // included (uniform sealed distribution).
+                    let mut recipients: std::collections::BTreeSet<OwnerAddr> =
+                        std::collections::BTreeSet::new();
+                    for ct in cts {
+                        if !recipients.insert(ct.recipient) {
+                            return Err(ApplyError::InvariantViolation);
+                        }
+                    }
+                    let expected: std::collections::BTreeSet<OwnerAddr> =
+                        p.helpers.iter().copied().collect();
+                    if recipients != expected {
+                        return Err(ApplyError::InvariantViolation);
+                    }
                     p.round2_seen.insert(event.actor);
                 } else {
+                    // Exactly one sigma, sealed to the participant.
+                    if cts.len() != 1 || cts[0].recipient != p.participant {
+                        return Err(ApplyError::InvariantViolation);
+                    }
                     p.round3_seen.insert(event.actor);
                 }
             }
@@ -4212,8 +4353,14 @@ mod tests {
             .pending_sign
             .insert([0x33; 32], PendingSignSession::default());
         log.committee_state.pending_refresh = Some(PendingCeremony::default());
-        log.committee_state.pending_repair =
-            Some(PendingRepair::new([0x55; 32], bob, 1, vec![alice]));
+        log.committee_state.pending_repair = Some(PendingRepair::new(
+            [0x55; 32],
+            bob,
+            1,
+            vec![alice],
+            1_000,
+            0,
+        ));
         log.beacon_index.insert([0x11; 32], [0x22; 32]);
 
         let restored = DfrostLog::from_restored(
@@ -4318,6 +4465,94 @@ mod tests {
         );
     }
 
+    /// Qodo #2 (#775 round 2): rf rn=2 must seal to EVERY other
+    /// ceremony member exactly once — an accepted event missing a
+    /// recipient would stall the refresh permanently (that member's
+    /// finalization can never see this sender's package).
+    #[test]
+    fn rf_rn2_recipient_set_completeness_zeb1027() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let mallory = OwnerAddr([0x66; 16]);
+        let ceremony_id = [0x78u8; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice, bob, carol];
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 3;
+        log.committee_state.pending_refresh = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice, bob, carol],
+            threshold: 2,
+            max_signers: 3,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+
+        let cts_for = |recipients: &[OwnerAddr]| {
+            recipients
+                .iter()
+                .map(|r| crate::community_membership::RecipientCiphertext {
+                    recipient: *r,
+                    sealed: vec![0u8; 4],
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut wall = 7_200u64;
+        let mut rn2 = |rc: Vec<crate::community_membership::RecipientCiphertext>| {
+            let payload = RefreshRoundPayload {
+                ceremony_id,
+                round_num: 2,
+                recipient_ciphertexts: Some(rc),
+                package: None,
+            };
+            let mut pd = Vec::new();
+            ciborium::into_writer(&payload, &mut pd).unwrap();
+            wall += 1;
+            SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: DfrostEventKind::ProactiveRefresh,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: bob,
+                payload: pd,
+                sig: vec![0u8; 64],
+            }
+        };
+
+        // Empty, missing a member, duplicate, self-addressed, and
+        // non-member sets are all malformed.
+        for bad in [
+            vec![],
+            cts_for(&[alice]),
+            cts_for(&[alice, alice]),
+            cts_for(&[alice, bob, carol]),
+            cts_for(&[alice, mallory]),
+        ] {
+            assert_eq!(
+                log.apply(rn2(bad)),
+                Err(ApplyError::InvariantViolation),
+                "incomplete recipient set must be rejected"
+            );
+        }
+        // Exactly {alice, carol} (= members ∖ {bob}) is well-formed.
+        log.apply(rn2(cts_for(&[alice, carol])))
+            .expect("complete recipient set applies");
+    }
+
     /// An rf rn=1 while a (stray) DKG occupies its slot is refused —
     /// the two transcripts must never interleave.
     #[test]
@@ -4372,6 +4607,33 @@ mod tests {
         rc: Option<Vec<crate::community_membership::RecipientCiphertext>>,
         wall_ms: u64,
     ) -> SignedCommitteeEvent {
+        rp_event_stamped(
+            actor,
+            ceremony_id,
+            round_num,
+            epoch,
+            helpers,
+            rc,
+            wall_ms,
+            1_000,
+            0,
+        )
+    }
+
+    /// `rp_event` with an explicit mint stamp — the arbitration tests
+    /// need distinct stamps to exercise `PendingRepair::rank`.
+    #[allow(clippy::too_many_arguments)]
+    fn rp_event_stamped(
+        actor: OwnerAddr,
+        ceremony_id: [u8; 32],
+        round_num: u8,
+        epoch: u64,
+        helpers: Option<Vec<OwnerAddr>>,
+        rc: Option<Vec<crate::community_membership::RecipientCiphertext>>,
+        wall_ms: u64,
+        minted_wall_ms: u64,
+        minted_logical: u32,
+    ) -> SignedCommitteeEvent {
         use crate::community_dfrost_types::RepairRoundPayload;
         use crate::owner_state_types::Hlc;
         let payload = RepairRoundPayload {
@@ -4379,8 +4641,16 @@ mod tests {
             round_num,
             epoch,
             helpers,
-            minted_wall_ms: if round_num == 1 { Some(1_000) } else { None },
-            minted_logical: if round_num == 1 { Some(0) } else { None },
+            minted_wall_ms: if round_num == 1 {
+                Some(minted_wall_ms)
+            } else {
+                None
+            },
+            minted_logical: if round_num == 1 {
+                Some(minted_logical)
+            } else {
+                None
+            },
             recipient_ciphertexts: rc,
         };
         let mut pd = Vec::new();
@@ -4521,9 +4791,10 @@ mod tests {
 
     #[test]
     fn rp_rn1_supersede_and_tiebreak_zeb1027() {
-        // Participant supersedes its OWN earlier ceremony.
+        // Same participant: the NEWER mint stamp wins — in both arrival
+        // orders (`PendingRepair::rank` puts newer stamps first).
         let (mut log, alice, bob, carol) = repair_committee_log();
-        log.apply(rp_event(
+        log.apply(rp_event_stamped(
             alice,
             [0xab; 32],
             1,
@@ -4531,9 +4802,11 @@ mod tests {
             Some(vec![bob, carol]),
             None,
             8_100,
+            1_000,
+            0,
         ))
         .expect("first request");
-        log.apply(rp_event(
+        log.apply(rp_event_stamped(
             alice,
             [0xac; 32],
             1,
@@ -4541,8 +4814,47 @@ mod tests {
             Some(vec![bob, carol]),
             None,
             8_101,
+            2_000,
+            0,
         ))
-        .expect("participant supersedes its own ceremony");
+        .expect("participant's newer retry supersedes its own ceremony");
+        assert_eq!(
+            log.committee_state
+                .pending_repair
+                .as_ref()
+                .unwrap()
+                .ceremony_id,
+            [0xac; 32]
+        );
+        // Reverse order: the OLDER stamp arriving late is refused — the
+        // outcome is the same ceremony either way.
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.apply(rp_event_stamped(
+            alice,
+            [0xac; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            8_102,
+            2_000,
+            0,
+        ))
+        .expect("newer request first");
+        assert_eq!(
+            log.apply(rp_event_stamped(
+                alice,
+                [0xab; 32],
+                1,
+                1,
+                Some(vec![bob, carol]),
+                None,
+                8_103,
+                1_000,
+                0,
+            )),
+            Err(ApplyError::CeremonyInFlight)
+        );
         assert_eq!(
             log.committee_state
                 .pending_repair
@@ -4552,8 +4864,8 @@ mod tests {
             [0xac; 32]
         );
 
-        // Racing requests from DIFFERENT participants: smaller
-        // (participant, id) wins while no helper has progressed…
+        // Racing requests from DIFFERENT participants: the smaller
+        // participant wins…
         let (mut log, alice, bob, carol) = repair_committee_log();
         log.apply(rp_event(
             bob,
@@ -4562,7 +4874,7 @@ mod tests {
             1,
             Some(vec![alice, carol]),
             None,
-            8_102,
+            8_104,
         ))
         .expect("bob's request");
         log.apply(rp_event(
@@ -4572,9 +4884,9 @@ mod tests {
             1,
             Some(vec![bob, carol]),
             None,
-            8_103,
+            8_105,
         ))
-        .expect("alice (smaller addr) wins the tie-break");
+        .expect("alice (smaller addr) wins the arbitration");
         assert_eq!(
             log.committee_state
                 .pending_repair
@@ -4592,20 +4904,27 @@ mod tests {
                 1,
                 Some(vec![alice, bob]),
                 None,
-                8_104,
+                8_106,
             )),
             Err(ApplyError::CeremonyInFlight)
         );
-        // Once a helper progressed, even a smaller newcomer is refused.
-        let (mut log, _alice, bob, carol) = repair_committee_log();
+        // Helper progress does NOT protect the incumbent (#775 round 2,
+        // Greptile P1 / Qodo #1): a progress-gated rule is itself
+        // arrival-order-dependent — a replica that saw the helper round
+        // first would keep the incumbent while one that saw the
+        // challenger first replaced it, and the two then reject each
+        // other's helper events. The smaller-ranked challenger wins
+        // everywhere; the displaced ceremony's progress dies with its
+        // slot.
+        let (mut log, alice, bob, carol) = repair_committee_log();
         log.apply(rp_event(
             carol,
             [0xab; 32],
             1,
             1,
-            Some(vec![_alice, bob]),
+            Some(vec![alice, bob]),
             None,
-            8_105,
+            8_107,
         ))
         .expect("carol's request");
         log.committee_state
@@ -4614,22 +4933,90 @@ mod tests {
             .unwrap()
             .round2_seen
             .insert(bob);
+        log.apply(rp_event(
+            alice,
+            [0xaf; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            8_108,
+        ))
+        .expect("smaller-ranked challenger replaces a progressed incumbent");
+        let p = log.committee_state.pending_repair.as_ref().unwrap();
+        assert_eq!(p.participant, alice);
+        assert!(
+            p.round2_seen.is_empty(),
+            "displaced ceremony's progress must not leak into the winner"
+        );
+    }
+
+    /// #775 round 2 (Greptile P1 / Qodo #1): the SAME event set must
+    /// yield the SAME incumbent on every replica regardless of arrival
+    /// order — including interleaved helper progress for the ceremony
+    /// that ends up losing.
+    #[test]
+    fn rp_rn1_arbitration_commutes_across_arrival_orders_zeb1027() {
+        let dummy_cts = |recipients: &[OwnerAddr]| {
+            recipients
+                .iter()
+                .map(|r| crate::community_membership::RecipientCiphertext {
+                    recipient: *r,
+                    sealed: vec![0u8; 4],
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let (_, alice, bob, carol) = repair_committee_log();
+        // Bob's request (larger participant → loses the arbitration),
+        // a helper round progressing IT, and alice's request.
+        let e_bob = rp_event(bob, [0xbb; 32], 1, 1, Some(vec![alice, carol]), None, 8_200);
+        let e_help = rp_event(
+            carol,
+            [0xbb; 32],
+            2,
+            1,
+            None,
+            Some(dummy_cts(&[alice, carol])),
+            8_201,
+        );
+        let e_alice = rp_event(alice, [0xaa; 32], 1, 1, Some(vec![bob, carol]), None, 8_202);
+
+        // Replica 1 sees bob's ceremony start and progress before
+        // alice's request arrives.
+        let (mut log1, ..) = repair_committee_log();
+        log1.apply(e_bob.clone()).expect("bob seeds");
+        log1.apply(e_help.clone()).expect("helper progresses bob's");
+        log1.apply(e_alice.clone())
+            .expect("alice replaces despite progress");
+
+        // Replica 2 sees alice first; bob's request and the helper
+        // round bounce off her incumbency.
+        let (mut log2, ..) = repair_committee_log();
+        log2.apply(e_alice).expect("alice seeds");
+        assert_eq!(log2.apply(e_bob), Err(ApplyError::CeremonyInFlight));
+        assert_eq!(log2.apply(e_help), Err(ApplyError::UnknownCeremony));
+
+        let p1 = log1.committee_state.pending_repair.as_ref().unwrap();
+        let p2 = log2.committee_state.pending_repair.as_ref().unwrap();
         assert_eq!(
-            log.apply(rp_event(
-                _alice,
-                [0xaf; 32],
-                1,
-                1,
-                Some(vec![bob, carol]),
-                None,
-                8_106,
-            )),
-            Err(ApplyError::CeremonyInFlight)
+            (p1.participant, p1.ceremony_id, p1.round2_seen.clone()),
+            (p2.participant, p2.ceremony_id, p2.round2_seen.clone()),
+            "replicas must converge on the same incumbent with the same progress"
         );
     }
 
     #[test]
     fn rp_round_tracking_and_helper_gates_zeb1027() {
+        let cts_for = |recipients: &[OwnerAddr]| {
+            recipients
+                .iter()
+                .map(|r| crate::community_membership::RecipientCiphertext {
+                    recipient: *r,
+                    sealed: vec![0u8; 4],
+                })
+                .collect::<Vec<_>>()
+        };
         let (mut log, alice, bob, carol) = repair_committee_log();
         log.apply(rp_event(
             alice,
@@ -4638,12 +5025,21 @@ mod tests {
             1,
             Some(vec![bob, carol]),
             None,
-            8_200,
+            8_300,
         ))
         .expect("request");
-        // rn=2 from a declared helper tracks.
-        log.apply(rp_event(bob, [0xab; 32], 2, 1, None, Some(vec![]), 8_201))
-            .expect("helper rn=2");
+        // rn=2 from a declared helper with a COMPLETE delta set (one
+        // per declared helper, self included) tracks.
+        log.apply(rp_event(
+            bob,
+            [0xab; 32],
+            2,
+            1,
+            None,
+            Some(cts_for(&[bob, carol])),
+            8_301,
+        ))
+        .expect("helper rn=2");
         assert!(log
             .committee_state
             .pending_repair
@@ -4653,17 +5049,91 @@ mod tests {
             .contains(&bob));
         // The PARTICIPANT is not a helper — its rn=2 is malformed.
         assert_eq!(
-            log.apply(rp_event(alice, [0xab; 32], 2, 1, None, Some(vec![]), 8_202)),
+            log.apply(rp_event(
+                alice,
+                [0xab; 32],
+                2,
+                1,
+                None,
+                Some(cts_for(&[bob, carol])),
+                8_302,
+            )),
             Err(ApplyError::InvariantViolation)
         );
         // Missing ciphertext vector is malformed.
         assert_eq!(
-            log.apply(rp_event(carol, [0xab; 32], 2, 1, None, None, 8_203)),
+            log.apply(rp_event(carol, [0xab; 32], 2, 1, None, None, 8_303)),
             Err(ApplyError::InvariantViolation)
         );
+        // Qodo #3 (#775 round 2): an INCOMPLETE delta set must not mark
+        // round progress — empty, missing a declared helper, holding a
+        // duplicate, or addressed outside the helper set.
+        for bad in [
+            vec![],
+            cts_for(&[carol]),
+            cts_for(&[carol, carol]),
+            cts_for(&[alice, carol]),
+        ] {
+            assert_eq!(
+                log.apply(rp_event(carol, [0xab; 32], 2, 1, None, Some(bad), 8_304)),
+                Err(ApplyError::InvariantViolation)
+            );
+        }
+        assert!(
+            !log.committee_state
+                .pending_repair
+                .as_ref()
+                .unwrap()
+                .round2_seen
+                .contains(&carol),
+            "rejected rounds must not count as progress"
+        );
+        // rn=3 must be exactly ONE sigma sealed to the participant.
+        log.committee_state
+            .pending_repair
+            .as_mut()
+            .unwrap()
+            .round2_seen
+            .insert(carol);
+        for bad in [
+            vec![],
+            cts_for(&[bob]),
+            cts_for(&[alice, alice]),
+            cts_for(&[alice, bob]),
+        ] {
+            assert_eq!(
+                log.apply(rp_event(carol, [0xab; 32], 3, 1, None, Some(bad), 8_305)),
+                Err(ApplyError::InvariantViolation)
+            );
+        }
+        log.apply(rp_event(
+            carol,
+            [0xab; 32],
+            3,
+            1,
+            None,
+            Some(cts_for(&[alice])),
+            8_306,
+        ))
+        .expect("well-formed rn=3");
+        assert!(log
+            .committee_state
+            .pending_repair
+            .as_ref()
+            .unwrap()
+            .round3_seen
+            .contains(&carol));
         // Unknown ceremony.
         assert_eq!(
-            log.apply(rp_event(carol, [0xff; 32], 2, 1, None, Some(vec![]), 8_204)),
+            log.apply(rp_event(
+                carol,
+                [0xff; 32],
+                2,
+                1,
+                None,
+                Some(cts_for(&[bob, carol])),
+                8_307,
+            )),
             Err(ApplyError::UnknownCeremony)
         );
     }
@@ -5140,8 +5610,14 @@ mod tests {
             proposed_epoch: 2,
             ..Default::default()
         });
-        log.committee_state.pending_repair =
-            Some(PendingRepair::new([0x55; 32], alice, 1, vec![bob, carol]));
+        log.committee_state.pending_repair = Some(PendingRepair::new(
+            [0x55; 32],
+            alice,
+            1,
+            vec![bob, carol],
+            1_000,
+            0,
+        ));
         let (r1_secret, _) =
             crate::community_dfrost_crypto::dkg_part1_local(identifier_1(), 3, 2).unwrap();
         log.local_dkg_secret = Some(r1_secret);
@@ -5208,10 +5684,13 @@ mod tests {
         );
     }
 
-    /// CR-2 (#775 round 1), the KEEP side: the node that finalized
-    /// installed the rotated package BEFORE applying its dk — its
-    /// verifying share matches the promoted consensus and must survive
-    /// promotion.
+    /// CR-2 (#775 round 1), the KEEP side: an installed share whose
+    /// verifying share matches the promoted consensus must survive
+    /// promotion. (Since #775 round 2 the finalizer's rotated share
+    /// arrives via `pending_rotated` — see
+    /// `refresh_promotion_installs_staged_rotated_share_zeb1027` — but
+    /// the staleness check must still keep any installed share that
+    /// matches.)
     #[test]
     fn promotion_keeps_matching_share_zeb1027() {
         use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
@@ -5291,14 +5770,151 @@ mod tests {
 
     /// Any real dealer-generated `KeyPackage` (identifier 1).
     fn dealer_key_package_for_tests() -> frost_ristretto255::keys::KeyPackage {
-        let (shares, _pkp) = frost_ristretto255::keys::generate_with_dealer(
+        dealer_key_material_for_tests().0
+    }
+
+    /// Real dealer-generated (KeyPackage for identifier 1, joint
+    /// PublicKeyPackage) — for tests that stage `pending_rotated`.
+    fn dealer_key_material_for_tests() -> (
+        frost_ristretto255::keys::KeyPackage,
+        frost_ristretto255::keys::PublicKeyPackage,
+    ) {
+        let (shares, pkp) = frost_ristretto255::keys::generate_with_dealer(
             3,
             2,
             frost_ristretto255::keys::IdentifierList::Default,
             frost_ristretto255::rand_core::OsRng,
         )
         .expect("dealer keygen");
-        frost_ristretto255::keys::KeyPackage::try_from(shares.values().next().unwrap().clone())
-            .expect("key package")
+        let kp =
+            frost_ristretto255::keys::KeyPackage::try_from(shares.values().next().unwrap().clone())
+                .expect("key package");
+        (kp, pkp)
+    }
+
+    /// Qodo #8 (#775 round 2): refresh finalization STAGES the rotated
+    /// key material; promotion installs it iff it matches the promoted
+    /// consensus. A stage that does not match (promotion belongs to a
+    /// different ceremony) is discarded — and the stale active share
+    /// with it.
+    #[test]
+    fn refresh_promotion_installs_staged_rotated_share_zeb1027() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+        use crate::owner_state_types::Hlc;
+
+        let promote = |log: &mut DfrostLog,
+                       members: &[OwnerAddr; 3],
+                       ceremony: [u8; 32],
+                       alice_share: [u8; 32],
+                       wall0: u64| {
+            let payload = DkgCompletePayload {
+                ceremony_id: ceremony,
+                joint_verifying_key: [0x44; 32],
+                verifying_shares: vec![
+                    MemberVerifyingShare {
+                        member: members[0],
+                        verifying_share: alice_share,
+                    },
+                    MemberVerifyingShare {
+                        member: members[1],
+                        verifying_share: [0xb3; 32],
+                    },
+                    MemberVerifyingShare {
+                        member: members[2],
+                        verifying_share: [0xc3; 32],
+                    },
+                ],
+                epoch: 2,
+                members: members.to_vec(),
+                threshold: 2,
+                max_signers: 3,
+            };
+            let mut wall = wall0;
+            for confirmer in [members[0], members[1]] {
+                let mut pd = Vec::new();
+                ciborium::into_writer(&payload, &mut pd).unwrap();
+                log.apply(SignedCommitteeEvent {
+                    tag: 'd',
+                    version: 1,
+                    committee_tier: 0,
+                    kind: DfrostEventKind::DkgComplete,
+                    hlc: Hlc {
+                        wall_ms: wall,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                    actor: confirmer,
+                    payload: pd,
+                    sig: vec![0u8; 64],
+                })
+                .expect("dk applies");
+                wall += 1;
+            }
+        };
+
+        // INSTALL side: the staged package's verifying share appears in
+        // the promoted consensus → promotion installs it, replacing the
+        // (now old-epoch) active share atomically.
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.committee_state.joint_verifying_key = Some([0x44; 32]);
+        let ceremony = [0x9bu8; 32];
+        log.committee_state.pending_refresh = Some(PendingCeremony {
+            ceremony_id: ceremony,
+            members: vec![alice, bob, carol],
+            threshold: 2,
+            max_signers: 3,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+        let (rotated_kp, rotated_pkp) = dealer_key_material_for_tests();
+        assert_eq!(rotated_kp.identifier(), &identifier_1());
+        let rotated_share_bytes =
+            crate::community_dfrost_crypto::verifying_share_to_bytes(rotated_kp.verifying_share());
+        // The pre-refresh (old-epoch) share stays installed through the
+        // dk-quorum window…
+        log.local_key_package = Some(dealer_key_package_for_tests());
+        log.pending_rotated = Some((rotated_kp, rotated_pkp));
+
+        promote(
+            &mut log,
+            &[alice, bob, carol],
+            ceremony,
+            rotated_share_bytes,
+            9_400,
+        );
+        assert_eq!(log.committee_state.current_epoch, 2, "promoted");
+        assert!(log.pending_rotated.is_none(), "stage consumed");
+        let installed = log.local_key_package.as_ref().expect("installed");
+        assert_eq!(
+            crate::community_dfrost_crypto::verifying_share_to_bytes(installed.verifying_share()),
+            rotated_share_bytes,
+            "…and promotion swaps in the STAGED rotated share"
+        );
+        assert!(log.local_pub_key_package.is_some());
+
+        // DISCARD side: a stage that does not match the promoted
+        // consensus is dropped, and the stale active share is
+        // invalidated by the staleness check right after.
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.committee_state.joint_verifying_key = Some([0x44; 32]);
+        let ceremony = [0x9cu8; 32];
+        log.committee_state.pending_refresh = Some(PendingCeremony {
+            ceremony_id: ceremony,
+            members: vec![alice, bob, carol],
+            threshold: 2,
+            max_signers: 3,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+        log.local_key_package = Some(dealer_key_package_for_tests());
+        log.pending_rotated = Some(dealer_key_material_for_tests());
+
+        promote(&mut log, &[alice, bob, carol], ceremony, [0xa9; 32], 9_500);
+        assert_eq!(log.committee_state.current_epoch, 2, "promoted");
+        assert!(log.pending_rotated.is_none(), "mismatched stage discarded");
+        assert!(
+            log.local_key_package.is_none() && log.local_pub_key_package.is_none(),
+            "neither the mismatched stage nor the stale share may survive"
+        );
     }
 }

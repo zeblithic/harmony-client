@@ -4141,9 +4141,10 @@ mod tests {
             g.local_key_package = Some(dealer_key_package());
             let mut helpers = vec![bob_addr, carol_addr];
             helpers.sort();
-            g.committee_state.pending_repair = Some(
-                crate::community_dfrost_log::PendingRepair::new(ceremony, alice_addr, 1, helpers),
-            );
+            g.committee_state.pending_repair =
+                Some(crate::community_dfrost_log::PendingRepair::new(
+                    ceremony, alice_addr, 1, helpers, 1_000, 0,
+                ));
         }
 
         wait_until("recovery drive fires repair rn=2", || async {
