@@ -209,6 +209,11 @@ struct OrchestratorState {
     /// failed transiently. Retried on empty-slot ticks; cleared once a
     /// pending ceremony exists again (ours or anyone's).
     stalled_restart: Option<(Vec<OwnerAddr>, u16)>,
+    /// ZEB-1022 straggler heal: last time this node re-minted its own
+    /// `dk` in response to a peer still working a ceremony this node
+    /// already promoted. Rate-limits the heal to one per
+    /// `rebroadcast_interval`.
+    last_straggler_heal: Option<Instant>,
 }
 
 struct CeremonyActivity {
@@ -524,22 +529,48 @@ async fn process_inbound<R: tauri::Runtime>(
             }
         }
         // Stale-replace: read the quiet clock BEFORE the log lock (lock
-        // order: orchestrator state, then log — never nested).
-        let quiet_long_enough = {
+        // order: orchestrator state, then log — never nested). The
+        // verdict is bound to the SPECIFIC ceremony it was computed for
+        // (CodeAnt race on #771): a concurrent tick can abort the stale
+        // incumbent and install a fresh replacement between this read
+        // and the log lock below — an unbound verdict would then clobber
+        // the fresh ceremony.
+        let quiet_verdict: Option<([u8; 32], bool)> = {
             let o = orchestrator.state.lock().await;
-            o.activity
-                .as_ref()
-                .map(|a| a.last_progress.elapsed() >= orchestrator.config.stale_replace_threshold)
-                // No tracked activity for the pending ceremony (e.g. it
-                // was hand-seeded before the engine started) — treat as
-                // quiet so the slot can't wedge permanently.
-                .unwrap_or(true)
+            o.activity.as_ref().map(|a| {
+                (
+                    a.ceremony_id,
+                    a.last_progress.elapsed() >= orchestrator.config.stale_replace_threshold,
+                )
+            })
         };
         {
             let mut log = dfrost_log.lock().await;
             if let Some(p) = log.committee_state.pending_dkg.as_ref() {
                 if p.ceremony_id != payload.ceremony_id {
-                    if quiet_long_enough {
+                    // Admissibility FIRST (CodeRabbit on #771): never
+                    // abort the incumbent for a replacement that
+                    // `apply_ceremony_init` would then reject — that
+                    // destroys the pending slot + local secrets and
+                    // seeds nothing.
+                    if let Err(e) = log.check_ceremony_init_admissible(&payload, &event.actor) {
+                        tracing::warn!(
+                            community_id = %hex::encode(community_id.0),
+                            newcomer = %hex::encode(payload.ceremony_id),
+                            error = ?e,
+                            "dfrost inbound: replacement di is not admissible — dropped \
+                             (incumbent kept)",
+                        );
+                        return;
+                    }
+                    // Quiet + verdict-bound-to-THIS-incumbent. An
+                    // untracked incumbent (hand-seeded before the engine
+                    // started) counts as quiet so the slot can't wedge.
+                    let stale = match quiet_verdict {
+                        None => true,
+                        Some((for_ceremony, quiet)) => quiet && for_ceremony == p.ceremony_id,
+                    };
+                    if stale {
                         let aborted = log.abort_pending_dkg();
                         tracing::info!(
                             community_id = %hex::encode(community_id.0),
@@ -553,7 +584,7 @@ async fn process_inbound<R: tauri::Runtime>(
                             pending = %hex::encode(p.ceremony_id),
                             newcomer = %hex::encode(payload.ceremony_id),
                             "dfrost inbound: di for a different ceremony while the pending one \
-                             is still live — dropped",
+                             is still live — dropped (re-mints retry once it goes quiet)",
                         );
                         return;
                     }
@@ -575,6 +606,15 @@ async fn process_inbound<R: tauri::Runtime>(
             error = ?e,
             "dfrost inbound: apply failed",
         );
+        // ZEB-1022 straggler heal (CI stall on #771): a ceremony event
+        // that fails to apply while OUR committee is already active is
+        // the signature of a peer still stuck in a ceremony we
+        // completed — most often it missed our `dk` (this node promoted
+        // and stopped re-broadcasting the moment its pending slot
+        // cleared). Re-mint our own `dk` for that ceremony so the
+        // straggler can reach quorum. Rate-limited; a no-op when we
+        // never completed the referenced ceremony (nothing to re-mint).
+        maybe_heal_straggler(community_id, dfrost_log, orchestrator, &event).await;
         return;
     }
 
@@ -722,6 +762,76 @@ async fn process_inbound<R: tauri::Runtime>(
         // emit above; Close is not yet defined as a kind.
         _ => {}
     }
+}
+
+/// ZEB-1022 straggler heal: on an inbound ceremony event that failed to
+/// apply while this node's committee is ACTIVE, re-mint this node's own
+/// `dk` for the event's ceremony (via `DkgDriver::rebroadcast_pending`,
+/// whose core falls back to a dk-only re-mint when the pending slot is
+/// gone but the committee is active). Closes the terminal wedge where a
+/// peer missed the final `dk`, the sender promoted, and promotion ended
+/// its re-broadcasts — leaving the peer pending forever (observed on
+/// #771's CI as the headline test stalling with `dk=1` on one side).
+async fn maybe_heal_straggler(
+    community_id: SpaceId,
+    dfrost_log: &Arc<Mutex<DfrostLog>>,
+    orchestrator: &Arc<OrchestratorHandle>,
+    event: &SignedCommitteeEvent,
+) {
+    let Some(driver) = orchestrator.driver.as_ref() else {
+        return;
+    };
+    // Only ceremony-family kinds can indicate a straggler.
+    let ceremony_id: Option<[u8; 32]> = match event.kind {
+        DfrostEventKind::CeremonyInit => {
+            ciborium::de::from_reader::<CeremonyInitPayload, _>(&event.payload[..])
+                .ok()
+                .map(|p| p.ceremony_id)
+        }
+        DfrostEventKind::DkgRound => {
+            ciborium::de::from_reader::<DkgRoundPayload, _>(&event.payload[..])
+                .ok()
+                .map(|p| p.ceremony_id)
+        }
+        DfrostEventKind::DkgComplete => ciborium::de::from_reader::<
+            crate::community_dfrost_types::DkgCompletePayload,
+            _,
+        >(&event.payload[..])
+        .ok()
+        .map(|p| p.ceremony_id),
+        _ => None,
+    };
+    let Some(ceremony_id) = ceremony_id else {
+        return;
+    };
+    {
+        let log = dfrost_log.lock().await;
+        if !log.committee_state.active {
+            return;
+        }
+    }
+    {
+        let mut o = orchestrator.state.lock().await;
+        let due = o
+            .last_straggler_heal
+            .map(|t| t.elapsed() >= orchestrator.config.rebroadcast_interval)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        o.last_straggler_heal = Some(Instant::now());
+    }
+    let driver = Arc::clone(driver);
+    tokio::spawn(async move {
+        if let Err(e) = driver.rebroadcast_pending(community_id, ceremony_id).await {
+            tracing::debug!(
+                community_id = %hex::encode(community_id.0),
+                ceremony_id = %hex::encode(ceremony_id),
+                error = %e,
+                "dfrost straggler heal: dk re-mint failed (best-effort)",
+            );
+        }
+    });
 }
 
 /// ZEB-1022: reconcile the orchestrator's timing cache against the log's
@@ -3391,5 +3501,98 @@ mod tests {
                 .unwrap_or(false)
         })
         .await;
+    }
+
+    /// ZEB-1022 (CodeRabbit on #771): a replacement `di` that would be
+    /// REJECTED by `apply_ceremony_init` (here: wrong proposed epoch)
+    /// must not abort the stale incumbent — admissibility is checked
+    /// BEFORE the abort, so an inadmissible newcomer can never destroy
+    /// the pending slot + local secrets and then seed nothing.
+    #[tokio::test]
+    async fn engine_inadmissible_replacement_di_keeps_stale_incumbent_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xC9);
+        let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xCA);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        resolver_map.insert(bob_addr, bob_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xD9; 16]);
+        let (_c_sk, observer_addr, _c) = fixture_identity(0xCB);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            observer_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            None,
+            DfrostOrchestratorConfig {
+                // Everything counts as stale — the admissibility gate,
+                // not freshness, must be what protects the incumbent.
+                stale_replace_threshold: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (di1, id1) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&di1)).await.unwrap();
+        wait_for_log("first di seeds", &log, |l| {
+            l.committee_state.pending_dkg.is_some()
+        })
+        .await;
+
+        // Bob's replacement passes the ceremony-id binding (epoch is not
+        // a derive input) but claims epoch 2 while current_epoch is 0 —
+        // apply_ceremony_init would reject it, so the admission gate must
+        // drop it WITHOUT aborting the incumbent.
+        let (bad, _bad_id) = signed_di(
+            &bob_sk,
+            bob_addr,
+            members.clone(),
+            2,
+            2,
+            &community_id,
+            2_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&bad)).await.unwrap();
+        // FIFO sentinel: a re-minted di1 — once applied, the bad di was
+        // provably processed (and dropped) first.
+        let sentinel = crate::community_dfrost_log::resign_dfrost_event_with_fresh_hlc(
+            &di1,
+            Hlc {
+                wall_ms: 3_000,
+                logical: 0,
+                device_id: "dev-a".into(),
+            },
+            &alice_sk,
+        )
+        .expect("re-mint di1");
+        sub_tx.send(encode_packet(&sentinel)).await.unwrap();
+        wait_for_log("sentinel processed", &log, |l| l.events.len() >= 2).await;
+
+        let guard = log.lock().await;
+        assert_eq!(
+            guard
+                .committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id),
+            Some(id1),
+            "inadmissible replacement must not clear the incumbent"
+        );
     }
 }

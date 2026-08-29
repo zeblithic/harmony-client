@@ -879,18 +879,18 @@ fn orchestrated_node(
     let registry: Arc<DfrostLogRegistry<MockRt>> = Arc::new(DfrostLogRegistry::new());
     let identity_resolver: Arc<dyn IdentityResolver + Send + Sync> =
         Arc::new(StaticResolver(resolver_map.clone()));
-    let handles = DfrostCoreHandles::<MockRt> {
-        hlc_tracker: Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+    let handles = DfrostCoreHandles::<MockRt>::for_tests(
+        Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             device_id.to_string(),
         ))),
-        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
-        device_id: device_id.to_string(),
-        self_owner: self_addr,
-        signing_key: Arc::new(signing_key.clone()),
+        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        device_id.to_string(),
+        self_addr,
+        Arc::new(signing_key.clone()),
         dfrost_logs,
-        identity_resolver: Some(identity_resolver),
-        dfrost_log_registry: Some(registry.clone()),
-    };
+        Some(identity_resolver),
+        Some(registry.clone()),
+    );
     OrchestratedNode {
         log,
         registry,
@@ -1183,14 +1183,38 @@ async fn dkg_recovers_when_initial_di_and_round1_are_lost() {
     let (bob_pub_tx, mut bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
     let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
     let (bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
-    // Lossy alice→bob leg: the FIRST TWO packets (di + dr rn=1 from the
-    // initiate call) vanish. Everything after is delivered.
+    // Lossy alice→bob leg: the FIRST `di` and the FIRST `dr` rn=1 seen
+    // on the wire vanish — dropped by CONTENT, not arrival count
+    // (CodeRabbit on #771: the orchestrator's tick re-broadcast can
+    // race the initiate call's own publishes, so position on the wire
+    // is not a reliable identity for "the originals"). Everything
+    // else — including the re-mints of those same events — is
+    // delivered.
     let _a2b = tokio::spawn(async move {
-        let mut dropped = 0u32;
+        let (mut di_dropped, mut dr1_dropped) = (false, false);
         while let Some(p) = alice_pub_rx.recv().await {
-            if dropped < 2 {
-                dropped += 1;
-                continue;
+            if let Ok(ev) = ciborium::de::from_reader::<
+                harmony_app::community_dfrost_types::SignedCommitteeEvent,
+                _,
+            >(&p[..])
+            {
+                match ev.kind {
+                    DfrostEventKind::CeremonyInit if !di_dropped => {
+                        di_dropped = true;
+                        continue;
+                    }
+                    DfrostEventKind::DkgRound if !dr1_dropped => {
+                        let is_rn1 =
+                            ciborium::de::from_reader::<DkgRoundPayload, _>(&ev.payload[..])
+                                .map(|pl| pl.round_num == 1)
+                                .unwrap_or(false);
+                        if is_rn1 {
+                            dr1_dropped = true;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
             }
             if bob_sub_tx.send(p).await.is_err() {
                 break;
@@ -1279,6 +1303,131 @@ async fn dkg_recovers_when_initial_di_and_round1_are_lost() {
             .any(|e| e.kind == DfrostEventKind::CeremonyInit),
         "bob's log must contain the re-minted di that seeded him"
     );
+    drop(la);
+    drop(lb);
+    drop(alice_engine);
+    drop(bob_engine);
+}
+
+/// ZEB-1022 straggler heal (the exact CI stall on #771): Alice's
+/// ORIGINAL `dk` is lost on the wire. Bob wedges one confirmation short
+/// of quorum while Alice promotes — and a promoted node's pending slot
+/// is gone, so ordinary re-broadcast no longer covers the ceremony.
+/// Bob's own re-mints then hit Alice's engine as apply failures
+/// (`UnknownCeremony` — she has no pending), which triggers the
+/// active-committee heal: Alice re-mints her `dk` (fresh HLC) and Bob
+/// reaches quorum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dkg_straggler_heals_after_peer_promotion_when_dk_is_lost() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xCC);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xCE);
+    let alice_x_priv = *dm_signing::ed25519_priv_to_x25519(&alice_sk);
+    let bob_x_priv = *dm_signing::ed25519_priv_to_x25519(&bob_sk);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+
+    let community_id = SpaceId([0xD0; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+    let bob = orchestrated_node(community_id, "bob-dev", bob_addr, &bob_sk, &resolver_map);
+
+    let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_pub_tx, mut bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Lossy alice→bob leg: the FIRST DkgComplete from Alice vanishes —
+    // Bob is left one dk short of quorum exactly as the CI stall showed.
+    let _a2b = tokio::spawn(async move {
+        let mut dk_dropped = false;
+        while let Some(p) = alice_pub_rx.recv().await {
+            if !dk_dropped {
+                if let Ok(ev) = ciborium::de::from_reader::<
+                    harmony_app::community_dfrost_types::SignedCommitteeEvent,
+                    _,
+                >(&p[..])
+                {
+                    if ev.kind == DfrostEventKind::DkgComplete {
+                        dk_dropped = true;
+                        continue;
+                    }
+                }
+            }
+            if bob_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _b2a = tokio::spawn(async move {
+        while let Some(p) = bob_pub_rx.recv().await {
+            if alice_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let alice_engine = start_orchestrated(
+        &alice,
+        community_id,
+        alice_addr,
+        alice_x_priv,
+        &resolver_map,
+        alice_pub_tx,
+        alice_sub_rx,
+    )
+    .await;
+    let bob_engine = start_orchestrated(
+        &bob,
+        community_id,
+        bob_addr,
+        bob_x_priv,
+        &resolver_map,
+        bob_pub_tx,
+        bob_sub_rx,
+    )
+    .await;
+
+    dfrost_initiate_dkg_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        vec![alice_addr, bob_addr],
+        2,
+    )
+    .await
+    .expect("alice initiates");
+
+    // Both must converge even though Alice's original dk never arrived —
+    // her heal path re-mints it once Bob's re-broadcasts reach her
+    // post-promotion engine.
+    expect_converged(
+        wait_converged("alice converges to active (dk lost)", &alice.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    expect_converged(
+        wait_converged("bob converges to active (dk lost)", &bob.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+
+    let la = alice.log.lock().await;
+    let lb = bob.log.lock().await;
+    assert_converged_active(&la, &lb);
     drop(la);
     drop(lb);
     drop(alice_engine);

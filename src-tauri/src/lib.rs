@@ -60520,6 +60520,22 @@ mod zeb718_voting_reconcile_tests {
 /// re-arm for prompter reconnect recovery is a deferred enhancement.)
 const VOTING_BACKFILL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// ZEB-1022: handles `ensure_dfrost_engine_for` needs to construct the
+/// engine's `ProductionDkgDriver` (auto-drive / re-broadcast /
+/// deadline-restart) and its membership validation. `None` ⇒ the engine
+/// runs ingest-only (no orchestration) — the pre-ZEB-1022 behaviour,
+/// kept for test shapes that don't carry HLC/signing handles.
+pub(crate) struct DfrostDriverWiring {
+    pub hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
+    >,
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    pub device_id: String,
+    pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    pub membership_resolver:
+        std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
+}
+
 /// ZEB-1018: lazily start + register the per-community D-FROST engine and
 /// wire its Zenoh adapter (`harmony/community/{id}/dfrost`). Mirrors
 /// `ensure_voting_engine_for`'s shape: fast-path when the registry already
@@ -60539,23 +60555,6 @@ const VOTING_BACKFILL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// `start_node`) still registers the engine — local applies and the
 /// Tier-3 `DfrostNotReady` gate work — but the engine runs without
 /// Zenoh wiring, exactly like a voting engine whose adapter send failed.
-#[allow(clippy::too_many_arguments)]
-/// ZEB-1022: handles `ensure_dfrost_engine_for` needs to construct the
-/// engine's `ProductionDkgDriver` (auto-drive / re-broadcast /
-/// deadline-restart) and its membership validation. `None` ⇒ the engine
-/// runs ingest-only (no orchestration) — the pre-ZEB-1022 behaviour,
-/// kept for test shapes that don't carry HLC/signing handles.
-pub(crate) struct DfrostDriverWiring {
-    pub hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
-    >,
-    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
-    pub device_id: String,
-    pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
-    pub membership_resolver:
-        std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn ensure_dfrost_engine_for(
     dfrost_logs: &DfrostLogsMap,
@@ -62905,23 +62904,66 @@ pub struct DfrostBeaconReadyPayload {
 /// driver over mock engines — orchestrated test ceremonies then run the
 /// production contribution code, not a test re-implementation.
 pub struct DfrostCoreHandles<R: tauri::Runtime> {
-    pub hlc_tracker: std::sync::Arc<
+    // Fields are pub(crate) (CodeRabbit on #771): the struct must be
+    // nameable publicly (it appears in `production_dkg_driver`'s
+    // signature), but the signing-key handle must not be reachable
+    // through the default public API — outside the crate the struct is
+    // constructible only via the test-fixtures-gated `for_tests`.
+    pub(crate) hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
-    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
-    pub device_id: String,
-    pub self_owner: crate::owner_state_types::OwnerAddr,
-    pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
-    pub dfrost_logs: DfrostLogsMap,
+    pub(crate) adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    pub(crate) device_id: String,
+    pub(crate) self_owner: crate::owner_state_types::OwnerAddr,
+    pub(crate) signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    pub(crate) dfrost_logs: DfrostLogsMap,
     /// Recipient X25519 lookup for sealing round-2 packages. `None`
     /// until the community registry exists (owner not loaded) — only
     /// the round-2 path needs it and errors cleanly without it.
-    pub identity_resolver:
+    pub(crate) identity_resolver:
         Option<std::sync::Arc<dyn crate::community_state_sync::IdentityResolver>>,
     /// Broadcast seam. `None` in test contexts that bypass `start_node`
     /// — broadcasts are skipped (logged), local applies stand.
-    pub dfrost_log_registry:
+    pub(crate) dfrost_log_registry:
         Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<R>>>,
+}
+
+impl<R: tauri::Runtime> DfrostCoreHandles<R> {
+    /// Test-fixtures-only constructor so integration tests can wire the
+    /// PRODUCTION `DkgDriver` over mock engines. Gated exactly like the
+    /// other deterministic test seams — production consumers build the
+    /// struct in-crate (`ensure_dfrost_engine_for`, the IPC wrappers).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_tests(
+        hlc_tracker: std::sync::Arc<
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
+        >,
+        adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+        device_id: String,
+        self_owner: crate::owner_state_types::OwnerAddr,
+        signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        dfrost_logs: DfrostLogsMap,
+        identity_resolver: Option<
+            std::sync::Arc<dyn crate::community_state_sync::IdentityResolver>,
+        >,
+        dfrost_log_registry: Option<
+            std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<R>>,
+        >,
+    ) -> Self {
+        Self {
+            hlc_tracker,
+            adopt_floor,
+            device_id,
+            self_owner,
+            signing_key,
+            dfrost_logs,
+            identity_resolver,
+            dfrost_log_registry,
+        }
+    }
 }
 
 // Manual Clone: `derive(Clone)` would demand `R: Clone`, but `R` only
@@ -63092,16 +63134,39 @@ pub async fn dfrost_rebroadcast_pending_core<R: tauri::Runtime>(
         }
     };
 
+    // ZEB-1022 (CI stall on #771): publication-order lock — the fresh
+    // HLCs reserved below must reach the wire in reservation order
+    // relative to every other publish from this node (see
+    // `DfrostLog::publish_order`).
+    let publish_order = {
+        let log = log_arc.lock().await;
+        log.publish_order.clone()
+    };
+    let _publish_order_guard = publish_order.lock().await;
+
     // Collect the newest self-authored event per slot (di / dr1 / dr2 /
     // dk) belonging to the pending ceremony, under one short log lock.
+    //
+    // ZEB-1022 straggler heal (CI stall on #771): when the pending slot
+    // is gone (or holds a different ceremony) but the committee is
+    // ACTIVE, fall through with `dk_only = true` — a peer still working
+    // the completed ceremony needs (at most) this node's `dk` re-mint
+    // to reach quorum; everything else about the ceremony is history.
     let to_remint: Vec<crate::community_dfrost_types::SignedCommitteeEvent> = {
         let log = log_arc.lock().await;
-        let Some(p) = log.committee_state.pending_dkg.as_ref() else {
+        let pending_matches = log
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .map(|p| p.ceremony_id == ceremony_bytes)
+            .unwrap_or(false);
+        let dk_only = if pending_matches {
+            false
+        } else if log.committee_state.active {
+            true
+        } else {
             return Ok(());
         };
-        if p.ceremony_id != ceremony_bytes {
-            return Ok(());
-        }
         let mut best: [Option<&crate::community_dfrost_types::SignedCommitteeEvent>; 4] = [None; 4];
         for ev in log.events.iter().filter(|e| e.actor == handles.self_owner) {
             let slot: Option<usize> = match ev.kind {
@@ -63129,6 +63194,9 @@ pub async fn dfrost_rebroadcast_pending_core<R: tauri::Runtime>(
                 _ => None,
             };
             if let Some(s) = slot {
+                if dk_only && s != 3 {
+                    continue;
+                }
                 let newer = best[s]
                     .map(|b| (b.hlc.wall_ms, b.hlc.logical) < (ev.hlc.wall_ms, ev.hlc.logical))
                     .unwrap_or(true);
@@ -63273,6 +63341,27 @@ pub async fn dfrost_initiate_dkg_core<R: tauri::Runtime, H: tauri::Runtime>(
         .ok_or("dfrost_initiate_dkg: initiator must be a committee member")?;
     let self_id = crate::community_dfrost_crypto::identifier_for_index(self_index);
 
+    // ZEB-1022 (CI stall on #771): hold the community's publication-
+    // order lock across the whole reserve→sign→apply→publish span (see
+    // `DfrostLog::publish_order`) so a concurrent re-broadcast cannot
+    // put fresh-HLC re-mints on the wire ahead of these lower-HLC
+    // events — peers' max-HLC dedup would drop the originals.
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+    let publish_order = {
+        let log = log_arc.lock().await;
+        log.publish_order.clone()
+    };
+    let _publish_order_guard = publish_order.lock().await;
+
     // Reserve TWO HLCs — one for the `di` (its HLC binds the
     // ceremony_id), one for the `dr` rn=1 — through the same path the
     // voting IPCs take, so cross-kind events on this device remain
@@ -63329,16 +63418,6 @@ pub async fn dfrost_initiate_dkg_core<R: tauri::Runtime, H: tauri::Runtime>(
     // committee shape still lives on PendingCeremony (never in
     // DkgRoundPayload), it just arrives via the signed `di` event.
     let (di_event, dr_event) = {
-        let log_arc = {
-            let mut map = dfrost_logs.lock().await;
-            map.entry(space_id)
-                .or_insert_with(|| {
-                    std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::community_dfrost_log::DfrostLog::new(),
-                    ))
-                })
-                .clone()
-        };
         let mut log = log_arc.lock().await;
 
         // Reject if there's already an in-flight DKG for this community —
@@ -63594,6 +63673,16 @@ pub async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime, H: tauri::Runti
             })
             .clone()
     };
+
+    // ZEB-1022 (CI stall on #771): publication-order lock — see
+    // `DfrostLog::publish_order` and the initiate core. Held for the
+    // rest of this function (every branch reserves an HLC and
+    // publishes).
+    let publish_order = {
+        let log = log_arc.lock().await;
+        log.publish_order.clone()
+    };
+    let _publish_order_guard = publish_order.lock().await;
 
     // ─── ROUND 1 (PEER SUBMISSION) ───────────────────────────────────────
     //
