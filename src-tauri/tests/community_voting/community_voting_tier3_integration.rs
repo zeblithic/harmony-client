@@ -231,6 +231,9 @@ async fn install_beacon_oracle_for(
             self_x25519_priv: [0u8; 32],
             identity_resolver: Arc::new(StaticIdentityResolver(HashMap::new())),
             registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
         },
     )
     .await;

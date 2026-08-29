@@ -15,8 +15,9 @@
 //! envelope fixture set).
 
 use harmony_app::community_dfrost_types::{
-    DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
-    RefreshRoundPayload, SignedCommitteeEvent, ThresholdSignPayload, VrfBeaconPayload,
+    CeremonyInitPayload, DfrostEventKind, DkgCompletePayload, DkgRoundPayload,
+    MemberVerifyingShare, RefreshRoundPayload, SignedCommitteeEvent, ThresholdSignPayload,
+    VrfBeaconPayload,
 };
 use harmony_app::community_membership::RecipientCiphertext;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};
@@ -114,6 +115,7 @@ fn assert_envelope_structure(encoded: &[u8], expected_kd: &str) {
 // Pinned hex constants
 // ---------------------------------------------------------------------------
 
+const EXPECTED_DI_HEX: &str = "a762636958206666666666666666666666666666666666666666666666666666666666666666626d628250aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa50bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62746802626d78026265700162776d1903e8626c6700";
 const EXPECTED_DR_ROUND1_HEX: &str = "a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0162706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const EXPECTED_DR_ROUND2_HEX: &str = "a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0262726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd";
 const EXPECTED_DK_HEX: &str = "a76263695820666666666666666666666666666666666666666666666666666666666666666662766b5820444444444444444444444444444444444444444444444444444444444444444462767381a262696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62766b5820333333333333333333333333333333333333333333333333333333333333333362657001626d628150aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62746801626d7801";
@@ -122,6 +124,7 @@ const EXPECTED_VB_HEX: &str = "a462636958206666666666666666666666666666666666666
 const EXPECTED_RF_ROUND1_HEX: &str = "a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0162726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd";
 const EXPECTED_RF_ROUND2_HEX: &str = "a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0262706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
+const EXPECTED_ENVELOPE_DI_HEX: &str = "a862746761646276720162747200626b64626469626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6270645862a762636958206666666666666666666666666666666666666666666666666666666666666666626d628250aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa50bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62746802626d78026265700162776d1903e8626c6700627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const EXPECTED_ENVELOPE_DR_ROUND1_HEX: &str = "a862746761646276720162747200626b64626472626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa627064584fa36263695820666666666666666666666666666666666666666666666666666666666666666662726e0162706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const EXPECTED_ENVELOPE_DR_ROUND2_HEX: &str = "a862746761646276720162747200626b64626472626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6270645857a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0262726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const EXPECTED_ENVELOPE_DK_HEX: &str = "a862746761646276720162747200626b6462646b626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62706458aaa76263695820666666666666666666666666666666666666666666666666666666666666666662766b5820444444444444444444444444444444444444444444444444444444444444444462767381a262696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62766b5820333333333333333333333333333333333333333333333333333333333333333362657001626d628150aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62746801626d7801627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
@@ -133,6 +136,22 @@ const EXPECTED_ENVELOPE_RF_ROUND2_HEX: &str = "a862746761646276720162747200626b6
 // ---------------------------------------------------------------------------
 // Payload fixture builders
 // ---------------------------------------------------------------------------
+
+/// ZEB-1022: CeremonyInit (`di`) — the ceremony-bootstrap event that
+/// carries the committee shape + payload-carried mint stamp.
+/// FIXTURE_ACTOR (0xaa) < FIXTURE_RECIPIENT (0xbb): sorted, as
+/// `apply_ceremony_init` requires.
+fn di_payload() -> CeremonyInitPayload {
+    CeremonyInitPayload {
+        ceremony_id: FIXTURE_CEREMONY_ID,
+        members: vec![FIXTURE_ACTOR, FIXTURE_RECIPIENT],
+        threshold: 2,
+        max_signers: 2,
+        epoch: 1,
+        minted_wall_ms: 1_000,
+        minted_logical: 0,
+    }
+}
 
 fn dr_round1_payload() -> DkgRoundPayload {
     DkgRoundPayload {
@@ -209,6 +228,18 @@ fn rf_round2_payload() -> RefreshRoundPayload {
 // ---------------------------------------------------------------------------
 // Payload byte-pinning tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn di_canonical_cbor() {
+    let actual_hex = hex::encode(encode(&di_payload()));
+    if EXPECTED_DI_HEX.contains("FILL_AFTER") {
+        panic!("REGENERATE EXPECTED_DI_HEX = \"{actual_hex}\";");
+    }
+    assert_eq!(
+        actual_hex, EXPECTED_DI_HEX,
+        "CeremonyInitPayload wire format changed"
+    );
+}
 
 #[test]
 fn dr_round1_canonical_cbor() {
@@ -297,6 +328,21 @@ fn rf_round2_canonical_cbor() {
 // ---------------------------------------------------------------------------
 // Envelope byte-pinning tests + structural assertions
 // ---------------------------------------------------------------------------
+
+#[test]
+fn envelope_di_canonical_cbor() {
+    let payload = encode(&di_payload());
+    let encoded = encode_envelope(DfrostEventKind::CeremonyInit, payload);
+    let actual_hex = hex::encode(&encoded);
+    if EXPECTED_ENVELOPE_DI_HEX.contains("FILL_AFTER") {
+        panic!("REGENERATE EXPECTED_ENVELOPE_DI_HEX = \"{actual_hex}\";");
+    }
+    assert_eq!(
+        actual_hex, EXPECTED_ENVELOPE_DI_HEX,
+        "CeremonyInit envelope wire format changed"
+    );
+    assert_envelope_structure(&encoded, "di");
+}
 
 #[test]
 fn envelope_dr_round1_canonical_cbor() {
