@@ -1185,6 +1185,43 @@ impl DfrostLog {
             // polynomial; its deltas/sigmas must never finalize. The
             // participant re-requests at the new epoch.
             self.committee_state.pending_repair = None;
+            // CR-2 (#775 round 1): a held signing share that does not
+            // match the PROMOTED consensus verifying shares is STALE —
+            // this node contributed refresh rounds but peer dks reached
+            // quorum before its own part3 (or it never finalized at
+            // all). Keeping it would (a) let threshold-sign produce
+            // shares that can never aggregate under the new committee
+            // package and (b) make `has_key_package` block the automatic
+            // repair that is exactly this node's recovery path. The
+            // node that DID finalize installed the rotated package
+            // BEFORE applying its dk, so its share matches and is kept.
+            // Cryptographic identity (verifying share == consensus
+            // entry) is the discriminator because this plain-apply path
+            // has no self address to compare against.
+            if let Some(kp) = self.local_key_package.as_ref() {
+                let matches_consensus =
+                    self.committee_state
+                        .identifier_map
+                        .iter()
+                        .any(|(addr, id)| {
+                            id == kp.identifier()
+                                && self.committee_state.verifying_shares.get(addr)
+                                    == Some(
+                                        &crate::community_dfrost_crypto::verifying_share_to_bytes(
+                                            kp.verifying_share(),
+                                        ),
+                                    )
+                        });
+                if !matches_consensus {
+                    self.local_key_package = None;
+                    self.local_pub_key_package = None;
+                    tracing::warn!(
+                        "dfrost promotion invalidated a stale local signing share (this node \
+                         missed the ceremony's finalization); automatic share repair is its \
+                         recovery path (ZEB-1027)"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -5108,6 +5145,10 @@ mod tests {
         let (r1_secret, _) =
             crate::community_dfrost_crypto::dkg_part1_local(identifier_1(), 3, 2).unwrap();
         log.local_dkg_secret = Some(r1_secret);
+        // CR-2 (#775 round 1): a held share whose verifying share does
+        // not match the PROMOTED consensus (this node missed the
+        // finalization) must be invalidated at promotion.
+        log.local_key_package = Some(dealer_key_package_for_tests());
 
         let payload = DkgCompletePayload {
             ceremony_id: ceremony,
@@ -5160,9 +5201,104 @@ mod tests {
             "promotion voids the in-flight repair (epoch moved)"
         );
         assert!(log.local_dkg_secret.is_none() && log.local_dkg_secret2.is_none());
+        assert!(
+            log.local_key_package.is_none() && log.local_pub_key_package.is_none(),
+            "CR-2: a share not matching the promoted consensus is stale and must be \
+             invalidated (repair is the recovery path)"
+        );
+    }
+
+    /// CR-2 (#775 round 1), the KEEP side: the node that finalized
+    /// installed the rotated package BEFORE applying its dk — its
+    /// verifying share matches the promoted consensus and must survive
+    /// promotion.
+    #[test]
+    fn promotion_keeps_matching_share_zeb1027() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+        use crate::owner_state_types::Hlc;
+
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.committee_state.joint_verifying_key = Some([0x44; 32]);
+        let ceremony = [0x9au8; 32];
+        log.committee_state.pending_refresh = Some(PendingCeremony {
+            ceremony_id: ceremony,
+            members: vec![alice, bob, carol],
+            threshold: 2,
+            max_signers: 3,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+        // Dealer share with identifier 1 == alice's committee identifier.
+        let kp = dealer_key_package_for_tests();
+        assert_eq!(kp.identifier(), &identifier_1());
+        let kp_share_bytes =
+            crate::community_dfrost_crypto::verifying_share_to_bytes(kp.verifying_share());
+        log.local_key_package = Some(kp);
+
+        let payload = DkgCompletePayload {
+            ceremony_id: ceremony,
+            joint_verifying_key: [0x44; 32],
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: alice,
+                    verifying_share: kp_share_bytes,
+                },
+                MemberVerifyingShare {
+                    member: bob,
+                    verifying_share: [0xb2; 32],
+                },
+                MemberVerifyingShare {
+                    member: carol,
+                    verifying_share: [0xc2; 32],
+                },
+            ],
+            epoch: 2,
+            members: vec![alice, bob, carol],
+            threshold: 2,
+            max_signers: 3,
+        };
+        let mut wall = 9_300u64;
+        for confirmer in [alice, bob] {
+            let mut pd = Vec::new();
+            ciborium::into_writer(&payload, &mut pd).unwrap();
+            log.apply(SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: DfrostEventKind::DkgComplete,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: confirmer,
+                payload: pd,
+                sig: vec![0u8; 64],
+            })
+            .expect("dk applies");
+            wall += 1;
+        }
+        assert_eq!(log.committee_state.current_epoch, 2, "promoted");
+        assert!(
+            log.local_key_package.is_some(),
+            "a share matching the promoted consensus must survive promotion"
+        );
     }
 
     fn identifier_1() -> frost_ristretto255::Identifier {
         crate::community_dfrost_crypto::identifier_for_index(0)
+    }
+
+    /// Any real dealer-generated `KeyPackage` (identifier 1).
+    fn dealer_key_package_for_tests() -> frost_ristretto255::keys::KeyPackage {
+        let (shares, _pkp) = frost_ristretto255::keys::generate_with_dealer(
+            3,
+            2,
+            frost_ristretto255::keys::IdentifierList::Default,
+            frost_ristretto255::rand_core::OsRng,
+        )
+        .expect("dealer keygen");
+        frost_ristretto255::keys::KeyPackage::try_from(shares.values().next().unwrap().clone())
+            .expect("key package")
     }
 }

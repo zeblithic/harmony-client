@@ -1591,7 +1591,7 @@ fn propose_refresh_local(
 /// verifying against the ORIGINAL vk — the refresh contract end-to-end.
 #[tokio::test]
 async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
-    let (mut log_a, mut log_b, key_pkg_a, key_pkg_b, pub_pkg_a, _pub_pkg_b, members) =
+    let (mut log_a, mut log_b, key_pkg_a, key_pkg_b, pub_pkg_a, pub_pkg_b, members) =
         dkg_complete_two_engine_via_ipc_path();
 
     let threshold: u16 = 2;
@@ -1755,11 +1755,19 @@ async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
         } else {
             key_pkg_b.clone()
         };
+        // CR-5 (#775 round 1): each member feeds its OWN stashed public
+        // package, matching the production path (byte-identical after
+        // DKG, but the assertion shape should not depend on that).
+        let old_pkp = if me == ALICE {
+            pub_pkg_a.clone()
+        } else {
+            pub_pkg_b.clone()
+        };
         let (new_kp, new_pkp) = refresh_part3_local(
             r2_secrets.get(&me).unwrap(),
             &r1_others,
             &r2_others,
-            pub_pkg_a.clone(),
+            old_pkp,
             old_kp.clone(),
         )
         .expect("refresh part3");
@@ -1798,6 +1806,14 @@ async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
         threshold,
         max_signers,
     };
+    // CR-6 (#775 round 1): re-stash round secrets immediately before the
+    // dk events so the post-promotion assertion below proves PROMOTION
+    // (not the test's own `.take()` during rn=2) cleared them.
+    for (log, id) in [(&mut log_a, id_alice), (&mut log_b, id_bob)] {
+        let (r1_secret, _) =
+            refresh_part1_local(id, max_signers, threshold).expect("re-stash r1 secret");
+        log.local_dkg_secret = Some(r1_secret);
+    }
     for (actor, sk, wall) in [(ALICE, &alice_sk, 7_400u64), (BOB, &bob_sk, 7_500)] {
         let dk = build_signed_dfrost_event(
             sk,

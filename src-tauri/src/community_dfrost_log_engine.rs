@@ -977,6 +977,21 @@ async fn process_inbound<R: tauri::Runtime>(
         }
     }
 
+    // 3d. CR-7 (#775 round 1): capture the repair participant BEFORE
+    //     apply — the final rn=3's inline settlement clears
+    //     `pending_repair`, so the post-apply progress emit would
+    //     otherwise report an empty participant for exactly the event
+    //     that completes a repair.
+    let repair_participant_pre: Option<OwnerAddr> = if event.kind == DfrostEventKind::RepairShare {
+        let log = dfrost_log.lock().await;
+        log.committee_state
+            .pending_repair
+            .as_ref()
+            .map(|p| p.participant)
+    } else {
+        None
+    };
+
     // 4. Apply. Hold the log lock only across the apply call itself.
     //    (The stale-replace path above already applied the event inside
     //    the abort's lock scope — don't re-apply.)
@@ -1147,19 +1162,15 @@ async fn process_inbound<R: tauri::Runtime>(
         DfrostEventKind::RepairShare => {
             match ciborium::de::from_reader::<RepairRoundPayload, _>(&event.payload[..]) {
                 Ok(payload) => {
-                    // rn=1's actor IS the participant; rounds 2–3 read
-                    // it from the (just-updated) pending slot.
+                    // rn=1's actor IS the participant; rounds 2–3 use
+                    // the PRE-apply capture (step 3d) — the slot
+                    // self-clears when the final rn=3 settles, so a
+                    // post-apply read would come back empty (CR-7).
                     let participant_hex = if payload.round_num == 1 {
                         hex::encode(event.actor.0)
                     } else {
-                        let log = dfrost_log.lock().await;
-                        log.committee_state
-                            .pending_repair
-                            .as_ref()
-                            .map(|p| hex::encode(p.participant.0))
-                            // The slot self-clears when the final rn=3
-                            // settles — fall back to empty rather than
-                            // guessing.
+                        repair_participant_pre
+                            .map(|p| hex::encode(p.0))
                             .unwrap_or_default()
                     };
                     let evt = DfrostRepairProgressPayload {
@@ -1400,11 +1411,15 @@ async fn maybe_auto_drive_recovery(
                 fires.push(Fire::Repair(cid, rn));
             }
         }
-        if should_request_repair(snapshot) && !o.repair_request_attempted {
+        // CR-1 (#775 round 1): latch only when the fire is actually
+        // queued — an inflight-guard refusal must not consume the
+        // single attempt.
+        if should_request_repair(snapshot)
+            && !o.repair_request_attempted
+            && o.recovery_inflight.insert(([0u8; 32], KIND_REQUEST | 1))
+        {
             o.repair_request_attempted = true;
-            if o.recovery_inflight.insert(([0u8; 32], KIND_REQUEST | 1)) {
-                fires.push(Fire::Request);
-            }
+            fires.push(Fire::Request);
         }
     }
 
@@ -1433,14 +1448,24 @@ async fn maybe_auto_drive_recovery(
                     "request_repair",
                 ),
             };
+            let mut o = orch.state.lock().await;
             if let Err(e) = result {
                 tracing::warn!(
                     community_id = %hex::encode(community_id.0),
                     error = %e,
                     "dfrost recovery-drive: {what} failed (retried on next trigger)",
                 );
+                // CR-1 (#775 round 1): a FAILED request never seeded a
+                // ceremony, so nothing will ever reset the latch — re-arm
+                // it here so the next tick retries. Transient transport
+                // errors thus self-heal; a permanently failing request
+                // (t == n) retries once per tick but only ever logs
+                // (should_request_repair still gates on helper count, so
+                // that shape never reaches the driver at all).
+                if matches!(fire, Fire::Request) {
+                    o.repair_request_attempted = false;
+                }
             }
-            let mut o = orch.state.lock().await;
             o.recovery_inflight.remove(&key);
         });
     }

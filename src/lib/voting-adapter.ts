@@ -27,9 +27,11 @@ import {
   DFROST_BEACON_READY,
   DFROST_DKG_PROGRESS,
   DFROST_REFRESH_PROGRESS,
+  DFROST_REPAIR_PROGRESS,
   type DfrostBeaconReadyPayload,
   type DfrostDkgProgressPayload,
   type DfrostRefreshProgressPayload,
+  type DfrostRepairProgressPayload,
 } from './types/dfrost-events';
 import type {
   AutoExecAction,
@@ -173,6 +175,11 @@ export class VotingAdapter {
   private dfrostBeaconReadySubs: Array<(p: DfrostBeaconReadyPayload) => void> = [];
   private dfrostRefreshProgressSubs: Array<
     (p: DfrostRefreshProgressPayload) => void
+  > = [];
+  // ZEB-1027 — RTS share-repair progress (rn=1 request, rn=2 deltas,
+  // rn=3 sigmas), local and inbound alike.
+  private dfrostRepairProgressSubs: Array<
+    (p: DfrostRepairProgressPayload) => void
   > = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
@@ -407,6 +414,16 @@ export class VotingAdapter {
     return () => {
       const i = this.dfrostRefreshProgressSubs.indexOf(handler);
       if (i >= 0) this.dfrostRefreshProgressSubs.splice(i, 1);
+    };
+  }
+
+  subscribeDfrostRepairProgress(
+    handler: (p: DfrostRepairProgressPayload) => void,
+  ): () => void {
+    this.dfrostRepairProgressSubs.push(handler);
+    return () => {
+      const i = this.dfrostRepairProgressSubs.indexOf(handler);
+      if (i >= 0) this.dfrostRepairProgressSubs.splice(i, 1);
     };
   }
 
@@ -661,6 +678,15 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenDfrostRefreshProgress);
+
+        const unlistenDfrostRepairProgress = await adapter.listen(
+          DFROST_REPAIR_PROGRESS,
+          (event) => {
+            const payload = event.payload as DfrostRepairProgressPayload;
+            for (const sub of [...this.dfrostRepairProgressSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenDfrostRepairProgress);
 
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);

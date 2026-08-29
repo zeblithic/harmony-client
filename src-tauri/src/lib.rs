@@ -63285,10 +63285,13 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
     ) -> Result<(), String> {
         if round_num == 1 {
             // Join/propose: the core derives the deterministic ceremony
-            // id from the ACTIVE committee's shape — read that shape and
-            // sanity-check it reproduces the observed id, so the drive
-            // can never contribute into a ceremony it mis-identified.
-            let (members, threshold) = {
+            // id from the ACTIVE committee's shape. CR-4/CodeAnt (#775
+            // round 1): derive the expected id from the same shape
+            // BEFORE calling the core and abort on mismatch — the old
+            // post-hoc warn had already published an rf rn=1 into a
+            // ceremony the drive mis-identified (committee state moved
+            // between the decide snapshot and this call).
+            let (members, threshold, current_epoch) = {
                 let log_arc = {
                     let mut map = self.handles.dfrost_logs.lock().await;
                     map.entry(community_id)
@@ -63306,9 +63309,25 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
                 (
                     log.committee_state.members.clone(),
                     log.committee_state.threshold,
+                    log.committee_state.current_epoch,
                 )
             };
-            let minted = dfrost_propose_refresh_core::<R, _>(
+            let expected = crate::community_dfrost_types::derive_refresh_ceremony_id(
+                &members,
+                threshold,
+                current_epoch
+                    .checked_add(1)
+                    .ok_or("contribute_refresh_round: epoch overflow")?,
+                &community_id,
+            );
+            if expected != ceremony_id {
+                return Err(format!(
+                    "contribute_refresh_round: observed ceremony id {} does not derive from                      the active committee's next epoch (expected {}) — committee state moved;                      the next drive pass re-decides against fresh state",
+                    hex::encode(ceremony_id),
+                    hex::encode(expected),
+                ));
+            }
+            dfrost_propose_refresh_core::<R, _>(
                 &self.handles,
                 self.app_handle.as_ref(),
                 community_id,
@@ -63316,16 +63335,6 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
                 threshold,
             )
             .await?;
-            if minted != hex::encode(ceremony_id) {
-                // Should be unreachable (both sides derive from the same
-                // committee state); loud so a drift never hides.
-                tracing::warn!(
-                    community_id = %hex::encode(community_id.0),
-                    expected = %hex::encode(ceremony_id),
-                    minted = %minted,
-                    "dfrost refresh auto-join derived a different ceremony id than observed",
-                );
-            }
             return Ok(());
         }
         dfrost_contribute_refresh_round_core::<R, _>(
@@ -66659,11 +66668,32 @@ pub async fn dfrost_request_share_repair_core<R: tauri::Runtime, H: tauri::Runti
         Some(registry) => match registry.get(space_id).await {
             Some(engine) => {
                 if let Err(e) = engine.publish_event(event_for_broadcast).await {
-                    tracing::warn!(
-                        space_id = ?space_id,
-                        error = %e,
-                        "dfrost_request_share_repair: broadcast failed (local apply succeeded)",
-                    );
+                    // CodeAnt (#775 round 1): a request no helper ever
+                    // hears must not squat the singleton repair slot —
+                    // it would suppress the automatic retry (the drive
+                    // gates on `pending_repair.is_none()`) until a
+                    // manual re-request or restart. Clear our own slot
+                    // and surface the failure; the recovery drive
+                    // re-arms its request latch on a driver error, so
+                    // the next tick retries with a fresh ceremony id.
+                    // (The applied rn=1 event stays in the log — it is
+                    // a valid, signed request that simply never
+                    // travelled; a retry supersedes it on every peer.)
+                    {
+                        let mut log = log_arc.lock().await;
+                        if log
+                            .committee_state
+                            .pending_repair
+                            .as_ref()
+                            .map(|p| p.ceremony_id)
+                            == Some(ceremony_id)
+                        {
+                            log.committee_state.pending_repair = None;
+                        }
+                    }
+                    return Err(format!(
+                        "dfrost_request_share_repair: broadcast failed after local apply —                          pending repair cleared for retry: {e}"
+                    ));
                 }
             }
             None => {
