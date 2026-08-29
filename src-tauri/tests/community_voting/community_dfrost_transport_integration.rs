@@ -942,9 +942,12 @@ async fn start_orchestrated(
     .await
 }
 
-/// Bounded convergence wait (10s — the orchestrated flow includes tick
-/// cadences, not just inbound latency).
-async fn wait_for_10s<F>(
+/// Bounded convergence wait (30s — the orchestrated flow includes tick
+/// cadences, not just inbound latency, and the 4-vCPU CI runners run
+/// many test processes concurrently; locally the full ceremony
+/// converges in ~25ms, so 30s is a >1000x margin, well under the
+/// suite's slowest tests).
+async fn wait_converged<F>(
     label: &'static str,
     log: &Arc<Mutex<DfrostLog>>,
     predicate: F,
@@ -952,7 +955,7 @@ async fn wait_for_10s<F>(
 where
     F: Fn(&DfrostLog) -> bool,
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         {
             let guard = log.lock().await;
@@ -961,9 +964,50 @@ where
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("wait_for_10s({label}) timed out"));
+            return Err(format!("wait_converged({label}) timed out after 30s"));
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// One-line orchestration-state snapshot for timeout diagnostics —
+/// CI-only failures need the stall point in the panic message.
+async fn dump_log_state(label: &'static str, log: &Arc<Mutex<DfrostLog>>) -> String {
+    let l = log.lock().await;
+    let pending = match l.committee_state.pending_dkg.as_ref() {
+        None => "none".to_string(),
+        Some(p) => format!(
+            "id={} r1={} r2recv={} dk={} init={:?}",
+            hex::encode(&p.ceremony_id[..4]),
+            p.round1_packages.len(),
+            p.round2_packages.len(),
+            p.dk_confirmations.len(),
+            p.initiator.map(|a| hex::encode(&a.0[..4])),
+        ),
+    };
+    format!(
+        "{label}: active={} epoch={} events={} s1={} s2={} kp={} pending=[{}]",
+        l.committee_state.active,
+        l.committee_state.current_epoch,
+        l.events.len(),
+        l.local_dkg_secret.is_some(),
+        l.local_dkg_secret2.is_some(),
+        l.local_key_package.is_some(),
+        pending,
+    )
+}
+
+/// Unwrap a convergence wait, panicking with BOTH nodes' state dumps on
+/// timeout so a CI-only stall is diagnosable from the failure alone.
+async fn expect_converged(
+    result: Result<(), String>,
+    alice_log: &Arc<Mutex<DfrostLog>>,
+    bob_log: &Arc<Mutex<DfrostLog>>,
+) {
+    if let Err(e) = result {
+        let a = dump_log_state("alice", alice_log).await;
+        let b = dump_log_state("bob", bob_log).await;
+        panic!("{e}\n{a}\n{b}");
     }
 }
 
@@ -1075,16 +1119,24 @@ async fn dkg_two_engine_auto_orchestrated_from_initiate_no_manual_seeding() {
     .expect("alice initiates");
     assert_eq!(ceremony_hex.len(), 64);
 
-    wait_for_10s("alice converges to active", &alice.log, |l| {
-        l.committee_state.active
-    })
-    .await
-    .expect("alice active");
-    wait_for_10s("bob converges to active", &bob.log, |l| {
-        l.committee_state.active
-    })
-    .await
-    .expect("bob active");
+    expect_converged(
+        wait_converged("alice converges to active", &alice.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    expect_converged(
+        wait_converged("bob converges to active", &bob.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
 
     let la = alice.log.lock().await;
     let lb = bob.log.lock().await;
@@ -1189,22 +1241,34 @@ async fn dkg_recovers_when_initial_di_and_round1_are_lost() {
     // poll (a 2-of-2 ceremony completes in single-digit milliseconds
     // once seeded), so accept either state — the di-in-log assertion
     // below pins that the seed really came through the wire.
-    wait_for_10s("bob seeds from re-minted di", &bob.log, |l| {
-        l.committee_state.pending_dkg.is_some() || l.committee_state.active
-    })
-    .await
-    .expect("bob seeded via re-broadcast");
+    expect_converged(
+        wait_converged("bob seeds from re-minted di", &bob.log, |l| {
+            l.committee_state.pending_dkg.is_some() || l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
 
-    wait_for_10s("alice converges to active (lossy start)", &alice.log, |l| {
-        l.committee_state.active
-    })
-    .await
-    .expect("alice active");
-    wait_for_10s("bob converges to active (lossy start)", &bob.log, |l| {
-        l.committee_state.active
-    })
-    .await
-    .expect("bob active");
+    expect_converged(
+        wait_converged("alice converges to active (lossy start)", &alice.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    expect_converged(
+        wait_converged("bob converges to active (lossy start)", &bob.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
 
     let la = alice.log.lock().await;
     let lb = bob.log.lock().await;
