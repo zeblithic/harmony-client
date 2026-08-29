@@ -183,30 +183,38 @@ pub trait DkgDriver: Send + Sync {
     /// the participant's quiet-deadline retry of a stalled repair —
     /// `helpers: None` declares every other member; `Some` narrows the
     /// declared set (the retry passes the helpers that responded to the
-    /// stalled attempt when enough of them reach threshold). Returns
-    /// the ceremony id (hex).
+    /// stalled attempt when enough of them reach threshold).
+    /// `expected_progress` (Qodo #7 on #776): for a deadline retry, the
+    /// stalled ceremony's observed `(round2, round3, deltas)` counts —
+    /// the core refuses the re-request if the ceremony progressed,
+    /// settled, or changed hands since. Returns the ceremony id (hex).
     async fn request_repair(
         &self,
         community_id: SpaceId,
         helpers: Option<Vec<OwnerAddr>>,
+        expected_progress: Option<(usize, usize, usize)>,
     ) -> Result<String, String> {
-        let _ = (community_id, helpers);
+        let _ = (community_id, helpers, expected_progress);
         Err("request_repair not supported by this driver".to_string())
     }
 
     /// ZEB-1028: publish this node's rf rn=1 for retry `attempt` of the
     /// current epoch's refresh, displacing the stalled lower-attempt
-    /// incumbent (locally via `abort_pending_refresh`, on peers via the
+    /// incumbent (locally in the propose core, on peers via the
     /// max-attempt rule in `apply_proactive_refresh`). Fired by the
     /// orchestrator's recovery quiet deadline; every member may fire it
     /// — concurrent retries at the same attempt derive the same
-    /// ceremony id and converge. Returns the new ceremony id (hex).
+    /// ceremony id and converge. `expected_progress` (Qodo #4/#5 on
+    /// #776): the incumbent's observed `(r1, r2_recv, dk)` counts — the
+    /// core refuses the displacement if the incumbent progressed since
+    /// the quiet decision. Returns the new ceremony id (hex).
     async fn propose_refresh_retry(
         &self,
         community_id: SpaceId,
         attempt: u32,
+        expected_progress: (usize, usize, usize),
     ) -> Result<String, String> {
-        let _ = (community_id, attempt);
+        let _ = (community_id, attempt, expected_progress);
         Err("propose_refresh_retry not supported by this driver".to_string())
     }
 }
@@ -1019,18 +1027,56 @@ async fn process_inbound<R: tauri::Runtime>(
                         return;
                     }
                 }
-                // ZEB-1028 griefing guard: a HIGHER-attempt rn=1 would
-                // displace the incumbent refresh in apply (max-attempt
-                // rule) — admit it only once the incumbent has been
-                // quiet past `stale_replace_threshold`, so a member
-                // cannot clobber a live converging ceremony with an
-                // eager retry. Verdict read from the orchestrator's
-                // activity clock and BOUND to the specific incumbent it
-                // was computed for (same race note as the di flow); an
-                // untracked incumbent counts as quiet so the slot can't
-                // wedge. Dropped events retry via the proposer's rn=1
-                // re-broadcast cadence once the incumbent actually goes
-                // quiet.
+                // ZEB-1028 griefing guards for the attempt ladder.
+                //
+                // (1) Greptile on #776: no admissible rn=1 ever carries
+                // an attempt above `max_restart_attempts` — honest
+                // retries stop below the cap, and a jumped-to-the-cap
+                // attempt would be a ceremony the deadline path can
+                // only ABORT (never retry), letting a member skip the
+                // honest retry ladder and park refresh in a dead
+                // ceremony. Dropped unconditionally, incumbent or not
+                // (an empty slot would otherwise seed it verbatim).
+                if payload.attempt > orchestrator.config.max_restart_attempts {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        actor = ?event.actor,
+                        attempt = payload.attempt,
+                        cap = orchestrator.config.max_restart_attempts,
+                        "dfrost inbound: rf rn=1 attempt above the retry cap — dropped \
+                         (honest retries never exceed it)",
+                    );
+                    return;
+                }
+                // (2) A HIGHER-attempt rn=1 would displace the
+                // incumbent refresh in apply (max-attempt rule) —
+                // admit it only once the incumbent has been quiet past
+                // `stale_replace_threshold` (a member cannot clobber a
+                // live converging ceremony with an eager retry) AND,
+                // on COMMITTEE-MEMBER replicas, only for the NEXT
+                // attempt (Greptile on #776: honest retries increment
+                // by exactly one per quiet window; a larger jump is a
+                // griefing fast-forward toward the cap). A member whose
+                // slot lags the committee's ladder converges by walking
+                // its own retries up — each step re-derives the same
+                // deterministic id the rest of the committee already
+                // shares. NON-MEMBER observers skip the gap rule (Qodo
+                // #3 on #776): they cannot retry, so their only path
+                // back onto the committee's current attempt is
+                // admitting whatever the members' re-mint cadence
+                // carries; the cap check above still bounds them.
+                //
+                // Verdict read from the orchestrator's activity clock
+                // and BOUND to the specific incumbent it was computed
+                // for (same race note as the di flow). An UNTRACKED
+                // incumbent DEFERS instead of counting as quiet (Qodo
+                // #2 on #776): a locally-seeded ceremony is untracked
+                // until the next tick reconciles it, and treating that
+                // window as stale lets an eager displacer bypass the
+                // whole guard; recovery slots are always tracked within
+                // one tick (≪ the stale threshold), so deferring can't
+                // wedge — the dropped event retries via the proposer's
+                // rn=1 re-broadcast cadence.
                 let quiet_verdict: Option<([u8; 32], bool)> = {
                     let o = orchestrator.state.lock().await;
                     o.refresh_activity.as_ref().map(|a| {
@@ -1045,8 +1091,20 @@ async fn process_inbound<R: tauri::Runtime>(
                     let log = dfrost_log.lock().await;
                     if let Some(pr) = log.committee_state.pending_refresh.as_ref() {
                         if pr.ceremony_id != payload.ceremony_id && payload.attempt > pr.attempt {
+                            let self_is_member = log.committee_state.members.contains(self_addr);
+                            if self_is_member && payload.attempt != pr.attempt + 1 {
+                                tracing::warn!(
+                                    community_id = %hex::encode(community_id.0),
+                                    pending = %hex::encode(pr.ceremony_id),
+                                    incumbent_attempt = pr.attempt,
+                                    attempt = payload.attempt,
+                                    "dfrost inbound: rf rn=1 skips attempts — dropped (honest \
+                                     retries increment by one)",
+                                );
+                                return;
+                            }
                             let stale = match quiet_verdict {
-                                None => true,
+                                None => false,
                                 Some((for_ceremony, quiet)) => {
                                     quiet && for_ceremony == pr.ceremony_id
                                 }
@@ -1058,8 +1116,8 @@ async fn process_inbound<R: tauri::Runtime>(
                                     newcomer = %hex::encode(payload.ceremony_id),
                                     attempt = payload.attempt,
                                     "dfrost inbound: higher-attempt rf rn=1 while the pending \
-                                     refresh is still live — dropped (re-mints retry once it \
-                                     goes quiet)",
+                                     refresh is still live or not yet tracked — dropped \
+                                     (re-mints retry once it goes quiet)",
                                 );
                                 return;
                             }
@@ -1103,21 +1161,40 @@ async fn process_inbound<R: tauri::Runtime>(
                     );
                     return;
                 }
-                // ZEB-1028 stale-replace: a competing request whose rank
-                // LOSES to the incumbent is rejected by apply's
-                // deterministic arbitration — correct while the
-                // incumbent is live, but a ceremony whose participant
-                // died can never settle, and the rank rule would starve
-                // every larger-ranked live participant forever. Once the
-                // incumbent has been quiet past
-                // `stale_replace_threshold`, a losing-rank but otherwise
-                // ADMISSIBLE request replaces it: abort + apply inside
-                // one lock scope (di-flow pattern — never leave the slot
-                // empty across an await). Replicas whose quiet clocks
-                // disagree converge via the requester's rn=1 re-mint
-                // cadence. Winning-rank requests fall through — apply
-                // displaces those deterministically with no timing gate
-                // (#775 round 2 semantics, unchanged).
+                // ZEB-1028 stale-replace, symmetric on rank (Greptile
+                // on #776): a CROSS-PARTICIPANT rn=1 for a different
+                // ceremony is admitted only once the incumbent has been
+                // quiet past `stale_replace_threshold` — in BOTH rank
+                // directions.
+                //
+                //   * Losing rank: apply's deterministic arbitration
+                //     would reject it — correct while the incumbent is
+                //     live, but a dead participant's ceremony never
+                //     settles and would starve every larger-ranked live
+                //     participant forever. When quiet, an ADMISSIBLE
+                //     losing-rank request replaces it: abort + apply in
+                //     one lock scope (di-flow pattern).
+                //   * Winning rank: apply would displace it
+                //     UNCONDITIONALLY (#775 rank rule) — which lets a
+                //     late-circulating rn=1 from the very participant a
+                //     stale-replace just displaced re-take the slot
+                //     from the LIVE repair and oscillate it. Quiet-
+                //     gating this direction pins the replacement:
+                //     nobody re-mints a dead participant's request, so
+                //     its stragglers drain while the live ceremony
+                //     stays live.
+                //
+                // A request whose actor IS the incumbent participant
+                // bypasses the gate entirely — that is the #775 retry
+                // path (fresh mint stamp supersedes the participant's
+                // own earlier ceremony), never griefing, and gating it
+                // would slow every deadline re-request by a full stale
+                // window. Replicas whose quiet clocks disagree converge
+                // via the live requester's rn=1 re-mint cadence. An
+                // UNTRACKED incumbent defers (Qodo #2 on #776 — same
+                // policy as the rf gate: locally-seeded ceremonies are
+                // untracked for up to one tick, and that window must
+                // not read as stale).
                 let quiet_verdict: Option<([u8; 32], bool)> = {
                     let o = orchestrator.state.lock().await;
                     o.repair_activity.as_ref().map(|a| {
@@ -1133,6 +1210,7 @@ async fn process_inbound<R: tauri::Runtime>(
                     let incumbent = log.committee_state.pending_repair.as_ref().map(|p| {
                         (
                             p.ceremony_id,
+                            p.participant,
                             crate::community_dfrost_log::PendingRepair::rank_key(
                                 p.participant,
                                 p.minted_wall_ms,
@@ -1141,33 +1219,53 @@ async fn process_inbound<R: tauri::Runtime>(
                             ),
                         )
                     });
-                    if let Some((incumbent_id, incumbent_rank)) = incumbent {
-                        let incoming_rank = crate::community_dfrost_log::PendingRepair::rank_key(
-                            event.actor,
-                            wm,
-                            lg,
-                            payload.ceremony_id,
-                        );
-                        if incumbent_id != payload.ceremony_id && incoming_rank > incumbent_rank {
-                            if let Err(e) =
-                                log.check_repair_request_admissible(&payload, &event.actor)
-                            {
-                                tracing::warn!(
-                                    community_id = %hex::encode(community_id.0),
-                                    newcomer = %hex::encode(payload.ceremony_id),
-                                    error = ?e,
-                                    "dfrost inbound: competing rp rn=1 is not admissible — \
-                                     dropped (incumbent kept)",
-                                );
-                                return;
-                            }
+                    if let Some((incumbent_id, incumbent_participant, incumbent_rank)) = incumbent {
+                        if incumbent_id != payload.ceremony_id
+                            && event.actor != incumbent_participant
+                        {
                             let stale = match quiet_verdict {
-                                None => true,
+                                None => false,
                                 Some((for_ceremony, quiet)) => {
                                     quiet && for_ceremony == incumbent_id
                                 }
                             };
-                            if stale {
+                            if !stale {
+                                tracing::warn!(
+                                    community_id = %hex::encode(community_id.0),
+                                    pending = %hex::encode(incumbent_id),
+                                    newcomer = %hex::encode(payload.ceremony_id),
+                                    actor = ?event.actor,
+                                    "dfrost inbound: cross-participant rp rn=1 while the \
+                                     incumbent repair is still live or not yet tracked — \
+                                     dropped (re-mints retry once it goes quiet)",
+                                );
+                                return;
+                            }
+                            let incoming_rank =
+                                crate::community_dfrost_log::PendingRepair::rank_key(
+                                    event.actor,
+                                    wm,
+                                    lg,
+                                    payload.ceremony_id,
+                                );
+                            if incoming_rank > incumbent_rank {
+                                // Apply would reject the losing rank;
+                                // clear the quiet incumbent for it —
+                                // admissibility first (never destroy
+                                // the slot for a request that then
+                                // fails to seed).
+                                if let Err(e) =
+                                    log.check_repair_request_admissible(&payload, &event.actor)
+                                {
+                                    tracing::warn!(
+                                        community_id = %hex::encode(community_id.0),
+                                        newcomer = %hex::encode(payload.ceremony_id),
+                                        error = ?e,
+                                        "dfrost inbound: competing rp rn=1 is not admissible — \
+                                         dropped (incumbent kept)",
+                                    );
+                                    return;
+                                }
                                 let aborted = log.abort_pending_repair();
                                 if let Err(e) = log.apply_with_identity(
                                     event.clone(),
@@ -1192,16 +1290,9 @@ async fn process_inbound<R: tauri::Runtime>(
                                     "dfrost inbound: stale pending repair replaced by \
                                      competing request",
                                 );
-                            } else {
-                                tracing::warn!(
-                                    community_id = %hex::encode(community_id.0),
-                                    pending = %hex::encode(incumbent_id),
-                                    newcomer = %hex::encode(payload.ceremony_id),
-                                    "dfrost inbound: competing rp rn=1 outranked by a live \
-                                     incumbent — dropped (re-mints retry once it goes quiet)",
-                                );
-                                return;
                             }
+                            // Winning rank + quiet: fall through — apply
+                            // displaces deterministically.
                         }
                     }
                 }
@@ -1576,16 +1667,19 @@ fn reconcile_activity(
 /// ZEB-1028: reconcile the recovery-ceremony timing caches against the
 /// snapshot, mirroring `reconcile_activity`'s model: a new ceremony id
 /// restarts its clock, material progress (fingerprint movement)
-/// advances it, idempotent re-mints do not.
-fn reconcile_recovery_activity(
-    state: &mut OrchestratorState,
-    snapshot: &DriveSnapshot,
-    touch_progress: bool,
-) {
+/// advances it, idempotent re-mints do not — a re-mint moves no
+/// fingerprint by definition.
+///
+/// Unlike the DKG activity, progress is credited on EVERY reconcile
+/// (ticks included), not just inbound applies (Qodo #6 on #776): this
+/// node's own contributions land via direct core applies that never
+/// pass through the inbound path — and its self-loopback is dedup-
+/// dropped — so an inbound-only clock goes stale on exactly the local
+/// progress and fires spurious retries against a live ceremony.
+fn reconcile_recovery_activity(state: &mut OrchestratorState, snapshot: &DriveSnapshot) {
     fn reconcile_one(
         slot: &mut Option<RecoveryActivity>,
         observed: Option<([u8; 32], (usize, usize, usize))>,
-        touch_progress: bool,
     ) {
         match observed {
             None => *slot = None,
@@ -1598,12 +1692,10 @@ fn reconcile_recovery_activity(
                         last_fingerprint: fingerprint,
                         last_rebroadcast: None,
                     });
-                } else if touch_progress {
-                    if let Some(a) = slot.as_mut() {
-                        if a.last_fingerprint != fingerprint {
-                            a.last_fingerprint = fingerprint;
-                            a.last_progress = Instant::now();
-                        }
+                } else if let Some(a) = slot.as_mut() {
+                    if a.last_fingerprint != fingerprint {
+                        a.last_fingerprint = fingerprint;
+                        a.last_progress = Instant::now();
                     }
                 }
             }
@@ -1615,7 +1707,6 @@ fn reconcile_recovery_activity(
             .refresh
             .as_ref()
             .map(|v| (v.ceremony_id, (v.r1_count, v.r2_recv_count, v.dk_count))),
-        touch_progress,
     );
     reconcile_one(
         &mut state.repair_activity,
@@ -1623,7 +1714,6 @@ fn reconcile_recovery_activity(
             .repair
             .as_ref()
             .map(|v| (v.ceremony_id, (v.r2_seen.len(), v.r3_count, v.deltas_count))),
-        touch_progress,
     );
     // Retry-budget resets: the deadline re-request ledger belongs to
     // THIS node's stint as a shareless participant. It clears when the
@@ -1655,7 +1745,7 @@ async fn after_successful_apply(
     {
         let mut o = orchestrator.state.lock().await;
         reconcile_activity(&mut o, &snapshot, self_addr, true);
-        reconcile_recovery_activity(&mut o, &snapshot, true);
+        reconcile_recovery_activity(&mut o, &snapshot);
     }
     maybe_auto_drive(community_id, self_addr, orchestrator, &snapshot).await;
     maybe_auto_drive_recovery(community_id, orchestrator, &snapshot).await;
@@ -1719,6 +1809,13 @@ async fn maybe_auto_drive_recovery(
             && o.recovery_inflight.insert(([0u8; 32], KIND_REQUEST | 1))
         {
             o.repair_request_attempted = true;
+            // Qodo #8 on #776: a fresh automatic request opens a fresh
+            // recovery episode — the deadline re-request budget starts
+            // over (without this, a budget exhausted in a previous
+            // episode — e.g. one whose ceremony a stale-replace
+            // displaced — permanently silences every later episode's
+            // retries).
+            o.repair_retry_attempts = 0;
             fires.push(Fire::Request);
         }
     }
@@ -1744,7 +1841,10 @@ async fn maybe_auto_drive_recovery(
                 ),
                 Fire::Request => (
                     ([0u8; 32], KIND_REQUEST | 1),
-                    driver.request_repair(community_id, None).await.map(|_| ()),
+                    driver
+                        .request_repair(community_id, None, None)
+                        .await
+                        .map(|_| ()),
                     "request_repair",
                 ),
             };
@@ -1947,6 +2047,11 @@ async fn recovery_liveness_tick(
                 let driver = Arc::clone(driver);
                 let orch = Arc::clone(orchestrator);
                 let ceremony_id = v.ceremony_id;
+                // Qodo #4/#5 on #776: carry the CURRENT snapshot's
+                // progress fingerprint into the retry — the core
+                // refuses the displacement under its own log lock if
+                // an inbound round lands in the spawn gap.
+                let expected = (v.r1_count, v.r2_recv_count, v.dk_count);
                 tracing::warn!(
                     community_id = %hex::encode(community_id.0),
                     stalled = %hex::encode(ceremony_id),
@@ -1955,7 +2060,7 @@ async fn recovery_liveness_tick(
                 );
                 tokio::spawn(async move {
                     if let Err(e) = driver
-                        .propose_refresh_retry(community_id, next_attempt)
+                        .propose_refresh_retry(community_id, next_attempt, expected)
                         .await
                     {
                         tracing::warn!(
@@ -1970,19 +2075,22 @@ async fn recovery_liveness_tick(
                         .remove(&(ceremony_id, KIND_RETRY_PROPOSE));
                 });
             }
-        } else if quiet && v.attempt >= orchestrator.config.max_restart_attempts {
-            // Retries exhausted: a still-quiet refresh is cleared
-            // locally. Members and non-member observers use the SAME
-            // bar — the attempt counter is carried by the ceremony
-            // itself, so every replica exhausts at the same count (on
-            // its own quiet clock) and a slow-but-live ceremony below
-            // the cap is never cleared by a mere observer. Residual
-            // risk (pre-existing partition class, not new here): a
-            // node that clears and then misses the dk quorum of a
-            // ceremony that somehow completed elsewhere stays at the
-            // old epoch — the dfrost topic is live-only, so only a
-            // future backfill/anti-entropy layer can close that
-            // completely (tracked: ZEB-1030).
+        } else if quiet
+            && (v.attempt >= orchestrator.config.max_restart_attempts || !snapshot.self_is_member)
+        {
+            // Retries exhausted — or self is a NON-MEMBER observer
+            // (Qodo #3 on #776): an observer can neither retry nor,
+            // below the cap, ever exhaust; a quiet observer mirror is
+            // cleared so a stale slot cannot wedge its replica's view
+            // (blocking its mirror of subsequent repairs) forever.
+            // Members below the cap never take this branch — they
+            // drive the retry ladder instead. Residual risk
+            // (pre-existing partition class, not new here): a node
+            // that clears and then misses the dk quorum of a ceremony
+            // that somehow completed elsewhere stays at the old epoch
+            // — the dfrost topic is live-only, so only a future
+            // backfill/anti-entropy layer can close that completely
+            // (tracked: ZEB-1030).
             let aborted = {
                 let mut log = dfrost_log.lock().await;
                 if log
@@ -2076,6 +2184,11 @@ async fn recovery_liveness_tick(
             let orch = Arc::clone(orchestrator);
             let ceremony_id = v.ceremony_id;
             let narrowed = subset.is_some();
+            // Qodo #7 on #776: carry the CURRENT snapshot's progress
+            // fingerprint into the re-request — the core refuses it
+            // under its own log lock if helper rounds land in the
+            // spawn gap (a fresh stamp would otherwise wipe them).
+            let expected = Some((v.r2_seen.len(), v.r3_count, v.deltas_count));
             tracing::warn!(
                 community_id = %hex::encode(community_id.0),
                 stalled = %hex::encode(ceremony_id),
@@ -2083,7 +2196,7 @@ async fn recovery_liveness_tick(
                 "dfrost recovery: repair quiet past deadline — re-requesting with fresh stamp",
             );
             tokio::spawn(async move {
-                if let Err(e) = driver.request_repair(community_id, subset).await {
+                if let Err(e) = driver.request_repair(community_id, subset, expected).await {
                     tracing::warn!(
                         community_id = %hex::encode(community_id.0),
                         error = %e,
@@ -2118,7 +2231,7 @@ async fn orchestrator_tick<R: tauri::Runtime>(
     {
         let mut o = orchestrator.state.lock().await;
         reconcile_activity(&mut o, &snapshot, self_addr, false);
-        reconcile_recovery_activity(&mut o, &snapshot, false);
+        reconcile_recovery_activity(&mut o, &snapshot);
     }
 
     // ZEB-1027: recovery drive runs every tick REGARDLESS of the DKG
@@ -4212,6 +4325,7 @@ mod tests {
             &self,
             community_id: SpaceId,
             helpers: Option<Vec<OwnerAddr>>,
+            _expected_progress: Option<(usize, usize, usize)>,
         ) -> Result<String, String> {
             self.repair_requests
                 .lock()
@@ -4223,6 +4337,7 @@ mod tests {
             &self,
             community_id: SpaceId,
             attempt: u32,
+            _expected_progress: (usize, usize, usize),
         ) -> Result<String, String> {
             self.refresh_retries
                 .lock()
@@ -5176,6 +5291,45 @@ mod tests {
             3,
             "deadline re-requests must stop at max_restart_attempts"
         );
+
+        // Qodo #8 on #776: a NEW recovery episode re-opens the budget.
+        // Clearing the slot (as a stale-replace whose replacement
+        // failed would) lets the automatic request fire again — and
+        // that fire resets `repair_retry_attempts`, so the fresh
+        // ceremony's deadline re-requests run once more instead of
+        // being permanently silenced by the previous episode's
+        // exhaustion.
+        {
+            let mut g = log.lock().await;
+            g.committee_state.pending_repair = None;
+        }
+        wait_until("fresh episode: automatic request re-fires", || async {
+            driver.repair_requests.lock().await.len() == 4
+        })
+        .await;
+        assert_eq!(
+            driver.repair_requests.lock().await.last(),
+            Some(&(community_id, None)),
+            "the fresh episode's automatic request declares the default helper set"
+        );
+        {
+            let mut g = log.lock().await;
+            let mut helpers = vec![bob_addr, carol_addr, dave_addr];
+            helpers.sort();
+            g.committee_state.pending_repair =
+                Some(crate::community_dfrost_log::PendingRepair::new(
+                    [0x63u8; 32],
+                    alice_addr,
+                    1,
+                    helpers,
+                    2_000,
+                    0,
+                ));
+        }
+        wait_until("fresh episode: deadline re-request fires again", || async {
+            driver.repair_requests.lock().await.len() >= 5
+        })
+        .await;
     }
 
     /// Stale-replace for repair: a competing rn=1 whose rank LOSES to
@@ -5493,6 +5647,468 @@ mod tests {
             })
             .await;
         }
+    }
+
+    /// Greptile on #776: the attempt ladder is guarded at ingest — an
+    /// rn=1 above the retry cap is never admissible (honest retries
+    /// stop below it; a jumped attempt parks refresh in a ceremony the
+    /// deadline path can only abort), and a displacing rn=1 must be
+    /// exactly the incumbent's attempt + 1 (honest retries increment by
+    /// one per quiet window).
+    #[tokio::test]
+    async fn engine_rf_attempt_ladder_guards_zeb1028() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xFB);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xFC);
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+        let community_id = SpaceId([0xFD; 16]);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            Some(Arc::new(RecordingDriver::default()) as Arc<dyn DkgDriver>),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_secs(60),
+                stale_replace_threshold: Duration::from_millis(30),
+                max_restart_attempts: 3,
+                recovery_quiet_deadline: Duration::from_secs(60),
+            },
+        )
+        .await;
+        seed_active_committee(&log, &[alice_addr, bob_addr], 2).await;
+        let members = {
+            let g = log.lock().await;
+            g.committee_state.members.clone()
+        };
+
+        let build_rf1 = |attempt: u32, wall_ms: u64| {
+            let ceremony_id = crate::community_dfrost_types::derive_refresh_ceremony_id(
+                &members,
+                2,
+                2,
+                attempt,
+                &community_id,
+            );
+            crate::community_dfrost_log::build_signed_dfrost_event(
+                &alice_sk,
+                alice_addr,
+                DfrostEventKind::ProactiveRefresh,
+                &crate::community_dfrost_types::RefreshRoundPayload {
+                    ceremony_id,
+                    round_num: 1,
+                    recipient_ciphertexts: None,
+                    package: Some(vec![0x01]),
+                    attempt,
+                },
+                Hlc {
+                    wall_ms,
+                    logical: 0,
+                    device_id: "alice".into(),
+                },
+            )
+            .expect("build rf1")
+        };
+
+        // Above-cap attempt on an EMPTY slot: dropped outright.
+        sub_tx
+            .send(encode_packet(&build_rf1(4, 4_000)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            log.lock().await.committee_state.pending_refresh.is_none(),
+            "an above-cap attempt must never seed the slot"
+        );
+
+        // Seed attempt 0, wait past the stale threshold, then try to
+        // SKIP to attempt 2: dropped (gap). Attempt 1 then displaces.
+        sub_tx
+            .send(encode_packet(&build_rf1(0, 4_100)))
+            .await
+            .unwrap();
+        wait_for_log("attempt 0 seeds", &log, |l| {
+            l.committee_state
+                .pending_refresh
+                .as_ref()
+                .map(|p| p.attempt == 0)
+                .unwrap_or(false)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        sub_tx
+            .send(encode_packet(&build_rf1(2, 4_200)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            log.lock()
+                .await
+                .committee_state
+                .pending_refresh
+                .as_ref()
+                .map(|p| p.attempt),
+            Some(0),
+            "an attempt-skipping rn=1 must not displace, even when quiet"
+        );
+        sub_tx
+            .send(encode_packet(&build_rf1(1, 4_300)))
+            .await
+            .unwrap();
+        wait_for_log("attempt 1 displaces the quiet incumbent", &log, |l| {
+            l.committee_state
+                .pending_refresh
+                .as_ref()
+                .map(|p| p.attempt == 1)
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// Greptile on #776: the WINNING-rank direction of the repair
+    /// stale-replace is quiet-gated too — a late-circulating rn=1 from
+    /// the very participant a stale-replace just displaced must not
+    /// re-take the slot from the live replacement (oscillation). The
+    /// incumbent participant's OWN retry (fresh stamp) bypasses the
+    /// gate — that is the designed #775 supersede path.
+    #[tokio::test]
+    async fn engine_rp_winning_rank_gated_on_quiet_zeb1028() {
+        // winner = smaller address (outranks); incumbent = larger.
+        let (sk_x, addr_x, pub_x) = fixture_identity(0xC1);
+        let (sk_y, addr_y, pub_y) = fixture_identity(0xC2);
+        let (winner_sk, winner_addr, winner_pub, incumbent_sk, incumbent_addr, incumbent_pub) =
+            if addr_x < addr_y {
+                (sk_x, addr_x, pub_x, sk_y, addr_y, pub_y)
+            } else {
+                (sk_y, addr_y, pub_y, sk_x, addr_x, pub_x)
+            };
+        let (_carol_sk, carol_addr, _c) = fixture_identity(0xC3);
+        let (_dave_sk, dave_addr, _d) = fixture_identity(0xC4);
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(winner_addr, winner_pub);
+        resolver_map.insert(incumbent_addr, incumbent_pub);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+        let community_id = SpaceId([0xC5; 16]);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            carol_addr,
+            [0u8; 32],
+            resolver,
+            Some(Arc::new(RecordingDriver::default()) as Arc<dyn DkgDriver>),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_secs(60),
+                stale_replace_threshold: Duration::from_secs(60),
+                max_restart_attempts: 3,
+                recovery_quiet_deadline: Duration::from_secs(60),
+            },
+        )
+        .await;
+        seed_active_committee(
+            &log,
+            &[winner_addr, incumbent_addr, carol_addr, dave_addr],
+            2,
+        )
+        .await;
+
+        let signed_rp1 =
+            |sk: &ed25519_dalek::SigningKey, actor: OwnerAddr, wm: u64, wall_ms: u64| {
+                let mut helpers: Vec<OwnerAddr> =
+                    [winner_addr, incumbent_addr, carol_addr, dave_addr]
+                        .into_iter()
+                        .filter(|a| *a != actor)
+                        .collect();
+                helpers.sort();
+                let ceremony_id = crate::community_dfrost_types::derive_repair_ceremony_id(
+                    &actor,
+                    1,
+                    &helpers,
+                    wm,
+                    0,
+                    &community_id,
+                );
+                (
+                    crate::community_dfrost_log::build_signed_dfrost_event(
+                        sk,
+                        actor,
+                        DfrostEventKind::RepairShare,
+                        &crate::community_dfrost_types::RepairRoundPayload {
+                            ceremony_id,
+                            round_num: 1,
+                            epoch: 1,
+                            helpers: Some(helpers),
+                            minted_wall_ms: Some(wm),
+                            minted_logical: Some(0),
+                            recipient_ciphertexts: None,
+                        },
+                        Hlc {
+                            wall_ms,
+                            logical: 0,
+                            device_id: "rp".into(),
+                        },
+                    )
+                    .expect("build rp1"),
+                    ceremony_id,
+                )
+            };
+
+        // LIVE incumbent ceremony for the larger-addr participant.
+        {
+            let mut g = log.lock().await;
+            let mut helpers: Vec<OwnerAddr> = [winner_addr, carol_addr, dave_addr].to_vec();
+            helpers.sort();
+            g.committee_state.pending_repair =
+                Some(crate::community_dfrost_log::PendingRepair::new(
+                    [0x55u8; 32],
+                    incumbent_addr,
+                    1,
+                    helpers,
+                    1_000,
+                    0,
+                ));
+        }
+        // Let a tick stamp the activity clock (live incumbent).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A winning-rank request from ANOTHER participant is dropped
+        // while the incumbent is live.
+        let (rp1_winner, _wcid) = signed_rp1(&winner_sk, winner_addr, 2_000, 5_000);
+        sub_tx.send(encode_packet(&rp1_winner)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            log.lock()
+                .await
+                .committee_state
+                .pending_repair
+                .as_ref()
+                .map(|p| p.participant),
+            Some(incumbent_addr),
+            "a live repair must not be displaced by a cross-participant winning rank"
+        );
+
+        // The incumbent participant's OWN fresh-stamp retry bypasses
+        // the gate and supersedes immediately (#775 path).
+        let (rp1_retry, retry_cid) = signed_rp1(&incumbent_sk, incumbent_addr, 3_000, 5_100);
+        sub_tx.send(encode_packet(&rp1_retry)).await.unwrap();
+        wait_for_log("own retry supersedes while live", &log, move |l| {
+            l.committee_state
+                .pending_repair
+                .as_ref()
+                .map(|p| p.ceremony_id == retry_cid)
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// Qodo #2 on #776: an UNTRACKED incumbent (no activity record yet
+    /// — e.g. locally seeded, before any tick reconciled it) must DEFER
+    /// a displacing rn=1, not count as quiet — otherwise an eager
+    /// higher attempt bypasses the whole anti-griefing guard in the
+    /// window before the first tick.
+    #[tokio::test]
+    async fn engine_rf_untracked_incumbent_defers_displacement_zeb1028() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xD1);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xD2);
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+        let community_id = SpaceId([0xD3; 16]);
+        // Ticks far out of frame: the hand-seeded slot stays UNTRACKED.
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            Some(Arc::new(RecordingDriver::default()) as Arc<dyn DkgDriver>),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_secs(60),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_secs(60),
+                stale_replace_threshold: Duration::from_millis(10),
+                max_restart_attempts: 3,
+                recovery_quiet_deadline: Duration::from_secs(60),
+            },
+        )
+        .await;
+        seed_active_committee(&log, &[alice_addr, bob_addr], 2).await;
+        let members = {
+            let g = log.lock().await;
+            g.committee_state.members.clone()
+        };
+        // Let the tick task's IMMEDIATE first tick pass (it fires at
+        // startup and would otherwise race the hand-seed below into a
+        // tracked — and, with the tiny threshold, stale — incumbent);
+        // the next tick is 60s out, so the slot seeded after this
+        // sleep stays genuinely UNTRACKED.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mut g = log.lock().await;
+            g.committee_state.pending_refresh =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id: crate::community_dfrost_types::derive_refresh_ceremony_id(
+                        &members,
+                        2,
+                        2,
+                        0,
+                        &community_id,
+                    ),
+                    members: members.clone(),
+                    threshold: 2,
+                    max_signers: 2,
+                    proposed_epoch: 2,
+                    ..Default::default()
+                });
+        }
+        // Even though far more than the (tiny) stale threshold has
+        // passed, the untracked incumbent defers the displacer.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let cid1 = crate::community_dfrost_types::derive_refresh_ceremony_id(
+            &members,
+            2,
+            2,
+            1,
+            &community_id,
+        );
+        let rf1_a1 = crate::community_dfrost_log::build_signed_dfrost_event(
+            &alice_sk,
+            alice_addr,
+            DfrostEventKind::ProactiveRefresh,
+            &crate::community_dfrost_types::RefreshRoundPayload {
+                ceremony_id: cid1,
+                round_num: 1,
+                recipient_ciphertexts: None,
+                package: Some(vec![0x01]),
+                attempt: 1,
+            },
+            Hlc {
+                wall_ms: 6_000,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+        )
+        .expect("build rf1");
+        sub_tx.send(encode_packet(&rf1_a1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            log.lock()
+                .await
+                .committee_state
+                .pending_refresh
+                .as_ref()
+                .map(|p| p.attempt),
+            Some(0),
+            "an untracked incumbent must defer displacement, not count as quiet"
+        );
+    }
+
+    /// Qodo #3 on #776: a NON-MEMBER observer can neither retry nor
+    /// (below the cap) exhaust — a quiet observer mirror clears instead
+    /// of wedging forever, and its ladder gate admits attempt jumps so
+    /// the members' re-mint cadence can pull it back onto the current
+    /// ceremony.
+    #[tokio::test]
+    async fn engine_observer_clears_quiet_refresh_below_cap_zeb1028() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xD8);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xD9);
+        let (_eve_sk, eve_addr, _e) = fixture_identity(0xDA);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xDB; 16]);
+        // Self (eve) is NOT a committee member.
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            eve_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_secs(60),
+                stale_replace_threshold: Duration::from_secs(60),
+                max_restart_attempts: 3,
+                recovery_quiet_deadline: Duration::from_millis(30),
+            },
+        )
+        .await;
+        seed_active_committee(&log, &[alice_addr, bob_addr], 2).await;
+        {
+            let mut g = log.lock().await;
+            g.committee_state.pending_refresh =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id: [0x56u8; 32],
+                    members: g.committee_state.members.clone(),
+                    threshold: 2,
+                    max_signers: 2,
+                    proposed_epoch: 2,
+                    attempt: 1,
+                    ..Default::default()
+                });
+        }
+        wait_until("quiet observer mirror clears below the cap", || async {
+            log.lock().await.committee_state.pending_refresh.is_none()
+        })
+        .await;
+        assert!(
+            driver.refresh_retries.lock().await.is_empty(),
+            "an observer never fires retries"
+        );
+    }
+
+    /// Qodo #6 on #776: recovery clocks credit progress on EVERY
+    /// reconcile — local core applies never pass through the inbound
+    /// path, so an inbound-only clock goes stale on exactly the local
+    /// contributions.
+    #[test]
+    fn reconcile_recovery_activity_credits_tick_observed_progress_zeb1028() {
+        use crate::community_dfrost_log_engine::{
+            drive_snapshot, reconcile_recovery_activity, OrchestratorState,
+        };
+        let alice = OwnerAddr([0x01; 16]);
+        let mut log = crate::community_dfrost_log::DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.members = vec![alice];
+        log.committee_state.pending_refresh = Some(crate::community_dfrost_log::PendingCeremony {
+            ceremony_id: [0x57u8; 32],
+            members: vec![alice],
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let mut state = OrchestratorState::default();
+        let snap = drive_snapshot(&log, &alice);
+        reconcile_recovery_activity(&mut state, &snap);
+        assert_eq!(
+            state.refresh_activity.as_ref().unwrap().last_fingerprint,
+            (0, 0, 0)
+        );
+        // Simulate a LOCAL core apply (no inbound involved).
+        log.committee_state
+            .pending_refresh
+            .as_mut()
+            .unwrap()
+            .round1_packages
+            .insert(alice, vec![0x01]);
+        let snap = drive_snapshot(&log, &alice);
+        reconcile_recovery_activity(&mut state, &snap);
+        assert_eq!(
+            state.refresh_activity.as_ref().unwrap().last_fingerprint,
+            (1, 0, 0),
+            "tick-observed (local) progress must advance the clock"
+        );
     }
 
     #[tokio::test]

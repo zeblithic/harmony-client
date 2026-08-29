@@ -63347,6 +63347,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
                 members,
                 threshold,
                 Some(slot_attempt),
+                None,
             )
             .await?;
             return Ok(());
@@ -63381,12 +63382,14 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
         &self,
         community_id: crate::owner_state_types::SpaceId,
         helpers: Option<Vec<crate::owner_state_types::OwnerAddr>>,
+        expected_progress: Option<(usize, usize, usize)>,
     ) -> Result<String, String> {
         dfrost_request_share_repair_core::<R, _>(
             &self.handles,
             self.app_handle.as_ref(),
             community_id,
             helpers,
+            expected_progress,
         )
         .await
     }
@@ -63395,6 +63398,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
         &self,
         community_id: crate::owner_state_types::SpaceId,
         attempt: u32,
+        expected_progress: (usize, usize, usize),
     ) -> Result<String, String> {
         // ZEB-1028: the deadline retry proposes against the ACTIVE
         // committee's shape at the explicit attempt; the core displaces
@@ -63427,6 +63431,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
             members,
             threshold,
             Some(attempt),
+            Some(expected_progress),
         )
         .await
     }
@@ -65754,8 +65759,36 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
         member_addrs,
         threshold,
         None,
+        None,
     )
     .await
+}
+
+/// ZEB-1028 (Qodo #1 on #776): everything a refresh-retry displacement
+/// removes from the log, held aside so EVERY failure path after the
+/// displacement — part1 crypto, event build, local apply, broadcast —
+/// restores the incumbent instead of leaving the slot empty with its
+/// transcript destroyed (an empty slot would silence the next deadline
+/// retry entirely: it only fires while a pending refresh exists).
+type DisplacedRefreshState = (
+    crate::community_dfrost_log::PendingCeremony,
+    Option<frost_ristretto255::keys::dkg::round1::SecretPackage>,
+    Option<frost_ristretto255::keys::dkg::round2::SecretPackage>,
+    Option<(
+        frost_ristretto255::keys::KeyPackage,
+        frost_ristretto255::keys::PublicKeyPackage,
+    )>,
+);
+
+fn restore_displaced_refresh(
+    log: &mut crate::community_dfrost_log::DfrostLog,
+    displaced: DisplacedRefreshState,
+) {
+    let (slot, s1, s2, stage) = displaced;
+    log.committee_state.pending_refresh = Some(slot);
+    log.local_dkg_secret = s1;
+    log.local_dkg_secret2 = s2;
+    log.pending_rotated = stage;
 }
 
 /// ZEB-1027: shared core of `dfrost_propose_refresh` — also fired by
@@ -65782,10 +65815,17 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
 /// (or proposes attempt 0 when the slot is empty — the manual IPC and
 /// initial-propose shape). `Some(n)` is the engine's deadline retry: it
 /// derives attempt `n`'s id and, when `n` is strictly higher than the
-/// incumbent's, locally displaces the stalled incumbent (via
-/// `abort_pending_refresh`) before seeding — peers displace through the
-/// same max-attempt rule in `apply_proactive_refresh` when the rn=1
-/// reaches them.
+/// incumbent's, locally displaces the stalled incumbent before seeding
+/// — peers displace through the same max-attempt rule in
+/// `apply_proactive_refresh` when the rn=1 reaches them.
+///
+/// `expected_progress` (Qodo #4/#5 on #776): the incumbent's
+/// `(r1_count, r2_recv_count, dk_count)` at the caller's quiet-deadline
+/// decision. Displacement is refused under this core's own log lock if
+/// the incumbent has progressed since — the tick's quiet verdict is
+/// computed before an async spawn, and an inbound round landing in that
+/// gap means the ceremony is alive and must not be discarded.
+#[allow(clippy::too_many_arguments)]
 pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
     handles: &DfrostCoreHandles<H>,
     app: Option<&tauri::AppHandle<R>>,
@@ -65793,6 +65833,7 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
     member_addrs: Vec<crate::owner_state_types::OwnerAddr>,
     threshold: u16,
     attempt: Option<u32>,
+    expected_progress: Option<(usize, usize, usize)>,
 ) -> Result<String, String> {
     let max_signers = u16::try_from(member_addrs.len())
         .map_err(|_| "dfrost_propose_refresh: committee too large for u16".to_string())?;
@@ -65864,10 +65905,11 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
     // gate → part1 → build → stash → apply so concurrent calls can
     // never double-mint round-1 material (publish_order already
     // serializes production callers; this keeps the invariant local).
-    let (ceremony_id, event_for_broadcast, prior_secret): (
+    let (ceremony_id, event_for_broadcast, prior_secret, displaced_for_rollback): (
         [u8; 32],
         crate::community_dfrost_types::SignedCommitteeEvent,
         Option<frost_ristretto255::keys::dkg::round1::SecretPackage>,
+        Option<DisplacedRefreshState>,
     ) = {
         let mut log = log_arc.lock().await;
 
@@ -65952,22 +65994,53 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
         // ceremony makes this call a peer contribution — allowed unless
         // self already submitted rn=1. A pending refresh with a
         // DIFFERENT id at a LOWER attempt is a stalled incumbent this
-        // deadline retry displaces (ZEB-1028) — cleared here under the
-        // same lock so the apply below seeds cleanly (also wiping the
-        // incumbent's transcript secrets BEFORE `prior_secret` is
-        // captured, so a broadcast-failure rollback restores `None`
-        // rather than leaking the displaced attempt's secret into the
-        // new ceremony). Any other divergent id is a protocol bug
-        // surfaced explicitly.
+        // deadline retry displaces (ZEB-1028) — TAKEN (not dropped)
+        // under this same lock, with its transcript secrets and staged
+        // rotation, so every later failure path can restore it whole
+        // (Qodo #1 on #776: an abort before the fallible crypto/build/
+        // apply/broadcast steps left the slot empty on failure, and the
+        // deadline retry only fires while a pending refresh exists).
+        // Any other divergent id is a protocol bug surfaced explicitly.
+        let mut displaced: Option<DisplacedRefreshState> = None;
         if let Some(pr) = &log.committee_state.pending_refresh {
             if pr.ceremony_id != ceremony_id {
                 if effective_attempt > pr.attempt {
-                    let aborted = log.abort_pending_refresh();
+                    // Qodo #4/#5 on #776: refuse the displacement if
+                    // the incumbent progressed since the caller's
+                    // quiet-deadline decision — an inbound round that
+                    // landed between the tick's verdict and this lock
+                    // means the ceremony is alive.
+                    if let Some(exp) = expected_progress {
+                        let cur = (
+                            pr.round1_packages.len(),
+                            pr.round2_packages.len(),
+                            pr.dk_confirmations.len(),
+                        );
+                        if cur != exp {
+                            return Err(format!(
+                                "dfrost_propose_refresh: incumbent refresh progressed since \
+                                 the retry decision (expected {exp:?}, now {cur:?}) — retry \
+                                 dropped as stale",
+                            ));
+                        }
+                    }
+                    let slot = log
+                        .committee_state
+                        .pending_refresh
+                        .take()
+                        .expect("checked Some above");
+                    let displaced_id = slot.ceremony_id;
+                    displaced = Some((
+                        slot,
+                        log.local_dkg_secret.take(),
+                        log.local_dkg_secret2.take(),
+                        log.pending_rotated.take(),
+                    ));
                     tracing::info!(
                         community_id = %hex::encode(space_id.0),
-                        aborted = ?aborted.map(hex::encode),
+                        displaced = %hex::encode(displaced_id),
                         attempt = effective_attempt,
-                        "dfrost_propose_refresh: displaced stalled refresh attempt for retry",
+                        "dfrost_propose_refresh: displacing stalled refresh attempt for retry",
                     );
                 } else {
                     return Err(format!(
@@ -65991,9 +66064,19 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
 
         // Zero-sharing round 1 (public commitment, no old share needed
         // — a restarted, shareless member participates here too).
-        let (r1_secret, r1_pkg_bytes) =
-            crate::community_dfrost_crypto::refresh_part1_local(self_id, max_signers, threshold)
-                .map_err(|e| format!("dfrost_propose_refresh: refresh part1: {e}"))?;
+        let (r1_secret, r1_pkg_bytes) = match crate::community_dfrost_crypto::refresh_part1_local(
+            self_id,
+            max_signers,
+            threshold,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(d) = displaced {
+                    restore_displaced_refresh(&mut log, d);
+                }
+                return Err(format!("dfrost_propose_refresh: refresh part1: {e}"));
+            }
+        };
 
         let payload = crate::community_dfrost_types::RefreshRoundPayload {
             ceremony_id,
@@ -66002,27 +66085,40 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
             package: Some(r1_pkg_bytes),
             attempt: effective_attempt,
         };
-        let event = crate::community_dfrost_log::build_signed_dfrost_event(
+        let event = match crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key_arc.as_ref(),
             self_owner,
             crate::community_dfrost_types::DfrostEventKind::ProactiveRefresh,
             &payload,
             hlc,
-        )
-        .map_err(|e| format!("dfrost_propose_refresh: build_signed: {e}"))?;
+        ) {
+            Ok(ev) => ev,
+            Err(e) => {
+                if let Some(d) = displaced {
+                    restore_displaced_refresh(&mut log, d);
+                }
+                return Err(format!("dfrost_propose_refresh: build_signed: {e}"));
+            }
+        };
         let self_x25519_priv: [u8; 32] =
             *crate::dm_signing::ed25519_priv_to_x25519(signing_key_arc.as_ref());
 
         // Stash + apply with rollback (R5-1 lineage). `prior_secret`
-        // rides out of this block so the broadcast-failure path below
-        // can restore it too.
+        // and `displaced` ride out of this block so the broadcast-
+        // failure path below can restore them too. (After a
+        // displacement `local_dkg_secret` was already taken into
+        // `displaced`, so `prior_secret` is None and the restore path
+        // reinstates the displaced secret, never both.)
         let prior_secret = log.local_dkg_secret.take();
         log.local_dkg_secret = Some(r1_secret);
         if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
-            log.local_dkg_secret = prior_secret;
+            match displaced {
+                Some(d) => restore_displaced_refresh(&mut log, d),
+                None => log.local_dkg_secret = prior_secret,
+            }
             return Err(format!("dfrost_propose_refresh: apply: {e:?}"));
         }
-        (ceremony_id, event, prior_secret)
+        (ceremony_id, event, prior_secret, displaced)
     };
 
     // Broadcast, outside the log lock (R8/R10 ordering). Qodo #4 (#775
@@ -66055,21 +66151,37 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
     };
     if let Some(err) = broadcast_err {
         let mut log = log_arc.lock().await;
-        let clear_slot = match log.committee_state.pending_refresh.as_mut() {
-            Some(pr) if pr.ceremony_id == ceremony_id => {
-                pr.round1_packages.remove(&self_owner);
-                // If this call seeded the slot and no peer has
-                // contributed yet, drop it entirely — an empty phantom
-                // slot would block repair requests (mutual exclusion)
-                // on this node for no reason.
-                pr.round1_packages.is_empty()
+        if let Some(d) = displaced_for_rollback {
+            // Qodo #1 on #776: a displacement whose replacement never
+            // reached the wire reinstates the incumbent whole (slot +
+            // transcript secrets + staged rotation) — peers still hold
+            // it, and the next quiet window retries the displacement.
+            if log
+                .committee_state
+                .pending_refresh
+                .as_ref()
+                .map(|pr| pr.ceremony_id)
+                == Some(ceremony_id)
+            {
+                restore_displaced_refresh(&mut log, d);
             }
-            _ => false,
-        };
-        if clear_slot {
-            log.committee_state.pending_refresh = None;
+        } else {
+            let clear_slot = match log.committee_state.pending_refresh.as_mut() {
+                Some(pr) if pr.ceremony_id == ceremony_id => {
+                    pr.round1_packages.remove(&self_owner);
+                    // If this call seeded the slot and no peer has
+                    // contributed yet, drop it entirely — an empty
+                    // phantom slot would block repair requests (mutual
+                    // exclusion) on this node for no reason.
+                    pr.round1_packages.is_empty()
+                }
+                _ => false,
+            };
+            if clear_slot {
+                log.committee_state.pending_refresh = None;
+            }
+            log.local_dkg_secret = prior_secret;
         }
-        log.local_dkg_secret = prior_secret;
         return Err(format!(
             "dfrost_propose_refresh: broadcast failed after local apply — rolled back for \
              retry: {err}"
@@ -66726,6 +66838,7 @@ async fn dfrost_request_share_repair<R: tauri::Runtime>(
         Some(&app),
         crate::owner_state_types::SpaceId(cid_bytes),
         helper_addrs,
+        None,
     )
     .await
 }
@@ -66733,11 +66846,23 @@ async fn dfrost_request_share_repair<R: tauri::Runtime>(
 /// ZEB-1027: shared core of `dfrost_request_share_repair` — also fired
 /// by the engine orchestrator when it observes a restored, shareless
 /// member on an otherwise-idle active committee.
+///
+/// `expected_progress` (Qodo #7 on #776, ZEB-1028): the incumbent
+/// repair's `(round2_seen, round3_seen, deltas)` counts at the caller's
+/// quiet-deadline decision. When `Some`, this call is a RE-REQUEST of
+/// this node's own stalled ceremony: it is refused under this core's
+/// log lock unless that ceremony still exists, still names self as
+/// participant, and has not progressed since — a fresh mint stamp
+/// always outranks the participant's own older request in apply, so an
+/// unchecked re-request would wipe helper rounds that arrived between
+/// the tick's verdict and this lock. `None` (manual IPC, the automatic
+/// first request) skips the check.
 pub async fn dfrost_request_share_repair_core<R: tauri::Runtime, H: tauri::Runtime>(
     handles: &DfrostCoreHandles<H>,
     app: Option<&tauri::AppHandle<R>>,
     space_id: crate::owner_state_types::SpaceId,
     helpers: Option<Vec<crate::owner_state_types::OwnerAddr>>,
+    expected_progress: Option<(usize, usize, usize)>,
 ) -> Result<String, String> {
     let hlc_tracker = &handles.hlc_tracker;
     let adopt_floor = &handles.adopt_floor;
@@ -66806,6 +66931,25 @@ pub async fn dfrost_request_share_repair_core<R: tauri::Runtime, H: tauri::Runti
                  afterwards at the new epoch)"
                     .to_string(),
             );
+        }
+        // Qodo #7 on #776: a deadline RE-REQUEST must still target the
+        // exact stalled state its caller observed.
+        if let Some(exp) = expected_progress {
+            let still_stalled = log
+                .committee_state
+                .pending_repair
+                .as_ref()
+                .is_some_and(|p| {
+                    p.participant == self_owner
+                        && (p.round2_seen.len(), p.round3_seen.len(), p.deltas.len()) == exp
+                });
+            if !still_stalled {
+                return Err(
+                    "dfrost_request_share_repair: the stalled ceremony progressed, settled, or \
+                     changed hands since the retry decision — re-request dropped as stale"
+                        .to_string(),
+                );
+            }
         }
         let epoch = log.committee_state.current_epoch;
         let threshold = log.committee_state.threshold as usize;
