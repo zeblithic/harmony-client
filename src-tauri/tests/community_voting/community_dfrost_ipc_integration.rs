@@ -49,16 +49,17 @@ use frost_ristretto255::{
     Identifier,
 };
 use harmony_app::community_dfrost_crypto::{
-    dkg_part1_local, dkg_part2_local, dkg_part3_local, identifier_for_index,
-    verify_schnorr_signature, verifying_key_to_bytes, verifying_share_to_bytes,
+    dkg_part1_local, dkg_part2_local, dkg_part3_local, identifier_for_index, refresh_part1_local,
+    refresh_part2_local, refresh_part3_local, verify_schnorr_signature, verifying_key_to_bytes,
+    verifying_share_to_bytes,
 };
 use harmony_app::community_dfrost_log::{
     build_signed_dfrost_event, CommitteeState, DfrostLog, PendingCeremony,
 };
 use harmony_app::community_dfrost_types::{
-    derive_ceremony_id as derive_ceremony_id_canonical, derive_vrf_output, derive_vrf_seed,
-    DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
-    RefreshRoundPayload, ThresholdSignPayload, VrfBeaconPayload,
+    derive_ceremony_id as derive_ceremony_id_canonical, derive_refresh_ceremony_id,
+    derive_vrf_output, derive_vrf_seed, DfrostEventKind, DkgCompletePayload, DkgRoundPayload,
+    MemberVerifyingShare, RefreshRoundPayload, ThresholdSignPayload, VrfBeaconPayload,
 };
 use harmony_app::community_membership::RecipientCiphertext;
 use harmony_app::dm_signing;
@@ -1535,93 +1536,35 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
     );
 }
 
-// ─── Task 10: proactive-refresh proposal IPC round-trip ────────────────────
+// ─── Task 10 (reworked for ZEB-1027): proactive-refresh COMPLETION ─────────
 
-/// IPC-canonical `refresh_ceremony_id` derivation, mirroring
-/// `dfrost_propose_refresh` step 8:
+/// Replicate `dfrost_propose_refresh` (rn=1) for one node: run the
+/// zero-sharing `refresh_part1_local`, broadcast the PUBLIC round-1
+/// package in an `rf` rn=1 event, stash `local_dkg_secret`, apply
+/// locally. Returns the signed event for cross-application.
 ///
-/// `blake3(sorted_members || proposed_epoch_le || threshold_le ||
-///   b"refresh-v1" || space_id)`.
-///
-/// R9 (Cursor "Refresh blocks second member"): DETERMINISTIC across
-/// committee members. HLC is intentionally EXCLUDED — every member
-/// derives the same ceremony_id from inputs they all observe (active
-/// committee shape, next epoch, this community's space_id), which lets
-/// peer members independently call `dfrost_propose_refresh` and
-/// converge on one shared ceremony. `(members, threshold,
-/// proposed_epoch, space_id)` uniquely identifies one refresh ceremony.
-fn derive_refresh_ceremony_id(
-    members: &[OwnerAddr],
-    proposed_epoch: u64,
-    threshold: u16,
-    space_id: &SpaceId,
-) -> [u8; 32] {
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 16);
-    for a in members {
-        hasher_input.extend_from_slice(&a.0);
-    }
-    hasher_input.extend_from_slice(&proposed_epoch.to_le_bytes());
-    hasher_input.extend_from_slice(&threshold.to_le_bytes());
-    hasher_input.extend_from_slice(b"refresh-v1");
-    hasher_input.extend_from_slice(&space_id.0);
-    blake3::hash(&hasher_input).into()
-}
-
-/// Replicate `dfrost_propose_refresh` step 9-12 for one node: run FROST
-/// DKG round-1 to mint a fresh share, seal the round-1 package bytes to
-/// every committee member's X25519 pubkey, stash `local_dkg_secret`,
-/// build + sign the `rf` rn=1 event, apply locally.
-///
-/// Returns the signed event so the caller can cross-apply it on peer
-/// engines. Mirrors the IPC's "stash r1_secret BEFORE apply" ordering
-/// (loss-of-secret avoidance per the IPC's step-12 doc-comment).
+/// Pre-ZEB-1027 this helper sealed a `dkg::part1` package per recipient
+/// (the placeholder shape); the real protocol's rn=1 is a public
+/// commitment, exactly like `dr` rn=1.
 #[allow(clippy::too_many_arguments)]
 fn propose_refresh_local(
     log: &mut DfrostLog,
     self_addr: OwnerAddr,
     self_id: Identifier,
-    members: &[OwnerAddr],
     threshold: u16,
     max_signers: u16,
     refresh_ceremony_id: [u8; 32],
-    recipient_x25519_pubs: &BTreeMap<OwnerAddr, [u8; 32]>,
     hlc: Hlc,
     signing_key: &ed25519_dalek::SigningKey,
     self_x25519_priv: &[u8; 32],
 ) -> harmony_app::community_dfrost_types::SignedCommitteeEvent {
-    // 1. FROST DKG round 1 — produces the fresh secret + public pkg bytes
-    //    the IPC seals per-recipient (step 9). The proper FROST resharing
-    //    primitive isn't wired in `community_dfrost_crypto.rs` yet (Task 6
-    //    deferred refresh completion to a follow-up); the IPC uses the
-    //    DKG round-1 bytes as a placeholder share material here too, so
-    //    this matches the IPC's current shape exactly.
     let (r1_secret, r1_pkg_bytes) =
-        dkg_part1_local(self_id, max_signers, threshold).expect("dkg_part1_local for refresh");
-
-    // 2. Seal r1_pkg_bytes to every committee member's X25519 pubkey
-    //    (step 10). The apply path on each recipient decrypts the entry
-    //    whose `recipient == self` into `pending_refresh.round2_packages`.
-    let mut recipient_ciphertexts: Vec<RecipientCiphertext> = Vec::with_capacity(members.len());
-    for recipient_addr in members {
-        let recipient_pub = recipient_x25519_pubs
-            .get(recipient_addr)
-            .expect("recipient X25519 pub registered");
-        let sealed = dm_signing::seal_to_owner(recipient_pub, &r1_pkg_bytes)
-            .expect("seal_to_owner for refresh r1 pkg");
-        recipient_ciphertexts.push(RecipientCiphertext {
-            recipient: *recipient_addr,
-            sealed,
-        });
-    }
-
-    // 3. Build + sign the rf rn=1 event (step 11). `round2_package` is
-    //    None at rn=1; `recipient_ciphertexts` carries the sealed share
-    //    material.
+        refresh_part1_local(self_id, max_signers, threshold).expect("refresh_part1_local");
     let payload = RefreshRoundPayload {
         ceremony_id: refresh_ceremony_id,
         round_num: 1,
-        recipient_ciphertexts: Some(recipient_ciphertexts),
-        round2_package: None,
+        recipient_ciphertexts: None,
+        package: Some(r1_pkg_bytes),
     };
     let event = build_signed_dfrost_event(
         signing_key,
@@ -1631,334 +1574,316 @@ fn propose_refresh_local(
         hlc,
     )
     .expect("build_signed rf rn=1");
-
-    // 4. Stash r1_secret BEFORE apply (matches IPC step 12 ordering —
-    //    avoids losing the secret if apply fails after a successful stash
-    //    would also be lost).
+    // Stash BEFORE apply (matches the IPC's loss-of-secret ordering).
     log.local_dkg_secret = Some(r1_secret);
-
-    // 5. Apply locally via apply_with_identity (decrypts the sealed-to-
-    //    self entry into pending_refresh.round2_packages[self_addr] and
-    //    initializes pending_refresh if absent).
     log.apply_with_identity(event.clone(), &self_addr, self_x25519_priv)
         .expect("apply own rf rn=1");
     event
 }
 
-/// Two-engine proactive-refresh PROPOSAL ceremony driven through the
-/// IPC-mandated event construction path. Picks up from the activated-
-/// committee state Task 8 already exercised
-/// (`dkg_complete_two_engine_via_ipc_path`) and walks:
-///
-///   * `dfrost_propose_refresh` — both nodes run FROST round-1, seal the
-///     fresh round-1 package per-recipient via `dm_signing::seal_to_owner`,
-///     build + sign + apply + cross-apply `rf` rn=1 events with
-///     `recipient_ciphertexts`.
-///
-/// Convergence assertions (the load-bearing IPC contract for refresh
-/// PROPOSAL):
-///
-///   * `joint_verifying_key` is PRESERVED on both engines — refresh must
-///     never invalidate the active signing identity until completion.
-///   * `pending_refresh` is materialised on both engines with matching
-///     ceremony_id + proposed_epoch.
-///   * `current_epoch` is unchanged — the epoch only advances at refresh
-///     COMPLETION (`apply_dkg_complete` for the rotated committee), which
-///     is NOT exercised in this test.
-///   * Each engine decrypted its own sealed share material from both rf
-///     events (mirrors `refresh_two_engine_preserves_joint_vk`'s R4
-///     CodeRabbit assertion in `community_dfrost_integration.rs`).
-///
-/// ## Refresh COMPLETION is NOT exercised here
-///
-/// Task 6's report for `dfrost_propose_refresh` flagged that the proper
-/// FROST resharing primitive isn't wired in `community_dfrost_crypto.rs`
-/// yet — only the DKG round-1 bytes are minted (as placeholder share
-/// material) and sealed per-recipient. The completion path (rn=2 +
-/// finalizing `dk` event for the rotated committee, with epoch
-/// advancement to `proposed_epoch`) lives in a follow-up task. This
-/// test scopes to the PROPOSAL contract: the apply layer correctly
-/// initialises `pending_refresh` from a real-shape `rf` rn=1 event,
-/// preserves the active joint_vk, and converges across both engines.
+/// ZEB-1027: full two-engine proactive-refresh round-trip through the
+/// IPC-mandated event shapes — proposal (rn=1 public zero-sharing
+/// commitments from BOTH members converging on the deterministic
+/// `derive_refresh_ceremony_id`), rn=2 sealed share distribution,
+/// `refresh_part3_local` finalization, and the `dk` completion that
+/// advances the epoch while PRESERVING the joint verifying key. Ends
+/// with a real 2-of-2 FROST signature under the ROTATED shares
+/// verifying against the ORIGINAL vk — the refresh contract end-to-end.
 #[tokio::test]
-async fn refresh_ipc_round_trip_two_engine_preserves_joint_vk() {
-    // ── Precondition: both engines DKG-complete + active on identical vk ──
-    let (mut log_a, mut log_b, _key_pkg_a, _key_pkg_b, _pub_pkg_a, _pub_pkg_b, members) =
+async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
+    let (mut log_a, mut log_b, key_pkg_a, key_pkg_b, pub_pkg_a, pub_pkg_b, members) =
         dkg_complete_two_engine_via_ipc_path();
 
     let threshold: u16 = 2;
     let max_signers: u16 = 2;
 
-    // Snapshot the load-bearing invariants we'll re-assert post-refresh.
     let joint_vk_before = log_a
         .committee_state
         .joint_verifying_key
         .expect("joint_vk materialised by DKG completion");
     let epoch_before = log_a.committee_state.current_epoch;
     let verifying_shares_before = log_a.committee_state.verifying_shares.clone();
-    let active_before = log_a.committee_state.active;
-
-    // Belt-and-suspenders: confirm Bob's pre-refresh state matches Alice's
-    // (DKG convergence precondition).
     assert_eq!(
-        log_b
-            .committee_state
-            .joint_verifying_key
-            .expect("bob joint_vk materialised"),
-        joint_vk_before,
+        log_b.committee_state.joint_verifying_key,
+        Some(joint_vk_before),
         "engines must agree on joint_vk before refresh starts"
     );
-    assert_eq!(log_b.committee_state.current_epoch, epoch_before);
+
+    // The finalization consumes the OLD signing share; make sure both
+    // logs hold theirs (the IPC's DKG rn=3 stashes them the same way).
+    log_a.local_key_package = Some(key_pkg_a.clone());
+    log_b.local_key_package = Some(key_pkg_b.clone());
 
     let id_alice = identifier_for_index(0);
     let id_bob = identifier_for_index(1);
-
-    let recipient_pubs: BTreeMap<OwnerAddr, [u8; 32]> =
-        [(ALICE, alice_x25519_pub()), (BOB, bob_x25519_pub())]
-            .into_iter()
-            .collect();
-
     let alice_sk = alice_ed25519_sk();
     let bob_sk = bob_ed25519_sk();
     let alice_x_priv = alice_x25519_priv();
     let bob_x_priv = bob_x25519_priv();
 
-    // ── Step 1: derive the deterministic refresh_ceremony_id ──────────────
-    //
-    // R9 (Cursor "Refresh blocks second member"): the IPC derives
-    // ceremony_id WITHOUT hlc — it's a function only of (members,
-    // threshold, proposed_epoch, space_id), all of which every
-    // committee member observes identically once the active committee
-    // is established. Each member's `dfrost_propose_refresh` call
-    // computes the same id, which is what lets peer members
-    // independently invoke the IPC and converge on one shared ceremony
-    // (rather than the pre-R9 design where each proposer's HLC minted
-    // a distinct id and only the first proposer's call landed).
-    let alice_propose_hlc = hlc_at(7_000, "alice");
     let proposed_epoch = epoch_before + 1;
     let refresh_ceremony_id =
-        derive_refresh_ceremony_id(&members, proposed_epoch, threshold, &TEST_SPACE_ID);
+        derive_refresh_ceremony_id(&members, threshold, proposed_epoch, &TEST_SPACE_ID);
 
-    // ── Step 2: Alice proposes refresh ────────────────────────────────────
+    // ── rn=1 from both members (R9: shared deterministic ceremony) ───────
     let rf1_alice = propose_refresh_local(
         &mut log_a,
         ALICE,
         id_alice,
-        &members,
         threshold,
         max_signers,
         refresh_ceremony_id,
-        &recipient_pubs,
-        alice_propose_hlc,
+        hlc_at(7_000, "alice"),
         &alice_sk,
         &alice_x_priv,
     );
-
-    // Cross-apply: Bob applies Alice's rf rn=1 (decrypts the sealed-to-Bob
-    // ciphertext into pending_refresh.round2_packages[ALICE], and
-    // initialises pending_refresh on Bob's engine).
     log_b
         .apply_with_identity(rf1_alice, &BOB, &bob_x_priv)
         .expect("bob applies alice's rf rn=1");
-
-    // ── Step 3: Bob proposes refresh with the SAME ceremony_id ────────────
-    //
-    // R9: Bob's `dfrost_propose_refresh` call would now WORK end-to-end
-    // through the IPC — the deterministic derivation produces the same
-    // ceremony_id Alice already seeded into `pending_refresh`, and the
-    // per-actor gate (`round2_packages.contains_key(&BOB)`) sees that
-    // Bob hasn't submitted yet. We still replicate steps 9-12 directly
-    // here for test hermeticity (the helper avoids the IPC's
-    // community_registry / outbox plumbing); the resulting event-
-    // construction shape is identical to the IPC's wire output, and
-    // the apply path Alice/Bob exercise below is exactly the path Bob's
-    // IPC call would take.
-    let bob_propose_hlc = hlc_at(7_100, "bob");
-    let (bob_r1_secret, bob_r1_pkg_bytes) =
-        dkg_part1_local(id_bob, max_signers, threshold).expect("bob dkg_part1 for refresh");
-    let mut bob_recipient_cts: Vec<RecipientCiphertext> = Vec::with_capacity(members.len());
-    for recipient_addr in &members {
-        let recipient_pub = recipient_pubs
-            .get(recipient_addr)
-            .expect("recipient X25519 pub registered");
-        let sealed = dm_signing::seal_to_owner(recipient_pub, &bob_r1_pkg_bytes)
-            .expect("seal_to_owner for bob refresh r1");
-        bob_recipient_cts.push(RecipientCiphertext {
-            recipient: *recipient_addr,
-            sealed,
-        });
-    }
-    log_b.local_dkg_secret = Some(bob_r1_secret);
-    let bob_rf1_payload = RefreshRoundPayload {
-        ceremony_id: refresh_ceremony_id,
-        round_num: 1,
-        recipient_ciphertexts: Some(bob_recipient_cts),
-        round2_package: None,
-    };
-    let rf1_bob = build_signed_dfrost_event(
-        &bob_sk,
+    let rf1_bob = propose_refresh_local(
+        &mut log_b,
         BOB,
-        DfrostEventKind::ProactiveRefresh,
-        &bob_rf1_payload,
-        bob_propose_hlc,
-    )
-    .expect("build_signed rf rn=1 (bob)");
-    log_b
-        .apply_with_identity(rf1_bob.clone(), &BOB, &bob_x_priv)
-        .expect("bob applies own rf rn=1");
+        id_bob,
+        threshold,
+        max_signers,
+        refresh_ceremony_id,
+        hlc_at(7_100, "bob"),
+        &bob_sk,
+        &bob_x_priv,
+    );
     log_a
         .apply_with_identity(rf1_bob, &ALICE, &alice_x_priv)
         .expect("alice applies bob's rf rn=1");
 
-    // ── Step 4: convergence assertions ────────────────────────────────────
-
-    // joint_vk PRESERVED on both engines — the load-bearing refresh
-    // invariant. Refresh PROPOSAL must NOT touch the active signing
-    // identity; only refresh COMPLETION (`dk` for the rotated committee)
-    // would replace it (and the IPC's apply_dkg_complete enforces equality
-    // anyway — a refresh whose finalization vk diverges from the active vk
-    // is rejected).
+    // Proposal rounds must not touch the active identity.
     assert_eq!(
         log_a.committee_state.joint_verifying_key,
-        Some(joint_vk_before),
-        "alice: refresh PROPOSAL must NOT change joint_vk"
+        Some(joint_vk_before)
     );
-    assert_eq!(
-        log_b.committee_state.joint_verifying_key,
-        Some(joint_vk_before),
-        "bob: refresh PROPOSAL must NOT change joint_vk"
-    );
+    assert_eq!(log_a.committee_state.current_epoch, epoch_before);
 
-    // current_epoch unchanged — epoch only advances at refresh COMPLETION
-    // (which lives in a follow-up task per Task 6's deferral).
-    assert_eq!(
-        log_a.committee_state.current_epoch, epoch_before,
-        "alice: current_epoch must NOT advance on refresh PROPOSAL"
-    );
-    assert_eq!(
-        log_b.committee_state.current_epoch, epoch_before,
-        "bob: current_epoch must NOT advance on refresh PROPOSAL"
-    );
+    // ── rn=2: refresh part2 over the peer's round-1 package, sealed ──────
+    let recipient_pubs: BTreeMap<OwnerAddr, [u8; 32]> =
+        [(ALICE, alice_x25519_pub()), (BOB, bob_x25519_pub())]
+            .into_iter()
+            .collect();
+    let mut r2_secrets: BTreeMap<OwnerAddr, frost::keys::dkg::round2::SecretPackage> =
+        BTreeMap::new();
+    for (me, sk, wall) in [(ALICE, &alice_sk, 7_200u64), (BOB, &bob_sk, 7_300)] {
+        let (r1_secret, r1_others) = {
+            let log = if me == ALICE { &mut log_a } else { &mut log_b };
+            let pending = log
+                .committee_state
+                .pending_refresh
+                .as_ref()
+                .expect("pending_refresh");
+            let others: BTreeMap<Identifier, Vec<u8>> = pending
+                .round1_packages
+                .iter()
+                .filter(|(a, _)| **a != me)
+                .map(|(a, b)| {
+                    let idx = members.iter().position(|m| m == a).unwrap();
+                    (identifier_for_index(idx), b.clone())
+                })
+                .collect();
+            (
+                log.local_dkg_secret.take().expect("r1 secret stashed"),
+                others,
+            )
+        };
+        let (r2_secret, r2_out) =
+            refresh_part2_local(r1_secret, &r1_others).expect("refresh part2");
+        r2_secrets.insert(me, r2_secret);
+        let mut cts = Vec::new();
+        for (rid, pkg) in &r2_out {
+            let addr = if *rid == id_alice { ALICE } else { BOB };
+            cts.push(RecipientCiphertext {
+                recipient: addr,
+                sealed: dm_signing::seal_to_owner(recipient_pubs.get(&addr).unwrap(), pkg)
+                    .expect("seal r2"),
+            });
+        }
+        let ev = build_signed_dfrost_event(
+            sk,
+            me,
+            DfrostEventKind::ProactiveRefresh,
+            &RefreshRoundPayload {
+                ceremony_id: refresh_ceremony_id,
+                round_num: 2,
+                recipient_ciphertexts: Some(cts),
+                package: None,
+            },
+            hlc_at(wall, if me == ALICE { "alice" } else { "bob" }),
+        )
+        .expect("build rf rn=2");
+        log_a
+            .apply_with_identity(ev.clone(), &ALICE, &alice_x_priv)
+            .expect("a applies rf rn=2");
+        log_b
+            .apply_with_identity(ev, &BOB, &bob_x_priv)
+            .expect("b applies rf rn=2");
+    }
 
-    // active flag preserved — the committee is still active under its
-    // current epoch's vk + shares.
-    assert_eq!(
-        log_a.committee_state.active, active_before,
-        "alice: active flag preserved across refresh proposal"
-    );
-    assert_eq!(
-        log_b.committee_state.active, active_before,
-        "bob: active flag preserved across refresh proposal"
-    );
+    // ── finalization: refresh_part3_local per member ─────────────────────
+    let mut rotated: BTreeMap<OwnerAddr, (KeyPackage, PublicKeyPackage)> = BTreeMap::new();
+    for me in [ALICE, BOB] {
+        let log = if me == ALICE { &log_a } else { &log_b };
+        let pending = log
+            .committee_state
+            .pending_refresh
+            .as_ref()
+            .expect("pending_refresh");
+        let r1_others: BTreeMap<Identifier, Vec<u8>> = pending
+            .round1_packages
+            .iter()
+            .filter(|(a, _)| **a != me)
+            .map(|(a, b)| {
+                let idx = members.iter().position(|m| m == a).unwrap();
+                (identifier_for_index(idx), b.clone())
+            })
+            .collect();
+        let r2_others: BTreeMap<Identifier, Vec<u8>> = pending
+            .round2_packages
+            .iter()
+            .map(|(a, b)| {
+                let idx = members.iter().position(|m| m == a).unwrap();
+                (identifier_for_index(idx), b.clone())
+            })
+            .collect();
+        let old_kp = if me == ALICE {
+            key_pkg_a.clone()
+        } else {
+            key_pkg_b.clone()
+        };
+        // CR-5 (#775 round 1): each member feeds its OWN stashed public
+        // package, matching the production path (byte-identical after
+        // DKG, but the assertion shape should not depend on that).
+        let old_pkp = if me == ALICE {
+            pub_pkg_a.clone()
+        } else {
+            pub_pkg_b.clone()
+        };
+        let (new_kp, new_pkp) = refresh_part3_local(
+            r2_secrets.get(&me).unwrap(),
+            &r1_others,
+            &r2_others,
+            old_pkp,
+            old_kp.clone(),
+        )
+        .expect("refresh part3");
+        assert_eq!(
+            verifying_key_to_bytes(new_pkp.verifying_key()),
+            joint_vk_before,
+            "zero-sharing preserves the joint verifying key"
+        );
+        assert_ne!(
+            old_kp.signing_share().serialize(),
+            new_kp.signing_share().serialize(),
+            "the signing share must rotate"
+        );
+        rotated.insert(me, (new_kp, new_pkp));
+    }
 
-    // verifying_shares preserved — the per-member shares for the current
-    // epoch are still authoritative until the refresh completes.
-    assert_eq!(
-        log_a.committee_state.verifying_shares, verifying_shares_before,
-        "alice: verifying_shares preserved across refresh proposal"
-    );
-    assert_eq!(
-        log_b.committee_state.verifying_shares, verifying_shares_before,
-        "bob: verifying_shares preserved across refresh proposal"
-    );
+    // ── dk completion from both members ──────────────────────────────────
+    let (_, new_pkp) = rotated.get(&ALICE).unwrap();
+    let mut verifying_shares = Vec::new();
+    for (i, member) in members.iter().enumerate() {
+        let vs = new_pkp
+            .verifying_shares()
+            .get(&identifier_for_index(i))
+            .unwrap();
+        verifying_shares.push(MemberVerifyingShare {
+            member: *member,
+            verifying_share: verifying_share_to_bytes(vs),
+        });
+    }
+    let dk_payload = DkgCompletePayload {
+        ceremony_id: refresh_ceremony_id,
+        joint_verifying_key: joint_vk_before,
+        verifying_shares,
+        epoch: proposed_epoch,
+        members: members.clone(),
+        threshold,
+        max_signers,
+    };
+    // CR-6 (#775 round 1): re-stash round secrets immediately before the
+    // dk events so the post-promotion assertion below proves PROMOTION
+    // (not the test's own `.take()` during rn=2) cleared them. Both
+    // secrets (#775 round 2 follow-up): `local_dkg_secret2` must be
+    // populated too, or its half of the assertion can never fail.
+    for (log, id, me) in [(&mut log_a, id_alice, ALICE), (&mut log_b, id_bob, BOB)] {
+        let (r1_secret, _) =
+            refresh_part1_local(id, max_signers, threshold).expect("re-stash r1 secret");
+        log.local_dkg_secret = Some(r1_secret);
+        log.local_dkg_secret2 = Some(r2_secrets.get(&me).unwrap().clone());
+    }
+    for (actor, sk, wall) in [(ALICE, &alice_sk, 7_400u64), (BOB, &bob_sk, 7_500)] {
+        let dk = build_signed_dfrost_event(
+            sk,
+            actor,
+            DfrostEventKind::DkgComplete,
+            &dk_payload,
+            hlc_at(wall, if actor == ALICE { "alice" } else { "bob" }),
+        )
+        .expect("build dk");
+        log_a
+            .apply_with_identity(dk.clone(), &ALICE, &alice_x_priv)
+            .expect("a applies dk");
+        log_b
+            .apply_with_identity(dk, &BOB, &bob_x_priv)
+            .expect("b applies dk");
+    }
 
-    // pending_refresh populated on both engines, with matching ceremony_id
-    // + proposed_epoch.
-    let pr_a = log_a
-        .committee_state
-        .pending_refresh
-        .as_ref()
-        .expect("alice pending_refresh materialised by rf rn=1");
-    let pr_b = log_b
-        .committee_state
-        .pending_refresh
-        .as_ref()
-        .expect("bob pending_refresh materialised by rf rn=1");
-    assert_eq!(
-        pr_a.ceremony_id, refresh_ceremony_id,
-        "alice pending_refresh.ceremony_id matches derived value"
-    );
-    assert_eq!(
-        pr_b.ceremony_id, refresh_ceremony_id,
-        "bob pending_refresh.ceremony_id matches derived value"
-    );
-    assert_eq!(
-        pr_a.proposed_epoch, proposed_epoch,
-        "alice pending_refresh.proposed_epoch = current_epoch + 1"
-    );
-    assert_eq!(
-        pr_b.proposed_epoch, proposed_epoch,
-        "bob pending_refresh.proposed_epoch = current_epoch + 1"
-    );
-    assert_eq!(
-        pr_a.members, members,
-        "alice pending_refresh.members copied from active committee"
-    );
-    assert_eq!(
-        pr_b.members, members,
-        "bob pending_refresh.members copied from active committee"
-    );
-    assert_eq!(pr_a.threshold, threshold);
-    assert_eq!(pr_b.threshold, threshold);
-    assert_eq!(pr_a.max_signers, max_signers);
-    assert_eq!(pr_b.max_signers, max_signers);
+    for log in [&log_a, &log_b] {
+        assert!(log.committee_state.active);
+        assert_eq!(
+            log.committee_state.current_epoch, proposed_epoch,
+            "epoch advanced at completion"
+        );
+        assert_eq!(
+            log.committee_state.joint_verifying_key,
+            Some(joint_vk_before),
+            "refresh completion preserves the joint vk"
+        );
+        assert_ne!(
+            log.committee_state.verifying_shares, verifying_shares_before,
+            "per-member verifying shares rotate at completion"
+        );
+        assert!(log.committee_state.pending_refresh.is_none());
+        assert!(
+            log.local_dkg_secret.is_none() && log.local_dkg_secret2.is_none(),
+            "promotion clears the round secrets (ZEB-1027)"
+        );
+    }
 
-    // Each engine decrypted its own sealed share material from BOTH rf
-    // events (sender-keyed in round2_packages). Mirrors the R4 CodeRabbit
-    // assertion in ZEB-303's `refresh_two_engine_preserves_joint_vk` —
-    // without this, a regression in apply_with_identity's
-    // ProactiveRefresh path (wrong recipient match, decrypt skip, wrong
-    // actor key) would still pass the pending_refresh-populated check.
-    assert_eq!(
-        pr_a.round2_packages.len(),
-        2,
-        "alice decrypted both senders' share material into round2_packages"
-    );
-    assert_eq!(
-        pr_b.round2_packages.len(),
-        2,
-        "bob decrypted both senders' share material into round2_packages"
-    );
-    assert!(
-        pr_a.round2_packages.contains_key(&ALICE),
-        "alice has round2_packages[ALICE] (own rf rn=1 decrypted-for-self)"
-    );
-    assert!(
-        pr_a.round2_packages.contains_key(&BOB),
-        "alice has round2_packages[BOB] (bob's rf rn=1 decrypted-for-self)"
-    );
-    assert!(
-        pr_b.round2_packages.contains_key(&ALICE),
-        "bob has round2_packages[ALICE] (alice's rf rn=1 decrypted-for-self)"
-    );
-    assert!(
-        pr_b.round2_packages.contains_key(&BOB),
-        "bob has round2_packages[BOB] (own rf rn=1 decrypted-for-self)"
-    );
-
-    // No DKG ceremony in flight — refresh proposal doesn't touch pending_dkg.
-    assert!(
-        log_a.committee_state.pending_dkg.is_none(),
-        "alice pending_dkg untouched by refresh proposal"
-    );
-    assert!(
-        log_b.committee_state.pending_dkg.is_none(),
-        "bob pending_dkg untouched by refresh proposal"
-    );
-
-    // Members + threshold preserved on the active CommitteeState (refresh
-    // PROPOSAL must not mutate the active committee; only completion
-    // would).
-    assert_eq!(
-        log_a.committee_state.members, members,
-        "alice active members preserved"
-    );
-    assert_eq!(
-        log_b.committee_state.members, members,
-        "bob active members preserved"
-    );
-    assert_eq!(log_a.committee_state.threshold, threshold);
-    assert_eq!(log_b.committee_state.threshold, threshold);
+    // ── rotated shares SIGN under the original joint vk ──────────────────
+    let mut rng = frost::rand_core::OsRng;
+    let mut nonces = BTreeMap::new();
+    let mut commitments = BTreeMap::new();
+    for (me, id) in [(ALICE, id_alice), (BOB, id_bob)] {
+        let (kp, _) = rotated.get(&me).unwrap();
+        let (n, c) = frost::round1::commit(kp.signing_share(), &mut rng);
+        nonces.insert(id, n);
+        commitments.insert(id, c);
+    }
+    let msg = b"zeb1027 refresh completion";
+    let signing_package = frost::SigningPackage::new(commitments, msg);
+    let mut shares = BTreeMap::new();
+    for (me, id) in [(ALICE, id_alice), (BOB, id_bob)] {
+        let (kp, _) = rotated.get(&me).unwrap();
+        shares.insert(
+            id,
+            frost::round2::sign(&signing_package, nonces.get(&id).unwrap(), kp).expect("sign"),
+        );
+    }
+    let sig = frost::aggregate(&signing_package, &shares, &rotated.get(&ALICE).unwrap().1)
+        .expect("aggregate");
+    verify_schnorr_signature(
+        &joint_vk_before,
+        msg,
+        &sig.serialize().expect("sig serialize"),
+    )
+    .expect("rotated-share signature verifies under the ORIGINAL joint vk");
 }
 
 // ─── R4-1 regression: threshold-sign with `threshold < max_signers` ────────
