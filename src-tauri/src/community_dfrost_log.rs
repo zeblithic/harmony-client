@@ -426,6 +426,16 @@ pub struct PendingCeremony {
     pub members: Vec<OwnerAddr>,
     pub threshold: u16,
     pub max_signers: u16,
+    /// ZEB-1028 (refresh slot only; always 0 for DKG): the deadline-
+    /// retry counter this ceremony's id was derived with. A later rn=1
+    /// carrying a STRICTLY higher attempt displaces this ceremony
+    /// (max-attempt-wins — a semilattice, so replicas converge on the
+    /// same incumbent from the same event set in any arrival order);
+    /// it also serves as the globally-convergent retry budget (the
+    /// engine stops re-proposing once `attempt` reaches its cap).
+    /// `serde(default)` so pre-ZEB-1028 snapshots load as attempt 0.
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 /// Per-signing-ceremony pending state. One entry per in-flight
@@ -548,10 +558,28 @@ impl PendingRepair {
     /// requests converge on the same incumbent (min is commutative,
     /// associative, and idempotent).
     fn rank(&self) -> (OwnerAddr, std::cmp::Reverse<(u64, u32)>, [u8; 32]) {
-        (
+        Self::rank_key(
             self.participant,
-            std::cmp::Reverse((self.minted_wall_ms, self.minted_logical)),
+            self.minted_wall_ms,
+            self.minted_logical,
             self.ceremony_id,
+        )
+    }
+
+    /// ZEB-1028: the same total-order key computed from loose parts —
+    /// the engine's stale-replace admission ranks an INCOMING rn=1
+    /// (not yet materialised as a `PendingRepair`) against the
+    /// incumbent before deciding whether a quiet incumbent must yield.
+    pub(crate) fn rank_key(
+        participant: OwnerAddr,
+        minted_wall_ms: u64,
+        minted_logical: u32,
+        ceremony_id: [u8; 32],
+    ) -> (OwnerAddr, std::cmp::Reverse<(u64, u32)>, [u8; 32]) {
+        (
+            participant,
+            std::cmp::Reverse((minted_wall_ms, minted_logical)),
+            ceremony_id,
         )
     }
 }
@@ -969,6 +997,45 @@ impl DfrostLog {
         let aborted = self.committee_state.pending_dkg.take()?;
         self.local_dkg_secret = None;
         self.local_dkg_secret2 = None;
+        Some(aborted.ceremony_id)
+    }
+
+    /// ZEB-1028: abort the in-flight proactive refresh, clearing the
+    /// pending slot, this node's zero-sharing transcript secrets (bound
+    /// to the aborted attempt's randomness — see `abort_pending_dkg`),
+    /// and any staged-but-unpromoted rotated key material
+    /// (`pending_rotated` was produced from the aborted transcript and
+    /// must never install). The active committee state — including this
+    /// node's CURRENT signing share — is untouched: an aborted refresh
+    /// simply leaves the committee signing at its existing epoch.
+    ///
+    /// Returns the aborted `ceremony_id`, or `None` if no refresh was
+    /// pending. Callers: the engine's retry-budget-exhausted quiet
+    /// deadline, and its stale-replace admission for a higher-attempt
+    /// rn=1.
+    pub fn abort_pending_refresh(&mut self) -> Option<[u8; 32]> {
+        let aborted = self.committee_state.pending_refresh.take()?;
+        self.local_dkg_secret = None;
+        self.local_dkg_secret2 = None;
+        self.pending_rotated = None;
+        Some(aborted.ceremony_id)
+    }
+
+    /// ZEB-1028: abort the in-flight share repair, clearing the pending
+    /// slot (declared helper set, observed rounds, and the local
+    /// decrypted delta/sigma material with it — all bound to the
+    /// aborted ceremony's Lagrange set). Nothing else changes: helpers
+    /// keep their shares, and the participant remains shareless until a
+    /// later repair completes.
+    ///
+    /// Returns the aborted `ceremony_id`, or `None` if no repair was
+    /// pending. Caller: the engine's stale-replace admission for a
+    /// competing rn=1 whose rank the deterministic apply rule would
+    /// reject (without this, a dead participant's ceremony — which can
+    /// never settle — starves every larger-ranked live participant
+    /// forever).
+    pub fn abort_pending_repair(&mut self) -> Option<[u8; 32]> {
+        let aborted = self.committee_state.pending_repair.take()?;
         Some(aborted.ceremony_id)
     }
 
@@ -1536,9 +1603,9 @@ impl DfrostLog {
         // Refresh preserves the member set, so the ACTIVE committee's
         // members are the ceremony's members. Without this, any
         // signature-valid community member could seed a phantom
-        // `pending_refresh` — a singleton slot with (currently) no
-        // abort/deadline machinery, so a phantom wedges real refreshes
-        // until restart.
+        // `pending_refresh` into the singleton slot (ZEB-1028's quiet
+        // deadline would eventually clear it, but only after stalling
+        // real refreshes for the full deadline window).
         if !self.committee_state.members.contains(&event.actor) {
             return Err(ApplyError::InvariantViolation);
         }
@@ -1560,6 +1627,40 @@ impl DfrostLog {
                 if self.committee_state.pending_dkg.is_some() {
                     return Err(ApplyError::CeremonyInFlight);
                 }
+                // ZEB-1028: attempt arbitration for a DIFFERENT ceremony
+                // id in the slot. The id is a pure function of
+                // (committee shape, next epoch, attempt), so:
+                //   * higher attempt  → a deadline retry; it DISPLACES
+                //     the incumbent (max-attempt-wins — a semilattice,
+                //     so every replica converges on the same incumbent
+                //     from the same event set regardless of arrival
+                //     order). The displaced attempt's transcript
+                //     secrets and staged rotation die with it — they
+                //     were minted against the old attempt's randomness.
+                //   * lower attempt   → a stale retry replay; dropped.
+                //   * equal attempt   → a forked/forged id (two ids at
+                //     one attempt cannot both derive from the shared
+                //     shape); reject loudly. The engine's rn=1 ingest
+                //     gate recomputes the derivation and never admits
+                //     this, so it is only reachable via direct apply.
+                if let Some(pr) = self.committee_state.pending_refresh.as_ref() {
+                    if pr.ceremony_id != payload.ceremony_id {
+                        match payload.attempt.cmp(&pr.attempt) {
+                            std::cmp::Ordering::Greater => {
+                                self.committee_state.pending_refresh = None;
+                                self.local_dkg_secret = None;
+                                self.local_dkg_secret2 = None;
+                                self.pending_rotated = None;
+                            }
+                            std::cmp::Ordering::Less => {
+                                return Err(ApplyError::CeremonyInFlight);
+                            }
+                            std::cmp::Ordering::Equal => {
+                                return Err(ApplyError::InvariantViolation);
+                            }
+                        }
+                    }
+                }
                 // Initialise the pending refresh once on the first rn=1
                 // event; every member's rn=1 accumulates into it.
                 if self.committee_state.pending_refresh.is_none() {
@@ -1569,24 +1670,15 @@ impl DfrostLog {
                         threshold: self.committee_state.threshold,
                         max_signers: self.committee_state.max_signers,
                         proposed_epoch: self.committee_state.current_epoch + 1,
+                        attempt: payload.attempt,
                         ..Default::default()
                     });
                 }
-                // Subsequent enforcement: ceremony_id must match. A
-                // divergent ceremony_id within the same refresh epoch
-                // indicates a forked proposer; reject to surface the
-                // protocol bug rather than silently apply. (The engine's
-                // ingest gate additionally recomputes
-                // `derive_refresh_ceremony_id` so a stale rn=1 replay
-                // can never seed the slot with a dead id.)
                 let pr = self
                     .committee_state
                     .pending_refresh
                     .as_mut()
                     .expect("seeded above");
-                if pr.ceremony_id != payload.ceremony_id {
-                    return Err(ApplyError::InvariantViolation);
-                }
                 // First-wins per actor, mirroring apply_dkg_round rn=1.
                 pr.round1_packages.entry(event.actor).or_insert(pkg);
             }
@@ -1658,6 +1750,67 @@ impl DfrostLog {
     ///   re-arms once the winner settles.
     /// rn=2 (helper deltas): records the helper in `round2_seen`.
     /// rn=3 (helper sigma): records the helper in `round3_seen`.
+    /// ZEB-1028: everything an rp rn=1 (repair request) must satisfy to
+    /// SEED the slot, minus the incumbent arbitration — the shape rules
+    /// (sorted/deduped helper set, no self-help, members-only, ≥
+    /// threshold, mint stamp present), the epoch/actor binding, and the
+    /// mutual exclusion with share-mutating ceremonies. Split out so the
+    /// engine's stale-replace admission can verify a competing request
+    /// is otherwise admissible BEFORE aborting a quiet incumbent for it
+    /// (mirror of `check_ceremony_init_admissible` in the di flow: never
+    /// destroy the slot for a request that would then fail to seed).
+    pub(crate) fn check_repair_request_admissible(
+        &self,
+        payload: &crate::community_dfrost_types::RepairRoundPayload,
+        actor: &OwnerAddr,
+    ) -> Result<(), ApplyError> {
+        if !self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if !self.committee_state.members.contains(actor) {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if payload.epoch != self.committee_state.current_epoch {
+            return Err(ApplyError::InvariantViolation);
+        }
+        let helpers = payload
+            .helpers
+            .as_ref()
+            .ok_or(ApplyError::InvariantViolation)?;
+        let mut sorted = helpers.clone();
+        sorted.sort();
+        sorted.dedup();
+        if &sorted != helpers || helpers.is_empty() {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if helpers.contains(actor) {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if helpers
+            .iter()
+            .any(|h| !self.committee_state.members.contains(h))
+        {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if helpers.len() < self.committee_state.threshold as usize {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if payload.minted_wall_ms.is_none() || payload.minted_logical.is_none() {
+            return Err(ApplyError::InvariantViolation);
+        }
+        // Mutual exclusion with share-mutating ceremonies: a repair
+        // reconstructs a point on the CURRENT polynomial; running it
+        // concurrently with a DKG/refresh transcript would mix
+        // polynomials. Refresh wins (its promotion clears
+        // `pending_repair`); a repair request waits.
+        if self.committee_state.pending_dkg.is_some()
+            || self.committee_state.pending_refresh.is_some()
+        {
+            return Err(ApplyError::CeremonyInFlight);
+        }
+        Ok(())
+    }
+
     fn apply_repair_round(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
         use crate::community_dfrost_types::RepairRoundPayload;
 
@@ -1679,40 +1832,17 @@ impl DfrostLog {
 
         match payload.round_num {
             1 => {
+                // Shape + exclusion validation, shared with the engine's
+                // stale-replace admission (ZEB-1028) so an incumbent is
+                // never aborted for a request that would then fail to
+                // seed.
+                self.check_repair_request_admissible(&payload, &event.actor)?;
                 let helpers = payload.helpers.ok_or(ApplyError::InvariantViolation)?;
-                let mut sorted = helpers.clone();
-                sorted.sort();
-                sorted.dedup();
-                if sorted != helpers || helpers.is_empty() {
-                    return Err(ApplyError::InvariantViolation);
-                }
-                if helpers.contains(&event.actor) {
-                    return Err(ApplyError::InvariantViolation);
-                }
-                if helpers
-                    .iter()
-                    .any(|h| !self.committee_state.members.contains(h))
-                {
-                    return Err(ApplyError::InvariantViolation);
-                }
-                if helpers.len() < self.committee_state.threshold as usize {
-                    return Err(ApplyError::InvariantViolation);
-                }
                 let (Some(minted_wall_ms), Some(minted_logical)) =
                     (payload.minted_wall_ms, payload.minted_logical)
                 else {
                     return Err(ApplyError::InvariantViolation);
                 };
-                // Mutual exclusion with share-mutating ceremonies: a
-                // repair reconstructs a point on the CURRENT polynomial;
-                // running it concurrently with a DKG/refresh transcript
-                // would mix polynomials. Refresh wins (its promotion
-                // clears `pending_repair`); a repair request waits.
-                if self.committee_state.pending_dkg.is_some()
-                    || self.committee_state.pending_refresh.is_some()
-                {
-                    return Err(ApplyError::CeremonyInFlight);
-                }
                 let candidate = PendingRepair::new(
                     payload.ceremony_id,
                     event.actor,
@@ -3200,6 +3330,7 @@ mod tests {
             round_num: 1,
             recipient_ciphertexts: None,
             package: Some(vec![0xde, 0xad]),
+            attempt: 0,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -3309,6 +3440,7 @@ mod tests {
             round_num: 1,
             recipient_ciphertexts: None,
             package: Some(vec![0xde, 0xad]),
+            attempt: 0,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -3367,6 +3499,7 @@ mod tests {
             round_num: 2,
             recipient_ciphertexts: Some(vec![]),
             package: None,
+            attempt: 0,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -3420,6 +3553,7 @@ mod tests {
             round_num: 1,
             recipient_ciphertexts: None,
             package: Some(vec![0xde, 0xad]),
+            attempt: 0,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -4431,6 +4565,7 @@ mod tests {
                 sealed,
             }]),
             package: None,
+            attempt: 0,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -4513,6 +4648,7 @@ mod tests {
                 round_num: 2,
                 recipient_ciphertexts: Some(rc),
                 package: None,
+                attempt: 0,
             };
             let mut pd = Vec::new();
             ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -4576,6 +4712,7 @@ mod tests {
             round_num: 1,
             recipient_ciphertexts: None,
             package: Some(vec![0x01]),
+            attempt: 0,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -5004,6 +5141,162 @@ mod tests {
             (p2.participant, p2.ceremony_id, p2.round2_seen.clone()),
             "replicas must converge on the same incumbent with the same progress"
         );
+    }
+
+    /// ZEB-1028: rf rn=1 event with an explicit attempt counter.
+    fn rf1_event(
+        actor: OwnerAddr,
+        ceremony_id: [u8; 32],
+        attempt: u32,
+        wall_ms: u64,
+    ) -> SignedCommitteeEvent {
+        use crate::community_dfrost_types::RefreshRoundPayload;
+        use crate::owner_state_types::Hlc;
+        let payload = RefreshRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            recipient_ciphertexts: None,
+            package: Some(vec![0xde, 0xad]),
+            attempt,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ProactiveRefresh,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor,
+            payload: pd,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// ZEB-1028: the max-attempt refresh arbitration must converge
+    /// replicas on the same incumbent from the same event set in ANY
+    /// arrival order, and displacement must wipe the displaced
+    /// attempt's transcript secrets + staged rotation.
+    #[test]
+    fn rf_rn1_attempt_supersede_commutes_zeb1028() {
+        let (mut log1, alice, bob, _carol) = repair_committee_log();
+        let e_a0 = rf1_event(alice, [0xA0; 32], 0, 9_000);
+        let e_b1 = rf1_event(bob, [0xA1; 32], 1, 9_001);
+        let e_a1 = rf1_event(alice, [0xA1; 32], 1, 9_002);
+
+        // Replica 1: attempt 0 seeds, gathers local transcript secrets
+        // + a staged rotation, then attempt 1 displaces — the stale
+        // attempt's material must die with it.
+        log1.apply(e_a0.clone()).expect("attempt 0 seeds");
+        let id = crate::community_dfrost_crypto::identifier_for_index(0);
+        let (secret, _pkg) =
+            crate::community_dfrost_crypto::dkg_part1_local(id, 2, 2).expect("part1");
+        log1.local_dkg_secret = Some(secret);
+        log1.pending_rotated = Some(dealer_key_material_for_tests());
+        log1.apply(e_b1.clone()).expect("attempt 1 displaces");
+        assert!(
+            log1.local_dkg_secret.is_none() && log1.pending_rotated.is_none(),
+            "displaced attempt's transcript secrets and staged rotation must be wiped"
+        );
+        log1.apply(e_a1.clone()).expect("alice joins attempt 1");
+
+        // Replica 2: attempt 1 arrives first; the stale attempt-0
+        // replay bounces off it.
+        let (mut log2, ..) = repair_committee_log();
+        log2.apply(e_b1).expect("attempt 1 seeds");
+        log2.apply(e_a1).expect("alice joins");
+        assert_eq!(
+            log2.apply(e_a0),
+            Err(ApplyError::CeremonyInFlight),
+            "lower-attempt replay is dropped, not an error to surface"
+        );
+
+        let p1 = log1.committee_state.pending_refresh.as_ref().unwrap();
+        let p2 = log2.committee_state.pending_refresh.as_ref().unwrap();
+        assert_eq!(
+            (
+                p1.ceremony_id,
+                p1.attempt,
+                p1.round1_packages.keys().copied().collect::<Vec<_>>()
+            ),
+            (
+                p2.ceremony_id,
+                p2.attempt,
+                p2.round1_packages.keys().copied().collect::<Vec<_>>()
+            ),
+            "replicas must converge on the same attempt with the same round-1 set"
+        );
+        assert_eq!(p1.attempt, 1);
+    }
+
+    /// ZEB-1028: two DIFFERENT ids at the same attempt cannot both
+    /// derive from the shared committee shape — a fork is rejected
+    /// loudly (the engine's ingest gate never admits one; this pins the
+    /// direct-apply behaviour).
+    #[test]
+    fn rf_rn1_equal_attempt_fork_rejected_zeb1028() {
+        let (mut log, alice, bob, _carol) = repair_committee_log();
+        log.apply(rf1_event(alice, [0xA0; 32], 0, 9_100))
+            .expect("seeds");
+        assert_eq!(
+            log.apply(rf1_event(bob, [0xF0; 32], 0, 9_101)),
+            Err(ApplyError::InvariantViolation),
+            "same-attempt divergent id is a forked/forged proposal"
+        );
+    }
+
+    /// ZEB-1028: `abort_pending_refresh` clears the slot, the
+    /// zero-sharing transcript secrets, and the staged-but-unpromoted
+    /// rotation; the active committee (and its current share) survives.
+    #[test]
+    fn abort_pending_refresh_clears_secrets_and_stage_zeb1028() {
+        let (mut log, alice, ..) = repair_committee_log();
+        assert_eq!(log.abort_pending_refresh(), None, "no-op on empty slot");
+        log.apply(rf1_event(alice, [0xA0; 32], 0, 9_200))
+            .expect("seeds");
+        let id = crate::community_dfrost_crypto::identifier_for_index(0);
+        let (secret, _pkg) =
+            crate::community_dfrost_crypto::dkg_part1_local(id, 2, 2).expect("part1");
+        log.local_dkg_secret = Some(secret);
+        log.pending_rotated = Some(dealer_key_material_for_tests());
+
+        assert_eq!(log.abort_pending_refresh(), Some([0xA0; 32]));
+        assert!(log.committee_state.pending_refresh.is_none());
+        assert!(log.local_dkg_secret.is_none());
+        assert!(log.local_dkg_secret2.is_none());
+        assert!(
+            log.pending_rotated.is_none(),
+            "a rotation staged from the aborted transcript must never install"
+        );
+        assert!(
+            log.committee_state.active,
+            "abort leaves the committee signing at its current epoch"
+        );
+    }
+
+    /// ZEB-1028: `abort_pending_repair` clears the slot (the engine's
+    /// stale-replace admission uses it before seeding a competing
+    /// request over a dead incumbent).
+    #[test]
+    fn abort_pending_repair_clears_slot_zeb1028() {
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        assert_eq!(log.abort_pending_repair(), None, "no-op on empty slot");
+        log.apply(rp_event(
+            alice,
+            [0xab; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            9_300,
+        ))
+        .expect("request seeds");
+        assert_eq!(log.abort_pending_repair(), Some([0xab; 32]));
+        assert!(log.committee_state.pending_repair.is_none());
     }
 
     #[test]

@@ -122,6 +122,10 @@ const EXPECTED_DK_HEX: &str = "a762636958206666666666666666666666666666666666666
 const EXPECTED_TS_HEX: &str = "a462636958206666666666666666666666666666666666666666666666666666666666666666626d735820555555555555555555555555555555555555555555555555555555555555555562636d5820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc6273685820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const EXPECTED_VB_HEX: &str = "a462636958206666666666666666666666666666666666666666666666666666666666666666626d735820555555555555555555555555555555555555555555555555555555555555555562736758409999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999962766658202222222222222222222222222222222222222222222222222222222222222222";
 const EXPECTED_RF_ROUND1_HEX: &str = "a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0162706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+// ZEB-1028: rn=1 with a non-zero retry attempt gains the `at` key (a
+// deadline-retry proposal). Attempt 0 omits the key — the unchanged
+// EXPECTED_RF_ROUND1_HEX above IS the wire-stability pin for that.
+const EXPECTED_RF_ROUND1_RETRY_HEX: &str = "a46263695820666666666666666666666666666666666666666666666666666666666666666662726e0162706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee62617402";
 const EXPECTED_RF_ROUND2_HEX: &str = "a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0262726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd";
 
 const EXPECTED_ENVELOPE_DI_HEX: &str = "a862746761646276720162747200626b64626469626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6270645862a762636958206666666666666666666666666666666666666666666666666666666666666666626d628250aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa50bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62746802626d78026265700162776d1903e8626c6700627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
@@ -222,6 +226,16 @@ fn rf_round1_payload() -> RefreshRoundPayload {
         round_num: 1,
         recipient_ciphertexts: None,
         package: Some(vec![0xee; 32]),
+        attempt: 0,
+    }
+}
+
+/// ZEB-1028: a deadline-retry proposal — attempt 2 of this epoch's
+/// refresh (carries the `at` key; derives a distinct ceremony id).
+fn rf_round1_retry_payload() -> RefreshRoundPayload {
+    RefreshRoundPayload {
+        attempt: 2,
+        ..rf_round1_payload()
     }
 }
 
@@ -231,6 +245,7 @@ fn rf_round2_payload() -> RefreshRoundPayload {
         round_num: 2,
         recipient_ciphertexts: Some(vec![fixture_recipient_ciphertext()]),
         package: None,
+        attempt: 0,
     }
 }
 
@@ -344,6 +359,18 @@ fn rf_round1_canonical_cbor() {
     assert_eq!(
         actual_hex, EXPECTED_RF_ROUND1_HEX,
         "RefreshRoundPayload (rn=1) wire format changed"
+    );
+}
+
+#[test]
+fn rf_round1_retry_canonical_cbor() {
+    let actual_hex = hex::encode(encode(&rf_round1_retry_payload()));
+    if EXPECTED_RF_ROUND1_RETRY_HEX.contains("FILL_AFTER") {
+        panic!("REGENERATE EXPECTED_RF_ROUND1_RETRY_HEX = \"{actual_hex}\";");
+    }
+    assert_eq!(
+        actual_hex, EXPECTED_RF_ROUND1_RETRY_HEX,
+        "RefreshRoundPayload (rn=1, attempt > 0) wire format changed"
     );
 }
 

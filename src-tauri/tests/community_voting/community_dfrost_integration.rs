@@ -793,6 +793,7 @@ fn refresh_two_engine_preserves_joint_vk() {
                 round_num: 1,
                 recipient_ciphertexts: None,
                 package: Some(pkg),
+                attempt: 0,
             },
         );
         c.engine_a
@@ -821,6 +822,7 @@ fn refresh_two_engine_preserves_joint_vk() {
                     .expect("seal bob"),
             }]),
             package: None,
+            attempt: 0,
         },
     );
     c.engine_a

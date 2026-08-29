@@ -848,7 +848,8 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
 
 use harmony_app::community_dfrost_log_engine::{DfrostLogRegistry, DfrostOrchestratorConfig};
 use harmony_app::{
-    dfrost_initiate_dkg_core, production_dkg_driver, DfrostCoreHandles, DfrostLogsMap,
+    dfrost_initiate_dkg_core, dfrost_propose_refresh_core, production_dkg_driver,
+    DfrostCoreHandles, DfrostLogsMap,
 };
 
 type MockRt = tauri::test::MockRuntime;
@@ -909,6 +910,7 @@ fn test_orchestrator_config() -> DfrostOrchestratorConfig {
         initiator_quiet_deadline: std::time::Duration::from_secs(60),
         stale_replace_threshold: std::time::Duration::from_secs(60),
         max_restart_attempts: 3,
+        recovery_quiet_deadline: std::time::Duration::from_secs(60),
     }
 }
 
@@ -1431,4 +1433,489 @@ async fn dkg_straggler_heals_after_peer_promotion_when_dk_is_lost() {
     drop(lb);
     drop(alice_engine);
     drop(bob_engine);
+}
+
+/// ZEB-1028 headline: a refresh round LOST on the wire no longer stalls
+/// the ceremony until restart. Alice's FIRST rf rn=2 (her sealed share
+/// distribution) vanishes on the alice→bob leg; the orchestrator's
+/// recovery re-broadcast cadence re-mints it (fresh HLC, identical
+/// payload) and the refresh still completes end-to-end on both engines
+/// — epoch advanced, joint verifying key preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_heals_lost_round_via_rebroadcast_zeb1028() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xD6);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xD7);
+    let alice_x_priv = *dm_signing::ed25519_priv_to_x25519(&alice_sk);
+    let bob_x_priv = *dm_signing::ed25519_priv_to_x25519(&bob_sk);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+
+    let community_id = SpaceId([0xD8; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+    let bob = orchestrated_node(community_id, "bob-dev", bob_addr, &bob_sk, &resolver_map);
+
+    let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_pub_tx, mut bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Lossy alice→bob leg: the FIRST ProactiveRefresh rn=2 from Alice
+    // vanishes — without re-broadcast healing, Bob can never finalize
+    // (he is missing Alice's sealed package) and the refresh wedges.
+    let _a2b = tokio::spawn(async move {
+        let mut rf2_dropped = false;
+        while let Some(p) = alice_pub_rx.recv().await {
+            if !rf2_dropped {
+                if let Ok(ev) = ciborium::de::from_reader::<
+                    harmony_app::community_dfrost_types::SignedCommitteeEvent,
+                    _,
+                >(&p[..])
+                {
+                    if ev.kind == DfrostEventKind::ProactiveRefresh {
+                        if let Ok(pl) = ciborium::de::from_reader::<
+                            harmony_app::community_dfrost_types::RefreshRoundPayload,
+                            _,
+                        >(&ev.payload[..])
+                        {
+                            if pl.round_num == 2 {
+                                rf2_dropped = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if bob_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _b2a = tokio::spawn(async move {
+        while let Some(p) = bob_pub_rx.recv().await {
+            if alice_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let alice_engine = start_orchestrated(
+        &alice,
+        community_id,
+        alice_addr,
+        alice_x_priv,
+        &resolver_map,
+        alice_pub_tx,
+        alice_sub_rx,
+    )
+    .await;
+    let bob_engine = start_orchestrated(
+        &bob,
+        community_id,
+        bob_addr,
+        bob_x_priv,
+        &resolver_map,
+        bob_pub_tx,
+        bob_sub_rx,
+    )
+    .await;
+
+    // Phase 1: a clean DKG activates the committee (nothing dropped —
+    // the filter only ever eats an rf rn=2).
+    dfrost_initiate_dkg_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        vec![alice_addr, bob_addr],
+        2,
+    )
+    .await
+    .expect("alice initiates DKG");
+    // Wait on EACH log before the combined assert (CI shard flush on
+    // #776: bob reaches dk quorum first — he holds alice's dk plus his
+    // own — so waiting on bob alone races alice's promotion).
+    expect_converged(
+        wait_converged("alice active after DKG", &alice.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    expect_converged(
+        wait_converged("bob active after DKG", &bob.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    let (vk_before, epoch_before) = {
+        let la = alice.log.lock().await;
+        let lb = bob.log.lock().await;
+        assert_converged_active(&la, &lb);
+        (
+            la.committee_state.joint_verifying_key,
+            la.committee_state.current_epoch,
+        )
+    };
+
+    // Phase 2: Alice proposes the refresh; auto-drive carries both
+    // members through rounds 1–3 + dk — surviving the lost rn=2.
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    dfrost_propose_refresh_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        members,
+        2,
+        None,
+        None,
+    )
+    .await
+    .expect("alice proposes refresh");
+
+    expect_converged(
+        wait_converged("alice promotes the refresh epoch", &alice.log, move |l| {
+            l.committee_state.current_epoch == epoch_before + 1
+                && l.committee_state.pending_refresh.is_none()
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    expect_converged(
+        wait_converged("bob promotes the refresh epoch", &bob.log, move |l| {
+            l.committee_state.current_epoch == epoch_before + 1
+                && l.committee_state.pending_refresh.is_none()
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+
+    let la = alice.log.lock().await;
+    let lb = bob.log.lock().await;
+    assert_eq!(
+        la.committee_state.joint_verifying_key, vk_before,
+        "refresh must preserve the joint verifying key"
+    );
+    assert_eq!(
+        lb.committee_state.joint_verifying_key, vk_before,
+        "refresh must preserve the joint verifying key on the healed peer"
+    );
+    assert!(
+        la.local_key_package.is_some() && lb.local_key_package.is_some(),
+        "both members hold rotated shares after promotion"
+    );
+    drop(la);
+    drop(lb);
+    drop(alice_engine);
+    drop(bob_engine);
+}
+
+/// ZEB-1028 / CodeAnt Major on #776: an explicit-attempt propose call
+/// is a retry/join of an OBSERVED ceremony; if the pending slot emptied
+/// between the caller's decision and the core's lock (the stalled
+/// refresh completed — epoch moved — or was aborted), the call must be
+/// dropped as stale instead of seeding a spurious new ceremony against
+/// the moved state.
+#[tokio::test]
+async fn refresh_retry_with_empty_slot_is_dropped_zeb1028() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xDA);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xDB);
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+    let community_id = SpaceId([0xDC; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    {
+        // Active committee, NO pending refresh — the state a completed
+        // (or aborted) ceremony leaves behind.
+        let mut log = alice.log.lock().await;
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 2;
+        log.committee_state.members = members.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+        log.committee_state.identifier_map =
+            harmony_app::community_dfrost_log::CommitteeState::build_identifier_map(&members);
+    }
+
+    let err = dfrost_propose_refresh_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        members,
+        2,
+        Some(1),
+        None,
+    )
+    .await
+    .expect_err("stale retry against an empty slot must be dropped");
+    assert!(err.contains("no longer pending"), "unexpected error: {err}");
+    assert!(
+        alice
+            .log
+            .lock()
+            .await
+            .committee_state
+            .pending_refresh
+            .is_none(),
+        "the stale retry must not seed a new ceremony"
+    );
+}
+
+/// Qodo #1 on #776 (ZEB-1028): a refresh-retry displacement whose
+/// replacement then FAILS (here: the broadcast — no engine registered)
+/// must restore the displaced incumbent whole: slot, transcript
+/// secrets, staged rotation. Leaving the slot empty would silence the
+/// next deadline retry entirely (it only fires while a pending refresh
+/// exists) and diverge this replica from its peers.
+#[tokio::test]
+async fn refresh_retry_rollback_restores_displaced_incumbent_zeb1028() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xDD);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xDE);
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+    let community_id = SpaceId([0xDF; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let incumbent_id = [0x60u8; 32];
+    let (dealer_kp, dealer_pkp) = {
+        let (shares, pkp) = frost_ristretto255::keys::generate_with_dealer(
+            3,
+            2,
+            frost_ristretto255::keys::IdentifierList::Default,
+            frost_ristretto255::rand_core::OsRng,
+        )
+        .expect("dealer keygen");
+        (
+            KeyPackage::try_from(shares.values().next().unwrap().clone()).expect("key package"),
+            pkp,
+        )
+    };
+    {
+        let mut log = alice.log.lock().await;
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 2;
+        log.committee_state.members = members.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+        log.committee_state.identifier_map =
+            harmony_app::community_dfrost_log::CommitteeState::build_identifier_map(&members);
+        let mut slot = PendingCeremony {
+            ceremony_id: incumbent_id,
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 3,
+            ..Default::default()
+        };
+        slot.round1_packages.insert(bob_addr, vec![0xb0; 8]);
+        log.committee_state.pending_refresh = Some(slot);
+        let (r1_secret, _pkg) = dkg_part1_local(identifier_for_index(0), 2, 2).expect("part1");
+        log.local_dkg_secret = Some(r1_secret);
+        log.pending_rotated = Some((dealer_kp, dealer_pkp));
+    }
+
+    let err = dfrost_propose_refresh_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        members.clone(),
+        2,
+        Some(1),
+        Some((1, 0, 0)),
+    )
+    .await
+    .expect_err("broadcast into a registry with no engine must fail");
+    assert!(err.contains("rolled back"), "unexpected error: {err}");
+
+    let log = alice.log.lock().await;
+    let pr = log
+        .committee_state
+        .pending_refresh
+        .as_ref()
+        .expect("displaced incumbent restored");
+    assert_eq!(pr.ceremony_id, incumbent_id);
+    assert_eq!(pr.attempt, 0);
+    assert!(
+        pr.round1_packages.contains_key(&bob_addr),
+        "incumbent progress restored"
+    );
+    assert!(
+        log.local_dkg_secret.is_some(),
+        "incumbent transcript secret restored"
+    );
+    assert!(
+        log.pending_rotated.is_some(),
+        "incumbent staged rotation restored"
+    );
+}
+
+/// Qodo #4/#5 on #776 (ZEB-1028): the retry core refuses to displace an
+/// incumbent that progressed after the caller's quiet-deadline decision
+/// — the decision-time fingerprint travels into the core and is
+/// re-checked under the seed lock.
+#[tokio::test]
+async fn refresh_retry_refused_when_incumbent_progressed_zeb1028() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xE0);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xE1);
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+    let community_id = SpaceId([0xE2; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    {
+        let mut log = alice.log.lock().await;
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 2;
+        log.committee_state.members = members.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+        log.committee_state.identifier_map =
+            harmony_app::community_dfrost_log::CommitteeState::build_identifier_map(&members);
+        let mut slot = PendingCeremony {
+            ceremony_id: [0x61u8; 32],
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 3,
+            ..Default::default()
+        };
+        // Progress the retry decision did NOT see.
+        slot.round1_packages.insert(bob_addr, vec![0xb0; 8]);
+        log.committee_state.pending_refresh = Some(slot);
+    }
+
+    let err = dfrost_propose_refresh_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        members,
+        2,
+        Some(1),
+        Some((0, 0, 0)),
+    )
+    .await
+    .expect_err("a progressed incumbent must refuse the stale retry");
+    assert!(err.contains("progressed"), "unexpected error: {err}");
+    let log = alice.log.lock().await;
+    let pr = log
+        .committee_state
+        .pending_refresh
+        .as_ref()
+        .expect("incumbent untouched");
+    assert_eq!(pr.ceremony_id, [0x61u8; 32]);
+    assert_eq!(pr.round1_packages.len(), 1);
+}
+
+/// Qodo #7 on #776 (ZEB-1028): the repair RE-REQUEST core refuses to
+/// mint a fresh (always-winning) stamp when the stalled ceremony has
+/// progressed, settled, or changed hands since the caller's decision.
+#[tokio::test]
+async fn repair_rerequest_refused_when_ceremony_progressed_zeb1028() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xE3);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xE4);
+    let (_carol_sk, carol_addr, carol_pub64) = fixture_identity(0xE5);
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+    resolver_map.insert(carol_addr, carol_pub64);
+    let community_id = SpaceId([0xE6; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+
+    let mut members = vec![alice_addr, bob_addr, carol_addr];
+    members.sort();
+    let mut helpers: Vec<OwnerAddr> = members
+        .iter()
+        .copied()
+        .filter(|a| *a != alice_addr)
+        .collect();
+    helpers.sort();
+    {
+        let mut log = alice.log.lock().await;
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = members.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 3;
+        log.committee_state.identifier_map =
+            harmony_app::community_dfrost_log::CommitteeState::build_identifier_map(&members);
+        let mut pending = harmony_app::community_dfrost_log::PendingRepair::new(
+            [0x62u8; 32],
+            alice_addr,
+            1,
+            helpers.clone(),
+            1_000,
+            0,
+        );
+        // A helper responded after the tick's quiet decision.
+        pending.round2_seen.insert(helpers[0]);
+        log.committee_state.pending_repair = Some(pending);
+    }
+
+    let err = harmony_app::dfrost_request_share_repair_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        None,
+        Some((0, 0, 0)),
+    )
+    .await
+    .expect_err("a progressed repair must refuse the stale re-request");
+    assert!(err.contains("dropped as stale"), "unexpected error: {err}");
+    let log = alice.log.lock().await;
+    let p = log
+        .committee_state
+        .pending_repair
+        .as_ref()
+        .expect("incumbent repair untouched");
+    assert_eq!(p.ceremony_id, [0x62u8; 32]);
+    assert_eq!(p.round2_seen.len(), 1, "helper progress preserved");
 }

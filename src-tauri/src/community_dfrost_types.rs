@@ -317,6 +317,22 @@ pub struct RefreshRoundPayload {
         default
     )]
     pub package: Option<Vec<u8>>,
+    /// ZEB-1028, `rn=1` only: retry attempt counter for this epoch's
+    /// refresh. Attempt 0 (the first proposal) omits the key entirely,
+    /// keeping attempt-0 events byte-identical to their ZEB-1027 form
+    /// (zeb303 pins unaffected). A deadline-aborted attempt is retried
+    /// as `attempt + 1`, which derives a DISTINCT ceremony id (see
+    /// `derive_refresh_ceremony_id`) — without this, a retry at the same
+    /// epoch re-derives the aborted ceremony's id and collides with
+    /// peers' first-wins round-1 state minted from the old randomness.
+    #[serde(rename = "at", skip_serializing_if = "is_zero_u32", default)]
+    pub attempt: u32,
+}
+
+/// serde helper: skip the `at` key for attempt 0 (wire-stability for
+/// pre-ZEB-1028 refresh events).
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Payload for `DfrostEventKind::RepairShare` (`rp`). ZEB-1027: FROST
@@ -418,20 +434,31 @@ pub fn derive_dkg_ceremony_id(
 /// is INTENTIONALLY excluded: with HLC each proposer would mint a
 /// distinct id and peers couldn't share one ceremony.
 ///
-/// Each `(members, threshold, proposed_epoch, space_id)` tuple
-/// identifies at most one refresh ceremony: `proposed_epoch` is
+/// Each `(members, threshold, proposed_epoch, attempt, space_id)`
+/// tuple identifies at most one refresh ceremony: `proposed_epoch` is
 /// `current_epoch + 1`, and refresh COMPLETION advances `current_epoch`
 /// before any next refresh can derive a new id. Also recomputed by the
 /// engine's rf rn=1 ingest gate (ZEB-1027) so a stale or forged rn=1
 /// whose id does not match the shape it would seed can never wedge the
 /// singleton `pending_refresh` slot.
+///
+/// ZEB-1028: `attempt` is the deadline-retry counter. Attempt 0 hashes
+/// EXACTLY the ZEB-1027 input (ids for first proposals are unchanged);
+/// attempt N > 0 appends `attempt_le4`, so a retry after a deadline
+/// abort derives a DISTINCT id while concurrent re-proposers at the
+/// same attempt still converge on one shared ceremony (preserving the
+/// R9 property the HLC exclusion bought). The conditional append is
+/// length-unambiguous: every other field is fixed-width, so the two
+/// forms are `16k + 36` vs `16k + 40` bytes and no member-count change
+/// (a multiple of 16) can make them collide.
 pub fn derive_refresh_ceremony_id(
     members: &[OwnerAddr],
     threshold: u16,
     proposed_epoch: u64,
+    attempt: u32,
     space_id: &SpaceId,
 ) -> [u8; 32] {
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 16);
+    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 16 + 4);
     for a in members {
         hasher_input.extend_from_slice(&a.0);
     }
@@ -439,6 +466,9 @@ pub fn derive_refresh_ceremony_id(
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(b"refresh-v1");
     hasher_input.extend_from_slice(&space_id.0);
+    if attempt != 0 {
+        hasher_input.extend_from_slice(&attempt.to_le_bytes());
+    }
     blake3::hash(&hasher_input).into()
 }
 
@@ -640,19 +670,84 @@ mod tests {
         use crate::owner_state_types::{OwnerAddr, SpaceId};
         let members = [OwnerAddr([0x11; 16]), OwnerAddr([0x22; 16])];
         let space = SpaceId([0xaa; 16]);
-        let base = derive_refresh_ceremony_id(&members, 2, 5, &space);
-        assert_eq!(base, derive_refresh_ceremony_id(&members, 2, 5, &space));
+        let base = derive_refresh_ceremony_id(&members, 2, 5, 0, &space);
+        assert_eq!(base, derive_refresh_ceremony_id(&members, 2, 5, 0, &space));
         let other_members = [OwnerAddr([0x11; 16]), OwnerAddr([0x33; 16])];
         assert_ne!(
             base,
-            derive_refresh_ceremony_id(&other_members, 2, 5, &space)
+            derive_refresh_ceremony_id(&other_members, 2, 5, 0, &space)
         );
-        assert_ne!(base, derive_refresh_ceremony_id(&members, 3, 5, &space));
-        assert_ne!(base, derive_refresh_ceremony_id(&members, 2, 6, &space));
+        assert_ne!(base, derive_refresh_ceremony_id(&members, 3, 5, 0, &space));
+        assert_ne!(base, derive_refresh_ceremony_id(&members, 2, 6, 0, &space));
         assert_ne!(
             base,
-            derive_refresh_ceremony_id(&members, 2, 5, &SpaceId([0xbb; 16]))
+            derive_refresh_ceremony_id(&members, 2, 5, 0, &SpaceId([0xbb; 16]))
         );
+        // ZEB-1028: the attempt counter binds too — each retry derives a
+        // fresh id, while the same attempt stays deterministic.
+        assert_ne!(base, derive_refresh_ceremony_id(&members, 2, 5, 1, &space));
+        assert_ne!(
+            derive_refresh_ceremony_id(&members, 2, 5, 1, &space),
+            derive_refresh_ceremony_id(&members, 2, 5, 2, &space)
+        );
+        assert_eq!(
+            derive_refresh_ceremony_id(&members, 2, 5, 1, &space),
+            derive_refresh_ceremony_id(&members, 2, 5, 1, &space)
+        );
+    }
+
+    #[test]
+    fn refresh_id_attempt_zero_matches_pre_zeb1028_derivation() {
+        // Recompute the ZEB-1027 input layout by hand (members ||
+        // epoch_le8 || threshold_le2 || b"refresh-v1" || space_id — no
+        // attempt) and pin that attempt 0 still derives EXACTLY that
+        // id: a ZEB-1027 peer's first proposal and a ZEB-1028 peer's
+        // must converge on one ceremony.
+        use crate::owner_state_types::{OwnerAddr, SpaceId};
+        let members = [OwnerAddr([0x11; 16]), OwnerAddr([0x22; 16])];
+        let space = SpaceId([0xaa; 16]);
+        let mut input: Vec<u8> = Vec::new();
+        for a in &members {
+            input.extend_from_slice(&a.0);
+        }
+        input.extend_from_slice(&5u64.to_le_bytes());
+        input.extend_from_slice(&2u16.to_le_bytes());
+        input.extend_from_slice(b"refresh-v1");
+        input.extend_from_slice(&space.0);
+        let legacy: [u8; 32] = blake3::hash(&input).into();
+        assert_eq!(
+            legacy,
+            derive_refresh_ceremony_id(&members, 2, 5, 0, &space)
+        );
+    }
+
+    #[test]
+    fn refresh_payload_attempt_zero_is_wire_stable_zeb1028() {
+        // The `at` key is omitted at attempt 0, so a ZEB-1027 decoder's
+        // bytes round-trip unchanged and a ZEB-1027-era event (no `at`
+        // key) decodes as attempt 0.
+        let p0 = RefreshRoundPayload {
+            ceremony_id: [0x5a; 32],
+            round_num: 1,
+            recipient_ciphertexts: None,
+            package: Some(vec![1, 2, 3]),
+            attempt: 0,
+        };
+        let mut bytes0 = Vec::new();
+        ciborium::ser::into_writer(&p0, &mut bytes0).unwrap();
+        assert!(
+            !bytes0.windows(2).any(|w| w == b"at"),
+            "attempt 0 must not serialize the `at` key"
+        );
+        let back0: RefreshRoundPayload = ciborium::de::from_reader(&bytes0[..]).unwrap();
+        assert_eq!(back0, p0);
+
+        let p1 = RefreshRoundPayload { attempt: 3, ..p0 };
+        let mut bytes1 = Vec::new();
+        ciborium::ser::into_writer(&p1, &mut bytes1).unwrap();
+        assert!(bytes1.windows(2).any(|w| w == b"at"));
+        let back1: RefreshRoundPayload = ciborium::de::from_reader(&bytes1[..]).unwrap();
+        assert_eq!(back1.attempt, 3);
     }
 
     #[test]
