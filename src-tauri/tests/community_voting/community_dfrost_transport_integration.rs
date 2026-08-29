@@ -1611,3 +1611,63 @@ async fn refresh_heals_lost_round_via_rebroadcast_zeb1028() {
     drop(alice_engine);
     drop(bob_engine);
 }
+
+/// ZEB-1028 / CodeAnt Major on #776: an explicit-attempt propose call
+/// is a retry/join of an OBSERVED ceremony; if the pending slot emptied
+/// between the caller's decision and the core's lock (the stalled
+/// refresh completed — epoch moved — or was aborted), the call must be
+/// dropped as stale instead of seeding a spurious new ceremony against
+/// the moved state.
+#[tokio::test]
+async fn refresh_retry_with_empty_slot_is_dropped_zeb1028() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xDA);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xDB);
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+    let community_id = SpaceId([0xDC; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    {
+        // Active committee, NO pending refresh — the state a completed
+        // (or aborted) ceremony leaves behind.
+        let mut log = alice.log.lock().await;
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 2;
+        log.committee_state.members = members.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+        log.committee_state.identifier_map =
+            harmony_app::community_dfrost_log::CommitteeState::build_identifier_map(&members);
+    }
+
+    let err = dfrost_propose_refresh_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        members,
+        2,
+        Some(1),
+    )
+    .await
+    .expect_err("stale retry against an empty slot must be dropped");
+    assert!(err.contains("no longer pending"), "unexpected error: {err}");
+    assert!(
+        alice
+            .log
+            .lock()
+            .await
+            .committee_state
+            .pending_refresh
+            .is_none(),
+        "the stale retry must not seed a new ceremony"
+    );
+}

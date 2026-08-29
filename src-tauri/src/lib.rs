@@ -65910,6 +65910,26 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
         // ZEB-1028: resolve the effective attempt — explicit for the
         // engine's deadline retry; otherwise join the incumbent's
         // attempt (or open attempt 0 on an empty slot).
+        //
+        // CodeAnt Major (#776): an EXPLICIT attempt is always a
+        // retry/join of a ceremony the caller OBSERVED — and the
+        // observation happened outside this lock. If the slot emptied
+        // in the gap (the stalled ceremony completed and advanced the
+        // epoch, or it was aborted), proceeding would seed a spurious
+        // brand-new ceremony against the moved state (a completed
+        // refresh would silently kick off a full extra rotation at the
+        // next epoch, which every peer would admit and auto-join).
+        // Re-validate under THIS lock — the same one that applies the
+        // seed — and drop the stale call; only an explicit-`None`
+        // (manual/initial propose) may open a ceremony on an empty
+        // slot.
+        if attempt.is_some() && log.committee_state.pending_refresh.is_none() {
+            return Err(
+                "dfrost_propose_refresh: retry/join targets a ceremony that is no longer \
+                 pending (completed or aborted since the caller's decision) — dropped as stale"
+                    .to_string(),
+            );
+        }
         let effective_attempt = attempt.unwrap_or_else(|| {
             log.committee_state
                 .pending_refresh
