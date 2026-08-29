@@ -2799,6 +2799,7 @@ mod tests {
     /// Build a properly-signed `di` event. `ceremony_override` forges a
     /// non-recomputing ceremony_id for the binding-gate test; `None`
     /// derives the honest id from the event's own HLC.
+    #[allow(clippy::too_many_arguments)]
     fn signed_di(
         sk: &ed25519_dalek::SigningKey,
         actor: OwnerAddr,
@@ -3185,12 +3186,7 @@ mod tests {
         }
 
         wait_until("tick re-broadcasts the pending ceremony", || async {
-            driver
-                .rebroadcasts
-                .lock()
-                .await
-                .iter()
-                .any(|c| *c == ceremony_id)
+            driver.rebroadcasts.lock().await.contains(&ceremony_id)
         })
         .await;
     }

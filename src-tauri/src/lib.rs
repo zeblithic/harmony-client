@@ -60613,28 +60613,25 @@ async fn ensure_dfrost_engine_for(
     // SAME shape the dfrost IPC wrappers build from NodeState, so
     // orchestrator-driven contributions and manual IPC contributions run
     // identical code.
-    let (driver, membership_resolver): (
-        Option<std::sync::Arc<dyn crate::community_dfrost_log_engine::DkgDriver>>,
-        Option<std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
-    ) = match driver_wiring {
-        Some(w) => {
-            let driver_handles = DfrostCoreHandles {
-                hlc_tracker: w.hlc_tracker,
-                adopt_floor: w.adopt_floor,
-                device_id: w.device_id,
-                self_owner: local_owner,
-                signing_key: w.signing_key,
-                dfrost_logs: dfrost_logs.clone(),
-                identity_resolver: Some(identity_resolver.clone()),
-                dfrost_log_registry: Some(registry.clone()),
-            };
-            (
-                Some(production_dkg_driver(driver_handles, app_handle.clone())),
-                Some(w.membership_resolver),
-            )
-        }
-        None => (None, None),
-    };
+    let mut driver: Option<std::sync::Arc<dyn crate::community_dfrost_log_engine::DkgDriver>> =
+        None;
+    let mut membership_resolver: Option<
+        std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
+    > = None;
+    if let Some(w) = driver_wiring {
+        let driver_handles = DfrostCoreHandles {
+            hlc_tracker: w.hlc_tracker,
+            adopt_floor: w.adopt_floor,
+            device_id: w.device_id,
+            self_owner: local_owner,
+            signing_key: w.signing_key,
+            dfrost_logs: dfrost_logs.clone(),
+            identity_resolver: Some(identity_resolver.clone()),
+            dfrost_log_registry: Some(registry.clone()),
+        };
+        driver = Some(production_dkg_driver(driver_handles, app_handle.clone()));
+        membership_resolver = Some(w.membership_resolver);
+    }
 
     let params = crate::community_dfrost_log_engine::DfrostLogEngineParams {
         community_id,
@@ -63621,9 +63618,9 @@ pub async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime, H: tauri::Runti
             .unwrap_or_default()
             .as_millis() as u64;
         let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
-            &hlc_tracker,
-            &adopt_floor,
-            &device_id,
+            hlc_tracker,
+            adopt_floor,
+            device_id,
             wall_now_ms,
         )
         .await;
@@ -63795,9 +63792,9 @@ pub async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime, H: tauri::Runti
         .unwrap_or_default()
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
-        &hlc_tracker,
-        &adopt_floor,
-        &device_id,
+        hlc_tracker,
+        adopt_floor,
+        device_id,
         wall_now_ms,
     )
     .await;
