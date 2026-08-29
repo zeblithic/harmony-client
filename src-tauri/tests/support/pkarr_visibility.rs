@@ -37,22 +37,32 @@ use ed25519_dalek::VerifyingKey;
 /// the message on deadline. Each attempt uses a fresh `PkarrResolver` so the
 /// 60s negative cache can never mask a late publish (mechanism 2 above).
 ///
-/// 10s (100×100ms) rather than the historical 5s: headroom for scheduler
-/// jitter on the loaded 4-vCPU CI runners (ZEB-1013 precedent). The loop
-/// exits on first success, so the pass path never pays for it.
+/// 10s rather than the historical 5s: headroom for scheduler jitter on the
+/// loaded 4-vCPU CI runners (ZEB-1013 precedent). The loop exits on first
+/// success, so the pass path never pays for it. The budget is a wall-clock
+/// deadline (`tokio::time::timeout`), not an iteration count — a slow
+/// `resolve_window` (each GET carries its own 5s relay timeout) counts
+/// against it rather than silently stretching the barrier.
 pub(crate) async fn await_record_visible_any(
     relay_client: &Arc<harmony_pkarr::RelayClient>,
     probe_vks: &[VerifyingKey],
     what: &str,
 ) {
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let fresh = harmony_pkarr::PkarrResolver::new(Arc::clone(relay_client));
-        if let Ok(Some(_)) = fresh.resolve_window(probe_vks).await {
-            return;
+    let poll = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let fresh = harmony_pkarr::PkarrResolver::new(Arc::clone(relay_client));
+            if let Ok(Some(_)) = fresh.resolve_window(probe_vks).await {
+                return;
+            }
         }
+    };
+    if tokio::time::timeout(Duration::from_secs(10), poll)
+        .await
+        .is_err()
+    {
+        panic!("{what} did not appear in the mock relay within 10s (any window epoch)");
     }
-    panic!("{what} did not appear in the mock relay within 10s (any window epoch)");
 }
 
 /// Case-A invite probe keys for `token_sig`: one per epoch in the ±1

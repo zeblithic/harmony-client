@@ -1341,7 +1341,6 @@ async fn identified_resolve_returns_beacon_identity() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
 
         // ZEB-827: strict resolve needs the community id (the vouch binds it)
         // and the enrolled device-key set (alice's enrolled community key signed
@@ -1431,7 +1430,6 @@ async fn identified_resolve_filters_own_endpoint() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
 
         let cfg = harmony_app::community_rendezvous::rendezvous_config_from_env();
         // ZEB-827: the self-filter drops alice's own slot before the vouch check,
@@ -1520,7 +1518,6 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
         let alice_node_id = *setup.alice_ep.node_id().as_bytes();
 
         // The owner the driver derives from the record's identity bytes — the
@@ -1656,7 +1653,6 @@ async fn gateway_dial_rejects_beacon_when_device_not_enrolled() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
         let alice_node_id = *setup.alice_ep.node_id().as_bytes();
 
         // Ctx whose enrolled set is EMPTY, so alice's real, epoch-valid beacon
