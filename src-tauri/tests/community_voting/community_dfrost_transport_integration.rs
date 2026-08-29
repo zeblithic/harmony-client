@@ -1537,8 +1537,20 @@ async fn refresh_heals_lost_round_via_rebroadcast_zeb1028() {
     )
     .await
     .expect("alice initiates DKG");
+    // Wait on EACH log before the combined assert (CI shard flush on
+    // #776: bob reaches dk quorum first — he holds alice's dk plus his
+    // own — so waiting on bob alone races alice's promotion).
     expect_converged(
-        wait_converged("both active after DKG", &bob.log, |l| {
+        wait_converged("alice active after DKG", &alice.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    expect_converged(
+        wait_converged("bob active after DKG", &bob.log, |l| {
             l.committee_state.active
         })
         .await,
