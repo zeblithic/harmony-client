@@ -28,3 +28,8 @@ mod error_phrasing_regression;
 mod ipc_arg_casing;
 #[path = "misc/open_join_shed_acceptor_harness_integration.rs"]
 mod open_join_shed_acceptor_harness_integration;
+
+// ZEB-1021: shared mock-relay visibility barrier (epoch tolerance window +
+// per-attempt fresh resolver). Shared across umbrella binaries via #[path].
+#[path = "support/pkarr_visibility.rs"]
+mod pkarr_visibility;

@@ -36,3 +36,8 @@ mod friend_token_roundtrip_integration;
 mod grant_ingest_seam_integration;
 #[path = "dm/mail_sync_integration.rs"]
 mod mail_sync_integration;
+
+// ZEB-1021: shared mock-relay visibility barrier (epoch tolerance window +
+// per-attempt fresh resolver). Shared across umbrella binaries via #[path].
+#[path = "support/pkarr_visibility.rs"]
+mod pkarr_visibility;

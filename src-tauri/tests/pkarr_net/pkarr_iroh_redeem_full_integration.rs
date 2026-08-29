@@ -268,6 +268,9 @@ pub(crate) struct TwoPartySetup {
     pub(crate) invite_pub: Arc<harmony_app::pkarr_invite_publisher::PkarrInvitePublisher>,
     pub(crate) pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
     pub(crate) pkarr_publisher: Arc<harmony_pkarr::PkarrPublisher>,
+    /// ZEB-1021: the raw relay client, so the visibility barrier can build a
+    /// fresh (cache-free) resolver per poll attempt.
+    pub(crate) relay_client: Arc<harmony_pkarr::RelayClient>,
 
     // ── keep-alive ──────────────────────────────────────────────────────
     pub(crate) _alice_accept: tokio::task::JoinHandle<()>,
@@ -705,6 +708,7 @@ pub(crate) async fn setup_two_party_iroh_handshake_with_config(
         invite_pub,
         pkarr_resolver,
         pkarr_publisher,
+        relay_client: client,
         _alice_accept: alice_accept,
         _bob_accept: bob_accept,
         _relay: relay,
@@ -712,40 +716,6 @@ pub(crate) async fn setup_two_party_iroh_handshake_with_config(
         _dir_alice: dir_alice,
         _dir_bob: dir_bob,
     }
-}
-
-/// Wait (≤5s) for Alice's case-A pkarr record — keyed on the invite token's
-/// signature for the current epoch — to become visible in the mock relay.
-/// Returns the probe verifying key so callers can re-resolve it later (e.g.
-/// to assert the record disappears after the invite is consumed).
-async fn await_pkarr_record_visible(
-    pkarr_resolver: &harmony_pkarr::PkarrResolver,
-    token_sig: &[u8; 64],
-) -> ed25519_dalek::VerifyingKey {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as u64;
-    let epoch_id = harmony_pkarr::current_epoch_id(now_ms);
-    let probe_signing = harmony_pkarr::derive_ephemeral_key(
-        harmony_pkarr::PkarrCase::Invite,
-        token_sig,
-        &epoch_id.to_be_bytes(),
-    );
-    let probe_verifying = probe_signing.verifying_key();
-    let mut record_visible = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Ok(Some(_)) = pkarr_resolver.resolve(&probe_verifying).await {
-            record_visible = true;
-            break;
-        }
-    }
-    assert!(
-        record_visible,
-        "alice's pkarr record must appear in the mock relay within 5s before driving Bob's IPC"
-    );
-    probe_verifying
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -858,7 +828,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
 
         // ── 7. Drive Bob's IPC. ─────────────────────────────────────────
         // ZEB-325 PR #159 R4-3 (CodeRabbit NITPICK): capture nav-updated
@@ -1193,7 +1163,7 @@ async fn targeted_invite_only_generate_then_redeem_roundtrip() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
 
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
             invite_url,
@@ -1362,7 +1332,7 @@ async fn targeted_invite_only_multi_device_redeem_opens_correct_envelope() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
 
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
             invite_url,
@@ -1542,7 +1512,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
 
         // ── 7. Drive Bob's IPC. ─────────────────────────────────────────
         // Bob passes his OWN bob_comm_sk as signing_key. The epoch key was NOT
@@ -1656,9 +1626,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
         // not by re-resolving the relay (which would keep returning the stale
         // record for far longer than the test's 5s budget). The handle format
         // mirrors `PkarrInvitePublisher::register_invite`: `invite:{hex(sig)}`.
-        // `probe_verifying` is retained for the resolve above; the
-        // active-handle check is the deterministic teardown signal.
-        let _ = probe_verifying;
+        // The active-handle check is the deterministic teardown signal.
         let invite_handle = format!("invite:{}", hex::encode(token_sig));
         let mut handle_gone = false;
         for _ in 0..50 {
@@ -1797,7 +1765,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe_verifying = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
 
         // ── Bob's owner-state SyncEngine over a temp identity dir. ──────
         // Shares the SAME `bob_crdt_state` Arc the redeem mutates, so the
@@ -2033,7 +2001,7 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
         let invite_handle = format!("invite:{}", hex::encode(token_sig));
         assert!(
             s.pkarr_publisher
@@ -2241,7 +2209,7 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
 
         // Real wall-clock now — production reads the cache with SystemTime::now()
         // and the cache TTL-purges stale entries.
@@ -2381,7 +2349,7 @@ async fn zeb899_latch_commit_failure_degrades_to_unreachable() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
 
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
             invite_url,
@@ -2496,7 +2464,7 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
         let invite_handle = format!("invite:{}", hex::encode(token_sig));
         assert!(
             s.pkarr_publisher
@@ -2746,7 +2714,7 @@ async fn zeb903_reattempt_driver_converges_latched_join_on_epoch_bump() {
         s.invite_pub
             .register_invite(invite_payload.invite_token.as_ref().map(|t| t.sig))
             .await;
-        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&s.relay_client, &token_sig).await;
         let invite_handle = format!("invite:{}", hex::encode(token_sig));
 
         // Seed the "first attempt landed host-side, delivery failed" state —

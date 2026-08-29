@@ -90,38 +90,6 @@ fn identity_pub_for(sk: &SigningKey) -> [u8; 64] {
     combined
 }
 
-/// Wait (≤5s) for Alice's case-A pkarr record — keyed on the friend token's
-/// signature for the current epoch — to become visible in the mock relay.
-async fn await_pkarr_record_visible(
-    pkarr_resolver: &harmony_pkarr::PkarrResolver,
-    token_sig: &[u8; 64],
-) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as u64;
-    let epoch_id = harmony_pkarr::current_epoch_id(now_ms);
-    let probe_signing = harmony_pkarr::derive_ephemeral_key(
-        harmony_pkarr::PkarrCase::Invite,
-        token_sig,
-        &epoch_id.to_be_bytes(),
-    );
-    let probe_verifying = probe_signing.verifying_key();
-    let mut record_visible = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Ok(Some(_)) = pkarr_resolver.resolve(&probe_verifying).await {
-            record_visible = true;
-            break;
-        }
-    }
-    assert!(
-        record_visible,
-        "alice's friend-token pkarr record must appear in the mock relay within 5s \
-         before driving Bob's redeem"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn friend_token_roundtrip_mutual_active_token_friends() {
     let _ = tracing_subscriber::fmt()
@@ -300,7 +268,7 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
         // None expiry → the consent gate (`is_friend_token_active`) treats this
         // token as live until consumed; the acceptor's gate then passes.
         friend_pub.register_friend_token(&token_sig, None).await;
-        await_pkarr_record_visible(&pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&client, &token_sig).await;
 
         // ── 7. Bob redeems. ─────────────────────────────────────────────
         let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));

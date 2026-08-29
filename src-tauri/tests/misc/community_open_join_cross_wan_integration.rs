@@ -29,11 +29,12 @@
 //! keyed by `rendezvous_slot_key(epoch_key, slot, current_epoch_id(now))` with
 //! Alice's `ReachabilityAnnouncePayload` as the routing blob. The spawned
 //! publisher task then PUTs that record into the mock relay (immediate, since
-//! `register` schedules `next_publish_at = now`). We poll
-//! `pkarr.resolve(rendezvous_slot_verifying_key(epoch_key, slot, epoch))` until
-//! the record is visible before driving Bob's dial — identical in spirit to the
-//! invite-only test's `await_pkarr_record_visible`, but keyed on the rendezvous
-//! slot vk instead of the invite-token-derived ephemeral key.
+//! `register` schedules `next_publish_at = now`). We poll the relay until the
+//! record is visible under ANY epoch in the ±1 tolerance window (ZEB-1021 —
+//! mirroring production resolves; see `tests/support/pkarr_visibility.rs`)
+//! before driving Bob's dial — identical in spirit to the invite-only test's
+//! `await_pkarr_record_visible`, but keyed on the rendezvous slot vk instead
+//! of the invite-token-derived ephemeral key.
 //!
 //! Slot selection is by advertiser rank (`slot_for_advertiser`: sort the
 //! advertiser set ascending by 16-byte address, position == slot). To force a
@@ -270,9 +271,10 @@ impl OpenJoinSetup {
     }
 
     /// Drive Alice's rendezvous publisher for the given advertiser set
-    /// (`me = alice_addr`), then poll the mock relay (through a FRESH resolver,
-    /// immune to any prior negative-cache entry) until the resulting slot record
-    /// is visible. Returns the slot index Alice claimed.
+    /// (`me = alice_addr`), then poll the mock relay until the resulting slot
+    /// record is visible (the barrier rebuilds its resolver per attempt, so no
+    /// prior negative-cache entry can mask it). Returns the slot index Alice
+    /// claimed.
     async fn publish_rendezvous_slot(&self, advertisers: Vec<OwnerAddr>) -> u16 {
         let slot =
             harmony_app::community_rendezvous::slot_for_advertiser(&advertisers, &self.alice_addr)
@@ -292,7 +294,7 @@ impl OpenJoinSetup {
                 self.alice_addr,
             )
             .await;
-        await_rendezvous_slot_visible(&self.fresh_resolver(), &self.epoch_key, slot).await;
+        await_rendezvous_slot_visible(&self.relay_client, &self.epoch_key, slot).await;
         slot
     }
 
@@ -703,31 +705,30 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
     }
 }
 
-/// Poll (≤5s) until Alice's rendezvous slot record for `slot` is visible in the
-/// mock relay under `rendezvous_slot_verifying_key(epoch_key, slot, epoch)` for
-/// the joiner's current wall-clock epoch. Mirrors `await_pkarr_record_visible`
-/// in the invite-only test but keyed on the rendezvous slot vk.
+/// Poll until Alice's rendezvous slot record for `slot` is visible in the mock
+/// relay under `rendezvous_slot_verifying_key(epoch_key, slot, epoch)` for ANY
+/// epoch in the ±1 tolerance window — the same window every production resolve
+/// uses. ZEB-1021: the previous single-epoch, single-resolver form hard-missed
+/// when the weekly epoch rolled over between Alice's publish and this poll
+/// (and its resolver's 60s negative cache collapsed the poll loop into one
+/// real relay query); see `tests/support/pkarr_visibility.rs` for both
+/// mechanisms.
 async fn await_rendezvous_slot_visible(
-    pkarr_resolver: &harmony_pkarr::PkarrResolver,
+    relay_client: &Arc<harmony_pkarr::RelayClient>,
     epoch_key: &EpochKey,
     slot: u16,
 ) {
-    let now_ms = wall_ms();
-    let epoch_id = harmony_pkarr::current_epoch_id(now_ms);
-    let vk = rendezvous_slot_verifying_key(epoch_key, slot, epoch_id);
-    let mut visible = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Ok(Some(_)) = pkarr_resolver.resolve(&vk).await {
-            visible = true;
-            break;
-        }
-    }
-    assert!(
-        visible,
-        "alice's rendezvous slot-{slot} record must appear in the mock relay within 5s \
-         before driving Bob's open-join dial"
-    );
+    let probe_vks: Vec<ed25519_dalek::VerifyingKey> =
+        harmony_pkarr::epoch_tolerance_window(wall_ms())
+            .into_iter()
+            .map(|epoch_id| rendezvous_slot_verifying_key(epoch_key, slot, epoch_id))
+            .collect();
+    crate::pkarr_visibility::await_record_visible_any(
+        relay_client,
+        &probe_vks,
+        &format!("alice's rendezvous slot-{slot} record (needed before Bob's open-join dial)"),
+    )
+    .await;
 }
 
 fn wall_ms() -> u64 {
@@ -1340,7 +1341,7 @@ async fn identified_resolve_returns_beacon_identity() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
 
         // ZEB-827: strict resolve needs the community id (the vouch binds it)
         // and the enrolled device-key set (alice's enrolled community key signed
@@ -1430,7 +1431,7 @@ async fn identified_resolve_filters_own_endpoint() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
 
         let cfg = harmony_app::community_rendezvous::rendezvous_config_from_env();
         // ZEB-827: the self-filter drops alice's own slot before the vouch check,
@@ -1519,7 +1520,7 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
         let alice_node_id = *setup.alice_ep.node_id().as_bytes();
 
         // The owner the driver derives from the record's identity bytes — the
@@ -1655,7 +1656,7 @@ async fn gateway_dial_rejects_beacon_when_device_not_enrolled() {
         let setup = setup_two_party_open_join().await;
         let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
-        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+        await_rendezvous_slot_visible(&setup.relay_client, &setup.epoch_key, slot).await;
         let alice_node_id = *setup.alice_ep.node_id().as_bytes();
 
         // Ctx whose enrolled set is EMPTY, so alice's real, epoch-valid beacon
@@ -1736,3 +1737,72 @@ async fn gateway_dial_rejects_beacon_when_device_not_enrolled() {
 // The escalating-batch failover test (Test 2) needs ≥2 slots to widen past a
 // dead slot 0; reference the const so an accidental N drift surfaces here.
 const _: () = assert!(RENDEZVOUS_SLOT_COUNT >= 2, "failover test needs >= 2 slots");
+
+// ────────────────────────────────────────────────────────────────────────────
+// ZEB-1021: the visibility barrier must tolerate a weekly epoch rollover
+// between Alice's publish and the poll.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A slot record published moments before the weekly epoch boundary sits under
+/// an ADJACENT epoch's derived key relative to the poller. The barrier polls
+/// the same ±1 `epoch_tolerance_window` production resolvers use, so it must
+/// still find the record. The pre-fix barrier derived ONLY the poll-time
+/// epoch's vk and hard-missed for its whole deadline (the ZEB-1021 CI flake:
+/// run 32989223004 executed across the Thursday 00:00 UTC weekly boundary).
+///
+/// The record is published under `epoch + 1` rather than `epoch - 1` (the two
+/// are symmetric for the window assertion) because +1 keeps THIS test
+/// deterministic if a real rollover lands mid-test: the window can only
+/// advance during the run, and an advanced window still contains +1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rendezvous_barrier_tolerates_epoch_boundary_zeb1021() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
+        let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
+        let publisher = Arc::new(harmony_pkarr::PkarrPublisher::new(Arc::clone(&client)));
+        let publisher_handle = Arc::clone(&publisher).spawn();
+
+        let epoch_key = EpochKey::new([0xE7; 32]);
+        let slot: u16 = 0;
+
+        // Inner-signed record: identity pub = x25519(32) ‖ ed25519_vk(32);
+        // `sign_new` guards that the signing key matches the ed25519 half.
+        let id_sk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(id_sk.verifying_key().as_bytes());
+
+        let ek_bytes = *epoch_key.as_bytes();
+        let key_builder: harmony_pkarr::EphemeralKeyBuilder = Arc::new(move |at_ms| {
+            let adjacent = harmony_pkarr::current_epoch_id(at_ms) + 1;
+            harmony_app::community_rendezvous::rendezvous_slot_key(
+                &EpochKey::new(ek_bytes),
+                slot,
+                adjacent,
+            )
+        });
+        let record_builder: harmony_pkarr::RecordBuilder = Arc::new(move |at_ms| {
+            harmony_pkarr::PkarrRoutingRecord::sign_new(
+                vec![0xAB; 8],
+                id_pub,
+                at_ms,
+                at_ms + 60_000,
+                &id_sk,
+            )
+            .expect("sign adjacent-epoch slot record")
+        });
+        publisher
+            .register(
+                "zeb1021-adjacent-epoch-slot".into(),
+                key_builder,
+                record_builder,
+            )
+            .await;
+
+        await_rendezvous_slot_visible(&client, &epoch_key, slot).await;
+
+        publisher_handle.abort();
+    })
+    .await
+    .expect("rendezvous_barrier_tolerates_epoch_boundary_zeb1021 timed out at 30s");
+}

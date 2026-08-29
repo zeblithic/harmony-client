@@ -45,3 +45,8 @@ mod zeb918_epoch_rotation;
 // party — the witness node — on top of it.
 #[path = "pkarr_net/zeb911_witness_redeem.rs"]
 mod zeb911_witness_redeem;
+
+// ZEB-1021: shared mock-relay visibility barrier (epoch tolerance window +
+// per-attempt fresh resolver). Shared across umbrella binaries via #[path].
+#[path = "support/pkarr_visibility.rs"]
+mod pkarr_visibility;

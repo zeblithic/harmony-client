@@ -148,32 +148,6 @@ fn identity_pub_for(sk: &SigningKey) -> [u8; 64] {
     combined
 }
 
-/// Wait (≤5s) for Alice's Case-A pkarr record (keyed on the friend token's
-/// signature for the current epoch) to become visible in the mock relay.
-async fn await_pkarr_record_visible(
-    pkarr_resolver: &harmony_pkarr::PkarrResolver,
-    token_sig: &[u8; 64],
-) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as u64;
-    let epoch_id = harmony_pkarr::current_epoch_id(now_ms);
-    let probe_signing = harmony_pkarr::derive_ephemeral_key(
-        harmony_pkarr::PkarrCase::Invite,
-        token_sig,
-        &epoch_id.to_be_bytes(),
-    );
-    let probe_verifying = probe_signing.verifying_key();
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Ok(Some(_)) = pkarr_resolver.resolve(&probe_verifying).await {
-            return;
-        }
-    }
-    panic!("alice's friend-token pkarr record did not appear within 5s");
-}
-
 /// No-op dispatcher for the multiplexer's invite + PEX slots (only the friend
 /// ALPN is ever dialed in this test).
 struct NoopDispatcher;
@@ -420,7 +394,7 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
         let token_url = encode_friend_token_url(&token_payload).expect("encode friend token url");
 
         friend_pub.register_friend_token(&token_sig, None).await;
-        await_pkarr_record_visible(&pkarr_resolver, &token_sig).await;
+        crate::pkarr_visibility::await_invite_record_visible(&client, &token_sig).await;
 
         // ── 7. Bob redeems (real handshake over harmony/friend/v1). ───────
         let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
