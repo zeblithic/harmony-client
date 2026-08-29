@@ -129,6 +129,7 @@ pub mod community_device_retire_deposit;
 pub mod community_dfrost_crypto;
 pub mod community_dfrost_log;
 pub mod community_dfrost_log_engine;
+pub mod community_dfrost_persist;
 pub mod community_dfrost_types;
 pub mod community_fork;
 pub mod community_gateway_dial_driver;
@@ -1391,9 +1392,15 @@ pub struct NodeState {
     /// registered `DfrostLogEngine` so local IPC applies and peer inbound
     /// applies converge on one log.
     ///
-    /// `DfrostLog` is in-memory only: committee/ceremony state does not
-    /// survive a restart (durable committee state is ZEB-753's VerifiedLog
-    /// adoption). Engine + Zenoh-adapter teardown is owned by
+    /// ZEB-753 durability contract: the DURABLE subset of `DfrostLog`
+    /// (accepted events, materialized `CommitteeState` minus its
+    /// serde-skipped secrets, beacon index) survives restarts via the
+    /// sealed `dfrost.cbor` snapshot (`community_dfrost_persist`),
+    /// restored by `ensure_dfrost_engine_for` and saved by the engine's
+    /// debounced task (flushed at registry shutdown). Everything ELSE is
+    /// in-memory only BY DESIGN: local DKG secrets/nonces and the three
+    /// pending-ceremony slots die with the process (interactive rounds
+    /// are not restartable). Engine + Zenoh-adapter teardown is owned by
     /// `dfrost_log_registry` shutdown in stop_inner / the start_node
     /// restart path, and BOTH clear this map right after the engines stop
     /// (PR #768 review) — retaining it would leak pending ceremonies and
@@ -59778,6 +59785,7 @@ mod zeb718_voting_reconcile_tests {
             [0u8; 64],
             None,
             None, // driver_wiring (ZEB-1022): ingest-only engine in this fixture
+            None, // identity_dir (ZEB-753): no durability in this fixture
         )
         .await
         .expect_err("send on a dead adapter channel must surface as Err");
@@ -59804,6 +59812,7 @@ mod zeb718_voting_reconcile_tests {
             [0u8; 64],
             None,
             None, // driver_wiring (ZEB-1022): ingest-only engine in this fixture
+            None, // identity_dir (ZEB-753): no durability in this fixture
         )
         .await
         .expect("retry after rollback must succeed");
@@ -59815,6 +59824,78 @@ mod zeb718_voting_reconcile_tests {
             .try_recv()
             .expect("retry must enqueue exactly one adapter request");
         assert_eq!(req.community_id, cid);
+    }
+
+    /// ZEB-753: `ensure_dfrost_engine_for` restores the persisted
+    /// committee snapshot into the shared log map on vacancy, and the
+    /// restore preserves the map entry's shared `publish_order`/`dirty`
+    /// Arcs (asserted indirectly: the log the map hands out afterwards
+    /// carries the restored state).
+    #[tokio::test]
+    async fn ensure_dfrost_engine_restores_persisted_snapshot_zeb753() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
+        let cid = SpaceId([0x96; 16]);
+        let actor = OwnerAddr([0xcd; 16]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+
+        // Persist a snapshot with an active committee (as the engine's
+        // save task would after a completed DKG).
+        {
+            let mut log = crate::community_dfrost_log::DfrostLog::new();
+            log.committee_state.active = true;
+            log.committee_state.current_epoch = 3;
+            log.committee_state.joint_verifying_key = Some([0xC7; 32]);
+            log.beacon_index.insert([0x15; 32], [0x16; 32]);
+            let path = crate::community_dfrost_persist::dfrost_path_for(dir.path(), &cid);
+            let snapshot = crate::community_dfrost_persist::snapshot_for_persist(&log, &cid);
+            crate::community_dfrost_persist::write_snapshot(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &snapshot,
+            )
+            .unwrap();
+        }
+
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let dfrost_registry: Arc<
+            crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>,
+        > = Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::new());
+        let dfrost_logs: DfrostLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        ensure_dfrost_engine_for(
+            &dfrost_logs,
+            &dfrost_registry,
+            cid,
+            None, // no adapter channel — engine registers without Zenoh wiring
+            &signing_key,
+            actor,
+            crdt_state,
+            [0u8; 64],
+            None,
+            None, // driver_wiring: ingest-only engine in this fixture
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("ensure with persisted snapshot succeeds");
+
+        let log_arc = dfrost_logs
+            .lock()
+            .await
+            .get(&cid)
+            .cloned()
+            .expect("log inserted for community");
+        let g = log_arc.lock().await;
+        assert!(g.committee_state.active, "restored committee is active");
+        assert_eq!(g.committee_state.current_epoch, 3);
+        assert_eq!(g.committee_state.joint_verifying_key, Some([0xC7; 32]));
+        assert_eq!(
+            g.beacon_index.get(&[0x15; 32]),
+            Some(&[0x16; 32]),
+            "beacon index restored — oracle lookups survive the restart"
+        );
     }
 
     #[tokio::test]
@@ -60569,10 +60650,36 @@ async fn ensure_dfrost_engine_for(
     self_identity_pub_64: [u8; 64],
     app_handle: Option<tauri::AppHandle<tauri::Wry>>,
     driver_wiring: Option<DfrostDriverWiring>,
+    identity_dir: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
     // Fast path: engine already registered for this community.
     if registry.get(community_id).await.is_some() {
         return Ok(());
+    }
+
+    // ZEB-753: derive the persistence target up front. A cipher-derive
+    // failure (or a restore hard-error below) leaves persistence
+    // DISARMED for the session — the engine runs in-memory rather than
+    // risk clobbering a recoverable sealed file, mirroring the voting
+    // engine's posture.
+    let mut persist_target: Option<crate::community_dfrost_persist::DfrostPersistTarget> = None;
+    if let Some(dir) = identity_dir.as_deref() {
+        match crate::device_dataset_file::get_or_derive(dir) {
+            Ok(cipher) => {
+                persist_target = Some(crate::community_dfrost_persist::DfrostPersistTarget {
+                    identity_dir: dir.to_path_buf(),
+                    cipher,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?community_id,
+                    err = %e,
+                    "dfrost persist: device cipher unavailable; \
+                     running without committee-log durability this session"
+                );
+            }
+        }
     }
 
     // Get-or-insert the shared DfrostLog Arc — the same map the 5 dfrost
@@ -60588,6 +60695,65 @@ async fn ensure_dfrost_engine_for(
             })
             .clone()
     };
+
+    // ZEB-753: restore the persisted committee snapshot into an empty,
+    // inactive log (vacancy is the common case; an IPC racing this
+    // ensure may have created an empty placeholder — restoring into it
+    // is equally safe). `publish_order` and `dirty` are preserved
+    // across the swap: they are the Arcs every handle bundle sharing
+    // this map entry already cloned.
+    if let Some(target) = persist_target.as_ref() {
+        let needs_restore = {
+            let g = log_arc.lock().await;
+            g.events_is_empty() && !g.committee_state.active
+        };
+        if needs_restore {
+            let path = crate::community_dfrost_persist::dfrost_path_for(
+                &target.identity_dir,
+                &community_id,
+            );
+            let cipher = target.cipher.clone();
+            let cid = community_id;
+            match tokio::task::spawn_blocking(move || {
+                crate::community_dfrost_persist::load_dfrost(&cipher, &path, &cid)
+            })
+            .await
+            {
+                Ok(Ok(restored)) => {
+                    let mut g = log_arc.lock().await;
+                    // Re-check under the lock — an apply may have raced
+                    // the disk read, and its state must win.
+                    if g.events_is_empty() && !g.committee_state.active {
+                        let publish_order = g.publish_order.clone();
+                        let dirty = g.dirty.clone();
+                        *g = restored;
+                        g.publish_order = publish_order;
+                        g.dirty = dirty;
+                    }
+                }
+                Ok(Err(e)) => {
+                    // Present-but-unreadable (I/O) or misrouted (id
+                    // mismatch): do NOT arm persistence — the first save
+                    // would overwrite a file that may be recoverable.
+                    tracing::error!(
+                        ?community_id,
+                        err = %e,
+                        "dfrost persist: load failed on an existing file; \
+                         leaving persistence disarmed this session to avoid clobbering it"
+                    );
+                    persist_target = None;
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        ?community_id,
+                        err = %join_err,
+                        "dfrost persist: load task join error; persistence disarmed this session"
+                    );
+                    persist_target = None;
+                }
+            }
+        }
+    }
 
     // Production identity resolver — the same OwnerDeviceCacheResolver the
     // voting/channel engines use (`process_inbound` resolves event.actor →
@@ -60647,6 +60813,7 @@ async fn ensure_dfrost_engine_for(
         membership_resolver,
         orchestrator_config: crate::community_dfrost_log_engine::DfrostOrchestratorConfig::default(
         ),
+        persist: persist_target,
     };
 
     // Race-safe: only the caller that actually created the engine sends
@@ -60765,6 +60932,9 @@ async fn ensure_voting_engine_for(
                 signing_key: local_signing_key.clone(),
                 membership_resolver: membership_resolver.clone(),
             }),
+            // ZEB-753: same identity_dir as voting persistence — the
+            // committee snapshot lands beside voting.cbor.
+            identity_dir.clone(),
         )
         .await
         {
@@ -63168,7 +63338,7 @@ pub async fn dfrost_rebroadcast_pending_core<R: tauri::Runtime>(
             return Ok(());
         };
         let mut best: [Option<&crate::community_dfrost_types::SignedCommitteeEvent>; 4] = [None; 4];
-        for ev in log.events.iter().filter(|e| e.actor == handles.self_owner) {
+        for ev in log.events().filter(|e| e.actor == handles.self_owner) {
             let slot: Option<usize> = match ev.kind {
                 DfrostEventKind::CeremonyInit => ciborium::de::from_reader::<
                     crate::community_dfrost_types::CeremonyInitPayload,

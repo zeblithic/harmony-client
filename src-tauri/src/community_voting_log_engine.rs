@@ -5261,6 +5261,7 @@ mod tests {
                     driver: None,
                     membership_resolver: None,
                     orchestrator_config: Default::default(),
+                    persist: None,
                 },
             )
             .await;
@@ -5627,6 +5628,7 @@ mod tests {
                     driver: None,
                     membership_resolver: None,
                     orchestrator_config: Default::default(),
+                    persist: None,
                 },
             )
             .await;

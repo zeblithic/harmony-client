@@ -201,6 +201,7 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
                 driver: None,
                 membership_resolver: None,
                 orchestrator_config: Default::default(),
+                persist: None,
             },
         )
         .await;
@@ -523,6 +524,7 @@ async fn no_kd_ts_emission_when_not_committee_member() {
                 driver: None,
                 membership_resolver: None,
                 orchestrator_config: Default::default(),
+                persist: None,
             },
         )
         .await;

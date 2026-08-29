@@ -175,6 +175,7 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         driver: None,
         membership_resolver: None,
         orchestrator_config: Default::default(),
+        persist: None,
     })
     .await;
 
@@ -191,6 +192,7 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         driver: None,
         membership_resolver: None,
         orchestrator_config: Default::default(),
+        persist: None,
     })
     .await;
 

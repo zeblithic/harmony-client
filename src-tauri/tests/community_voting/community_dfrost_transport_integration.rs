@@ -526,6 +526,7 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         driver: None,
         membership_resolver: None,
         orchestrator_config: Default::default(),
+        persist: None,
     })
     .await;
 
@@ -542,6 +543,7 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         driver: None,
         membership_resolver: None,
         orchestrator_config: Default::default(),
+        persist: None,
     })
     .await;
 
@@ -937,6 +939,7 @@ async fn start_orchestrated(
             driver: Some(driver),
             membership_resolver: None,
             orchestrator_config: test_orchestrator_config(),
+            persist: None,
         },
     )
     .await
@@ -989,7 +992,7 @@ async fn dump_log_state(label: &'static str, log: &Arc<Mutex<DfrostLog>>) -> Str
         "{label}: active={} epoch={} events={} s1={} s2={} kp={} pending=[{}]",
         l.committee_state.active,
         l.committee_state.current_epoch,
-        l.events.len(),
+        l.event_count(),
         l.local_dkg_secret.is_some(),
         l.local_dkg_secret2.is_some(),
         l.local_key_package.is_some(),
@@ -1142,9 +1145,7 @@ async fn dkg_two_engine_auto_orchestrated_from_initiate_no_manual_seeding() {
     let lb = bob.log.lock().await;
     assert_converged_active(&la, &lb);
     assert!(
-        lb.events
-            .iter()
-            .any(|e| e.kind == DfrostEventKind::CeremonyInit),
+        lb.events().any(|e| e.kind == DfrostEventKind::CeremonyInit),
         "bob's log must contain the (re-minted) di that seeded him"
     );
     drop(la);
@@ -1298,9 +1299,7 @@ async fn dkg_recovers_when_initial_di_and_round1_are_lost() {
     let lb = bob.log.lock().await;
     assert_converged_active(&la, &lb);
     assert!(
-        lb.events
-            .iter()
-            .any(|e| e.kind == DfrostEventKind::CeremonyInit),
+        lb.events().any(|e| e.kind == DfrostEventKind::CeremonyInit),
         "bob's log must contain the re-minted di that seeded him"
     );
     drop(la);

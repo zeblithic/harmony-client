@@ -11,6 +11,29 @@
 //! the type lattice + `apply()` dispatcher with stub handlers (all return
 //! `Ok(())` except `apply_dkg_round` which checks pending-ceremony presence
 //! so the dispatcher's "unknown ceremony" error path is exercised).
+//!
+//! ZEB-753: the accepted-event set is backed by the core
+//! `VerifiedLog<DfrostEventPolicy>` engine (`harmony-crdt-sync`), the
+//! second production adopter after community-membership's
+//! `MembershipPolicy`. The adoption is EVENT-SET-shaped, deliberately
+//! narrower than membership's: the policy's `verify` carries only the
+//! envelope gate, and `State = ()` — deep verification stays fused in
+//! the six apply handlers because (a) signature verification awaits an
+//! async `IdentityResolver` (`LogPolicy::verify` is sync), (b) `di`
+//! admission is partly ENGINE context (the stale-replace policy binds
+//! to wall-clock ceremony quiet time, so replaying the log through the
+//! handlers would reject its own history), and (c) `apply_with_identity`
+//! materialises decrypt-derived secret state no pure fold over the
+//! event set can reproduce. What the core engine buys here: exact-
+//! duplicate applies are structural no-ops (id dedup), iteration is
+//! HLC-ordered by construction (discharging the old "caller is expected
+//! to order by HLC" doc obligation), and the trusted
+//! `from_verified_events` restore path is the substrate for the sealed
+//! on-disk snapshot (`community_dfrost_persist`). Supersession is
+//! unused (`SupersessionKey = ()`): re-mint lineages are NOT
+//! materialize-neutral (the first-arrived event is the one that shaped
+//! first-wins state), so compacting them would violate the core's
+//! neutrality contract.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -22,18 +45,95 @@ use frost_ristretto255::round1::SigningNonces;
 use frost_ristretto255::Identifier;
 use serde::{Deserialize, Serialize};
 
+use harmony_crdt_sync::verified_log::{InsertOutcome as CoreInsertOutcome, LogPolicy, VerifiedLog};
+
 use crate::community_dfrost_types::{DfrostEventKind, SignedCommitteeEvent};
 use crate::owner_state_types::OwnerAddr;
+
+/// Synthesized dedup/sort key for a `SignedCommitteeEvent` (ZEB-753).
+///
+/// The wire envelope carries no id field (and must not grow one — the
+/// zeb303 fixtures byte-pin the 8-key map), so the id is derived from
+/// the envelope: HLC-major, so `VerifiedLog`'s id-ordered iteration IS
+/// HLC order. `sig` is included so two DISTINCT events can never
+/// compare equal (an Ed25519 signature binds the whole signing-bytes
+/// image; two events differing anywhere else differ in `sig`), which
+/// also makes each re-minted re-broadcast (fresh HLC + fresh sig) a
+/// DISTINCT event — the transport's healing re-mints must never dedup
+/// against their originals.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DfrostEventId {
+    wall_ms: u64,
+    logical: u32,
+    device_id: String,
+    actor: OwnerAddr,
+    sig: Vec<u8>,
+}
+
+/// Extract the synthesized [`DfrostEventId`] for an event.
+pub fn dfrost_event_id(event: &SignedCommitteeEvent) -> DfrostEventId {
+    DfrostEventId {
+        wall_ms: event.hlc.wall_ms,
+        logical: event.hlc.logical,
+        device_id: event.hlc.device_id.clone(),
+        actor: event.actor,
+        sig: event.sig.clone(),
+    }
+}
+
+/// Envelope gate shared by BOTH apply paths and the log policy's
+/// `verify` (ZEB-753 single-sourcing of the check that `apply` and
+/// `apply_with_identity` previously duplicated by hand). Never
+/// reachable from honest peers — cheap defence-in-depth.
+pub(crate) fn check_envelope(event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+    if event.tag != 'd' || event.committee_tier != 0 {
+        return Err(ApplyError::UnexpectedEnvelope);
+    }
+    Ok(())
+}
+
+/// `LogPolicy` adopter for the D-FROST committee log (ZEB-753).
+///
+/// EVENT-SET-shaped (see the module doc for why this is deliberately
+/// narrower than membership's `MembershipPolicy`): `verify` is the
+/// envelope gate only, `State = ()`. The strict total order is the
+/// synthesized HLC-major id itself.
+pub(crate) struct DfrostEventPolicy;
+
+impl LogPolicy for DfrostEventPolicy {
+    type Event = SignedCommitteeEvent;
+    type EventId = DfrostEventId;
+    type State = ();
+    type Context = ();
+    type Error = ApplyError;
+    type SupersessionKey = ();
+
+    fn event_id(e: &SignedCommitteeEvent) -> DfrostEventId {
+        dfrost_event_id(e)
+    }
+
+    fn cmp(a: &SignedCommitteeEvent, b: &SignedCommitteeEvent) -> std::cmp::Ordering {
+        dfrost_event_id(a).cmp(&dfrost_event_id(b))
+    }
+
+    fn verify(e: &SignedCommitteeEvent, _prior: &(), _ctx: &()) -> Result<(), ApplyError> {
+        check_envelope(e)
+    }
+
+    fn materialize(_events: &[&SignedCommitteeEvent], _ctx: &()) {}
+}
 
 /// All D-FROST committee events for a single community, plus the
 /// materialized `CommitteeState`. Lives in
 /// `NodeState.dfrost_logs: HashMap<SpaceId, Arc<Mutex<DfrostLog>>>` once
 /// Task 9 wires the IPC surface.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct DfrostLog {
-    /// All accepted events, ordered by insert time (caller is expected
-    /// to order by HLC at verify time before invoking `apply`).
-    pub events: Vec<SignedCommitteeEvent>,
+    /// All accepted events, backed by `VerifiedLog` (ZEB-753): deduped
+    /// by the synthesized HLC-major [`DfrostEventId`] and iterated in
+    /// id (= HLC) order. Private — all access goes through the
+    /// accessors below so the backing engine stays swappable.
+    log: VerifiedLog<DfrostEventPolicy>,
 
     /// Materialized state derived from `events`. Reset/rebuilt on
     /// deserialization via the `serde(from = "CommitteeStateRaw")` shim.
@@ -49,9 +149,12 @@ pub struct DfrostLog {
     pub local_dkg_secret2: Option<dkg_r2::SecretPackage>,
 
     /// Local FROST `KeyPackage` (this node's signing share). Materialised
-    /// at DKG completion or refresh completion. NOT persisted in Phase
-    /// 4a-foundation (Phase 4b adds sealed-disk storage gated by the
-    /// device-binding flow).
+    /// at DKG completion or refresh completion. NOT persisted — ZEB-753
+    /// kept the signing share out of the `dfrost.cbor` snapshot
+    /// deliberately (identity-switch teardown contract: local secret
+    /// material dies with the process). A restarted node knows the
+    /// committee (restored public state) but cannot contribute
+    /// signatures until the next proactive refresh re-mints its share.
     pub local_key_package: Option<KeyPackage>,
 
     /// Local FROST `PublicKeyPackage` (joint verifying key + per-member
@@ -87,9 +190,46 @@ pub struct DfrostLog {
     /// Given a poll's beacon seed and the committee's epoch, callers compute
     /// the expected `message_hash = derive_vrf_seed(seed, epoch)` and look it up here.
     ///
-    /// Not persisted (same as `local_key_package`): rebuilt on replay.
+    /// ZEB-753: persisted in the sealed snapshot (`community_dfrost_persist`)
+    /// so completed beacons survive a restart — `DfrostBeaconOracle`
+    /// lookups for already-minted beacons must not go dark on reboot.
     /// Task 10: consulted by `DfrostBeaconOracle<R>` for `verify_ss`.
     pub beacon_index: HashMap<[u8; 32], [u8; 32]>,
+
+    /// ZEB-753: durability dirty signal. `notify_one` fires on every
+    /// successful apply (both apply paths route through
+    /// `insert_applied`), regardless of WHICH holder of the shared
+    /// `Arc<Mutex<DfrostLog>>` applied — engine ingest and the IPC/
+    /// driver cores alike. The engine's debounced save task awaits it.
+    /// `Notify` stores a permit, so an apply landing while the save
+    /// task is mid-write is not lost. Not serialized: `Arc` shared via
+    /// the `dfrost_logs` map, same pattern as `publish_order`.
+    pub dirty: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl std::fmt::Debug for DfrostLog {
+    /// Hand-written because `VerifiedLog` does not derive `Debug` —
+    /// and, deliberately, the secret fields render as presence flags
+    /// only (the old derive printed the FROST secret-package structs
+    /// into any debug log that formatted the struct).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DfrostLog")
+            .field("events", &self.log.events().collect::<Vec<_>>())
+            .field("committee_state", &self.committee_state)
+            .field("local_dkg_secret", &self.local_dkg_secret.is_some())
+            .field("local_dkg_secret2", &self.local_dkg_secret2.is_some())
+            .field("local_key_package", &self.local_key_package.is_some())
+            .field(
+                "local_pub_key_package",
+                &self.local_pub_key_package.is_some(),
+            )
+            .field(
+                "local_signing_nonces",
+                &self.local_signing_nonces.keys().collect::<Vec<_>>(),
+            )
+            .field("beacon_index", &self.beacon_index)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Persisted (CBOR) committee state for a community. The
@@ -440,10 +580,19 @@ impl DfrostLog {
     /// no-op `Ok(())` stubs to be fleshed out in Tasks 4–6.
     pub fn apply(&mut self, event: SignedCommitteeEvent) -> Result<(), ApplyError> {
         // Envelope sanity — never reachable from honest peers, but
-        // these are cheap defence-in-depth checks given the dispatcher
-        // already pattern-matches `event.kind`.
-        if event.tag != 'd' || event.committee_tier != 0 {
-            return Err(ApplyError::UnexpectedEnvelope);
+        // cheap defence-in-depth given the dispatcher already
+        // pattern-matches `event.kind`. Single-sourced with the log
+        // policy's `verify` (ZEB-753).
+        check_envelope(&event)?;
+
+        // ZEB-753: an EXACT duplicate (same synthesized id ⇒ same
+        // bytes) is a structural no-op. Previously it re-ran the
+        // (idempotent, first-wins) handler AND pushed a second copy
+        // onto the Vec; now neither happens. Re-minted re-broadcasts
+        // carry a fresh HLC + sig ⇒ a distinct id, so they still reach
+        // the handlers.
+        if self.log.contains(&dfrost_event_id(&event)) {
+            return Ok(());
         }
 
         let result = match event.kind {
@@ -456,8 +605,86 @@ impl DfrostLog {
         };
         result?;
 
-        self.events.push(event);
+        self.insert_applied(event);
         Ok(())
+    }
+
+    /// Store a handler-accepted event in the backing `VerifiedLog` and
+    /// fire the durability dirty signal (ZEB-753). Both apply paths
+    /// funnel here.
+    ///
+    /// The insert is infallible by construction — the envelope gate
+    /// (the policy's whole `verify`) already passed and the id was
+    /// checked absent before the handler ran — so anything but
+    /// `Inserted` indicates a logic drift worth a loud log line.
+    fn insert_applied(&mut self, event: SignedCommitteeEvent) {
+        let outcome = self.log.insert(event, &());
+        if !matches!(outcome, CoreInsertOutcome::Inserted) {
+            tracing::warn!(
+                "dfrost log insert of a handler-accepted event did not report Inserted; \
+                 apply-path dedup and policy verify are out of sync"
+            );
+        }
+        self.dirty.notify_one();
+    }
+
+    /// Iterate accepted events in synthesized-id order — which is
+    /// HLC-major order by construction (ZEB-753). This discharges the
+    /// old `events: Vec` doc obligation ("caller is expected to order
+    /// by HLC") structurally.
+    pub fn events(&self) -> impl Iterator<Item = &SignedCommitteeEvent> {
+        self.log.events()
+    }
+
+    /// Number of accepted events.
+    pub fn event_count(&self) -> usize {
+        self.log.len()
+    }
+
+    /// Whether the log holds no events.
+    pub fn events_is_empty(&self) -> bool {
+        self.log.is_empty()
+    }
+
+    /// Whether an event with this exact synthesized id was accepted.
+    pub fn contains_event(&self, id: &DfrostEventId) -> bool {
+        self.log.contains(id)
+    }
+
+    /// Snapshot the accepted-event set for persistence (ZEB-753).
+    /// Ordered by synthesized id (= HLC order).
+    pub(crate) fn export_events(&self) -> Vec<SignedCommitteeEvent> {
+        self.log.events().cloned().collect()
+    }
+
+    /// Rebuild a log from a trusted persisted snapshot (ZEB-753).
+    ///
+    /// Events restore through `VerifiedLog::from_verified_events` — no
+    /// re-verification (they were verified when first applied), no
+    /// handler replay (replaying through the handlers would REJECT
+    /// history the live engine admitted under engine-only context,
+    /// e.g. a stale-replace `di` — see the module doc). The three
+    /// pending slots are CLEARED: interactive ceremony rounds do not
+    /// survive a restart by design ("a node that missed a round cannot
+    /// retroactively join"), their secret halves were never persisted,
+    /// and a restored zombie `pending_dkg` would wedge new ceremonies
+    /// until the engine's stale-replace deadline. Local secret fields
+    /// start empty, exactly as the identity-switch teardown contract
+    /// requires (lib.rs `dfrost_logs` doc).
+    pub(crate) fn from_restored(
+        events: Vec<SignedCommitteeEvent>,
+        mut committee_state: CommitteeState,
+        beacon_index: HashMap<[u8; 32], [u8; 32]>,
+    ) -> Self {
+        committee_state.pending_dkg = None;
+        committee_state.pending_sign.clear();
+        committee_state.pending_refresh = None;
+        Self {
+            log: VerifiedLog::from_verified_events(events),
+            committee_state,
+            beacon_index,
+            ..Self::default()
+        }
     }
 
     /// ZEB-1022: apply a `di` (CeremonyInit) event — seed `pending_dkg`
@@ -659,8 +886,8 @@ impl DfrostLog {
         // Round 2: the broadcast log path is intentionally inert here.
         // Per-recipient decryption + share storage happens in
         // `apply_with_identity` (Task 5). Returning Ok keeps the dr(rn=2)
-        // event flowing into `self.events` so non-committee replicas
-        // still observe the protocol progress.
+        // event flowing into the accepted-event log so non-committee
+        // replicas still observe the protocol progress.
         Ok(())
     }
 
@@ -1158,10 +1385,15 @@ impl DfrostLog {
         use crate::community_dfrost_types::{DkgRoundPayload, RefreshRoundPayload};
         use crate::dm_signing;
 
-        // Envelope checks duplicated from `apply` so the early-bail paths
-        // surface the same diagnostics.
-        if event.tag != 'd' || event.committee_tier != 0 {
-            return Err(ApplyError::UnexpectedEnvelope);
+        // Same envelope gate as `apply` (single-sourced, ZEB-753) so
+        // the early-bail paths surface the same diagnostics.
+        check_envelope(&event)?;
+
+        // ZEB-753: exact-duplicate no-op, mirroring `apply`. The two
+        // decrypt branches below return early without going through
+        // `apply`, so the dedup must sit on this path too.
+        if self.log.contains(&dfrost_event_id(&event)) {
+            return Ok(());
         }
 
         match event.kind {
@@ -1209,7 +1441,7 @@ impl DfrostLog {
                             break;
                         }
                     }
-                    self.events.push(event);
+                    self.insert_applied(event);
                     return Ok(());
                 }
                 // For round_num != 2, fall back to the broadcast apply path.
@@ -1260,7 +1492,7 @@ impl DfrostLog {
                             .entry(event.actor)
                             .or_insert(plaintext);
                     }
-                    self.events.push(event);
+                    self.insert_applied(event);
                     return Ok(());
                 }
                 self.apply(event)
@@ -1345,7 +1577,7 @@ mod tests {
         assert!(!log.committee_state.active);
         assert_eq!(log.committee_state.current_epoch, 0);
         assert!(log.committee_state.joint_verifying_key.is_none());
-        assert!(log.events.is_empty());
+        assert!(log.events_is_empty());
     }
 
     #[test]
@@ -1452,7 +1684,7 @@ mod tests {
         assert_eq!(p.max_signers, 2);
         assert_eq!(p.proposed_epoch, 1);
         assert!(p.round1_packages.is_empty());
-        assert_eq!(log.events.len(), 1);
+        assert_eq!(log.event_count(), 1);
     }
 
     #[test]
@@ -1547,7 +1779,7 @@ mod tests {
         );
         // Nothing seeded by any of the rejects.
         assert!(log.committee_state.pending_dkg.is_none());
-        assert!(log.events.is_empty());
+        assert!(log.events_is_empty());
     }
 
     #[test]
@@ -1583,7 +1815,7 @@ mod tests {
             log.apply(di_event(alice, vec![alice, bob, carol], 2, 1, cid, 2_000)),
             Err(ApplyError::InvariantViolation)
         );
-        assert_eq!(log.events.len(), 1);
+        assert_eq!(log.event_count(), 1);
     }
 
     #[test]
@@ -1863,7 +2095,7 @@ mod tests {
         assert_eq!(log.committee_state.joint_verifying_key, Some(fake_vk));
         assert_eq!(log.committee_state.verifying_shares[&alice], [0xaa; 32]);
         assert!(log.committee_state.pending_dkg.is_none());
-        assert_eq!(log.events.len(), 2);
+        assert_eq!(log.event_count(), 2);
     }
 
     #[test]
@@ -2428,7 +2660,7 @@ mod tests {
             "rejected non-member ts must not create a signing session"
         );
         assert!(
-            log.events.is_empty(),
+            log.events_is_empty(),
             "rejected event must not be appended to the log"
         );
     }
@@ -2606,7 +2838,7 @@ mod tests {
             "non-member rf rn=1 must not seed pending_refresh via the local path"
         );
         assert!(
-            log.events.is_empty(),
+            log.events_is_empty(),
             "rejected event must not be appended to the log"
         );
     }
@@ -3200,7 +3432,7 @@ mod tests {
         });
         assert_eq!(result, Err(ApplyError::InvariantViolation));
         assert!(
-            log.events.is_empty(),
+            log.events_is_empty(),
             "rejected event must NOT append to log"
         );
     }
@@ -3395,5 +3627,139 @@ mod tests {
         let decoded: DkgRoundPayload =
             ciborium::de::from_reader(&ev.payload[..]).expect("decode payload");
         assert_eq!(decoded, payload);
+    }
+
+    // ── ZEB-753: VerifiedLog event-set adoption ─────────────────────────
+
+    /// An EXACT duplicate (byte-identical event ⇒ same synthesized id)
+    /// is a structural no-op on the second apply: same Ok result, no
+    /// second stored copy, no handler re-run side effects. The old Vec
+    /// backing pushed a second copy.
+    #[test]
+    fn exact_duplicate_apply_is_noop_zeb753() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let cid = [0x42u8; 32];
+        let ev = di_event(alice, vec![alice, bob], 2, 1, cid, 1_000);
+
+        let mut log = DfrostLog::new();
+        assert_eq!(log.apply(ev.clone()), Ok(()));
+        assert_eq!(log.event_count(), 1);
+        let pending_before = log.committee_state.pending_dkg.clone().expect("pending");
+
+        assert_eq!(log.apply(ev), Ok(()), "duplicate apply stays Ok");
+        assert_eq!(log.event_count(), 1, "duplicate must not store again");
+        assert_eq!(
+            log.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id),
+            Some(pending_before.ceremony_id),
+            "duplicate must not disturb pending state"
+        );
+    }
+
+    /// A re-mint (same logical content, fresh HLC ⇒ distinct id) is NOT
+    /// deduped — the transport's healing re-broadcasts depend on
+    /// re-mints reaching the handlers.
+    #[test]
+    fn re_minted_event_is_distinct_not_deduped_zeb753() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let cid = [0x42u8; 32];
+        let original = di_event(alice, vec![alice, bob], 2, 1, cid, 1_000);
+        // Same payload identity; later HLC (a re-mint). di is idempotent
+        // for the same initiator+shape, so the handler accepts it.
+        let mut remint = di_event(alice, vec![alice, bob], 2, 1, cid, 1_000);
+        remint.hlc.wall_ms = 2_000;
+
+        let mut log = DfrostLog::new();
+        assert_eq!(log.apply(original), Ok(()));
+        assert_eq!(log.apply(remint), Ok(()));
+        assert_eq!(
+            log.event_count(),
+            2,
+            "a fresh-HLC re-mint is a distinct event in the set"
+        );
+    }
+
+    /// `events()` iterates in HLC order regardless of apply order — the
+    /// synthesized id is HLC-major, so id-ordered iteration IS HLC
+    /// order. (The old Vec yielded arrival order and left ordering as a
+    /// doc obligation on the caller.)
+    #[test]
+    fn events_iterate_in_hlc_order_zeb753() {
+        use crate::community_dfrost_types::{DfrostEventKind, DkgRoundPayload};
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let cid = [0x42u8; 32];
+        // di minted at wall 2_000, then a dr(rn=1) minted EARLIER
+        // (wall 1_000) applied after — valid live shape (the dr only
+        // needs the pending slot to exist at apply time).
+        let di = di_event(alice, vec![alice, bob], 2, 1, cid, 2_000);
+        let payload = DkgRoundPayload {
+            ceremony_id: cid,
+            round_num: 1,
+            round1_package: Some(vec![0xde]),
+            recipient_ciphertexts: None,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        let dr = crate::community_dfrost_types::SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgRound,
+            hlc: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![7u8; 64],
+        };
+
+        let mut log = DfrostLog::new();
+        log.apply(di).expect("di applies");
+        log.apply(dr).expect("dr applies");
+        let walls: Vec<u64> = log.events().map(|e| e.hlc.wall_ms).collect();
+        assert_eq!(walls, vec![1_000, 2_000], "iteration is HLC order");
+    }
+
+    /// `from_restored` keeps the durable subset and clears the three
+    /// pending slots — interactive rounds do not survive a restart.
+    #[test]
+    fn from_restored_clears_pending_slots_zeb753() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let cid = [0x42u8; 32];
+        let mut log = DfrostLog::new();
+        log.apply(di_event(alice, vec![alice, bob], 2, 1, cid, 1_000))
+            .expect("di applies");
+        log.committee_state
+            .pending_sign
+            .insert([0x33; 32], PendingSignSession::default());
+        log.committee_state.pending_refresh = Some(PendingCeremony::default());
+        log.beacon_index.insert([0x11; 32], [0x22; 32]);
+
+        let restored = DfrostLog::from_restored(
+            log.export_events(),
+            log.committee_state.clone(),
+            log.beacon_index.clone(),
+        );
+        assert_eq!(restored.event_count(), 1, "events survive");
+        assert_eq!(
+            restored.beacon_index.get(&[0x11; 32]),
+            Some(&[0x22; 32]),
+            "beacon index survives"
+        );
+        assert!(restored.committee_state.pending_dkg.is_none());
+        assert!(restored.committee_state.pending_sign.is_empty());
+        assert!(restored.committee_state.pending_refresh.is_none());
+        assert!(restored.local_dkg_secret.is_none());
+        assert!(restored.local_key_package.is_none());
     }
 }
