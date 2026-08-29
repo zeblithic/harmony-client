@@ -1356,6 +1356,13 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// `u64` to match `committee_state.current_epoch` directly (CodeAnt
     /// PR #155 critical: the earlier `u32` truncation silently broke the
     /// epoch contract once CHURP rotations exceeded `u32::MAX`).
+    ///
+    /// ZEB-1024: also the readiness probe for the Tier-3 PollCreate
+    /// gate. `active` and `current_epoch` are read under ONE log lock,
+    /// so the epoch the gate stores via `set_tier3_poll_epoch` can never
+    /// belong to a different committee generation than the `active`
+    /// verdict it rode in on (a refresh promotion between two separate
+    /// reads would produce exactly that skew).
     pub async fn latest_committee_epoch(&self) -> Option<u64> {
         let log = self.dfrost_log.lock().await;
         if !log.committee_state.active {

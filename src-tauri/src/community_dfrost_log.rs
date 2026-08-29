@@ -890,6 +890,16 @@ impl DfrostLog {
         if !self.committee_state.active {
             return Err(ApplyError::InvariantViolation);
         }
+        // ZEB-1025: only ACTIVE-committee members may contribute signing
+        // rounds. The Zenoh plane gates publishing to community members,
+        // not committee members, so a signature-valid non-committee actor
+        // could otherwise pollute `pending_sign[..].contributions` — and
+        // because the upsert rules treat an existing entry as immutable
+        // commitment state, a squatter entry under a member-colliding
+        // future key would wedge that member's real contribution.
+        if !self.committee_state.members.contains(&event.actor) {
+            return Err(ApplyError::InvariantViolation);
+        }
 
         let session = self
             .committee_state
@@ -1053,6 +1063,18 @@ impl DfrostLog {
             ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
 
         if !self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+        // ZEB-1025: only committee members may open or advance a refresh.
+        // Refresh preserves the member set, so the ACTIVE committee's
+        // members are the ceremony's members. Without this, any
+        // signature-valid community member could seed a phantom
+        // `pending_refresh` — a singleton slot with (currently) no
+        // abort/deadline machinery, so a phantom wedges real refreshes
+        // until restart. Placed before the rn=1 init so the local
+        // `apply_with_identity` path (which routes through here before
+        // its `round2_packages` insert) is covered by the same gate.
+        if !self.committee_state.members.contains(&event.actor) {
             return Err(ApplyError::InvariantViolation);
         }
 
@@ -2357,6 +2379,236 @@ mod tests {
         let pr = log.committee_state.pending_refresh.as_ref().unwrap();
         assert_eq!(pr.ceremony_id, ceremony_id);
         assert_eq!(pr.proposed_epoch, 2);
+    }
+
+    /// ZEB-1025: a `ts` from a signature-valid actor OUTSIDE the active
+    /// committee must be rejected before any session state is created.
+    /// Pre-fix, mallory's contribution landed in
+    /// `pending_sign[..].contributions` keyed by her addr.
+    #[test]
+    fn ts_from_non_committee_actor_rejected_zeb1025() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, SignedCommitteeEvent, ThresholdSignPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let mallory = OwnerAddr([0x66; 16]);
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.members = vec![alice];
+
+        let payload = ThresholdSignPayload {
+            ceremony_id: [0xcc; 32],
+            message_hash: [0xde; 32],
+            commitment_bytes: vec![0x01, 0x02],
+            share_bytes: vec![0x03, 0x04],
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 4000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: mallory,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        assert!(
+            log.committee_state.pending_sign.is_empty(),
+            "rejected non-member ts must not create a signing session"
+        );
+        assert!(
+            log.events.is_empty(),
+            "rejected event must not be appended to the log"
+        );
+    }
+
+    /// ZEB-1025: an `rf` rn=1 from a non-committee actor must not open a
+    /// phantom refresh ceremony. The pending_refresh slot is a singleton
+    /// with no abort/deadline machinery — pre-fix, a phantom wedged real
+    /// refreshes until restart.
+    #[test]
+    fn rf_rn1_from_non_committee_actor_rejected_zeb1025() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::community_membership::RecipientCiphertext;
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let mallory = OwnerAddr([0x66; 16]);
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice];
+        log.committee_state.threshold = 1;
+        log.committee_state.max_signers = 1;
+
+        let payload = RefreshRoundPayload {
+            ceremony_id: [0x77u8; 32],
+            round_num: 1,
+            recipient_ciphertexts: Some(vec![RecipientCiphertext {
+                recipient: alice,
+                sealed: vec![0xde, 0xad],
+            }]),
+            round2_package: None,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ProactiveRefresh,
+            hlc: Hlc {
+                wall_ms: 6000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: mallory,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        assert!(
+            log.committee_state.pending_refresh.is_none(),
+            "non-member rf rn=1 must not seed pending_refresh"
+        );
+    }
+
+    /// ZEB-1025: an `rf` rn=2 from a non-committee actor against a real
+    /// in-flight refresh is rejected (the gate covers both rounds).
+    #[test]
+    fn rf_rn2_from_non_committee_actor_rejected_zeb1025() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let mallory = OwnerAddr([0x66; 16]);
+        let ceremony_id = [0x77u8; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice];
+        log.committee_state.threshold = 1;
+        log.committee_state.max_signers = 1;
+        log.committee_state.pending_refresh = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+
+        let payload = RefreshRoundPayload {
+            ceremony_id,
+            round_num: 2,
+            recipient_ciphertexts: None,
+            round2_package: Some(vec![0xbe, 0xef]),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ProactiveRefresh,
+            hlc: Hlc {
+                wall_ms: 6500,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: mallory,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+    }
+
+    /// ZEB-1025: the LOCAL apply path (`apply_with_identity`) for rf rn=1
+    /// routes through `apply_proactive_refresh` before any
+    /// `round2_packages` insert, so the same membership gate must cover
+    /// it — a non-member's rf must not seed pending_refresh via the local
+    /// path either (the dr rn=2 local path needed its own mirror gate in
+    /// #771; this test pins that rf does NOT regress the same way).
+    #[test]
+    fn rf_rn1_with_identity_from_non_committee_actor_rejected_zeb1025() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::community_membership::RecipientCiphertext;
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let mallory = OwnerAddr([0x66; 16]);
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice, bob];
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+
+        // Ciphertext targets bob, not self (alice) — the decrypt-staging
+        // step finds nothing for self and proceeds to the shared apply,
+        // where the membership gate must reject.
+        let payload = RefreshRoundPayload {
+            ceremony_id: [0x77u8; 32],
+            round_num: 1,
+            recipient_ciphertexts: Some(vec![RecipientCiphertext {
+                recipient: bob,
+                sealed: vec![0xde, 0xad],
+            }]),
+            round2_package: None,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply_with_identity(
+            SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: DfrostEventKind::ProactiveRefresh,
+                hlc: Hlc {
+                    wall_ms: 6800,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: mallory,
+                payload: pd,
+                sig: vec![0u8; 64],
+            },
+            &alice,
+            &[0u8; 32],
+        );
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        assert!(
+            log.committee_state.pending_refresh.is_none(),
+            "non-member rf rn=1 must not seed pending_refresh via the local path"
+        );
+        assert!(
+            log.events.is_empty(),
+            "rejected event must not be appended to the log"
+        );
     }
 
     /// R1 (CodeRabbit Critical): refresh completion routes through
