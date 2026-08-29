@@ -60726,9 +60726,11 @@ async fn ensure_dfrost_engine_for(
                     if g.events_is_empty() && !g.committee_state.active {
                         let publish_order = g.publish_order.clone();
                         let dirty = g.dirty.clone();
+                        let persist_order = g.persist_order.clone();
                         *g = restored;
                         g.publish_order = publish_order;
                         g.dirty = dirty;
+                        g.persist_order = persist_order;
                     }
                 }
                 Ok(Err(e)) => {

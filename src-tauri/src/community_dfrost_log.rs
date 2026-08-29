@@ -153,8 +153,13 @@ pub struct DfrostLog {
     /// kept the signing share out of the `dfrost.cbor` snapshot
     /// deliberately (identity-switch teardown contract: local secret
     /// material dies with the process). A restarted node knows the
-    /// committee (restored public state) but cannot contribute
-    /// signatures until the next proactive refresh re-mints its share.
+    /// committee (restored public state: it verifies beacons and binds
+    /// oracles) but is VERIFICATION-ONLY for signing until it receives
+    /// a fresh share — which requires refresh resharing rounds 2-3 +
+    /// finalization, tracked as ZEB-1027 (the Phase 4a-foundation
+    /// refresh IPC ships rn=1 only). Pre-#774 a restart lost the
+    /// public state too, so this narrows the loss; it does not yet
+    /// close it.
     pub local_key_package: Option<KeyPackage>,
 
     /// Local FROST `PublicKeyPackage` (joint verifying key + per-member
@@ -205,6 +210,21 @@ pub struct DfrostLog {
     /// task is mid-write is not lost. Not serialized: `Arc` shared via
     /// the `dfrost_logs` map, same pattern as `publish_order`.
     pub dirty: std::sync::Arc<tokio::sync::Notify>,
+
+    /// ZEB-753 (#774 round 2): snapshot-WRITE-order lock. Every
+    /// `dfrost.cbor` writer (an engine's debounce task, a teardown /
+    /// replace `flush_persist`) acquires this FIRST, then takes the log
+    /// lock only long enough to snapshot, releases it, and performs the
+    /// sealed write while still holding this lock. That keeps rename
+    /// order equal to snapshot order (a slower older write can never
+    /// clobber a newer one — CodeRabbit/CodeAnt round 1) WITHOUT
+    /// holding the protocol-state lock across fsyncs (Qodo round 2:
+    /// inbound apply and IPC paths must not stall on storage latency).
+    /// Lives here rather than on the engine so the old and new engine
+    /// of a registry replace — which share this log — serialize on the
+    /// same lock. Not serialized: `Arc` shared via the `dfrost_logs`
+    /// map, same pattern as `publish_order`.
+    pub persist_order: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for DfrostLog {

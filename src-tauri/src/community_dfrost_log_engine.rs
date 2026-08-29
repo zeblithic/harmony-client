@@ -353,23 +353,25 @@ async fn persist_dfrost_snapshot(
     let path =
         crate::community_dfrost_persist::dfrost_path_for(&target.identity_dir, &community_id);
     let cipher = target.cipher.clone();
-    // The log lock is intentionally held ACROSS the write, not released
-    // after the snapshot (the `VotingLogEngine::persist_now` idiom):
-    // the debounce task and a teardown/replace `flush_persist` write the
-    // same `dfrost.cbor` concurrently, and releasing before the write
-    // would let their renames land out of order — an older snapshot
-    // renaming last rolls durable state back (CodeRabbit + CodeAnt on
-    // #774). Holding the lock makes rename order equal snapshot order:
-    // each writer snapshots under its own lock tenure, so whichever
-    // writes last snapshotted last. The hold is a sub-ms clone plus an
-    // off-worker blocking write, so contention is negligible.
-    let g = log.lock().await;
-    let snapshot = crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id);
+    // Two locks, two jobs (#774 rounds 1+2). The WRITE-ORDER lock
+    // (`persist_order`, shared through the log so a replace's old and
+    // new engines serialize too) is held across snapshot AND write:
+    // rename order equals persist_order tenure order equals snapshot
+    // order, so a slower older write can never clobber a newer one
+    // (CodeRabbit + CodeAnt). The LOG lock is held only for the
+    // snapshot clone — never across the fsync-backed write — so
+    // inbound apply and IPC paths do not stall on storage latency
+    // (Qodo; snapshot-then-write-outside-the-protocol-lock precedent).
+    let persist_order = log.lock().await.persist_order.clone();
+    let _order_guard = persist_order.lock().await;
+    let snapshot = {
+        let g = log.lock().await;
+        crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id)
+    };
     let outcome = tokio::task::spawn_blocking(move || {
         crate::community_dfrost_persist::write_snapshot(&cipher, &path, &snapshot)
     })
     .await;
-    drop(g);
     match outcome {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(
@@ -1580,12 +1582,24 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// the registry transition (which would otherwise defer `Drop`
     /// and leave the loop consuming packets).
     pub(crate) fn abort(&self) {
+        self.abort_ingest();
+        if let Some(p) = self.persist_handle.as_ref() {
+            p.abort();
+        }
+    }
+
+    /// ZEB-753 (Greptile on #774): stop ONLY the ingest tasks (receive
+    /// loop + orchestrator tick), leaving the persist task alive. The
+    /// teardown paths call this BEFORE `flush_persist` so no event can
+    /// apply after the final snapshot and then be discarded with the
+    /// in-memory map: an apply already holding the log lock finishes
+    /// its synchronous section and is captured by the flush's later
+    /// lock acquisition; one not yet holding it is cancelled at the
+    /// lock await — the same outcome as arriving after process death.
+    pub(crate) fn abort_ingest(&self) {
         self.receive_handle.abort();
         if let Some(t) = self.tick_handle.as_ref() {
             t.abort();
-        }
-        if let Some(p) = self.persist_handle.as_ref() {
-            p.abort();
         }
     }
 
@@ -1728,9 +1742,13 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
         let engine = DfrostLogEngine::start(params).await;
         let mut engines = this.engines.lock().await;
         if let Some(old) = engines.insert(cid, Arc::clone(&engine)) {
-            // ZEB-753: close the debounce window before killing the old
-            // engine's save task — the log Arc is shared, so this can
-            // never write stale state.
+            // ZEB-753: stop the old engine's ingest FIRST (Greptile on
+            // #774 — an event applying after the snapshot would be
+            // silently unpersisted), then close the debounce window,
+            // then kill its save task. The log Arc is shared and writes
+            // serialize on `persist_order`, so this can never write
+            // stale state past the new engine's saves.
+            old.abort_ingest();
             old.flush_persist().await;
             old.abort();
         }
@@ -1785,6 +1803,12 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
             .get(&community_id)
             .is_some_and(|cur| Arc::ptr_eq(cur, engine))
         {
+            // ZEB-753 (Qodo on #774): same teardown ordering as
+            // shutdown/replace — a local apply racing the failed
+            // adapter registration may sit inside the debounce window,
+            // and aborting the save task first would drop it.
+            engine.abort_ingest();
+            engine.flush_persist().await;
             engine.abort();
             engines.remove(&community_id);
         }
@@ -1799,10 +1823,13 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
     pub async fn shutdown(&self) {
         let mut engines = self.engines.lock().await;
         for engine in engines.values() {
-            // ZEB-753: final snapshot before the save task dies — an
-            // apply inside the debounce window must still reach disk.
-            // Runs BEFORE `stop_inner` clears the `dfrost_logs` map
-            // (registry shutdown precedes the map clear by contract).
+            // ZEB-753: ingest stops FIRST (Greptile on #774 — a late
+            // inbound event applying after the final snapshot would be
+            // discarded with the in-memory map), then the final
+            // snapshot, then the save task dies. Runs BEFORE
+            // `stop_inner` clears the `dfrost_logs` map (registry
+            // shutdown precedes the map clear by contract).
+            engine.abort_ingest();
             engine.flush_persist().await;
             engine.abort();
         }
