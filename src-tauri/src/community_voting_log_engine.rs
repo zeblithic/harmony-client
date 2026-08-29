@@ -2107,7 +2107,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 let dr = self.dfrost_registry.lock().await;
                 if let Some(reg) = dr.as_ref() {
                     if let Some(engine) = reg.get(self.community_id).await {
-                        match engine.active_epoch().await {
+                        match engine.latest_committee_epoch().await {
                             Some(epoch) => epoch,
                             None => {
                                 return Err("DfrostNotReady: D-FROST committee is not active for \
