@@ -848,7 +848,8 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
 
 use harmony_app::community_dfrost_log_engine::{DfrostLogRegistry, DfrostOrchestratorConfig};
 use harmony_app::{
-    dfrost_initiate_dkg_core, production_dkg_driver, DfrostCoreHandles, DfrostLogsMap,
+    dfrost_initiate_dkg_core, dfrost_propose_refresh_core, production_dkg_driver,
+    DfrostCoreHandles, DfrostLogsMap,
 };
 
 type MockRt = tauri::test::MockRuntime;
@@ -909,6 +910,7 @@ fn test_orchestrator_config() -> DfrostOrchestratorConfig {
         initiator_quiet_deadline: std::time::Duration::from_secs(60),
         stale_replace_threshold: std::time::Duration::from_secs(60),
         max_restart_attempts: 3,
+        recovery_quiet_deadline: std::time::Duration::from_secs(60),
     }
 }
 
@@ -1427,6 +1429,183 @@ async fn dkg_straggler_heals_after_peer_promotion_when_dk_is_lost() {
     let la = alice.log.lock().await;
     let lb = bob.log.lock().await;
     assert_converged_active(&la, &lb);
+    drop(la);
+    drop(lb);
+    drop(alice_engine);
+    drop(bob_engine);
+}
+
+/// ZEB-1028 headline: a refresh round LOST on the wire no longer stalls
+/// the ceremony until restart. Alice's FIRST rf rn=2 (her sealed share
+/// distribution) vanishes on the alice→bob leg; the orchestrator's
+/// recovery re-broadcast cadence re-mints it (fresh HLC, identical
+/// payload) and the refresh still completes end-to-end on both engines
+/// — epoch advanced, joint verifying key preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_heals_lost_round_via_rebroadcast_zeb1028() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xD6);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xD7);
+    let alice_x_priv = *dm_signing::ed25519_priv_to_x25519(&alice_sk);
+    let bob_x_priv = *dm_signing::ed25519_priv_to_x25519(&bob_sk);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+
+    let community_id = SpaceId([0xD8; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+    let bob = orchestrated_node(community_id, "bob-dev", bob_addr, &bob_sk, &resolver_map);
+
+    let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_pub_tx, mut bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Lossy alice→bob leg: the FIRST ProactiveRefresh rn=2 from Alice
+    // vanishes — without re-broadcast healing, Bob can never finalize
+    // (he is missing Alice's sealed package) and the refresh wedges.
+    let _a2b = tokio::spawn(async move {
+        let mut rf2_dropped = false;
+        while let Some(p) = alice_pub_rx.recv().await {
+            if !rf2_dropped {
+                if let Ok(ev) = ciborium::de::from_reader::<
+                    harmony_app::community_dfrost_types::SignedCommitteeEvent,
+                    _,
+                >(&p[..])
+                {
+                    if ev.kind == DfrostEventKind::ProactiveRefresh {
+                        if let Ok(pl) = ciborium::de::from_reader::<
+                            harmony_app::community_dfrost_types::RefreshRoundPayload,
+                            _,
+                        >(&ev.payload[..])
+                        {
+                            if pl.round_num == 2 {
+                                rf2_dropped = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if bob_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _b2a = tokio::spawn(async move {
+        while let Some(p) = bob_pub_rx.recv().await {
+            if alice_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let alice_engine = start_orchestrated(
+        &alice,
+        community_id,
+        alice_addr,
+        alice_x_priv,
+        &resolver_map,
+        alice_pub_tx,
+        alice_sub_rx,
+    )
+    .await;
+    let bob_engine = start_orchestrated(
+        &bob,
+        community_id,
+        bob_addr,
+        bob_x_priv,
+        &resolver_map,
+        bob_pub_tx,
+        bob_sub_rx,
+    )
+    .await;
+
+    // Phase 1: a clean DKG activates the committee (nothing dropped —
+    // the filter only ever eats an rf rn=2).
+    dfrost_initiate_dkg_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        vec![alice_addr, bob_addr],
+        2,
+    )
+    .await
+    .expect("alice initiates DKG");
+    expect_converged(
+        wait_converged("both active after DKG", &bob.log, |l| {
+            l.committee_state.active
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    let (vk_before, epoch_before) = {
+        let la = alice.log.lock().await;
+        let lb = bob.log.lock().await;
+        assert_converged_active(&la, &lb);
+        (
+            la.committee_state.joint_verifying_key,
+            la.committee_state.current_epoch,
+        )
+    };
+
+    // Phase 2: Alice proposes the refresh; auto-drive carries both
+    // members through rounds 1–3 + dk — surviving the lost rn=2.
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    dfrost_propose_refresh_core::<MockRt, MockRt>(
+        &alice.handles,
+        None,
+        community_id,
+        members,
+        2,
+        None,
+    )
+    .await
+    .expect("alice proposes refresh");
+
+    expect_converged(
+        wait_converged("alice promotes the refresh epoch", &alice.log, move |l| {
+            l.committee_state.current_epoch == epoch_before + 1
+                && l.committee_state.pending_refresh.is_none()
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    expect_converged(
+        wait_converged("bob promotes the refresh epoch", &bob.log, move |l| {
+            l.committee_state.current_epoch == epoch_before + 1
+                && l.committee_state.pending_refresh.is_none()
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+
+    let la = alice.log.lock().await;
+    let lb = bob.log.lock().await;
+    assert_eq!(
+        la.committee_state.joint_verifying_key, vk_before,
+        "refresh must preserve the joint verifying key"
+    );
+    assert_eq!(
+        lb.committee_state.joint_verifying_key, vk_before,
+        "refresh must preserve the joint verifying key on the healed peer"
+    );
+    assert!(
+        la.local_key_package.is_some() && lb.local_key_package.is_some(),
+        "both members hold rotated shares after promotion"
+    );
     drop(la);
     drop(lb);
     drop(alice_engine);

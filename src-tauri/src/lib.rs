@@ -63291,7 +63291,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
             // post-hoc warn had already published an rf rn=1 into a
             // ceremony the drive mis-identified (committee state moved
             // between the decide snapshot and this call).
-            let (members, threshold, current_epoch) = {
+            let (members, threshold, current_epoch, slot_attempt) = {
                 let log_arc = {
                     let mut map = self.handles.dfrost_logs.lock().await;
                     map.entry(community_id)
@@ -63306,10 +63306,22 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
                 if !log.committee_state.active {
                     return Err("contribute_refresh_round: no active committee".to_string());
                 }
+                // ZEB-1028: joining derives at the OBSERVED ceremony's
+                // attempt (the slot the drive decided against). An
+                // empty/moved slot falls back to attempt 0 and the
+                // mismatch check below surfaces the race.
+                let slot_attempt = log
+                    .committee_state
+                    .pending_refresh
+                    .as_ref()
+                    .filter(|pr| pr.ceremony_id == ceremony_id)
+                    .map(|pr| pr.attempt)
+                    .unwrap_or(0);
                 (
                     log.committee_state.members.clone(),
                     log.committee_state.threshold,
                     log.committee_state.current_epoch,
+                    slot_attempt,
                 )
             };
             let expected = crate::community_dfrost_types::derive_refresh_ceremony_id(
@@ -63318,6 +63330,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
                 current_epoch
                     .checked_add(1)
                     .ok_or("contribute_refresh_round: epoch overflow")?,
+                slot_attempt,
                 &community_id,
             );
             if expected != ceremony_id {
@@ -63333,6 +63346,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
                 community_id,
                 members,
                 threshold,
+                Some(slot_attempt),
             )
             .await?;
             return Ok(());
@@ -63366,12 +63380,53 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
     async fn request_repair(
         &self,
         community_id: crate::owner_state_types::SpaceId,
+        helpers: Option<Vec<crate::owner_state_types::OwnerAddr>>,
     ) -> Result<String, String> {
         dfrost_request_share_repair_core::<R, _>(
             &self.handles,
             self.app_handle.as_ref(),
             community_id,
-            None,
+            helpers,
+        )
+        .await
+    }
+
+    async fn propose_refresh_retry(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        attempt: u32,
+    ) -> Result<String, String> {
+        // ZEB-1028: the deadline retry proposes against the ACTIVE
+        // committee's shape at the explicit attempt; the core displaces
+        // the stalled lower-attempt incumbent locally and peers follow
+        // via the max-attempt apply rule.
+        let (members, threshold) = {
+            let log_arc = {
+                let mut map = self.handles.dfrost_logs.lock().await;
+                map.entry(community_id)
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::community_dfrost_log::DfrostLog::new(),
+                        ))
+                    })
+                    .clone()
+            };
+            let log = log_arc.lock().await;
+            if !log.committee_state.active {
+                return Err("propose_refresh_retry: no active committee".to_string());
+            }
+            (
+                log.committee_state.members.clone(),
+                log.committee_state.threshold,
+            )
+        };
+        dfrost_propose_refresh_core::<R, _>(
+            &self.handles,
+            self.app_handle.as_ref(),
+            community_id,
+            members,
+            threshold,
+            Some(attempt),
         )
         .await
     }
@@ -63387,6 +63442,17 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
 /// clears the tracker while first-wins apply semantics keep the
 /// re-application a no-op for peers that already have it. Never
 /// re-applies locally.
+///
+/// ZEB-1028: also serves the RECOVERY ceremonies over the same
+/// mechanism — when `ceremony_bytes` names the in-flight refresh, the
+/// slots are `rf` rn=1 / `rf` rn=2 / its `dk`; when it names the
+/// in-flight repair, they are `rp` rn=1 (the participant's request) /
+/// rn=2 / rn=3. The payload-carried identity of each ceremony (the
+/// refresh attempt, the repair mint stamp) survives a re-mint by
+/// construction, so a re-broadcast can never fork the ceremony it
+/// heals. This closes the ticket's headline gap: the dfrost transport
+/// is live-only pub/sub, so before this a single lost `rf`/`rp` round
+/// stalled its ceremony until restart.
 pub async fn dfrost_rebroadcast_pending_core<R: tauri::Runtime>(
     handles: &DfrostCoreHandles<R>,
     space_id: crate::owner_state_types::SpaceId,
@@ -63419,59 +63485,109 @@ pub async fn dfrost_rebroadcast_pending_core<R: tauri::Runtime>(
     };
     let _publish_order_guard = publish_order.lock().await;
 
-    // Collect the newest self-authored event per slot (di / dr1 / dr2 /
-    // dk) belonging to the pending ceremony, under one short log lock.
+    // Collect the newest self-authored event per slot belonging to the
+    // named ceremony, under one short log lock. Which slots exist
+    // depends on which pending ceremony the id names (ZEB-1028):
+    //   * pending_dkg      → di / dr rn=1 / dr rn=2 / dk
+    //   * pending_refresh  → rf rn=1 / rf rn=2 / dk
+    //   * pending_repair   → rp rn=1 / rn=2 / rn=3
     //
-    // ZEB-1022 straggler heal (CI stall on #771): when the pending slot
-    // is gone (or holds a different ceremony) but the committee is
-    // ACTIVE, fall through with `dk_only = true` — a peer still working
-    // the completed ceremony needs (at most) this node's `dk` re-mint
-    // to reach quorum; everything else about the ceremony is history.
+    // ZEB-1022 straggler heal (CI stall on #771): when no pending slot
+    // holds the ceremony but the committee is ACTIVE, fall through with
+    // `dk_only = true` — a peer still working the completed ceremony
+    // needs (at most) this node's `dk` re-mint to reach quorum;
+    // everything else about the ceremony is history. (This covers
+    // refresh stragglers too: a refresh promotion's `dk` is collected
+    // by ceremony id exactly like a DKG's.)
     let to_remint: Vec<crate::community_dfrost_types::SignedCommitteeEvent> = {
         let log = log_arc.lock().await;
-        let pending_matches = log
-            .committee_state
-            .pending_dkg
-            .as_ref()
-            .map(|p| p.ceremony_id == ceremony_bytes)
-            .unwrap_or(false);
-        let dk_only = if pending_matches {
-            false
+        enum Family {
+            Dkg,
+            Refresh,
+            Repair,
+            DkOnly,
+        }
+        let slot_named = |p: Option<&[u8; 32]>| p == Some(&ceremony_bytes);
+        let family = if slot_named(
+            log.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| &p.ceremony_id),
+        ) {
+            Family::Dkg
+        } else if slot_named(
+            log.committee_state
+                .pending_refresh
+                .as_ref()
+                .map(|p| &p.ceremony_id),
+        ) {
+            Family::Refresh
+        } else if slot_named(
+            log.committee_state
+                .pending_repair
+                .as_ref()
+                .map(|p| &p.ceremony_id),
+        ) {
+            Family::Repair
         } else if log.committee_state.active {
-            true
+            Family::DkOnly
         } else {
             return Ok(());
         };
+        // Slot indices are family-local; 4 covers every family's width.
         let mut best: [Option<&crate::community_dfrost_types::SignedCommitteeEvent>; 4] = [None; 4];
         for ev in log.events().filter(|e| e.actor == handles.self_owner) {
-            let slot: Option<usize> = match ev.kind {
-                DfrostEventKind::CeremonyInit => ciborium::de::from_reader::<
-                    crate::community_dfrost_types::CeremonyInitPayload,
-                    _,
-                >(&ev.payload[..])
-                .ok()
-                .filter(|pl| pl.ceremony_id == ceremony_bytes)
-                .map(|_| 0),
-                DfrostEventKind::DkgRound => ciborium::de::from_reader::<
-                    crate::community_dfrost_types::DkgRoundPayload,
-                    _,
-                >(&ev.payload[..])
-                .ok()
-                .filter(|pl| pl.ceremony_id == ceremony_bytes)
-                .map(|pl| if pl.round_num == 1 { 1 } else { 2 }),
-                DfrostEventKind::DkgComplete => ciborium::de::from_reader::<
-                    crate::community_dfrost_types::DkgCompletePayload,
-                    _,
-                >(&ev.payload[..])
-                .ok()
-                .filter(|pl| pl.ceremony_id == ceremony_bytes)
-                .map(|_| 3),
-                _ => None,
-            };
+            let slot: Option<usize> =
+                match (&family, ev.kind) {
+                    (Family::Dkg, DfrostEventKind::CeremonyInit) => {
+                        ciborium::de::from_reader::<
+                            crate::community_dfrost_types::CeremonyInitPayload,
+                            _,
+                        >(&ev.payload[..])
+                        .ok()
+                        .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                        .map(|_| 0)
+                    }
+                    (Family::Dkg, DfrostEventKind::DkgRound) => ciborium::de::from_reader::<
+                        crate::community_dfrost_types::DkgRoundPayload,
+                        _,
+                    >(
+                        &ev.payload[..]
+                    )
+                    .ok()
+                    .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                    .map(|pl| if pl.round_num == 1 { 1 } else { 2 }),
+                    (Family::Refresh, DfrostEventKind::ProactiveRefresh) => {
+                        ciborium::de::from_reader::<
+                            crate::community_dfrost_types::RefreshRoundPayload,
+                            _,
+                        >(&ev.payload[..])
+                        .ok()
+                        .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                        .map(|pl| if pl.round_num == 1 { 0 } else { 1 })
+                    }
+                    (Family::Repair, DfrostEventKind::RepairShare) => {
+                        ciborium::de::from_reader::<
+                            crate::community_dfrost_types::RepairRoundPayload,
+                            _,
+                        >(&ev.payload[..])
+                        .ok()
+                        .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                        .map(|pl| (pl.round_num.saturating_sub(1) as usize).min(2))
+                    }
+                    (
+                        Family::Dkg | Family::Refresh | Family::DkOnly,
+                        DfrostEventKind::DkgComplete,
+                    ) => ciborium::de::from_reader::<
+                        crate::community_dfrost_types::DkgCompletePayload,
+                        _,
+                    >(&ev.payload[..])
+                    .ok()
+                    .filter(|pl| pl.ceremony_id == ceremony_bytes)
+                    .map(|_| 3),
+                    _ => None,
+                };
             if let Some(s) = slot {
-                if dk_only && s != 3 {
-                    continue;
-                }
                 let newer = best[s]
                     .map(|b| (b.hlc.wall_ms, b.hlc.logical) < (ev.hlc.wall_ms, ev.hlc.logical))
                     .unwrap_or(true);
@@ -65631,8 +65747,15 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     member_addrs.sort();
     member_addrs.dedup();
     let handles = dfrost_core_handles_from_state(&state_lock).await?;
-    dfrost_propose_refresh_core::<R, _>(&handles, Some(&app), space_id, member_addrs, threshold)
-        .await
+    dfrost_propose_refresh_core::<R, _>(
+        &handles,
+        Some(&app),
+        space_id,
+        member_addrs,
+        threshold,
+        None,
+    )
+    .await
 }
 
 /// ZEB-1027: shared core of `dfrost_propose_refresh` — also fired by
@@ -65650,16 +65773,26 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
 ///
 /// Ceremony convergence (R9): the ceremony id is
 /// `derive_refresh_ceremony_id(members, threshold, current_epoch + 1,
-/// space_id)` — deterministic, so each member's independent call joins
-/// the same ceremony. "Self already submitted" is
+/// attempt, space_id)` — deterministic, so each member's independent
+/// call joins the same ceremony. "Self already submitted" is
 /// `pending_refresh.round1_packages.contains_key(self)` (pre-1027 it
 /// was a `round2_packages` marker from the sealed placeholder shape).
+///
+/// ZEB-1028 `attempt`: `None` joins the in-flight ceremony's attempt
+/// (or proposes attempt 0 when the slot is empty — the manual IPC and
+/// initial-propose shape). `Some(n)` is the engine's deadline retry: it
+/// derives attempt `n`'s id and, when `n` is strictly higher than the
+/// incumbent's, locally displaces the stalled incumbent (via
+/// `abort_pending_refresh`) before seeding — peers displace through the
+/// same max-attempt rule in `apply_proactive_refresh` when the rn=1
+/// reaches them.
 pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
     handles: &DfrostCoreHandles<H>,
     app: Option<&tauri::AppHandle<R>>,
     space_id: crate::owner_state_types::SpaceId,
     member_addrs: Vec<crate::owner_state_types::OwnerAddr>,
     threshold: u16,
+    attempt: Option<u32>,
 ) -> Result<String, String> {
     let max_signers = u16::try_from(member_addrs.len())
         .map_err(|_| "dfrost_propose_refresh: committee too large for u16".to_string())?;
@@ -65774,31 +65907,60 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
             .checked_add(1)
             .ok_or("dfrost_propose_refresh: epoch overflow")?;
 
+        // ZEB-1028: resolve the effective attempt — explicit for the
+        // engine's deadline retry; otherwise join the incumbent's
+        // attempt (or open attempt 0 on an empty slot).
+        let effective_attempt = attempt.unwrap_or_else(|| {
+            log.committee_state
+                .pending_refresh
+                .as_ref()
+                .map(|pr| pr.attempt)
+                .unwrap_or(0)
+        });
+
         // Deterministic ceremony id (R9): see
         // `derive_refresh_ceremony_id` for why the HLC is excluded.
         let ceremony_id = crate::community_dfrost_types::derive_refresh_ceremony_id(
             &member_addrs,
             threshold,
             proposed_epoch,
+            effective_attempt,
             &space_id,
         );
 
         // Per-actor in-flight gate (R9): a pending refresh for THIS
         // ceremony makes this call a peer contribution — allowed unless
         // self already submitted rn=1. A pending refresh with a
-        // DIFFERENT id is a protocol bug surfaced explicitly.
+        // DIFFERENT id at a LOWER attempt is a stalled incumbent this
+        // deadline retry displaces (ZEB-1028) — cleared here under the
+        // same lock so the apply below seeds cleanly (also wiping the
+        // incumbent's transcript secrets BEFORE `prior_secret` is
+        // captured, so a broadcast-failure rollback restores `None`
+        // rather than leaking the displaced attempt's secret into the
+        // new ceremony). Any other divergent id is a protocol bug
+        // surfaced explicitly.
         if let Some(pr) = &log.committee_state.pending_refresh {
             if pr.ceremony_id != ceremony_id {
-                return Err(format!(
-                    "dfrost_propose_refresh: a different refresh ceremony is in flight \
-                     (pending={}, requested={}). Refresh derivations are deterministic per \
-                     (members, threshold, proposed_epoch, space_id); a mismatch indicates a \
-                     protocol bug — abort the in-flight ceremony before retrying.",
-                    hex::encode(pr.ceremony_id),
-                    hex::encode(ceremony_id),
-                ));
-            }
-            if pr.round1_packages.contains_key(&self_owner) {
+                if effective_attempt > pr.attempt {
+                    let aborted = log.abort_pending_refresh();
+                    tracing::info!(
+                        community_id = %hex::encode(space_id.0),
+                        aborted = ?aborted.map(hex::encode),
+                        attempt = effective_attempt,
+                        "dfrost_propose_refresh: displaced stalled refresh attempt for retry",
+                    );
+                } else {
+                    return Err(format!(
+                        "dfrost_propose_refresh: a different refresh ceremony is in flight \
+                         (pending={}, requested={}). Refresh derivations are deterministic per \
+                         (members, threshold, proposed_epoch, attempt, space_id); a mismatch \
+                         at the same or lower attempt indicates a protocol bug — abort the \
+                         in-flight ceremony before retrying.",
+                        hex::encode(pr.ceremony_id),
+                        hex::encode(ceremony_id),
+                    ));
+                }
+            } else if pr.round1_packages.contains_key(&self_owner) {
                 return Err(
                     "dfrost_propose_refresh: self has already submitted rn=1 for this refresh \
                      ceremony"
@@ -65818,6 +65980,7 @@ pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
             round_num: 1,
             recipient_ciphertexts: None,
             package: Some(r1_pkg_bytes),
+            attempt: effective_attempt,
         };
         let event = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key_arc.as_ref(),
@@ -66158,6 +66321,9 @@ pub async fn dfrost_contribute_refresh_round_core<R: tauri::Runtime, H: tauri::R
             round_num: 2,
             recipient_ciphertexts: Some(recipient_ciphertexts),
             package: None,
+            // rn≥2 events are already ceremony-id-scoped; the attempt
+            // rides only on rn=1 (0 serializes as key-absent).
+            attempt: 0,
         };
         let signing_key = handles.signing_key.as_ref();
         let ev = crate::community_dfrost_log::build_signed_dfrost_event(
@@ -66419,8 +66585,9 @@ pub async fn dfrost_contribute_refresh_round_core<R: tauri::Runtime, H: tauri::R
     // and `pending_rotated` must stay staged — a peer-driven quorum can
     // still promote this node correctly. The error reports the partial
     // state; with more live members than threshold the ceremony
-    // completes without this node's confirmation, otherwise it stalls
-    // until re-broadcast machinery exists (ZEB-1028).
+    // completes without this node's confirmation, otherwise the
+    // orchestrator's re-broadcast cadence (ZEB-1028) re-mints the
+    // logged dk until it lands.
     let broadcast_err: Option<String> = match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
             Some(engine) => engine
@@ -67074,10 +67241,10 @@ pub async fn dfrost_contribute_repair_round_core<R: tauri::Runtime, H: tauri::Ru
     // progress markers and error; the drive re-decides the round on the
     // next tick. Residual gap: if this node's rn=3 was the LAST sigma,
     // its own apply already ran the non-participant settlement and
-    // cleared the slot — nothing to roll back, and the participant
-    // stalls exactly like any other lost round until re-broadcast
-    // machinery exists (ZEB-1028). A registry-less context (tests)
-    // stays best-effort.
+    // cleared the slot — nothing to roll back here; the participant's
+    // quiet-deadline re-request (ZEB-1028) recovers the ceremony with a
+    // fresh mint stamp. A registry-less context (tests) stays
+    // best-effort.
     let broadcast_err: Option<String> = match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
             Some(engine) => engine

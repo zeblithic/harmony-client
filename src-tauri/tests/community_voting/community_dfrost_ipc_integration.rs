@@ -1565,6 +1565,7 @@ fn propose_refresh_local(
         round_num: 1,
         recipient_ciphertexts: None,
         package: Some(r1_pkg_bytes),
+        attempt: 0,
     };
     let event = build_signed_dfrost_event(
         signing_key,
@@ -1623,7 +1624,7 @@ async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
 
     let proposed_epoch = epoch_before + 1;
     let refresh_ceremony_id =
-        derive_refresh_ceremony_id(&members, threshold, proposed_epoch, &TEST_SPACE_ID);
+        derive_refresh_ceremony_id(&members, threshold, proposed_epoch, 0, &TEST_SPACE_ID);
 
     // ── rn=1 from both members (R9: shared deterministic ceremony) ───────
     let rf1_alice = propose_refresh_local(
@@ -1712,6 +1713,7 @@ async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
                 round_num: 2,
                 recipient_ciphertexts: Some(cts),
                 package: None,
+                attempt: 0,
             },
             hlc_at(wall, if me == ALICE { "alice" } else { "bob" }),
         )
