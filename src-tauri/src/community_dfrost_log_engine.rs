@@ -350,17 +350,26 @@ async fn persist_dfrost_snapshot(
     target: &crate::community_dfrost_persist::DfrostPersistTarget,
     community_id: SpaceId,
 ) {
-    let snapshot = {
-        let g = log.lock().await;
-        crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id)
-    };
     let path =
         crate::community_dfrost_persist::dfrost_path_for(&target.identity_dir, &community_id);
     let cipher = target.cipher.clone();
+    // The log lock is intentionally held ACROSS the write, not released
+    // after the snapshot (the `VotingLogEngine::persist_now` idiom):
+    // the debounce task and a teardown/replace `flush_persist` write the
+    // same `dfrost.cbor` concurrently, and releasing before the write
+    // would let their renames land out of order — an older snapshot
+    // renaming last rolls durable state back (CodeRabbit + CodeAnt on
+    // #774). Holding the lock makes rename order equal snapshot order:
+    // each writer snapshots under its own lock tenure, so whichever
+    // writes last snapshotted last. The hold is a sub-ms clone plus an
+    // off-worker blocking write, so contention is negligible.
+    let g = log.lock().await;
+    let snapshot = crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id);
     let outcome = tokio::task::spawn_blocking(move || {
         crate::community_dfrost_persist::write_snapshot(&cipher, &path, &snapshot)
     })
     .await;
+    drop(g);
     match outcome {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(

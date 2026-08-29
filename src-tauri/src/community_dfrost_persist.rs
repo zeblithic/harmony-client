@@ -11,6 +11,12 @@
 //! hard error. The error type and seal-label derivation are shared with
 //! `community_state_persist` so the whole family stays one contract.
 //!
+//! ONE deliberate divergence from the older siblings: `dfrost.cbor` is
+//! BORN-SEALED (this module shipped after ZEB-982), so there is no
+//! legacy-plaintext migration — a plaintext image is rejected and
+//! quarantined instead of parsed (see `load_dfrost`). An
+//! unauthenticated blob must never become trusted committee state.
+//!
 //! WHAT IS PERSISTED — and, more importantly, what is not. The snapshot
 //! carries the accepted-event set (the `VerifiedLog` contents), the
 //! materialized `CommitteeState` (whose secret fields are already
@@ -42,9 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::community_dfrost_log::{CommitteeState, DfrostLog};
 use crate::community_dfrost_types::SignedCommitteeEvent;
 use crate::community_state_persist::{seal_label, PersistError};
-use crate::device_dataset_file::{
-    read_image, reseal_if_legacy, write_image, DeviceCipher, Image, ImageError,
-};
+use crate::device_dataset_file::{read_image, write_image, DeviceCipher, Image, ImageError};
 use crate::owner_state_types::SpaceId;
 
 pub(crate) const DFROST_FILENAME: &str = "dfrost.cbor";
@@ -73,9 +77,10 @@ pub fn dfrost_path_for(identity_dir: &Path, community_id: &SpaceId) -> PathBuf {
         .join(DFROST_FILENAME)
 }
 
-/// The on-disk shape. `community_id` makes legacy-plaintext misrouting
-/// detectable (a SEALED misroute already fails the AAD tag first —
-/// same asymmetry as `crdt.cbor`).
+/// The on-disk shape. `community_id` is defence-in-depth routing: a
+/// misrouted SEALED file already fails the AAD tag (the label binds the
+/// community id), so with plaintext images rejected outright this field
+/// can only disagree with the label if label derivation itself drifted.
 #[derive(Serialize, Deserialize)]
 struct DfrostSnapshot {
     version: u8,
@@ -150,13 +155,22 @@ fn open_family_image(
 ///
 /// - Missing file → a fresh `DfrostLog` (first-boot / never-persisted
 ///   is the common case).
+/// - Legacy PLAINTEXT image → quarantine + fresh default (CodeRabbit
+///   on #774). `dfrost.cbor` is born-sealed — this module and ZEB-982
+///   sealing coexisted from the file's first release, so no honest
+///   plaintext snapshot can exist. Unlike its older siblings, there is
+///   nothing to migrate, and accepting bare CBOR here would let an
+///   unauthenticated on-disk blob impersonate committee state (joint
+///   vk, verifying shares, beacon outputs) that `from_restored` then
+///   trusts without re-verification.
 /// - Corrupt content (CBOR decode, AEAD tag, unknown snapshot version)
 ///   → quarantine + fresh default. Self-heal is the right posture: a
 ///   lost committee snapshot costs a re-DKG at worst, while refusing to
 ///   spawn would wedge the community's Tier-3 permanently.
-/// - `community_id` mismatch (reachable for legacy plaintext files
-///   only; sealed misroutes fail the AAD) → hard
-///   `PersistError::CommunityIdMismatch`, file left in place.
+/// - `community_id` mismatch → hard `PersistError::CommunityIdMismatch`,
+///   file left in place. With plaintext rejected this is pure
+///   defence-in-depth: it can only fire if a sealed image's AAD label
+///   and body disagree, i.e. an internal label-derivation bug.
 /// - I/O error → hard: the bytes may be fine; the caller should run
 ///   without persistence armed rather than risk clobbering them.
 pub fn load_dfrost(
@@ -169,6 +183,14 @@ pub fn load_dfrost(
         Some(image) => image,
         None => return Ok(DfrostLog::new()),
     };
+    if image.was_legacy {
+        quarantine_corrupted(
+            path,
+            "plaintext dfrost.cbor rejected: the file is born-sealed and an \
+             unauthenticated snapshot must never be trusted",
+        );
+        return Ok(DfrostLog::new());
+    }
     match ciborium::from_reader::<DfrostSnapshot, _>(image.bytes.as_slice()) {
         Ok(snapshot) => {
             if snapshot.community_id != *expected_id {
@@ -187,7 +209,6 @@ pub fn load_dfrost(
                 );
                 return Ok(DfrostLog::new());
             }
-            reseal_if_legacy(cipher, path, &label, &image);
             Ok(DfrostLog::from_restored(
                 snapshot.events,
                 snapshot.committee_state,
@@ -361,19 +382,56 @@ mod tests {
         );
     }
 
-    /// Legacy-plaintext routing check: a bare-CBOR snapshot parsing as a
-    /// DIFFERENT community hard-errors, file left in place (a sealed
-    /// misroute fails the AAD first and quarantines instead).
+    /// CodeRabbit on #774: `dfrost.cbor` is born-sealed, so a PLAINTEXT
+    /// snapshot — even one whose `community_id` MATCHES — is rejected
+    /// and quarantined, never parsed into trusted committee state. An
+    /// unauthenticated blob claiming an active committee (joint vk,
+    /// verifying shares, beacon outputs) must not survive the load.
     #[test]
-    fn legacy_id_mismatch_stays_hard_unquarantined() {
+    fn matching_id_plaintext_snapshot_rejected_and_quarantined() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dfrost.cbor");
-        let snapshot = snapshot_for_persist(&sample_log(), &cid(9));
+        let snapshot = snapshot_for_persist(&sample_log(), &cid(7));
         let mut bytes = Vec::new();
         ciborium::into_writer(&snapshot.0, &mut bytes).unwrap();
         std::fs::write(&path, &bytes).unwrap();
 
-        let err = load_dfrost(&test_cipher(), &path, &cid(7)).unwrap_err();
+        let restored = load_dfrost(&test_cipher(), &path, &cid(7)).unwrap();
+        assert!(
+            restored.events_is_empty() && !restored.committee_state.active,
+            "plaintext snapshot must load as a fresh log, never as committee state"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".corrupt.")),
+            "plaintext snapshot quarantined aside"
+        );
+    }
+
+    /// Defence-in-depth pin: a SEALED image whose AAD label and body
+    /// `community_id` disagree (only reachable through a label-derivation
+    /// bug — `write_snapshot` derives the label from the body) surfaces
+    /// as the hard `CommunityIdMismatch`, file left in place.
+    #[test]
+    fn sealed_label_body_id_mismatch_stays_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dfrost.cbor");
+        let cipher = test_cipher();
+        // Body claims community 9; seal it under community 7's label.
+        let snapshot = snapshot_for_persist(&sample_log(), &cid(9));
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&snapshot.0, &mut bytes).unwrap();
+        write_image(
+            &cipher,
+            &path,
+            &seal_label(&cid(7), DFROST_FILENAME),
+            &bytes,
+        )
+        .unwrap();
+
+        let err = load_dfrost(&cipher, &path, &cid(7)).unwrap_err();
         assert!(matches!(err, PersistError::CommunityIdMismatch { .. }));
         assert!(path.exists(), "mismatched file left in place");
     }
