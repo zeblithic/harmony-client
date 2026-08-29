@@ -268,8 +268,10 @@ pub struct VotingLogAdapterRequest {
 /// Live pub/sub only — committee ceremonies (DKG / threshold-sign /
 /// proactive refresh) are interactive multi-party rounds, so there is
 /// no backfill or RBSR half: a node that missed a round cannot
-/// retroactively join the ceremony, and durable committee state is
-/// ZEB-753's VerifiedLog adoption, not a transport concern.
+/// retroactively join the ceremony. Durable committee state is handled
+/// off-transport, per ZEB-753: the engine snapshots the accepted-event
+/// log + materialized committee state to the sealed `dfrost.cbor`
+/// (`community_dfrost_persist`) and restores it at ensure time.
 pub struct DfrostLogAdapterRequest {
     /// Hex-encoded community SpaceId — used to form
     /// `harmony/community/{id_hex}/dfrost`.

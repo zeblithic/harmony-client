@@ -234,6 +234,7 @@ async fn install_beacon_oracle_for(
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         },
     )
     .await;

@@ -332,6 +332,61 @@ pub(crate) struct OrchestratorHandle {
 /// Parameters bundle for `DfrostLogEngine::start`. Tauri-runtime-generic so
 /// tests can pass `tauri::test::MockRuntime` and production can pass the
 /// default Wry runtime.
+/// ZEB-753: debounce between the first dirty signal and the snapshot
+/// write. A DKG ceremony bursts O(n²) events in seconds; the debounce
+/// coalesces each burst into a handful of sealed writes. Losses are
+/// bounded by `flush_persist` on every orderly teardown; a hard kill
+/// forfeits at most this window (acceptable — a mid-ceremony crash
+/// forfeits the ceremony anyway, and completed-committee promotions
+/// re-arm the signal on their own apply).
+const DFROST_PERSIST_DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// Snapshot-under-lock, write-off-worker (the codebase persistence
+/// split). Failures are logged and swallowed — durability is
+/// best-effort on top of a log that remains authoritative in memory,
+/// and the next dirty signal retries.
+async fn persist_dfrost_snapshot(
+    log: &Arc<Mutex<DfrostLog>>,
+    target: &crate::community_dfrost_persist::DfrostPersistTarget,
+    community_id: SpaceId,
+) {
+    let path =
+        crate::community_dfrost_persist::dfrost_path_for(&target.identity_dir, &community_id);
+    let cipher = target.cipher.clone();
+    // Two locks, two jobs (#774 rounds 1+2). The WRITE-ORDER lock
+    // (`persist_order`, shared through the log so a replace's old and
+    // new engines serialize too) is held across snapshot AND write:
+    // rename order equals persist_order tenure order equals snapshot
+    // order, so a slower older write can never clobber a newer one
+    // (CodeRabbit + CodeAnt). The LOG lock is held only for the
+    // snapshot clone — never across the fsync-backed write — so
+    // inbound apply and IPC paths do not stall on storage latency
+    // (Qodo; snapshot-then-write-outside-the-protocol-lock precedent).
+    let persist_order = log.lock().await.persist_order.clone();
+    let _order_guard = persist_order.lock().await;
+    let snapshot = {
+        let g = log.lock().await;
+        crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id)
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::community_dfrost_persist::write_snapshot(&cipher, &path, &snapshot)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            ?community_id,
+            err = %e,
+            "dfrost persist: snapshot write failed; will retry on next dirty signal"
+        ),
+        Err(join_err) => tracing::warn!(
+            ?community_id,
+            err = %join_err,
+            "dfrost persist: snapshot write task panicked"
+        ),
+    }
+}
+
 pub struct DfrostLogEngineParams<R: tauri::Runtime> {
     pub community_id: SpaceId,
     pub dfrost_log: Arc<Mutex<DfrostLog>>,
@@ -366,6 +421,11 @@ pub struct DfrostLogEngineParams<R: tauri::Runtime> {
     pub membership_resolver: Option<Arc<dyn MembershipSnapshotResolver>>,
     /// ZEB-1022: orchestration timers/retry policy.
     pub orchestrator_config: DfrostOrchestratorConfig,
+    /// ZEB-753: where to seal `dfrost.cbor` snapshots. `None` ⇒ the
+    /// engine runs without durability (test contexts, or a load failure
+    /// left persistence disarmed for the session so a recoverable file
+    /// is never clobbered — the voting engine's posture).
+    pub persist: Option<crate::community_dfrost_persist::DfrostPersistTarget>,
 }
 
 /// Per-community D-FROST signed-event engine. Owns the inbound receive loop
@@ -393,6 +453,13 @@ pub struct DfrostLogEngine<R: tauri::Runtime> {
     // initiator deadline). Spawned only when a driver is configured;
     // aborted alongside the receive task.
     tick_handle: Option<tokio::task::JoinHandle<()>>,
+    // ZEB-753: persistence target + debounced save task. The task awaits
+    // the log's `dirty` Notify (armed by BOTH apply paths, so IPC-core
+    // applies and engine ingest alike schedule a save), debounces, then
+    // snapshots-under-lock and writes off-worker. Aborted alongside the
+    // other tasks; `flush_persist` covers the shutdown gap.
+    persist: Option<crate::community_dfrost_persist::DfrostPersistTarget>,
+    persist_handle: Option<tokio::task::JoinHandle<()>>,
     // ZEB-307 Task 7: `PhantomData<fn() -> R>` (not `PhantomData<R>`) so the
     // engine is unconditionally `Send + Sync` when wired into
     // `NodeState<tauri::Wry>` — `tauri::Wry` itself is not `Send`
@@ -1465,6 +1532,23 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             None
         };
 
+        // ZEB-753: debounced save task. `dirty` is an `Arc<Notify>`
+        // stable for the life of the shared log map entry (the restore
+        // path preserves it), and `Notify` stores a permit, so an apply
+        // landing mid-write schedules exactly one more save pass.
+        let persist_handle = params.persist.as_ref().map(|target| {
+            let log = params.dfrost_log.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                let dirty = log.lock().await.dirty.clone();
+                loop {
+                    dirty.notified().await;
+                    tokio::time::sleep(DFROST_PERSIST_DEBOUNCE).await;
+                    persist_dfrost_snapshot(&log, &target, community_id).await;
+                }
+            })
+        });
+
         Arc::new(Self {
             community_id,
             dfrost_log: params.dfrost_log,
@@ -1472,8 +1556,21 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             publisher_tx: params.publisher_tx,
             receive_handle,
             tick_handle,
+            persist: params.persist,
+            persist_handle,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// ZEB-753: write one final snapshot synchronously-with-respect-to
+    /// the caller. Called by the registry on shutdown and on engine
+    /// replacement BEFORE `abort()`, closing the debounce window — an
+    /// apply that landed within `DFROST_PERSIST_DEBOUNCE` of teardown
+    /// would otherwise never reach disk. No-op without a persist target.
+    pub(crate) async fn flush_persist(&self) {
+        if let Some(target) = self.persist.as_ref() {
+            persist_dfrost_snapshot(&self.dfrost_log, target, self.community_id).await;
+        }
     }
 
     /// Abort the receive loop without waiting for the last `Arc` clone
@@ -1485,6 +1582,21 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// the registry transition (which would otherwise defer `Drop`
     /// and leave the loop consuming packets).
     pub(crate) fn abort(&self) {
+        self.abort_ingest();
+        if let Some(p) = self.persist_handle.as_ref() {
+            p.abort();
+        }
+    }
+
+    /// ZEB-753 (Greptile on #774): stop ONLY the ingest tasks (receive
+    /// loop + orchestrator tick), leaving the persist task alive. The
+    /// teardown paths call this BEFORE `flush_persist` so no event can
+    /// apply after the final snapshot and then be discarded with the
+    /// in-memory map: an apply already holding the log lock finishes
+    /// its synchronous section and is captured by the flush's later
+    /// lock acquisition; one not yet holding it is cancelled at the
+    /// lock await — the same outcome as arriving after process death.
+    pub(crate) fn abort_ingest(&self) {
         self.receive_handle.abort();
         if let Some(t) = self.tick_handle.as_ref() {
             t.abort();
@@ -1544,6 +1656,9 @@ impl<R: tauri::Runtime> Drop for DfrostLogEngine<R> {
         self.receive_handle.abort();
         if let Some(t) = self.tick_handle.as_ref() {
             t.abort();
+        }
+        if let Some(p) = self.persist_handle.as_ref() {
+            p.abort();
         }
     }
 }
@@ -1627,6 +1742,14 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
         let engine = DfrostLogEngine::start(params).await;
         let mut engines = this.engines.lock().await;
         if let Some(old) = engines.insert(cid, Arc::clone(&engine)) {
+            // ZEB-753: stop the old engine's ingest FIRST (Greptile on
+            // #774 — an event applying after the snapshot would be
+            // silently unpersisted), then close the debounce window,
+            // then kill its save task. The log Arc is shared and writes
+            // serialize on `persist_order`, so this can never write
+            // stale state past the new engine's saves.
+            old.abort_ingest();
+            old.flush_persist().await;
             old.abort();
         }
         engine
@@ -1680,6 +1803,12 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
             .get(&community_id)
             .is_some_and(|cur| Arc::ptr_eq(cur, engine))
         {
+            // ZEB-753 (Qodo on #774): same teardown ordering as
+            // shutdown/replace — a local apply racing the failed
+            // adapter registration may sit inside the debounce window,
+            // and aborting the save task first would drop it.
+            engine.abort_ingest();
+            engine.flush_persist().await;
             engine.abort();
             engines.remove(&community_id);
         }
@@ -1694,6 +1823,14 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
     pub async fn shutdown(&self) {
         let mut engines = self.engines.lock().await;
         for engine in engines.values() {
+            // ZEB-753: ingest stops FIRST (Greptile on #774 — a late
+            // inbound event applying after the final snapshot would be
+            // discarded with the in-memory map), then the final
+            // snapshot, then the save task dies. Runs BEFORE
+            // `stop_inner` clears the `dfrost_logs` map (registry
+            // shutdown precedes the map clear by contract).
+            engine.abort_ingest();
+            engine.flush_persist().await;
             engine.abort();
         }
         engines.clear();
@@ -1858,6 +1995,7 @@ mod tests {
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         })
         .await;
 
@@ -1991,6 +2129,7 @@ mod tests {
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         })
         .await;
 
@@ -2131,6 +2270,7 @@ mod tests {
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         })
         .await;
 
@@ -2265,6 +2405,7 @@ mod tests {
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         })
         .await;
 
@@ -2337,6 +2478,7 @@ mod tests {
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         })
         .await;
 
@@ -2472,6 +2614,7 @@ mod tests {
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         })
         .await;
 
@@ -2549,6 +2692,7 @@ mod tests {
             driver: None,
             membership_resolver: None,
             orchestrator_config: Default::default(),
+            persist: None,
         }
     }
 
@@ -2847,6 +2991,7 @@ mod tests {
                 driver: None,
                 membership_resolver: None,
                 orchestrator_config: Default::default(),
+                persist: None,
             },
         )
         .await;
@@ -2959,6 +3104,7 @@ mod tests {
                 driver: None,
                 membership_resolver: None,
                 orchestrator_config: Default::default(),
+                persist: None,
             },
         )
         .await;
@@ -3137,6 +3283,7 @@ mod tests {
             driver,
             membership_resolver,
             orchestrator_config,
+            persist: None,
         })
         .await;
         (engine, log, sub_tx)
@@ -3271,7 +3418,7 @@ mod tests {
         .await;
         let guard = log.lock().await;
         assert_eq!(
-            guard.events.len(),
+            guard.event_count(),
             1,
             "forged di must have been dropped before apply"
         );
@@ -3343,7 +3490,7 @@ mod tests {
         .await;
         let guard = log.lock().await;
         assert_eq!(
-            guard.events.len(),
+            guard.event_count(),
             1,
             "non-member di must have been dropped before apply"
         );
@@ -3580,7 +3727,7 @@ mod tests {
         .expect("re-mint di1");
         sub_tx.send(encode_packet(&sentinel)).await.unwrap();
 
-        wait_for_log("sentinel processed", &log, |l| l.events.len() >= 2).await;
+        wait_for_log("sentinel processed", &log, |l| l.event_count() >= 2).await;
         let guard = log.lock().await;
         assert_eq!(
             guard
@@ -3729,7 +3876,7 @@ mod tests {
         )
         .expect("re-mint di1");
         sub_tx.send(encode_packet(&sentinel)).await.unwrap();
-        wait_for_log("sentinel processed", &log, |l| l.events.len() >= 2).await;
+        wait_for_log("sentinel processed", &log, |l| l.event_count() >= 2).await;
 
         let guard = log.lock().await;
         assert_eq!(
@@ -4156,6 +4303,101 @@ mod tests {
             seen,
             vec![1_000],
             "membership snapshot must be taken at the mint stamp, not the envelope HLC"
+        );
+    }
+
+    // ── ZEB-753: engine persistence ─────────────────────────────────────
+
+    /// The debounced save task writes `dfrost.cbor` after an apply on the
+    /// SHARED log (here applied directly, the IPC-core path — no engine
+    /// involvement in the apply, proving the dirty signal crosses handle
+    /// bundles), and `flush_persist` closes the debounce window at
+    /// teardown (registry shutdown/replace call exactly this per engine).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persists_snapshot_on_dirty_and_flush_zeb753() {
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = crate::device_dataset_file::test_cipher();
+        let community_id = SpaceId([0x77; 16]);
+        let target = crate::community_dfrost_persist::DfrostPersistTarget {
+            identity_dir: dir.path().to_path_buf(),
+            cipher: cipher.clone(),
+        };
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log.clone(),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0xAA; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: Arc::new(StaticResolver(HashMap::new())),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: Some(target),
+        })
+        .await;
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let alice = OwnerAddr([0xAA; 16]);
+        let bob = OwnerAddr([0xBB; 16]);
+        let (di1, _cid1) = signed_di(
+            &sk,
+            alice,
+            vec![alice, bob],
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        {
+            let mut g = log.lock().await;
+            g.apply(di1.clone()).expect("di applies");
+        }
+
+        // The debounced write lands with no flush call.
+        let path = crate::community_dfrost_persist::dfrost_path_for(dir.path(), &community_id);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("debounced save must write dfrost.cbor within 5s");
+
+        // A second apply inside a fresh debounce window: a production-shape
+        // re-mint (same payload bytes, fresh HLC + signature). `flush_persist`
+        // must capture it deterministically.
+        let fresh_hlc = Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "dev-a".into(),
+        };
+        let di2 =
+            crate::community_dfrost_log::resign_dfrost_event_with_fresh_hlc(&di1, fresh_hlc, &sk)
+                .expect("re-mint di");
+        {
+            let mut g = log.lock().await;
+            g.apply(di2).expect("re-mint di applies");
+        }
+        engine.flush_persist().await;
+        let restored = crate::community_dfrost_persist::load_dfrost(&cipher, &path, &community_id)
+            .expect("reload after flush");
+        assert_eq!(
+            restored.event_count(),
+            2,
+            "flush captured the apply still inside the debounce window"
+        );
+        assert!(
+            restored.committee_state.pending_dkg.is_none(),
+            "restore clears the pending ceremony"
         );
     }
 }
