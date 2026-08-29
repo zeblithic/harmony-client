@@ -12,7 +12,7 @@ use crate::community_dfrost_types::{
 };
 use crate::community_state_sync::IdentityResolver;
 use crate::community_voting_log::MembershipSnapshotResolver;
-use crate::owner_state_types::{OwnerAddr, SpaceId};
+use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use crate::{
     DfrostBeaconReadyPayload, DfrostDkgAbortedPayload, DfrostDkgProgressPayload,
     DfrostRefreshProgressPayload,
@@ -206,9 +206,19 @@ struct OrchestratorState {
     /// emitted, so the tick loop doesn't re-emit every interval.
     failure_emitted: bool,
     /// Initiator-only: a deadline abort whose replacement `reinitiate`
-    /// failed transiently. Retried on empty-slot ticks; cleared once a
-    /// pending ceremony exists again (ours or anyone's).
-    stalled_restart: Option<(Vec<OwnerAddr>, u16)>,
+    /// failed transiently — `(aborted_ceremony_id, members, threshold)`.
+    /// Retried on empty-slot ticks WITH budget (each retry consumes a
+    /// restart attempt — Qodo/Greptile on #771: an unbudgeted retry
+    /// loop never exhausts); cleared once a pending ceremony exists
+    /// again (ours or anyone's) or on terminal exhaustion.
+    stalled_restart: Option<([u8; 32], Vec<OwnerAddr>, u16)>,
+    /// True between an ORCHESTRATOR-initiated `reinitiate` call and the
+    /// resulting ceremony appearing (or the call failing). Lets
+    /// `reconcile_activity` distinguish auto-restarts (keep counting
+    /// toward the cap) from MANUAL `dfrost_initiate_dkg` recovery
+    /// (fresh budget) — without this, a manual restart after exhaustion
+    /// would be terminally aborted on its first quiet deadline.
+    auto_restart_pending: bool,
     /// ZEB-1022 straggler heal: last time this node re-minted its own
     /// `dk` in response to a peer still working a ceremony this node
     /// already promoted. Rate-limits the heal to one per
@@ -218,9 +228,17 @@ struct OrchestratorState {
 
 struct CeremonyActivity {
     ceremony_id: [u8; 32],
-    /// Advanced on every successfully-applied event belonging to the
-    /// dfrost log while this ceremony is pending, and at seed time.
+    /// Advanced when an applied event MATERIALLY changed the ceremony
+    /// (fingerprint moved), and at seed time. Deliberately NOT advanced
+    /// by idempotent re-mint no-ops (Qodo/Greptile on #771): peers
+    /// re-broadcast every `rebroadcast_interval`, which is shorter than
+    /// both quiet thresholds — counting those as progress would make a
+    /// genuinely stalled ceremony look permanently live and disable
+    /// both the initiator deadline and peer stale replacement.
     last_progress: Instant,
+    /// Material-progress fingerprint: (r1_count, r2_recv_count,
+    /// dk_count). `last_progress` advances only when this moves.
+    last_fingerprint: (usize, usize, usize),
     /// Last time this node re-broadcast its own contributions.
     last_rebroadcast: Option<Instant>,
     /// Rounds with a `contribute_round` currently in flight (guard
@@ -245,6 +263,7 @@ struct PendingDriveView {
     r1_count: usize,
     r1_has_self: bool,
     r2_recv_count: usize,
+    dk_count: usize,
     dk_has_self: bool,
     has_secret1: bool,
     has_secret2: bool,
@@ -264,6 +283,7 @@ fn drive_snapshot(log: &DfrostLog, self_addr: &OwnerAddr) -> DriveSnapshot {
             r1_count: p.round1_packages.len(),
             r1_has_self: p.round1_packages.contains_key(self_addr),
             r2_recv_count: p.round2_packages.len(),
+            dk_count: p.dk_confirmations.len(),
             dk_has_self: p.dk_confirmations.contains_key(self_addr),
             has_secret1: log.local_dkg_secret.is_some(),
             has_secret2: log.local_dkg_secret2.is_some(),
@@ -466,13 +486,19 @@ async fn process_inbound<R: tauri::Runtime>(
     //       committee. (Stamp lives in the payload, not the envelope
     //       HLC, so re-minted re-broadcasts still validate.)
     //     * membership: every claimed member must exist in the
-    //       community's membership snapshot at the event's HLC (skipped
-    //       when no resolver is configured — test engines).
+    //       community's membership snapshot at the ceremony's MINT
+    //       stamp (payload `wm`/`lg`), not the envelope HLC — a re-mint
+    //       carries a fresh envelope HLC, and validating there would
+    //       both let membership churn after the mint change the verdict
+    //       across re-broadcasts and unpin the snapshot the ceremony id
+    //       was derived against (skipped when no resolver is
+    //       configured — test engines).
     //     * stale-replace policy: a `di` for a DIFFERENT ceremony than
     //       the pending one is admitted (pending aborted first) only
     //       when the pending ceremony has been quiet past
     //       `stale_replace_threshold`; a live ceremony is never
     //       clobbered. Same-id `di` falls through (idempotent apply).
+    let mut pre_applied = false;
     if event.kind == DfrostEventKind::CeremonyInit {
         let payload: CeremonyInitPayload = match ciborium::de::from_reader(&event.payload[..]) {
             Ok(p) => p,
@@ -502,7 +528,12 @@ async fn process_inbound<R: tauri::Runtime>(
             return;
         }
         if let Some(resolver) = orchestrator.membership_resolver.as_ref() {
-            match resolver.snapshot_at(community_id, &event.hlc).await {
+            let minted_hlc = Hlc {
+                wall_ms: payload.minted_wall_ms,
+                logical: payload.minted_logical,
+                device_id: event.hlc.device_id.clone(),
+            };
+            match resolver.snapshot_at(community_id, &minted_hlc).await {
                 Ok(snapshot) => {
                     if let Some(non_member) = payload
                         .members
@@ -548,6 +579,7 @@ async fn process_inbound<R: tauri::Runtime>(
             let mut log = dfrost_log.lock().await;
             if let Some(p) = log.committee_state.pending_dkg.as_ref() {
                 if p.ceremony_id != payload.ceremony_id {
+                    let incumbent_id = p.ceremony_id;
                     // Admissibility FIRST (CodeRabbit on #771): never
                     // abort the incumbent for a replacement that
                     // `apply_ceremony_init` would then reject — that
@@ -568,10 +600,31 @@ async fn process_inbound<R: tauri::Runtime>(
                     // started) counts as quiet so the slot can't wedge.
                     let stale = match quiet_verdict {
                         None => true,
-                        Some((for_ceremony, quiet)) => quiet && for_ceremony == p.ceremony_id,
+                        Some((for_ceremony, quiet)) => quiet && for_ceremony == incumbent_id,
                     };
                     if stale {
                         let aborted = log.abort_pending_dkg();
+                        // Apply the replacement INSIDE this same lock
+                        // scope (Qodo on #771): releasing the lock
+                        // between abort and apply opens a window where
+                        // a concurrent initiate/auto-drive seeds its
+                        // own ceremony into the just-emptied slot — the
+                        // deferred apply then fails CeremonyInFlight
+                        // and the incumbent was destroyed for nothing.
+                        if let Err(e) =
+                            log.apply_with_identity(event.clone(), self_addr, self_x25519_priv)
+                        {
+                            tracing::warn!(
+                                community_id = %hex::encode(community_id.0),
+                                aborted = ?aborted.map(hex::encode),
+                                replacement = %hex::encode(payload.ceremony_id),
+                                error = ?e,
+                                "dfrost inbound: replacement di failed to apply after \
+                                 stale-replace abort",
+                            );
+                            return;
+                        }
+                        pre_applied = true;
                         tracing::info!(
                             community_id = %hex::encode(community_id.0),
                             aborted = ?aborted.map(hex::encode),
@@ -594,7 +647,11 @@ async fn process_inbound<R: tauri::Runtime>(
     }
 
     // 4. Apply. Hold the log lock only across the apply call itself.
-    let apply_result = {
+    //    (The stale-replace path above already applied the event inside
+    //    the abort's lock scope — don't re-apply.)
+    let apply_result = if pre_applied {
+        Ok(())
+    } else {
         let mut log = dfrost_log.lock().await;
         log.apply_with_identity(event.clone(), self_addr, self_x25519_priv)
     };
@@ -856,24 +913,43 @@ fn reconcile_activity(
         Some(v) => {
             // A live pending slot supersedes any restart-retry debt.
             state.stalled_restart = None;
+            let fingerprint = (v.r1_count, v.r2_recv_count, v.dk_count);
             let same = state.activity.as_ref().map(|a| a.ceremony_id) == Some(v.ceremony_id);
             if !same {
                 state.activity = Some(CeremonyActivity {
                     ceremony_id: v.ceremony_id,
                     last_progress: Instant::now(),
+                    last_fingerprint: fingerprint,
                     last_rebroadcast: None,
                     inflight_rounds: HashSet::new(),
                 });
                 state.failure_emitted = false;
-                // A replacement ceremony driven by someone ELSE resets
-                // this node's initiator retry budget; our own
-                // re-initiations keep counting toward the cap.
-                if v.initiator != Some(*self_addr) {
+                // Retry-budget ownership: a replacement driven by someone
+                // ELSE, or a MANUAL restart by this node, gets a fresh
+                // budget; the orchestrator's own auto-restarts (flagged
+                // via `auto_restart_pending`) keep counting toward the
+                // cap — otherwise every auto-replacement would reset it
+                // and the cap could never bind.
+                if v.initiator == Some(*self_addr) {
+                    if state.auto_restart_pending {
+                        state.auto_restart_pending = false;
+                    } else {
+                        state.restart_attempts = 0;
+                    }
+                } else {
                     state.restart_attempts = 0;
+                    state.auto_restart_pending = false;
                 }
             } else if touch_progress {
                 if let Some(a) = state.activity.as_mut() {
-                    a.last_progress = Instant::now();
+                    // Material progress only (Qodo/Greptile on #771):
+                    // idempotent re-mints apply successfully but move no
+                    // state — they must not keep a stalled ceremony
+                    // looking live.
+                    if a.last_fingerprint != fingerprint {
+                        a.last_fingerprint = fingerprint;
+                        a.last_progress = Instant::now();
+                    }
                 }
             }
         }
@@ -976,32 +1052,74 @@ async fn orchestrator_tick<R: tauri::Runtime>(
 
     let Some(v) = snapshot.pending.as_ref() else {
         // No pending ceremony. If our own deadline abort's re-initiate
-        // failed transiently, retry it here until the cap.
-        let retry: Option<(Vec<OwnerAddr>, u16)> = {
-            let o = orchestrator.state.lock().await;
-            if o.restart_attempts <= orchestrator.config.max_restart_attempts {
-                o.stalled_restart.clone()
-            } else {
-                None
+        // failed transiently, retry here — each retry CONSUMES a
+        // restart attempt (Qodo/Greptile on #771: an unbudgeted `<=`
+        // retry loop re-initiated forever), and exhaustion surfaces the
+        // same terminal `will_retry = false` signal as the deadline
+        // path, with the retry state cleared so nothing keeps firing.
+        enum RetryDecision {
+            Idle,
+            Retry(Vec<OwnerAddr>, u16, u32),
+            Exhausted([u8; 32], u32),
+        }
+        let decision = {
+            let mut o = orchestrator.state.lock().await;
+            match o.stalled_restart.take() {
+                None => RetryDecision::Idle,
+                Some((aborted_id, members, threshold)) => {
+                    if o.restart_attempts >= orchestrator.config.max_restart_attempts {
+                        let d = if o.failure_emitted {
+                            RetryDecision::Idle
+                        } else {
+                            RetryDecision::Exhausted(aborted_id, o.restart_attempts)
+                        };
+                        o.failure_emitted = true;
+                        d
+                    } else {
+                        // Put the retry state back — it is cleared only
+                        // on a successful re-initiate (or exhaustion).
+                        o.stalled_restart = Some((aborted_id, members.clone(), threshold));
+                        o.restart_attempts += 1;
+                        o.auto_restart_pending = true;
+                        RetryDecision::Retry(members, threshold, o.restart_attempts)
+                    }
+                }
             }
         };
-        if let Some((members, threshold)) = retry {
-            match driver.reinitiate(community_id, members, threshold).await {
-                Ok(new_id) => {
-                    tracing::info!(
-                        community_id = %hex::encode(community_id.0),
-                        new_ceremony = %new_id,
-                        "dfrost orchestrator: stalled re-initiate recovered",
-                    );
-                    let mut o = orchestrator.state.lock().await;
-                    o.stalled_restart = None;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        community_id = %hex::encode(community_id.0),
-                        error = %e,
-                        "dfrost orchestrator: re-initiate retry failed",
-                    );
+        match decision {
+            RetryDecision::Idle => {}
+            RetryDecision::Exhausted(aborted_id, attempts) => {
+                tracing::warn!(
+                    community_id = %hex::encode(community_id.0),
+                    aborted = %hex::encode(aborted_id),
+                    attempts,
+                    "dfrost orchestrator: re-initiate retries exhausted — giving up \
+                     (manual dfrost_initiate_dkg required)",
+                );
+                emit_dkg_aborted(app_handle, &community_id, &aborted_id, attempts, false);
+            }
+            RetryDecision::Retry(members, threshold, attempt) => {
+                match driver.reinitiate(community_id, members, threshold).await {
+                    Ok(new_id) => {
+                        tracing::info!(
+                            community_id = %hex::encode(community_id.0),
+                            new_ceremony = %new_id,
+                            attempt,
+                            "dfrost orchestrator: stalled re-initiate recovered",
+                        );
+                        let mut o = orchestrator.state.lock().await;
+                        o.stalled_restart = None;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            community_id = %hex::encode(community_id.0),
+                            error = %e,
+                            attempt,
+                            "dfrost orchestrator: re-initiate retry failed",
+                        );
+                        let mut o = orchestrator.state.lock().await;
+                        o.auto_restart_pending = false;
+                    }
                 }
             }
         }
@@ -1064,16 +1182,34 @@ async fn orchestrator_tick<R: tauri::Runtime>(
     }
     if attempts >= orchestrator.config.max_restart_attempts {
         if !already_failed {
+            // Clear the wedged ceremony (guarded: only if the slot still
+            // holds it) so the advertised MANUAL `dfrost_initiate_dkg`
+            // recovery isn't blocked by its own already-in-flight guard
+            // (Qodo on #771). The manual restart then gets a fresh
+            // budget via `reconcile_activity` (no auto_restart_pending).
+            {
+                let mut log = dfrost_log.lock().await;
+                if log
+                    .committee_state
+                    .pending_dkg
+                    .as_ref()
+                    .map(|p| p.ceremony_id)
+                    == Some(v.ceremony_id)
+                {
+                    log.abort_pending_dkg();
+                }
+            }
             {
                 let mut o = orchestrator.state.lock().await;
                 o.failure_emitted = true;
+                o.activity = None;
             }
             tracing::warn!(
                 community_id = %hex::encode(community_id.0),
                 ceremony_id = %hex::encode(v.ceremony_id),
                 attempts,
-                "dfrost orchestrator: DKG restart budget exhausted — giving up \
-                 (manual dfrost_initiate_dkg required)",
+                "dfrost orchestrator: DKG restart budget exhausted — ceremony aborted, \
+                 giving up (manual dfrost_initiate_dkg required)",
             );
             emit_dkg_aborted(app_handle, &community_id, &v.ceremony_id, attempts, false);
         }
@@ -1102,7 +1238,8 @@ async fn orchestrator_tick<R: tauri::Runtime>(
         let mut o = orchestrator.state.lock().await;
         o.restart_attempts += 1;
         o.activity = None;
-        o.stalled_restart = Some((v.members.clone(), v.threshold));
+        o.stalled_restart = Some((aborted_id, v.members.clone(), v.threshold));
+        o.auto_restart_pending = true;
         o.restart_attempts
     };
     tracing::warn!(
@@ -1127,13 +1264,16 @@ async fn orchestrator_tick<R: tauri::Runtime>(
             o.stalled_restart = None;
         }
         Err(e) => {
-            // stalled_restart stays set — the next empty-slot tick retries.
+            // stalled_restart stays set — the next empty-slot tick
+            // retries (with budget).
             tracing::warn!(
                 community_id = %hex::encode(community_id.0),
                 error = %e,
                 attempt,
                 "dfrost orchestrator: re-initiate failed (will retry next tick)",
             );
+            let mut o = orchestrator.state.lock().await;
+            o.auto_restart_pending = false;
         }
     }
 }
@@ -3593,6 +3733,422 @@ mod tests {
                 .map(|p| p.ceremony_id),
             Some(id1),
             "inadmissible replacement must not clear the incumbent"
+        );
+    }
+
+    /// Driver whose `reinitiate` always fails. Bounded-retry regression
+    /// (Greptile/Qodo on #771): each empty-slot retry must consume a
+    /// restart attempt, so a persistently failing re-initiate stops at
+    /// the cap instead of retrying forever.
+    #[derive(Default)]
+    struct FailingReinitiateDriver {
+        reinitiates: tokio::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl DkgDriver for FailingReinitiateDriver {
+        async fn contribute_round(
+            &self,
+            _community_id: SpaceId,
+            _ceremony_id: [u8; 32],
+            _round_num: u8,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn rebroadcast_pending(
+            &self,
+            _community_id: SpaceId,
+            _ceremony_id: [u8; 32],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn reinitiate(
+            &self,
+            _community_id: SpaceId,
+            _members: Vec<OwnerAddr>,
+            _threshold: u16,
+        ) -> Result<String, String> {
+            *self.reinitiates.lock().await += 1;
+            Err("transport down".into())
+        }
+    }
+
+    /// Driver whose `reinitiate` seeds a fresh pending ceremony into the
+    /// log (what the production driver's `dfrost_initiate_dkg_core`
+    /// does) — exercises the auto-restart budget across replacement
+    /// ceremonies and the exhaustion-clears-pending path.
+    struct SeedingReinitiateDriver {
+        log: tokio::sync::Mutex<
+            Option<Arc<tokio::sync::Mutex<crate::community_dfrost_log::DfrostLog>>>,
+        >,
+        initiator: OwnerAddr,
+        reinitiates: tokio::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl DkgDriver for SeedingReinitiateDriver {
+        async fn contribute_round(
+            &self,
+            _community_id: SpaceId,
+            _ceremony_id: [u8; 32],
+            _round_num: u8,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn rebroadcast_pending(
+            &self,
+            _community_id: SpaceId,
+            _ceremony_id: [u8; 32],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn reinitiate(
+            &self,
+            _community_id: SpaceId,
+            members: Vec<OwnerAddr>,
+            threshold: u16,
+        ) -> Result<String, String> {
+            let mut n = self.reinitiates.lock().await;
+            *n += 1;
+            let log = self
+                .log
+                .lock()
+                .await
+                .clone()
+                .expect("log wired before ticks run");
+            let mut guard = log.lock().await;
+            guard.committee_state.pending_dkg =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id: [0x90 + *n as u8; 32],
+                    initiator: Some(self.initiator),
+                    members,
+                    threshold,
+                    max_signers: threshold,
+                    proposed_epoch: 1,
+                    ..Default::default()
+                });
+            Ok(format!("replacement-{n}"))
+        }
+    }
+
+    /// Membership resolver that records the HLC wall-clock of every
+    /// snapshot query (mint-stamp-binding regression, Greptile on #771).
+    struct RecordingMembership {
+        members: Vec<OwnerAddr>,
+        seen_wall_ms: tokio::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for RecordingMembership {
+        async fn snapshot_at(
+            &self,
+            _community_id: SpaceId,
+            hlc: &Hlc,
+        ) -> Result<
+            crate::community_voting_core::MembershipSnapshot,
+            crate::community_voting_log::SnapshotResolverError,
+        > {
+            self.seen_wall_ms.lock().await.push(hlc.wall_ms);
+            let members = self
+                .members
+                .iter()
+                .map(|a| {
+                    (
+                        *a,
+                        crate::community_voting_core::MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .collect();
+            Ok(crate::community_voting_core::MembershipSnapshot { members })
+        }
+    }
+
+    /// Greptile P1 / Qodo HIGH on #771: peers re-broadcast every
+    /// `rebroadcast_interval` (much shorter than both quiet thresholds),
+    /// and each re-mint applies successfully as an idempotent no-op. If
+    /// those no-op applies refreshed `last_progress`, a genuinely
+    /// stalled ceremony would look permanently live and the initiator
+    /// deadline could never fire. Only MATERIAL progress (the
+    /// r1/r2/dk fingerprint moving) may refresh the clock.
+    #[tokio::test]
+    async fn engine_remint_noise_does_not_suppress_deadline_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xD0);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xD1);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xDA; 16]);
+        // Self = alice = the initiator (deadline is initiator-only).
+        let (_engine, _log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            alice_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_millis(100),
+                stale_replace_threshold: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (di1, _id1) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        sub_tx.send(encode_packet(&di1)).await.unwrap();
+
+        // Re-mint noise for LONGER than wait_until's 2s cap: without the
+        // fingerprint gate every injection refreshes the quiet clock and
+        // the deadline can never expire inside the wait window.
+        let noise = tokio::spawn({
+            let sub_tx = sub_tx.clone();
+            let alice_sk = alice_sk.clone();
+            async move {
+                for i in 0..400u64 {
+                    let remint = crate::community_dfrost_log::resign_dfrost_event_with_fresh_hlc(
+                        &di1,
+                        Hlc {
+                            wall_ms: 1_000 + (i + 1) * 10,
+                            logical: 0,
+                            device_id: "dev-a".into(),
+                        },
+                        &alice_sk,
+                    )
+                    .expect("re-mint di1");
+                    if sub_tx.send(encode_packet(&remint)).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(8)).await;
+                }
+            }
+        });
+
+        wait_until("deadline fires despite re-mint noise", || async {
+            !driver.reinitiates.lock().await.is_empty()
+        })
+        .await;
+        noise.abort();
+    }
+
+    /// Greptile P1 / Qodo on #771: a persistently failing `reinitiate`
+    /// must stop at `max_restart_attempts` — the empty-slot retry loop
+    /// consumes budget per attempt and then goes terminally quiet.
+    #[tokio::test]
+    async fn engine_reinitiate_retry_budget_is_bounded_zeb1022() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xD2);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xD3);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(FailingReinitiateDriver::default());
+        let community_id = SpaceId([0xDB; 16]);
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            alice_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_millis(30),
+                stale_replace_threshold: Duration::from_secs(60),
+                max_restart_attempts: 3,
+            },
+        )
+        .await;
+
+        {
+            let mut guard = log.lock().await;
+            guard.committee_state.pending_dkg =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id: [0x7Au8; 32],
+                    initiator: Some(alice_addr),
+                    members: members.clone(),
+                    threshold: 2,
+                    max_signers: 2,
+                    proposed_epoch: 1,
+                    ..Default::default()
+                });
+        }
+
+        wait_until("retries reach the cap", || async {
+            *driver.reinitiates.lock().await == 3
+        })
+        .await;
+        // Terminal: no further attempts on later ticks.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            *driver.reinitiates.lock().await,
+            3,
+            "exhausted retry loop must stay quiet"
+        );
+        assert!(
+            log.lock().await.committee_state.pending_dkg.is_none(),
+            "aborted slot stays empty for manual recovery"
+        );
+    }
+
+    /// Qodo HIGH on #771: exhausting the restart budget on a still-quiet
+    /// ceremony must ABORT it — leaving it in `pending_dkg` blocks the
+    /// advertised manual `dfrost_initiate_dkg` recovery behind its own
+    /// ceremony-in-flight guard. Also pins the auto-restart budget: the
+    /// orchestrator's own replacement ceremony (seeded by `reinitiate`)
+    /// keeps counting toward the cap instead of resetting it — otherwise
+    /// the abort→reseed cycle never terminates.
+    #[tokio::test]
+    async fn engine_restart_exhaustion_clears_pending_for_manual_recovery_zeb1022() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xD4);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xD5);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(SeedingReinitiateDriver {
+            log: tokio::sync::Mutex::new(None),
+            initiator: alice_addr,
+            reinitiates: tokio::sync::Mutex::new(0),
+        });
+        let community_id = SpaceId([0xDC; 16]);
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            alice_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                rebroadcast_interval: Duration::from_secs(60),
+                initiator_quiet_deadline: Duration::from_millis(30),
+                stale_replace_threshold: Duration::from_secs(60),
+                max_restart_attempts: 1,
+            },
+        )
+        .await;
+        *driver.log.lock().await = Some(log.clone());
+
+        {
+            let mut guard = log.lock().await;
+            guard.committee_state.pending_dkg =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id: [0x7Bu8; 32],
+                    initiator: Some(alice_addr),
+                    members: members.clone(),
+                    threshold: 2,
+                    max_signers: 2,
+                    proposed_epoch: 1,
+                    ..Default::default()
+                });
+        }
+
+        // Deadline 1 aborts the hand-seeded ceremony and re-initiates
+        // (seeding a replacement); the replacement's own quiet deadline
+        // then finds the budget exhausted and must CLEAR the slot.
+        wait_for_log("exhaustion aborts the wedged replacement", &log, |l| {
+            l.committee_state.pending_dkg.is_none()
+        })
+        .await;
+        assert_eq!(
+            *driver.reinitiates.lock().await,
+            1,
+            "auto-restart keeps consuming the budget — exactly cap re-initiations"
+        );
+        // Terminal: the abort→reseed cycle must not resume.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(*driver.reinitiates.lock().await, 1);
+        assert!(log.lock().await.committee_state.pending_dkg.is_none());
+    }
+
+    /// Greptile P1 on #771: `di` membership must be validated at the
+    /// ceremony's payload-carried MINT stamp, not the envelope HLC — a
+    /// re-mint carries a fresh envelope HLC, and validating there would
+    /// let post-mint membership churn flip the verdict between the
+    /// original broadcast and its re-mints.
+    #[tokio::test]
+    async fn engine_di_membership_validated_at_mint_stamp_zeb1022() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xD6);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xD7);
+        let mut members = vec![alice_addr, bob_addr];
+        members.sort();
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+        let membership = Arc::new(RecordingMembership {
+            members: members.clone(),
+            seen_wall_ms: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let community_id = SpaceId([0xDD; 16]);
+        let (_c_sk, observer_addr, _c) = fixture_identity(0xD8);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            observer_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            Some(membership.clone()),
+            DfrostOrchestratorConfig::default(),
+        )
+        .await;
+
+        // Mint at wall 1000, but deliver only a RE-MINT whose envelope
+        // HLC says 3000 — the snapshot query must still ask for 1000.
+        let (di1, id1) = signed_di(
+            &alice_sk,
+            alice_addr,
+            members.clone(),
+            2,
+            1,
+            &community_id,
+            1_000,
+            None,
+        );
+        let remint = crate::community_dfrost_log::resign_dfrost_event_with_fresh_hlc(
+            &di1,
+            Hlc {
+                wall_ms: 3_000,
+                logical: 0,
+                device_id: "dev-a".into(),
+            },
+            &alice_sk,
+        )
+        .expect("re-mint di1");
+        sub_tx.send(encode_packet(&remint)).await.unwrap();
+
+        wait_for_log("re-minted di seeds", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| p.ceremony_id)
+                == Some(id1)
+        })
+        .await;
+        let seen = membership.seen_wall_ms.lock().await.clone();
+        assert_eq!(
+            seen,
+            vec![1_000],
+            "membership snapshot must be taken at the mint stamp, not the envelope HLC"
         );
     }
 }
