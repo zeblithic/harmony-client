@@ -37,7 +37,7 @@
 //! log lock, so the two halves cannot diverge on disk.
 //!
 //! The restore path (`DfrostLog::from_restored`) additionally clears
-//! the three pending slots — interactive ceremony rounds do not survive
+//! the four pending slots — interactive ceremony rounds do not survive
 //! a restart by design, and their secret halves were never persisted.
 
 use std::collections::BTreeMap;

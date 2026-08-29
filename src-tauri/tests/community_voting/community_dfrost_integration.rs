@@ -773,43 +773,69 @@ fn refresh_two_engine_preserves_joint_vk() {
     let refresh_ceremony_id: [u8; 32] = [0xee; 32];
     let preserved_vk = c.joint_vk;
 
-    // ── rf rn=1: proposer distributes sealed packages to each member ─────
-    // Synthetic sealed bytes — the apply path decrypts them but doesn't
-    // interpret the content. In a real refresh the sealed bytes carry the
-    // new share polynomial coefficients.
-    let synthetic_share_for_alice = vec![0xaa; 64];
-    let synthetic_share_for_bob = vec![0xbb; 64];
-    let sealed_for_alice =
-        dm_signing::seal_to_owner(&alice_pub, &synthetic_share_for_alice).expect("seal alice");
-    let sealed_for_bob =
-        dm_signing::seal_to_owner(&bob_pub, &synthetic_share_for_bob).expect("seal bob");
+    // ── rf rn=1 (ZEB-1027): each member broadcasts its PUBLIC
+    //    zero-sharing round-1 commitment — same shape as dr rn=1.
+    //    Synthetic package bytes: the apply path stores them without
+    //    interpretation (the FROST content is unit-covered in
+    //    community_dfrost_crypto).
+    let alice_r1_pkg = vec![0xaa; 32];
+    let bob_r1_pkg = vec![0xbb; 32];
+    for (actor, pkg, wall) in [
+        (ALICE, alice_r1_pkg.clone(), 6_000u64),
+        (BOB, bob_r1_pkg.clone(), 6_050),
+    ] {
+        let rf1 = build_rf_event(
+            actor,
+            wall,
+            if actor == ALICE { "alice" } else { "bob" },
+            RefreshRoundPayload {
+                ceremony_id: refresh_ceremony_id,
+                round_num: 1,
+                recipient_ciphertexts: None,
+                package: Some(pkg),
+            },
+        );
+        c.engine_a
+            .apply_with_identity(rf1.clone(), &ALICE, &alice_priv)
+            .expect("a applies rf1");
+        c.engine_b
+            .apply_with_identity(rf1, &BOB, &bob_priv)
+            .expect("b applies rf1");
+    }
 
-    let rf1 = build_rf_event(
+    // ── rf rn=2: sealed per-recipient round-2 packages (here: alice's
+    //    only, targeting bob — plus a sealed-to-self entry, matching the
+    //    production core's uniform distribution).
+    let synthetic_share_for_alice = vec![0xa1; 64];
+    let synthetic_share_for_bob = vec![0xb1; 64];
+    let rf2 = build_rf_event(
         ALICE,
-        6_000,
+        6_100,
         "alice",
         RefreshRoundPayload {
             ceremony_id: refresh_ceremony_id,
-            round_num: 1,
-            round2_package: None,
+            round_num: 2,
             recipient_ciphertexts: Some(vec![
                 RecipientCiphertext {
                     recipient: ALICE,
-                    sealed: sealed_for_alice,
+                    sealed: dm_signing::seal_to_owner(&alice_pub, &synthetic_share_for_alice)
+                        .expect("seal alice"),
                 },
                 RecipientCiphertext {
                     recipient: BOB,
-                    sealed: sealed_for_bob,
+                    sealed: dm_signing::seal_to_owner(&bob_pub, &synthetic_share_for_bob)
+                        .expect("seal bob"),
                 },
             ]),
+            package: None,
         },
     );
     c.engine_a
-        .apply_with_identity(rf1.clone(), &ALICE, &alice_priv)
-        .expect("a applies rf1 + decrypts");
+        .apply_with_identity(rf2.clone(), &ALICE, &alice_priv)
+        .expect("a applies rf2 + decrypts");
     c.engine_b
-        .apply_with_identity(rf1, &BOB, &bob_priv)
-        .expect("b applies rf1 + decrypts");
+        .apply_with_identity(rf2, &BOB, &bob_priv)
+        .expect("b applies rf2 + decrypts");
 
     // ── Both engines now have pending_refresh populated ──────────────────
     let pr_a = c
@@ -828,15 +854,14 @@ fn refresh_two_engine_preserves_joint_vk() {
     assert_eq!(pr_b.ceremony_id, refresh_ceremony_id);
     assert_eq!(pr_a.proposed_epoch, 2);
     assert_eq!(pr_b.proposed_epoch, 2);
+    // rn=1 public packages accumulated on both engines (ZEB-1027).
+    assert_eq!(pr_a.round1_packages.get(&ALICE), Some(&alice_r1_pkg));
+    assert_eq!(pr_a.round1_packages.get(&BOB), Some(&bob_r1_pkg));
+    assert_eq!(pr_b.round1_packages.get(&ALICE), Some(&alice_r1_pkg));
+    assert_eq!(pr_b.round1_packages.get(&BOB), Some(&bob_r1_pkg));
 
-    // R4 (CodeRabbit): mirror the R3 DKG round-2 decrypt assertion for the
-    // refresh path. Without this check, a regression in apply_with_identity
-    // for ProactiveRefresh (e.g., wrong recipient match, decrypt skip,
-    // wrong actor key) would still pass — the dk finalization below reuses
-    // epoch-1 verifying_shares and never consumes the refresh's decrypted
-    // bytes. Read back pending_refresh.round2_packages (keyed by sender =
-    // ALICE since she's the proposer of rf rn=1) and assert each engine
-    // decrypted its targeted ciphertext.
+    // R4 (CodeRabbit) lineage: each engine must have decrypted the rn=2
+    // ciphertext addressed to it (keyed by sender = ALICE).
     assert_eq!(
         pr_a.round2_packages.get(&ALICE),
         Some(&synthetic_share_for_alice),
@@ -847,7 +872,7 @@ fn refresh_two_engine_preserves_joint_vk() {
         Some(&synthetic_share_for_bob),
         "engine B must have decrypted refresh share targeted at BOB"
     );
-    // Each engine stored exactly one entry (only one proposer's rf rn=1).
+    // Each engine stored exactly one entry (only one sender's rf rn=2).
     assert_eq!(
         pr_a.round2_packages.len(),
         1,

@@ -1398,9 +1398,13 @@ pub struct NodeState {
     /// sealed `dfrost.cbor` snapshot (`community_dfrost_persist`),
     /// restored by `ensure_dfrost_engine_for` and saved by the engine's
     /// debounced task (flushed at registry shutdown). Everything ELSE is
-    /// in-memory only BY DESIGN: local DKG secrets/nonces and the three
+    /// in-memory only BY DESIGN: local DKG secrets/nonces and the four
     /// pending-ceremony slots die with the process (interactive rounds
-    /// are not restartable). Engine + Zenoh-adapter teardown is owned by
+    /// are not restartable). ZEB-1027 closes the resulting signing gap
+    /// PROTOCOL-side: a restored member auto-requests RTS share repair
+    /// (`rp` events) and regains its signing share from ≥ threshold
+    /// helpers without any secret touching disk. Engine + Zenoh-adapter
+    /// teardown is owned by
     /// `dfrost_log_registry` shutdown in stop_inner / the start_node
     /// restart path, and BOTH clear this map right after the engines stop
     /// (PR #768 review) — retaining it would leak pending ceremonies and
@@ -63272,6 +63276,96 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
         )
         .await
     }
+
+    async fn contribute_refresh_round(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        ceremony_id: [u8; 32],
+        round_num: u8,
+    ) -> Result<(), String> {
+        if round_num == 1 {
+            // Join/propose: the core derives the deterministic ceremony
+            // id from the ACTIVE committee's shape — read that shape and
+            // sanity-check it reproduces the observed id, so the drive
+            // can never contribute into a ceremony it mis-identified.
+            let (members, threshold) = {
+                let log_arc = {
+                    let mut map = self.handles.dfrost_logs.lock().await;
+                    map.entry(community_id)
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(tokio::sync::Mutex::new(
+                                crate::community_dfrost_log::DfrostLog::new(),
+                            ))
+                        })
+                        .clone()
+                };
+                let log = log_arc.lock().await;
+                if !log.committee_state.active {
+                    return Err("contribute_refresh_round: no active committee".to_string());
+                }
+                (
+                    log.committee_state.members.clone(),
+                    log.committee_state.threshold,
+                )
+            };
+            let minted = dfrost_propose_refresh_core::<R, _>(
+                &self.handles,
+                self.app_handle.as_ref(),
+                community_id,
+                members,
+                threshold,
+            )
+            .await?;
+            if minted != hex::encode(ceremony_id) {
+                // Should be unreachable (both sides derive from the same
+                // committee state); loud so a drift never hides.
+                tracing::warn!(
+                    community_id = %hex::encode(community_id.0),
+                    expected = %hex::encode(ceremony_id),
+                    minted = %minted,
+                    "dfrost refresh auto-join derived a different ceremony id than observed",
+                );
+            }
+            return Ok(());
+        }
+        dfrost_contribute_refresh_round_core::<R, _>(
+            &self.handles,
+            self.app_handle.as_ref(),
+            community_id,
+            ceremony_id,
+            round_num,
+        )
+        .await
+    }
+
+    async fn contribute_repair_round(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        ceremony_id: [u8; 32],
+        round_num: u8,
+    ) -> Result<(), String> {
+        dfrost_contribute_repair_round_core::<R, _>(
+            &self.handles,
+            self.app_handle.as_ref(),
+            community_id,
+            ceremony_id,
+            round_num,
+        )
+        .await
+    }
+
+    async fn request_repair(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+    ) -> Result<String, String> {
+        dfrost_request_share_repair_core::<R, _>(
+            &self.handles,
+            self.app_handle.as_ref(),
+            community_id,
+            None,
+        )
+        .await
+    }
 }
 
 /// ZEB-1022: re-mint (fresh HLC + signature, identical payloads) and
@@ -65463,50 +65557,34 @@ pub struct DfrostRefreshProgressPayload {
     pub round_num: u8,
 }
 
-/// Tauri IPC: admin proposes a proactive D-FROST committee share refresh.
+/// Tauri IPC: admin proposes (or a peer joins) a proactive D-FROST
+/// committee share refresh — round 1 of the zero-sharing refresh DKG.
 ///
-/// Refresh applies the FROST resharing protocol against an EXISTING
-/// active committee: every member receives a fresh signing share while
-/// the committee's joint verifying key is preserved (the
+/// ZEB-1027: this is now the REAL refresh protocol
+/// (`frost_core::keys::refresh`), not the Phase 4a-foundation
+/// placeholder. Refresh rotates every member's signing share while
+/// preserving the committee's joint verifying key (the
 /// `apply_dkg_complete` invariant rejects any refresh whose
-/// `joint_verifying_key` differs from the active committee's). Member
-/// identity (OwnerAddr → FROST Identifier mapping) is preserved across
-/// refresh so existing per-member verifying shares remain valid for the
-/// new epoch.
+/// `joint_verifying_key` differs from the active committee's) and the
+/// member set / identifier assignment.
 ///
-/// Pipeline:
-///   1. Validate `new_members` matches the active committee's member set
-///      (refresh preserves membership; member-change requires a separate
-///      flow that re-runs full DKG).
-///   2. Reject if no active committee, or if a refresh is already in
-///      flight.
-///   3. Run `dkg_part1_local` to mint a fresh round-1 secret + package
-///      bytes (placeholder share material — the FROST resharing primitive
-///      lands in a future task; for now the rn=1 payload carries the
-///      sealed round-1 package as the per-recipient ciphertext, matching
-///      the integration-test shape that `apply_proactive_refresh` accepts).
-///   4. Seal the round-1 package bytes to each member's X25519 pubkey via
-///      `seal_to_owner` (same path `dfrost_contribute_dkg_round` rn=2
-///      uses).
-///   5. Build + sign an `rf` rn=1 event carrying `recipient_ciphertexts`
-///      (no `round1_package` field — refresh's broadcast is the sealed
-///      per-recipient distribution, not a public round-1 commitment).
-///   6. Apply locally via `apply_with_identity`. The apply path auto-
-///      initialises `pending_refresh` on the first rn=1 with
-///      `proposed_epoch = current_epoch + 1`, and decrypts the
-///      sealed-to-self ciphertext into `pending_refresh.round2_packages`.
-///   7. Stash the round-1 secret on `local_dkg_secret` so a future
-///      refresh-completion IPC can recover it (mirrors `dfrost_initiate_dkg`).
-///   8. Emit `dfrost-refresh-progress` with `round_num=1`.
+/// Pipeline (see `dfrost_propose_refresh_core`):
+///   1. Validate `new_members` matches the active committee's member
+///      set (refresh preserves membership; member-change requires a
+///      separate flow that re-runs full DKG) and the threshold matches.
+///   2. Reject if no active committee or a DKG is in flight; derive the
+///      deterministic ceremony id (`derive_refresh_ceremony_id`) so
+///      every member independently converges on ONE ceremony (R9).
+///   3. Run `refresh_part1_local` (zero-constant-term commitment) and
+///      broadcast the PUBLIC round-1 package in an `rf` rn=1 event —
+///      exactly `dr` rn=1's shape. Rounds 2–3 continue via
+///      `dfrost_contribute_refresh_round`.
 ///
 /// Returns the hex-encoded ceremony_id (32 bytes → 64 chars).
 ///
-/// Out of scope (Phase 4a-foundation): rounds 2-3 of the refresh DKG and
-/// the `dk` finalization — `dfrost_contribute_dkg_round` only inspects
-/// `pending_dkg`, not `pending_refresh`, so refresh completion will arrive
-/// in a follow-up task (likely a dedicated `dfrost_contribute_refresh_round`
-/// IPC). Zenoh broadcast of the `rf` rn=1 event to peer committee members
-/// is also Phase 4a-main.
+/// A member that lost its share (restart) can still participate in
+/// rounds 1–2 — the zero-sharing deals need no old share — but cannot
+/// finalize (round 3); its recovery path is `dfrost_request_share_repair`.
 #[tauri::command]
 async fn dfrost_propose_refresh<R: tauri::Runtime>(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
@@ -65543,7 +65621,37 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
         .collect::<Result<Vec<_>, String>>()?;
     member_addrs.sort();
     member_addrs.dedup();
+    let handles = dfrost_core_handles_from_state(&state_lock).await?;
+    dfrost_propose_refresh_core::<R, _>(&handles, Some(&app), space_id, member_addrs, threshold)
+        .await
+}
 
+/// ZEB-1027: shared core of `dfrost_propose_refresh` — also fired by
+/// the engine orchestrator (`DkgDriver::contribute_refresh_round`
+/// rn=1) so peer members auto-join a refresh ceremony the moment they
+/// observe it. `member_addrs` must be sorted bytewise + deduplicated.
+///
+/// Round-1 shape (ZEB-1027): `refresh_part1_local` mints a
+/// zero-constant-term commitment; the PUBLIC package bytes broadcast in
+/// the `rf` rn=1 payload's `pk` field (no sealing — round 1 of a DKG is
+/// a public commitment). The round-1 secret stashes on
+/// `local_dkg_secret` exactly as the DKG rn=1 path does; the
+/// `pending_refresh` slot accumulates every member's package via
+/// `apply_proactive_refresh`.
+///
+/// Ceremony convergence (R9): the ceremony id is
+/// `derive_refresh_ceremony_id(members, threshold, current_epoch + 1,
+/// space_id)` — deterministic, so each member's independent call joins
+/// the same ceremony. "Self already submitted" is
+/// `pending_refresh.round1_packages.contains_key(self)` (pre-1027 it
+/// was a `round2_packages` marker from the sealed placeholder shape).
+pub async fn dfrost_propose_refresh_core<R: tauri::Runtime, H: tauri::Runtime>(
+    handles: &DfrostCoreHandles<H>,
+    app: Option<&tauri::AppHandle<R>>,
+    space_id: crate::owner_state_types::SpaceId,
+    member_addrs: Vec<crate::owner_state_types::OwnerAddr>,
+    threshold: u16,
+) -> Result<String, String> {
     let max_signers = u16::try_from(member_addrs.len())
         .map_err(|_| "dfrost_propose_refresh: committee too large for u16".to_string())?;
     if max_signers < 2 {
@@ -65557,54 +65665,21 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
         ));
     }
 
-    // 3. Extract NodeState handles. community_registry needed for the
-    //    OwnerAddr → identity_pub_64 → X25519 pubkey lookup used to seal
-    //    each per-recipient share package (same path
-    //    `dfrost_contribute_dkg_round` rn=2 uses).
-    // T8: also pull `dfrost_log_registry` (Option, None in test contexts).
-    let (
-        hlc_tracker,
-        adopt_floor,
-        device_id,
-        self_owner,
-        dm_outbox,
-        dfrost_logs,
-        community_registry,
-        dfrost_log_registry,
-    ) = {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("dfrost_propose_refresh: NodeState poisoned: {e}"))?;
-        (
-            g.hlc_tracker
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.hlc_adopt_floor.clone(),
-            g.dm_device_id
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dm_outbox
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            std::sync::Arc::clone(&g.dfrost_logs),
-            g.community_registry
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dfrost_log_registry.clone(),
-        )
-    };
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
 
-    // 4. Find self in the (sorted) member list; compute local FROST
-    //    Identifier from that zero-based index. The proposer MUST be a
-    //    committee member.
+    // Self must be a committee member; identifier from sorted index.
     let self_index = member_addrs
         .iter()
         .position(|a| *a == self_owner)
         .ok_or("dfrost_propose_refresh: proposer must be a committee member")?;
     let self_id = crate::community_dfrost_crypto::identifier_for_index(self_index);
 
-    // 5. Get the per-community DfrostLog Arc.
+    // Per-community DfrostLog Arc.
     let log_arc = {
         let mut map = dfrost_logs.lock().await;
         map.entry(space_id)
@@ -65616,17 +65691,46 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
             .clone()
     };
 
-    // 6. Snapshot active committee state + sanity-check refresh
-    //    preconditions: (a) committee must be active, (b) no DKG in
-    //    flight, (c) proposed member set must equal the active set
-    //    (refresh preserves membership), (d) threshold must match.
-    //    The "is a refresh already in flight?" gate is deferred until
-    //    after we compute the (deterministic) ceremony_id so we can
-    //    distinguish "same ceremony, different proposer" (a legitimate
-    //    peer contribution per R9) from "different refresh in flight"
-    //    (a protocol bug).
-    let proposed_epoch = {
+    // ZEB-1022 publication-order lock: this path now reserves an HLC
+    // and publishes into a live multi-node ceremony (pre-1027 the rn=1
+    // broadcast carried placeholder material no peer acted on), so it
+    // joins the initiate/contribute cores under the same ordering
+    // contract. Held for the rest of the function.
+    let publish_order = {
         let log = log_arc.lock().await;
+        log.publish_order.clone()
+    };
+    let _publish_order_guard = publish_order.lock().await;
+
+    // Reserve the HLC BEFORE the log critical section (the tracker has
+    // its own lock; never nest it under the log lock).
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        wall_now_ms,
+    )
+    .await;
+    let signing_key_arc: std::sync::Arc<ed25519_dalek::SigningKey> =
+        std::sync::Arc::clone(&handles.signing_key);
+
+    // R7 lineage (DKG rn=1): hold the log lock CONTINUOUSLY across
+    // gate → part1 → build → stash → apply so concurrent calls can
+    // never double-mint round-1 material (publish_order already
+    // serializes production callers; this keeps the invariant local).
+    let (ceremony_id, event_for_broadcast): (
+        [u8; 32],
+        crate::community_dfrost_types::SignedCommitteeEvent,
+    ) = {
+        let mut log = log_arc.lock().await;
+
+        // Preconditions: active committee, no DKG in flight, member set
+        // + threshold preserved (a refresh that changes either requires
+        // the separate member-change flow re-running full DKG).
         if !log.committee_state.active {
             return Err(
                 "dfrost_propose_refresh: no active committee — DKG must complete before refresh"
@@ -65640,11 +65744,6 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
                     .to_string(),
             );
         }
-        // Membership preservation: a refresh that changes the member set
-        // would require re-running full DKG (member-change implies new
-        // identifier assignment and new verifying shares). Active members
-        // are stored sorted; we sorted `member_addrs` above, so a direct
-        // slice compare is correct.
         if log.committee_state.members.as_slice() != member_addrs.as_slice() {
             return Err(
                 "dfrost_propose_refresh: refresh must preserve the active committee's member \
@@ -65659,75 +65758,25 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
                 log.committee_state.threshold
             ));
         }
-        log.committee_state
+        let proposed_epoch = log
+            .committee_state
             .current_epoch
             .checked_add(1)
-            .ok_or("dfrost_propose_refresh: epoch overflow")?
-    };
+            .ok_or("dfrost_propose_refresh: epoch overflow")?;
 
-    // 7. Reserve next HLC for this device — same path the other voting /
-    //    dfrost IPCs use so cross-kind events stay monotonic per device.
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
-        &hlc_tracker,
-        &adopt_floor,
-        &device_id,
-        wall_now_ms,
-    )
-    .await;
+        // Deterministic ceremony id (R9): see
+        // `derive_refresh_ceremony_id` for why the HLC is excluded.
+        let ceremony_id = crate::community_dfrost_types::derive_refresh_ceremony_id(
+            &member_addrs,
+            threshold,
+            proposed_epoch,
+            &space_id,
+        );
 
-    // 8. Derive ceremony_id = blake3(sorted_members || proposed_epoch_le ||
-    //    threshold_le || b"refresh-v1" || space_id). DETERMINISTIC by
-    //    design — every committee member computes the same ceremony_id
-    //    from inputs they all observe (active committee shape, agreed
-    //    next epoch, scoped to this community). This is what lets peer
-    //    members independently call `dfrost_propose_refresh` and
-    //    converge on one shared ceremony (R9 Cursor HIGH
-    //    "Refresh blocks second member").
-    //
-    //    HLC is INTENTIONALLY excluded from the ceremony_id input: with
-    //    HLC each proposer's IPC would mint a distinct id and peers
-    //    couldn't share one ceremony. HLC still appears in the rf rn=1
-    //    EVENT envelope (signed by the actor) — it's just not load-
-    //    bearing for ceremony scoping any more.
-    //
-    //    Each (members, threshold, proposed_epoch, space_id) tuple
-    //    uniquely identifies one refresh ceremony at most. `proposed_epoch`
-    //    is `current_epoch + 1`, so within a given committee epoch there's
-    //    exactly one possible refresh ceremony_id — and refresh
-    //    COMPLETION (a `dk` for the rotated committee) clears
-    //    `pending_refresh` and advances `current_epoch` before any next
-    //    refresh can derive a new id.
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(member_addrs.len() * 16 + 8 + 2 + 10 + 16);
-    for a in &member_addrs {
-        hasher_input.extend_from_slice(&a.0);
-    }
-    hasher_input.extend_from_slice(&proposed_epoch.to_le_bytes());
-    hasher_input.extend_from_slice(&threshold.to_le_bytes());
-    hasher_input.extend_from_slice(b"refresh-v1");
-    hasher_input.extend_from_slice(&space_id.0);
-    let ceremony_id: [u8; 32] = blake3::hash(&hasher_input).into();
-
-    // 8b. Per-actor in-flight gate (R9): if a refresh is already in
-    //     flight for THIS ceremony, this call is a peer contribution —
-    //     allow it through unless self has already submitted rn=1. A
-    //     pending_refresh with a different ceremony_id signals a
-    //     protocol bug (different members / threshold / proposed_epoch
-    //     than this call computed) and we surface it explicitly rather
-    //     than silently apply.
-    //
-    //     The per-actor "have I already submitted?" signal is
-    //     `pending_refresh.round2_packages.contains_key(&self_owner)`:
-    //     `apply_with_identity` for ProactiveRefresh rn=1 stores the
-    //     decrypted sealed-to-self ciphertext at
-    //     `round2_packages[event.actor]`. For self's own rf rn=1,
-    //     `event.actor == self_owner`, so this map entry is the
-    //     definitive "self contributed" marker on this node.
-    {
-        let log = log_arc.lock().await;
+        // Per-actor in-flight gate (R9): a pending refresh for THIS
+        // ceremony makes this call a peer contribution — allowed unless
+        // self already submitted rn=1. A pending refresh with a
+        // DIFFERENT id is a protocol bug surfaced explicitly.
         if let Some(pr) = &log.committee_state.pending_refresh {
             if pr.ceremony_id != ceremony_id {
                 return Err(format!(
@@ -65739,7 +65788,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
                     hex::encode(ceremony_id),
                 ));
             }
-            if pr.round2_packages.contains_key(&self_owner) {
+            if pr.round1_packages.contains_key(&self_owner) {
                 return Err(
                     "dfrost_propose_refresh: self has already submitted rn=1 for this refresh \
                      ceremony"
@@ -65747,129 +65796,46 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
                 );
             }
         }
-    }
 
-    // 9. Run DKG round-1 to mint a fresh round-1 secret + public round-1
-    //    package bytes. In the current implementation the package bytes
-    //    serve as the placeholder per-recipient share material (sealed to
-    //    each member below). When the proper FROST resharing primitive
-    //    lands in a future task, this call site will switch to it; the
-    //    rest of the IPC shape (seal-per-recipient → rf rn=1 →
-    //    pending_refresh) stays identical.
-    let (r1_secret, r1_pkg_bytes) =
-        crate::community_dfrost_crypto::dkg_part1_local(self_id, max_signers, threshold)
-            .map_err(|e| format!("dfrost_propose_refresh: dkg::part1 failed: {e}"))?;
+        // Zero-sharing round 1 (public commitment, no old share needed
+        // — a restarted, shareless member participates here too).
+        let (r1_secret, r1_pkg_bytes) =
+            crate::community_dfrost_crypto::refresh_part1_local(self_id, max_signers, threshold)
+                .map_err(|e| format!("dfrost_propose_refresh: refresh part1: {e}"))?;
 
-    // 10. Seal the round-1 package bytes to every committee member's
-    //     X25519 pubkey. Per `apply_proactive_refresh` rn=1, the apply
-    //     path requires `recipient_ciphertexts.is_some()` (broadcast
-    //     check) and decrypts the entry whose `recipient == self` (local
-    //     identity-aware path) into `pending_refresh.round2_packages`.
-    let resolver = community_registry.identity_resolver();
-    let mut recipient_ciphertexts: Vec<crate::community_membership::RecipientCiphertext> =
-        Vec::with_capacity(member_addrs.len());
-    for recipient_addr in &member_addrs {
-        let identity_pub_64 = resolver.resolve(recipient_addr).await.ok_or_else(|| {
-            format!(
-                "dfrost_propose_refresh: identity_pub for recipient {} not resolvable — peer \
-                 device pub has not propagated yet",
-                hex::encode(recipient_addr.0)
-            )
-        })?;
-        let ed_pub: &[u8; 32] = identity_pub_64[32..64].try_into().map_err(|_| {
-            "dfrost_propose_refresh: identity_pub_64 slice 32..64 not 32 bytes (should never \
-             happen)"
-        })?;
-        let recipient_x25519_pub =
-            crate::dm_signing::ed25519_pub_to_x25519(ed_pub).map_err(|e| {
-                format!(
-                    "dfrost_propose_refresh: ed25519_pub_to_x25519 for {}: {e}",
-                    hex::encode(recipient_addr.0)
-                )
-            })?;
-        let sealed = crate::dm_signing::seal_to_owner(&recipient_x25519_pub, &r1_pkg_bytes)
-            .map_err(|e| {
-                format!(
-                    "dfrost_propose_refresh: seal_to_owner for {}: {e:?}",
-                    hex::encode(recipient_addr.0)
-                )
-            })?;
-        recipient_ciphertexts.push(crate::community_membership::RecipientCiphertext {
-            recipient: *recipient_addr,
-            sealed,
-        });
-    }
-
-    // 11. Build + sign the `rf` rn=1 event. `round2_package` is None at
-    //     rn=1; `recipient_ciphertexts` carries the sealed per-recipient
-    //     share material.
-    let payload = crate::community_dfrost_types::RefreshRoundPayload {
-        ceremony_id,
-        round_num: 1,
-        round2_package: None,
-        recipient_ciphertexts: Some(recipient_ciphertexts),
-    };
-    let (event, self_x25519_priv) = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
-            signing_key,
+        let payload = crate::community_dfrost_types::RefreshRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            recipient_ciphertexts: None,
+            package: Some(r1_pkg_bytes),
+        };
+        let event = crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key_arc.as_ref(),
             self_owner,
             crate::community_dfrost_types::DfrostEventKind::ProactiveRefresh,
             &payload,
             hlc,
         )
         .map_err(|e| format!("dfrost_propose_refresh: build_signed: {e}"))?;
-        // Derive X25519 priv while we still hold the outbox lock (avoids
-        // re-locking just to read the same Arc<SigningKey>).
-        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
-        (ev, x_priv)
-    };
+        let self_x25519_priv: [u8; 32] =
+            *crate::dm_signing::ed25519_priv_to_x25519(signing_key_arc.as_ref());
 
-    // 12. Apply locally + stash local_dkg_secret. The apply path
-    //     (`apply_proactive_refresh` rn=1) auto-initialises
-    //     `pending_refresh` if absent, copying members / threshold /
-    //     max_signers from the active committee and setting
-    //     `proposed_epoch = current_epoch + 1` — same value we computed
-    //     in step 6, so no pre-seeding is needed. The proposer-side
-    //     `apply_with_identity` also decrypts the sealed-to-self entry
-    //     into `pending_refresh.round2_packages`, mirroring the
-    //     integration-test shape.
-    //
-    //     Stash r1_secret BEFORE apply: if apply fails the secret is
-    //     still recoverable; if we stashed after apply and apply
-    //     succeeded but the stash errored, the round-1 secret would be
-    //     lost and the refresh would be unrecoverable.
-    //
-    //     R5-1 (HIGH, paired with dfrost_initiate_dkg): snapshot the
-    //     prior `local_dkg_secret` so an apply failure rolls back the
-    //     pre-mutation. Without rollback, a transient apply error leaves
-    //     a stale local_dkg_secret that could collide with a subsequent
-    //     concurrent DKG / refresh attempt. The `pending_refresh` field
-    //     is NOT pre-mutated here (apply auto-initialises it), so no
-    //     snapshot is needed for that field.
-    // T8: clone the event for apply so the original remains available for
-    // the post-lock broadcast block below.
-    {
-        let mut log = log_arc.lock().await;
-        let prior_local_dkg_secret = log.local_dkg_secret.clone();
+        // Stash + apply with rollback (R5-1 lineage).
+        let prior_secret = log.local_dkg_secret.take();
         log.local_dkg_secret = Some(r1_secret);
         if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
-            // R5-1: restore prior secret so retry isn't fighting a stale
-            // stash from this failed attempt.
-            log.local_dkg_secret = prior_local_dkg_secret;
+            log.local_dkg_secret = prior_secret;
             return Err(format!("dfrost_propose_refresh: apply: {e:?}"));
         }
-    }
+        (ceremony_id, event)
+    };
 
-    // T8: broadcast the rf rn=1 event (best-effort; local apply already
-    // succeeded). Lock ordering: this runs OUTSIDE the log lock scope
-    // above (R8 + R10 from PR #143). R9 per-actor idempotency gate
-    // happens INSIDE the log lock pre-apply — broadcast does NOT move it.
+    // Broadcast (best-effort; local apply already succeeded), outside
+    // the log lock (R8/R10 ordering).
     match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
             Some(engine) => {
-                if let Err(e) = engine.publish_event(event).await {
+                if let Err(e) = engine.publish_event(event_for_broadcast).await {
                     tracing::warn!(
                         space_id = ?space_id,
                         error = %e,
@@ -65893,19 +65859,1196 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
         }
     }
 
-    // 13. Emit progress event.
     let ceremony_id_hex = hex::encode(ceremony_id);
-    let evt_payload = DfrostRefreshProgressPayload {
-        community_id: hex::encode(space_id.0),
-        ceremony_id: ceremony_id_hex.clone(),
-        round_num: 1,
-    };
-    if let Err(e) = app.emit("dfrost-refresh-progress", &evt_payload) {
-        // Non-fatal: state is already mutated; the emit is a UI hint.
-        tracing::warn!(error = %e, "dfrost-refresh-progress emit failed");
+    if let Some(app) = app {
+        let evt_payload = DfrostRefreshProgressPayload {
+            community_id: hex::encode(space_id.0),
+            ceremony_id: ceremony_id_hex.clone(),
+            round_num: 1,
+        };
+        if let Err(e) = app.emit("dfrost-refresh-progress", &evt_payload) {
+            // Non-fatal: state is already mutated; the emit is a UI hint.
+            tracing::warn!(error = %e, "dfrost-refresh-progress emit failed");
+        }
     }
 
     Ok(ceremony_id_hex)
+}
+
+/// Tauri IPC: contribute rounds 2–3 of an in-flight proactive refresh
+/// (ZEB-1027 — the follow-up the Phase 4a-foundation
+/// `dfrost_propose_refresh` doc promised). Round 1 goes through
+/// `dfrost_propose_refresh`; this IPC covers:
+///
+/// * `round_num=2`: run `refresh_part2_local` over every OTHER member's
+///   round-1 package, seal the per-recipient round-2 packages, publish
+///   `rf` rn=2.
+/// * `round_num=3`: run `refresh_part3_local` (requires this node's OLD
+///   `KeyPackage` — a shareless member CANNOT finalize; its path is
+///   `dfrost_request_share_repair`), install the rotated key material,
+///   publish the ceremony's `dk` (which, at quorum, bumps the epoch and
+///   rotates `CommitteeState.verifying_shares` while preserving the
+///   joint verifying key).
+#[tauri::command]
+async fn dfrost_contribute_refresh_round<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    ceremony_id: String,
+    round_num: u8,
+) -> Result<(), String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("dfrost_contribute_refresh_round: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_refresh_round: community_id must be 16 bytes (32 hex chars)"
+                .to_string()
+        })?;
+    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
+        .map_err(|e| format!("dfrost_contribute_refresh_round: invalid ceremony_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_refresh_round: ceremony_id must be 32 bytes (64 hex chars)"
+                .to_string()
+        })?;
+    let handles = dfrost_core_handles_from_state(&state_lock).await?;
+    dfrost_contribute_refresh_round_core::<R, _>(
+        &handles,
+        Some(&app),
+        crate::owner_state_types::SpaceId(cid_bytes),
+        ceremony_bytes,
+        round_num,
+    )
+    .await
+}
+
+/// ZEB-1027: shared core of `dfrost_contribute_refresh_round` —
+/// callable by the engine orchestrator so refresh rounds auto-drive
+/// exactly like DKG rounds. Structurally mirrors
+/// `dfrost_contribute_dkg_round_core` rn=2/3 with `pending_refresh` in
+/// place of `pending_dkg` and the zero-sharing crypto wrappers in place
+/// of the DKG ones.
+pub async fn dfrost_contribute_refresh_round_core<R: tauri::Runtime, H: tauri::Runtime>(
+    handles: &DfrostCoreHandles<H>,
+    app: Option<&tauri::AppHandle<R>>,
+    space_id: crate::owner_state_types::SpaceId,
+    ceremony_bytes: [u8; 32],
+    round_num: u8,
+) -> Result<(), String> {
+    if !matches!(round_num, 2 | 3) {
+        return Err(format!(
+            "dfrost_contribute_refresh_round: round_num must be 2 or 3 (round 1 is \
+             dfrost_propose_refresh), got {round_num}"
+        ));
+    }
+
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
+
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    // ZEB-1022 publication-order lock — held for the rest of the
+    // function (both branches reserve an HLC and publish).
+    let publish_order = {
+        let log = log_arc.lock().await;
+        log.publish_order.clone()
+    };
+    let _publish_order_guard = publish_order.lock().await;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    // The rotated (KeyPackage, PublicKeyPackage) pair round 3 installs.
+    type RotatedKeyMaterial = (
+        frost_ristretto255::keys::KeyPackage,
+        frost_ristretto255::keys::PublicKeyPackage,
+    );
+    let (event_to_apply, self_x25519_priv, r2_secret_to_stash, rotated_to_stash): (
+        crate::community_dfrost_types::SignedCommitteeEvent,
+        [u8; 32],
+        Option<frost_ristretto255::keys::dkg::round2::SecretPackage>,
+        Option<RotatedKeyMaterial>,
+    ) = if round_num == 2 {
+        // ─── ROUND 2 ──────────────────────────────────────────────────
+        let resolver = handles.identity_resolver.clone().ok_or(
+            "dfrost_contribute_refresh_round: identity resolver unavailable \
+             (community registry not initialised — owner not loaded?)",
+        )?;
+
+        let (members, r1_received_by_addr, r1_secret) = {
+            let log = log_arc.lock().await;
+            let pending = log.committee_state.pending_refresh.as_ref().ok_or(
+                "dfrost_contribute_refresh_round: no pending refresh ceremony for community",
+            )?;
+            if pending.ceremony_id != ceremony_bytes {
+                return Err(format!(
+                    "dfrost_contribute_refresh_round: ceremony_id mismatch \
+                     (pending={}, requested={})",
+                    hex::encode(pending.ceremony_id),
+                    hex::encode(ceremony_bytes)
+                ));
+            }
+            if !pending.round1_packages.contains_key(&self_owner) {
+                return Err(
+                    "dfrost_contribute_refresh_round: self has not submitted rn=1 — \
+                     call dfrost_propose_refresh first"
+                        .to_string(),
+                );
+            }
+            // R5-3 lineage: round-2 double-submit gate. Safe against
+            // stale post-DKG leftovers because `apply_dkg_complete` now
+            // clears both round secrets at promotion (ZEB-1027).
+            if log.local_dkg_secret2.is_some() {
+                return Err(
+                    "dfrost_contribute_refresh_round: round 2 already submitted by self"
+                        .to_string(),
+                );
+            }
+            let r1: std::collections::BTreeMap<crate::owner_state_types::OwnerAddr, Vec<u8>> =
+                pending
+                    .round1_packages
+                    .iter()
+                    .filter(|(addr, _)| **addr != self_owner)
+                    .map(|(addr, pkg)| (*addr, pkg.clone()))
+                    .collect();
+            let secret = log.local_dkg_secret.clone().ok_or(
+                "dfrost_contribute_refresh_round: local_dkg_secret missing — \
+                     was dfrost_propose_refresh called on this node?",
+            )?;
+            (pending.members.clone(), r1, secret)
+        };
+
+        // Quorum gate: part2 needs round-1 packages from EVERY other
+        // member.
+        let expected_others = members.len().saturating_sub(1);
+        if r1_received_by_addr.len() != expected_others {
+            return Err(format!(
+                "dfrost_contribute_refresh_round: round 2 needs round-1 packages from all \
+                 {expected_others} other member(s); have {}",
+                r1_received_by_addr.len()
+            ));
+        }
+
+        let mut r1_by_id: std::collections::BTreeMap<frost_ristretto255::Identifier, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for (addr, pkg_bytes) in &r1_received_by_addr {
+            let idx = members.iter().position(|a| *a == *addr).ok_or_else(|| {
+                format!(
+                    "dfrost_contribute_refresh_round: peer addr {} not in member list",
+                    hex::encode(addr.0)
+                )
+            })?;
+            let id = crate::community_dfrost_crypto::identifier_for_index(idx);
+            r1_by_id.insert(id, pkg_bytes.clone());
+        }
+
+        let (r2_secret, r2_packages_by_id) =
+            crate::community_dfrost_crypto::refresh_part2_local(r1_secret, &r1_by_id)
+                .map_err(|e| format!("dfrost_contribute_refresh_round: refresh part2: {e}"))?;
+
+        // Seal each round-2 package to its recipient (same resolver
+        // path as DKG rn=2).
+        let mut recipient_ciphertexts: Vec<crate::community_membership::RecipientCiphertext> =
+            Vec::with_capacity(r2_packages_by_id.len());
+        for (recipient_id, r2_pkg_bytes) in &r2_packages_by_id {
+            let idx = members
+                .iter()
+                .enumerate()
+                .find_map(|(i, _addr)| {
+                    if crate::community_dfrost_crypto::identifier_for_index(i) == *recipient_id {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or("dfrost_contribute_refresh_round: FROST identifier→addr lookup failed")?;
+            let recipient_addr = members[idx];
+
+            let identity_pub_64 = resolver.resolve(&recipient_addr).await.ok_or_else(|| {
+                format!(
+                    "dfrost_contribute_refresh_round: identity_pub for recipient {} not \
+                         resolvable — peer device pub has not propagated yet",
+                    hex::encode(recipient_addr.0)
+                )
+            })?;
+            let ed_pub: &[u8; 32] = identity_pub_64[32..64].try_into().map_err(|_| {
+                "dfrost_contribute_refresh_round: identity_pub_64 slice 32..64 not 32 bytes \
+                 (should never happen)"
+            })?;
+            let recipient_x25519_pub =
+                crate::dm_signing::ed25519_pub_to_x25519(ed_pub).map_err(|e| {
+                    format!(
+                        "dfrost_contribute_refresh_round: ed25519_pub_to_x25519 for {}: {e}",
+                        hex::encode(recipient_addr.0)
+                    )
+                })?;
+            let sealed = crate::dm_signing::seal_to_owner(&recipient_x25519_pub, r2_pkg_bytes)
+                .map_err(|e| {
+                    format!(
+                        "dfrost_contribute_refresh_round: seal_to_owner for {}: {e:?}",
+                        hex::encode(recipient_addr.0)
+                    )
+                })?;
+            recipient_ciphertexts.push(crate::community_membership::RecipientCiphertext {
+                recipient: recipient_addr,
+                sealed,
+            });
+        }
+
+        let payload = crate::community_dfrost_types::RefreshRoundPayload {
+            ceremony_id: ceremony_bytes,
+            round_num: 2,
+            recipient_ciphertexts: Some(recipient_ciphertexts),
+            package: None,
+        };
+        let signing_key = handles.signing_key.as_ref();
+        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::ProactiveRefresh,
+            &payload,
+            hlc,
+        )
+        .map_err(|e| format!("dfrost_contribute_refresh_round: build_signed: {e}"))?;
+        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+        (ev, x_priv, Some(r2_secret), None)
+    } else {
+        // ─── ROUND 3 (finalization) ───────────────────────────────────
+        let (
+            members,
+            threshold,
+            max_signers,
+            proposed_epoch,
+            r1_by_id,
+            r2_by_id,
+            secret2,
+            old_key_package,
+            old_pub_key_package,
+        ) = {
+            let log = log_arc.lock().await;
+            let pending = log.committee_state.pending_refresh.as_ref().ok_or(
+                "dfrost_contribute_refresh_round: no pending refresh ceremony for community",
+            )?;
+            if pending.ceremony_id != ceremony_bytes {
+                return Err(format!(
+                    "dfrost_contribute_refresh_round: ceremony_id mismatch \
+                     (pending={}, requested={})",
+                    hex::encode(pending.ceremony_id),
+                    hex::encode(ceremony_bytes)
+                ));
+            }
+            let members = pending.members.clone();
+
+            let mut r1: std::collections::BTreeMap<frost_ristretto255::Identifier, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (addr, pkg) in pending
+                .round1_packages
+                .iter()
+                .filter(|(a, _)| **a != self_owner)
+            {
+                let idx = members.iter().position(|a| *a == *addr).ok_or_else(|| {
+                    format!(
+                        "dfrost_contribute_refresh_round: peer addr {} not in member list",
+                        hex::encode(addr.0)
+                    )
+                })?;
+                r1.insert(
+                    crate::community_dfrost_crypto::identifier_for_index(idx),
+                    pkg.clone(),
+                );
+            }
+
+            let mut r2: std::collections::BTreeMap<frost_ristretto255::Identifier, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (addr, pkg) in &pending.round2_packages {
+                let idx = members.iter().position(|a| *a == *addr).ok_or_else(|| {
+                    format!(
+                        "dfrost_contribute_refresh_round: r2 sender addr {} not in member list",
+                        hex::encode(addr.0)
+                    )
+                })?;
+                r2.insert(
+                    crate::community_dfrost_crypto::identifier_for_index(idx),
+                    pkg.clone(),
+                );
+            }
+
+            let secret = log.local_dkg_secret2.clone().ok_or(
+                "dfrost_contribute_refresh_round: local_dkg_secret2 missing — \
+                     was round_num=2 contributed first on this node?",
+            )?;
+
+            // ZEB-1027: finalization ROTATES the existing share —
+            // `new = old + Σ deltas` — so the old share is a hard
+            // requirement. A restarted member lands here after having
+            // contributed rounds 1–2; its recovery path is share
+            // repair, not refresh.
+            let old_kp = log.local_key_package.clone().ok_or(
+                "dfrost_contribute_refresh_round: this node holds no signing share, so it \
+                     cannot finalize a refresh (new share = old share + refresh deltas). \
+                     Recover the share via dfrost_request_share_repair after this refresh \
+                     completes for the members that do hold shares.",
+            )?;
+            // Old PublicKeyPackage rebuilt from the persisted consensus
+            // bytes — deliberately NOT `local_pub_key_package`, so the
+            // input is the same committee-agreed state on every member.
+            let mut shares_by_id: std::collections::BTreeMap<
+                frost_ristretto255::Identifier,
+                [u8; 32],
+            > = std::collections::BTreeMap::new();
+            for (addr, bytes) in &log.committee_state.verifying_shares {
+                let id = *log
+                    .committee_state
+                    .identifier_map
+                    .get(addr)
+                    .ok_or_else(|| {
+                        format!(
+                            "dfrost_contribute_refresh_round: verifying-share holder {} not in \
+                             identifier_map",
+                            hex::encode(addr.0)
+                        )
+                    })?;
+                shares_by_id.insert(id, *bytes);
+            }
+            let joint_vk = log.committee_state.joint_verifying_key.as_ref().ok_or(
+                "dfrost_contribute_refresh_round: active committee has no joint verifying key",
+            )?;
+            let old_pkp = crate::community_dfrost_crypto::pub_key_package_from_bytes(
+                &shares_by_id,
+                joint_vk,
+                log.committee_state.threshold,
+            )
+            .map_err(|e| format!("dfrost_contribute_refresh_round: rebuild old package: {e}"))?;
+
+            (
+                members,
+                pending.threshold,
+                pending.max_signers,
+                pending.proposed_epoch,
+                r1,
+                r2,
+                secret,
+                old_kp,
+                old_pkp,
+            )
+        };
+
+        let expected_others = members.len().saturating_sub(1);
+        if r1_by_id.len() != expected_others || r2_by_id.len() != expected_others {
+            return Err(format!(
+                "dfrost_contribute_refresh_round: round 3 needs r1 + r2 from all \
+                 {expected_others} other member(s); have r1={}, r2={}",
+                r1_by_id.len(),
+                r2_by_id.len()
+            ));
+        }
+
+        let (new_key_package, new_pub_key_package) =
+            crate::community_dfrost_crypto::refresh_part3_local(
+                &secret2,
+                &r1_by_id,
+                &r2_by_id,
+                old_pub_key_package,
+                old_key_package,
+            )
+            .map_err(|e| format!("dfrost_contribute_refresh_round: refresh part3: {e}"))?;
+
+        let joint_vk = crate::community_dfrost_crypto::verifying_key_to_bytes(
+            new_pub_key_package.verifying_key(),
+        );
+        // Defence-in-depth (the dk apply invariant also enforces this):
+        // zero-sharing must preserve the joint verifying key exactly.
+        {
+            let log = log_arc.lock().await;
+            if log.committee_state.joint_verifying_key != Some(joint_vk) {
+                return Err(
+                    "dfrost_contribute_refresh_round: refresh produced a DIFFERENT joint \
+                     verifying key — zero-sharing invariant broken, aborting before publish"
+                        .to_string(),
+                );
+            }
+        }
+
+        let mut verifying_shares: Vec<crate::community_dfrost_types::MemberVerifyingShare> =
+            Vec::with_capacity(members.len());
+        for (id, vs) in new_pub_key_package.verifying_shares() {
+            let idx = members
+                .iter()
+                .enumerate()
+                .find_map(|(i, _)| {
+                    if crate::community_dfrost_crypto::identifier_for_index(i) == *id {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(
+                    "dfrost_contribute_refresh_round: VerifyingShare identifier→addr lookup \
+                     failed",
+                )?;
+            verifying_shares.push(crate::community_dfrost_types::MemberVerifyingShare {
+                member: members[idx],
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(vs),
+            });
+        }
+
+        let payload = crate::community_dfrost_types::DkgCompletePayload {
+            ceremony_id: ceremony_bytes,
+            joint_verifying_key: joint_vk,
+            verifying_shares,
+            epoch: proposed_epoch,
+            members: members.clone(),
+            threshold,
+            max_signers,
+        };
+        let signing_key = handles.signing_key.as_ref();
+        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::DkgComplete,
+            &payload,
+            hlc,
+        )
+        .map_err(|e| format!("dfrost_contribute_refresh_round: build_signed: {e}"))?;
+        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+        (
+            ev,
+            x_priv,
+            None,
+            Some((new_key_package, new_pub_key_package)),
+        )
+    };
+
+    // Apply locally. Round 2 stashes the round-2 secret in the same
+    // lock window (R6 rollback pattern); round 3 installs the ROTATED
+    // key material and rolls it back if its own dk fails to apply —
+    // signing at the still-current epoch with an already-rotated share
+    // would poison every contribution this node makes.
+    {
+        let mut log = log_arc.lock().await;
+        let prior_secret2 = if r2_secret_to_stash.is_some() {
+            let prior = log.local_dkg_secret2.take();
+            log.local_dkg_secret2 = r2_secret_to_stash;
+            Some(prior)
+        } else {
+            None
+        };
+        let prior_rotated = if let Some((kp, pkp)) = rotated_to_stash {
+            let prior = (
+                log.local_key_package.take(),
+                log.local_pub_key_package.take(),
+            );
+            log.local_key_package = Some(kp);
+            log.local_pub_key_package = Some(pkp);
+            Some(prior)
+        } else {
+            None
+        };
+        if let Err(e) =
+            log.apply_with_identity(event_to_apply.clone(), &self_owner, &self_x25519_priv)
+        {
+            if let Some(prior) = prior_secret2 {
+                log.local_dkg_secret2 = prior;
+            }
+            if let Some((prior_kp, prior_pkp)) = prior_rotated {
+                log.local_key_package = prior_kp;
+                log.local_pub_key_package = prior_pkp;
+            }
+            return Err(format!("dfrost_contribute_refresh_round: apply: {e:?}"));
+        }
+    }
+
+    // Broadcast (best-effort), outside the log lock.
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event_to_apply).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        round_num = round_num,
+                        error = %e,
+                        "dfrost_contribute_refresh_round: broadcast failed \
+                         (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    space_id = ?space_id,
+                    round_num = round_num,
+                    "dfrost_contribute_refresh_round: no engine registered for community — \
+                     broadcast skipped \
+                     (engine not registered — boot/join ensure has not run for this community?)",
+                );
+            }
+        },
+        None => {
+            tracing::debug!(
+                round_num = round_num,
+                "dfrost_contribute_refresh_round: dfrost_log_registry is None — \
+                 broadcast skipped (test context?)",
+            );
+        }
+    }
+
+    if let Some(app) = app {
+        let evt_payload = DfrostRefreshProgressPayload {
+            community_id: hex::encode(space_id.0),
+            ceremony_id: hex::encode(ceremony_bytes),
+            round_num,
+        };
+        if let Err(e) = app.emit("dfrost-refresh-progress", &evt_payload) {
+            // Non-fatal: state is already mutated; the emit is a UI hint.
+            tracing::warn!(error = %e, "dfrost-refresh-progress emit failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Tauri event payload for `"dfrost-repair-progress"` (ZEB-1027).
+/// Mirrors `DfrostRefreshProgressPayload` on a repair-specific channel;
+/// `participant` identifies whose share is being repaired.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DfrostRepairProgressPayload {
+    pub community_id: String,
+    pub ceremony_id: String,
+    pub round_num: u8,
+    /// Hex OwnerAddr of the member whose share is being repaired.
+    pub participant: String,
+}
+
+/// Tauri IPC: request repair of THIS node's lost D-FROST signing share
+/// (ZEB-1027 — the restart-recovery path).
+///
+/// After a restart the sealed `dfrost.cbor` snapshot restores the full
+/// PUBLIC committee state but — by the never-persist-secrets contract —
+/// not the signing share. This IPC publishes an `rp` rn=1 request; the
+/// declared helpers (default: every other member) respond with RTS
+/// rounds 2–3, and `settle_repair_after_round3` reconstructs + verifies
+/// + reinstalls the share entirely in memory.
+///
+/// `helpers` (optional, hex OwnerAddrs) narrows the declared helper set
+/// — the retry path when a member is offline; every declared helper
+/// must respond, and at least `threshold` are required. A t-of-n
+/// committee with t == n therefore cannot repair (only t−1 shares
+/// survive the loss) — that failure mode is permanent and surfaces
+/// here as a clear error.
+#[tauri::command]
+async fn dfrost_request_share_repair<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    helpers: Option<Vec<String>>,
+) -> Result<String, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("dfrost_request_share_repair: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_request_share_repair: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let helper_addrs: Option<Vec<crate::owner_state_types::OwnerAddr>> = match helpers {
+        None => None,
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for h in &list {
+                let bytes: [u8; 16] = hex::decode(h)
+                    .map_err(|e| format!("dfrost_request_share_repair: invalid helper hex: {e}"))?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| {
+                        "dfrost_request_share_repair: helper must be 16 bytes (32 hex chars)"
+                            .to_string()
+                    })?;
+                out.push(crate::owner_state_types::OwnerAddr(bytes));
+            }
+            Some(out)
+        }
+    };
+    let handles = dfrost_core_handles_from_state(&state_lock).await?;
+    dfrost_request_share_repair_core::<R, _>(
+        &handles,
+        Some(&app),
+        crate::owner_state_types::SpaceId(cid_bytes),
+        helper_addrs,
+    )
+    .await
+}
+
+/// ZEB-1027: shared core of `dfrost_request_share_repair` — also fired
+/// by the engine orchestrator when it observes a restored, shareless
+/// member on an otherwise-idle active committee.
+pub async fn dfrost_request_share_repair_core<R: tauri::Runtime, H: tauri::Runtime>(
+    handles: &DfrostCoreHandles<H>,
+    app: Option<&tauri::AppHandle<R>>,
+    space_id: crate::owner_state_types::SpaceId,
+    helpers: Option<Vec<crate::owner_state_types::OwnerAddr>>,
+) -> Result<String, String> {
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
+
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    let publish_order = {
+        let log = log_arc.lock().await;
+        log.publish_order.clone()
+    };
+    let _publish_order_guard = publish_order.lock().await;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        wall_now_ms,
+    )
+    .await;
+    let signing_key_arc: std::sync::Arc<ed25519_dalek::SigningKey> =
+        std::sync::Arc::clone(&handles.signing_key);
+
+    let (ceremony_id, event_for_broadcast): (
+        [u8; 32],
+        crate::community_dfrost_types::SignedCommitteeEvent,
+    ) = {
+        let mut log = log_arc.lock().await;
+        if !log.committee_state.active {
+            return Err(
+                "dfrost_request_share_repair: no active committee — nothing to repair".to_string(),
+            );
+        }
+        if !log.committee_state.members.contains(&self_owner) {
+            return Err("dfrost_request_share_repair: self is not a committee member".to_string());
+        }
+        if log.local_key_package.is_some() {
+            return Err(
+                "dfrost_request_share_repair: this node already holds its signing share — \
+                 repair is only for lost shares"
+                    .to_string(),
+            );
+        }
+        if log.committee_state.pending_dkg.is_some()
+            || log.committee_state.pending_refresh.is_some()
+        {
+            return Err(
+                "dfrost_request_share_repair: a DKG/refresh ceremony is in flight — repair \
+                 must wait for it to settle (a completed refresh clears the way; re-request \
+                 afterwards at the new epoch)"
+                    .to_string(),
+            );
+        }
+        let epoch = log.committee_state.current_epoch;
+        let threshold = log.committee_state.threshold as usize;
+
+        // Default helper set: every OTHER member. `members` is sorted,
+        // so the filtered list stays sorted (the apply path requires
+        // sorted + deduplicated).
+        let helper_addrs: Vec<crate::owner_state_types::OwnerAddr> = match &helpers {
+            None => log
+                .committee_state
+                .members
+                .iter()
+                .filter(|a| **a != self_owner)
+                .copied()
+                .collect(),
+            Some(list) => {
+                let mut sorted = list.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted
+            }
+        };
+        if helper_addrs.contains(&self_owner) {
+            return Err(
+                "dfrost_request_share_repair: the participant cannot be its own helper".to_string(),
+            );
+        }
+        if helper_addrs
+            .iter()
+            .any(|h| !log.committee_state.members.contains(h))
+        {
+            return Err(
+                "dfrost_request_share_repair: every helper must be a committee member".to_string(),
+            );
+        }
+        if helper_addrs.len() < threshold {
+            return Err(format!(
+                "dfrost_request_share_repair: RTS needs at least threshold ({threshold}) \
+                 helpers; only {} available/declared. A committee with threshold == size \
+                 cannot repair a lost share — the surviving members no longer reach quorum",
+                helper_addrs.len()
+            ));
+        }
+
+        let ceremony_id = crate::community_dfrost_types::derive_repair_ceremony_id(
+            &self_owner,
+            epoch,
+            &helper_addrs,
+            hlc.wall_ms,
+            hlc.logical,
+            &space_id,
+        );
+
+        let payload = crate::community_dfrost_types::RepairRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            epoch,
+            helpers: Some(helper_addrs),
+            minted_wall_ms: Some(hlc.wall_ms),
+            minted_logical: Some(hlc.logical),
+            recipient_ciphertexts: None,
+        };
+        let event = crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key_arc.as_ref(),
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::RepairShare,
+            &payload,
+            hlc,
+        )
+        .map_err(|e| format!("dfrost_request_share_repair: build_signed: {e}"))?;
+        let self_x25519_priv: [u8; 32] =
+            *crate::dm_signing::ed25519_priv_to_x25519(signing_key_arc.as_ref());
+        if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
+            return Err(format!("dfrost_request_share_repair: apply: {e:?}"));
+        }
+        (ceremony_id, event)
+    };
+
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event_for_broadcast).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_request_share_repair: broadcast failed (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    space_id = ?space_id,
+                    "dfrost_request_share_repair: no engine registered for community — \
+                     broadcast skipped \
+                     (engine not registered — boot/join ensure has not run for this community?)",
+                );
+            }
+        },
+        None => {
+            tracing::debug!(
+                "dfrost_request_share_repair: dfrost_log_registry is None — \
+                 broadcast skipped (test context?)",
+            );
+        }
+    }
+
+    let ceremony_id_hex = hex::encode(ceremony_id);
+    if let Some(app) = app {
+        let evt_payload = DfrostRepairProgressPayload {
+            community_id: hex::encode(space_id.0),
+            ceremony_id: ceremony_id_hex.clone(),
+            round_num: 1,
+            participant: hex::encode(self_owner.0),
+        };
+        if let Err(e) = app.emit("dfrost-repair-progress", &evt_payload) {
+            // Non-fatal: state is already mutated; the emit is a UI hint.
+            tracing::warn!(error = %e, "dfrost-repair-progress emit failed");
+        }
+    }
+
+    Ok(ceremony_id_hex)
+}
+
+/// Tauri IPC: contribute a helper round of an in-flight share repair
+/// (ZEB-1027). `round_num=2` distributes this helper's sealed RTS
+/// deltas to every declared helper; `round_num=3` sums the received
+/// deltas into a sigma sealed to the participant. The participant
+/// itself contributes nothing after rn=1 — its finalization runs
+/// inline in the apply path (`settle_repair_after_round3`).
+#[tauri::command]
+async fn dfrost_contribute_repair_round<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    ceremony_id: String,
+    round_num: u8,
+) -> Result<(), String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("dfrost_contribute_repair_round: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_repair_round: community_id must be 16 bytes (32 hex chars)"
+                .to_string()
+        })?;
+    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
+        .map_err(|e| format!("dfrost_contribute_repair_round: invalid ceremony_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_repair_round: ceremony_id must be 32 bytes (64 hex chars)"
+                .to_string()
+        })?;
+    let handles = dfrost_core_handles_from_state(&state_lock).await?;
+    dfrost_contribute_repair_round_core::<R, _>(
+        &handles,
+        Some(&app),
+        crate::owner_state_types::SpaceId(cid_bytes),
+        ceremony_bytes,
+        round_num,
+    )
+    .await
+}
+
+/// ZEB-1027: shared core of `dfrost_contribute_repair_round` — also
+/// fired by the engine orchestrator so helpers respond to a repair
+/// request without operator involvement.
+pub async fn dfrost_contribute_repair_round_core<R: tauri::Runtime, H: tauri::Runtime>(
+    handles: &DfrostCoreHandles<H>,
+    app: Option<&tauri::AppHandle<R>>,
+    space_id: crate::owner_state_types::SpaceId,
+    ceremony_bytes: [u8; 32],
+    round_num: u8,
+) -> Result<(), String> {
+    if !matches!(round_num, 2 | 3) {
+        return Err(format!(
+            "dfrost_contribute_repair_round: round_num must be 2 or 3 (round 1 is \
+             dfrost_request_share_repair, participant-only), got {round_num}"
+        ));
+    }
+
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
+
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    let publish_order = {
+        let log = log_arc.lock().await;
+        log.publish_order.clone()
+    };
+    let _publish_order_guard = publish_order.lock().await;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    // Resolver for sealing (both rounds seal to at least one peer).
+    let resolver = handles.identity_resolver.clone().ok_or(
+        "dfrost_contribute_repair_round: identity resolver unavailable \
+         (community registry not initialised — owner not loaded?)",
+    )?;
+
+    // Snapshot pending-repair state under a short log lock.
+    let (participant, helper_addrs, epoch, key_package, identifier_pairs, deltas_for_sigma) = {
+        let log = log_arc.lock().await;
+        let pending =
+            log.committee_state.pending_repair.as_ref().ok_or(
+                "dfrost_contribute_repair_round: no pending repair ceremony for community",
+            )?;
+        if pending.ceremony_id != ceremony_bytes {
+            return Err(format!(
+                "dfrost_contribute_repair_round: ceremony_id mismatch (pending={}, requested={})",
+                hex::encode(pending.ceremony_id),
+                hex::encode(ceremony_bytes)
+            ));
+        }
+        if !pending.helpers.contains(&self_owner) {
+            return Err(
+                "dfrost_contribute_repair_round: self is not a declared helper for this repair"
+                    .to_string(),
+            );
+        }
+        if round_num == 2 && pending.round2_seen.contains(&self_owner) {
+            return Err(
+                "dfrost_contribute_repair_round: round 2 already submitted by self".to_string(),
+            );
+        }
+        if round_num == 3 && pending.round3_seen.contains(&self_owner) {
+            return Err(
+                "dfrost_contribute_repair_round: round 3 already submitted by self".to_string(),
+            );
+        }
+        let kp = log.local_key_package.clone().ok_or(
+            "dfrost_contribute_repair_round: this node holds no signing share and cannot \
+                 help — if it also lost its share, request repair once this ceremony settles",
+        )?;
+        // OwnerAddr → Identifier pairs for participant + helpers, from
+        // the committee's canonical map.
+        let mut pairs: Vec<(
+            crate::owner_state_types::OwnerAddr,
+            frost_ristretto255::Identifier,
+        )> = Vec::with_capacity(pending.helpers.len() + 1);
+        for addr in pending
+            .helpers
+            .iter()
+            .chain(std::iter::once(&pending.participant))
+        {
+            let id = *log
+                .committee_state
+                .identifier_map
+                .get(addr)
+                .ok_or_else(|| {
+                    format!(
+                        "dfrost_contribute_repair_round: {} not in identifier_map",
+                        hex::encode(addr.0)
+                    )
+                })?;
+            pairs.push((*addr, id));
+        }
+        // rn=3 needs the full delta set (own + every other helper's).
+        let deltas: Option<Vec<Vec<u8>>> = if round_num == 3 {
+            if pending.deltas.len() != pending.helpers.len() {
+                return Err(format!(
+                    "dfrost_contribute_repair_round: round 3 needs deltas from all {} \
+                         helper(s); have {}",
+                    pending.helpers.len(),
+                    pending.deltas.len()
+                ));
+            }
+            Some(pending.deltas.values().cloned().collect())
+        } else {
+            None
+        };
+        (
+            pending.participant,
+            pending.helpers.clone(),
+            pending.epoch,
+            kp,
+            pairs,
+            deltas,
+        )
+    };
+
+    let id_for = |addr: &crate::owner_state_types::OwnerAddr| -> Result<
+        frost_ristretto255::Identifier,
+        String,
+    > {
+        identifier_pairs
+            .iter()
+            .find(|(a, _)| a == addr)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| {
+                format!(
+                    "dfrost_contribute_repair_round: no identifier for {}",
+                    hex::encode(addr.0)
+                )
+            })
+    };
+    let addr_for = |id: frost_ristretto255::Identifier| -> Result<
+        crate::owner_state_types::OwnerAddr,
+        String,
+    > {
+        identifier_pairs
+            .iter()
+            .find(|(_, i)| *i == id)
+            .map(|(a, _)| *a)
+            .ok_or("dfrost_contribute_repair_round: identifier→addr lookup failed".to_string())
+    };
+
+    // Shared sealing helper: resolve + seal `plain` to `addr`.
+    async fn seal_to(
+        resolver: &std::sync::Arc<dyn crate::community_state_sync::IdentityResolver>,
+        addr: &crate::owner_state_types::OwnerAddr,
+        plain: &[u8],
+    ) -> Result<crate::community_membership::RecipientCiphertext, String> {
+        let identity_pub_64 = resolver.resolve(addr).await.ok_or_else(|| {
+            format!(
+                "dfrost_contribute_repair_round: identity_pub for recipient {} not resolvable \
+                     — peer device pub has not propagated yet",
+                hex::encode(addr.0)
+            )
+        })?;
+        let ed_pub: &[u8; 32] = identity_pub_64[32..64].try_into().map_err(|_| {
+            "dfrost_contribute_repair_round: identity_pub_64 slice 32..64 not 32 bytes \
+             (should never happen)"
+        })?;
+        let x_pub = crate::dm_signing::ed25519_pub_to_x25519(ed_pub).map_err(|e| {
+            format!(
+                "dfrost_contribute_repair_round: ed25519_pub_to_x25519 for {}: {e}",
+                hex::encode(addr.0)
+            )
+        })?;
+        let sealed = crate::dm_signing::seal_to_owner(&x_pub, plain).map_err(|e| {
+            format!(
+                "dfrost_contribute_repair_round: seal_to_owner for {}: {e:?}",
+                hex::encode(addr.0)
+            )
+        })?;
+        Ok(crate::community_membership::RecipientCiphertext {
+            recipient: *addr,
+            sealed,
+        })
+    }
+
+    let recipient_ciphertexts: Vec<crate::community_membership::RecipientCiphertext> =
+        if round_num == 2 {
+            // RTS part 1: deltas for every declared helper (self
+            // included — sealed-to-self keeps the distribution uniform
+            // and re-broadcast-healable; own delta comes back through
+            // `apply_with_identity` like everyone else's).
+            let helper_ids: Vec<frost_ristretto255::Identifier> = {
+                let mut ids = Vec::with_capacity(helper_addrs.len());
+                for h in &helper_addrs {
+                    ids.push(id_for(h)?);
+                }
+                ids
+            };
+            let participant_id = id_for(&participant)?;
+            let deltas_by_id = crate::community_dfrost_crypto::repair_part1_local(
+                &helper_ids,
+                &key_package,
+                participant_id,
+            )
+            .map_err(|e| format!("dfrost_contribute_repair_round: repair part1: {e}"))?;
+            let mut cts = Vec::with_capacity(deltas_by_id.len());
+            for (id, delta_bytes) in &deltas_by_id {
+                let addr = addr_for(*id)?;
+                cts.push(seal_to(&resolver, &addr, delta_bytes).await?);
+            }
+            cts
+        } else {
+            // RTS part 2: sigma to the participant only.
+            let delta_list = deltas_for_sigma.expect("populated for rn=3 above");
+            let sigma = crate::community_dfrost_crypto::repair_part2_local(&delta_list)
+                .map_err(|e| format!("dfrost_contribute_repair_round: repair part2: {e}"))?;
+            vec![seal_to(&resolver, &participant, &sigma).await?]
+        };
+
+    let payload = crate::community_dfrost_types::RepairRoundPayload {
+        ceremony_id: ceremony_bytes,
+        round_num,
+        epoch,
+        helpers: None,
+        minted_wall_ms: None,
+        minted_logical: None,
+        recipient_ciphertexts: Some(recipient_ciphertexts),
+    };
+    let signing_key = handles.signing_key.as_ref();
+    let event = crate::community_dfrost_log::build_signed_dfrost_event(
+        signing_key,
+        self_owner,
+        crate::community_dfrost_types::DfrostEventKind::RepairShare,
+        &payload,
+        hlc,
+    )
+    .map_err(|e| format!("dfrost_contribute_repair_round: build_signed: {e}"))?;
+    let self_x25519_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+
+    {
+        let mut log = log_arc.lock().await;
+        if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
+            return Err(format!("dfrost_contribute_repair_round: apply: {e:?}"));
+        }
+    }
+
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        round_num = round_num,
+                        error = %e,
+                        "dfrost_contribute_repair_round: broadcast failed \
+                         (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    space_id = ?space_id,
+                    round_num = round_num,
+                    "dfrost_contribute_repair_round: no engine registered for community — \
+                     broadcast skipped \
+                     (engine not registered — boot/join ensure has not run for this community?)",
+                );
+            }
+        },
+        None => {
+            tracing::debug!(
+                round_num = round_num,
+                "dfrost_contribute_repair_round: dfrost_log_registry is None — \
+                 broadcast skipped (test context?)",
+            );
+        }
+    }
+
+    if let Some(app) = app {
+        let evt_payload = DfrostRepairProgressPayload {
+            community_id: hex::encode(space_id.0),
+            ceremony_id: hex::encode(ceremony_bytes),
+            round_num,
+            participant: hex::encode(participant.0),
+        };
+        if let Err(e) = app.emit("dfrost-repair-progress", &evt_payload) {
+            // Non-fatal: state is already mutated; the emit is a UI hint.
+            tracing::warn!(error = %e, "dfrost-repair-progress emit failed");
+        }
+    }
+
+    Ok(())
 }
 
 // ── ZEB-323 Phase 2b: connectivity IPCs ──────────────────────────────
@@ -77694,6 +78837,9 @@ pub fn run() {
             dfrost_request_vrf_beacon,
             dfrost_contribute_threshold_sign,
             dfrost_propose_refresh,
+            dfrost_contribute_refresh_round,
+            dfrost_request_share_repair,
+            dfrost_contribute_repair_round,
             #[cfg(debug_assertions)]
             e2e_close_window,
             // Mint personal-finance commands.
@@ -77925,6 +79071,9 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         dfrost_request_vrf_beacon,
         dfrost_contribute_threshold_sign,
         dfrost_propose_refresh,
+        dfrost_contribute_refresh_round,
+        dfrost_request_share_repair,
+        dfrost_contribute_repair_round,
         // ZEB-352 Voice V4: DM-call signaling + media IPCs.
         place_call,
         accept_call,

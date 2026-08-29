@@ -2,7 +2,8 @@
 //!
 //! Parallels `community_voting_core::SignedVotingEvent`, but the envelope
 //! tag is `'d'` (DFrost) instead of `'p'` (Poll) and the kind discriminator
-//! covers the five committee-ceremony events (`dr`/`dk`/`ts`/`vb`/`rf`).
+//! covers the seven committee-ceremony events
+//! (`di`/`dr`/`dk`/`ts`/`vb`/`rf`/`rp`).
 //!
 //! Same-length-keys invariant: every top-level CBOR map in this module
 //! uses 2-character keys, matching the `SignedVotingEvent` envelope
@@ -34,7 +35,7 @@ const VRF_SEED_DS: &[u8] = b"dfrost-vrf-seed-v1";
 /// derivations are domain-independent under the random-oracle model.
 const VRF_OUTPUT_DS: &[u8] = b"dfrost-vrf-output-v1";
 
-/// Discriminator for the 6 D-FROST committee event kinds. Wire-encoded
+/// Discriminator for the 7 D-FROST committee event kinds. Wire-encoded
 /// as a 2-char string in the envelope's `kd` field.
 ///
 /// * `CeremonyInit` (`di`) — ZEB-1022: authenticated ceremony bootstrap
@@ -43,7 +44,12 @@ const VRF_OUTPUT_DS: &[u8] = b"dfrost-vrf-output-v1";
 /// * `DkgComplete` (`dk`) — finalisation announcement (joint VK + per-member shares).
 /// * `ThresholdSign` (`ts`) — per-member contribution to a threshold-signing ceremony.
 /// * `VrfBeacon` (`vb`) — aggregated Schnorr signature + derived VRF output.
-/// * `ProactiveRefresh` (`rf`) — coordinator-mediated proactive share refresh.
+/// * `ProactiveRefresh` (`rf`) — fully-distributed zero-sharing refresh
+///   DKG (ZEB-1027: rn=1 public commitment, rn=2 sealed shares; completes
+///   via `dk`).
+/// * `RepairShare` (`rp`) — ZEB-1027: FROST Repairable-Threshold-Scheme
+///   rounds restoring a member's LOST signing share (rn=1 request,
+///   rn=2 helper deltas, rn=3 helper sigmas).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DfrostEventKind {
     #[serde(rename = "di")]
@@ -58,6 +64,8 @@ pub enum DfrostEventKind {
     VrfBeacon,
     #[serde(rename = "rf")]
     ProactiveRefresh,
+    #[serde(rename = "rp")]
+    RepairShare,
 }
 
 /// Wire envelope for every D-FROST committee event. Structurally
@@ -275,24 +283,93 @@ pub struct VrfBeaconPayload {
     pub vrf_output: [u8; 32],
 }
 
-/// Payload for `DfrostEventKind::ProactiveRefresh` (`rf`). Carries
-/// either coordinator-distributed sealed `SecretShare`s (`rn=1`) or the
-/// round-2 refresh DKG package (`rn=2`, fully-distributed mode).
+/// Payload for `DfrostEventKind::ProactiveRefresh` (`rf`). ZEB-1027:
+/// the fully-distributed zero-sharing refresh DKG, mirroring
+/// `DkgRoundPayload`'s round shapes exactly:
+///
+/// * `rn=1`: `package` carries the PUBLIC `refresh_dkg_part1` round-1
+///   commitment bytes (zero constant term — the identity coefficient is
+///   stripped by frost-core for serialization); `recipient_ciphertexts`
+///   is `None`. Broadcast in the clear, like DKG rn=1.
+/// * `rn=2`: `recipient_ciphertexts` carries one sealed (X25519)
+///   round-2 signing-share package per recipient; `package` is `None`.
+///
+/// Pre-ZEB-1027 the rounds were inverted placeholders (rn=1 sealed a
+/// copy of a `dkg::part1` package to every member and rn=2 was never
+/// produced). The STRUCT shape is unchanged — same optional fields,
+/// same 2-char keys — only which round populates which field moved, so
+/// the zeb303 byte pins still hold per field-combination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshRoundPayload {
     #[serde(rename = "ci", with = "serde_bytes")]
     pub ceremony_id: [u8; 32],
     #[serde(rename = "rn")]
     pub round_num: u8,
+    /// `rn=2` only: one sealed round-2 refresh package per recipient.
     #[serde(rename = "rc", skip_serializing_if = "Option::is_none", default)]
     pub recipient_ciphertexts: Option<Vec<RecipientCiphertext>>,
+    /// `rn=1` only: ciborium-encoded `refresh_dkg_part1` round-1
+    /// package bytes (public commitment + proof of knowledge).
     #[serde(
         rename = "pk",
         with = "serde_bytes",
         skip_serializing_if = "Option::is_none",
         default
     )]
-    pub round2_package: Option<Vec<u8>>,
+    pub package: Option<Vec<u8>>,
+}
+
+/// Payload for `DfrostEventKind::RepairShare` (`rp`). ZEB-1027: FROST
+/// Repairable Threshold Scheme (RTS) rounds that restore ONE member's
+/// lost signing share at the current committee epoch, using a declared
+/// helper subset of the other members (each of whom still holds their
+/// share).
+///
+/// * `rn=1` (request): `event.actor` IS the participant whose share is
+///   being repaired — no separate field, so a member can only ever
+///   request repair of its own share. `helpers` declares the helper
+///   set (sorted, deduplicated, ⊆ members ∖ {actor}, len ≥ threshold);
+///   the RTS Lagrange coefficients are computed over exactly this set,
+///   so every declared helper MUST contribute rounds 2–3. `minted_*`
+///   carry the request's mint stamp (payload-carried, NOT the envelope
+///   HLC, so a re-minted re-broadcast keeps the same `ceremony_id` —
+///   same rationale as `CeremonyInitPayload`).
+/// * `rn=2` (helper deltas): `recipient_ciphertexts` seals one RTS
+///   delta per helper (INCLUDING the sender itself — uniform sealed
+///   distribution means a re-broadcast heals every helper the same
+///   way).
+/// * `rn=3` (helper sigma): `recipient_ciphertexts` seals the helper's
+///   summed sigma to the participant only.
+///
+/// `epoch` binds every round to the committee epoch the repair targets;
+/// a refresh completion mid-repair bumps the epoch and voids the
+/// ceremony (shares from different epochs must never mix).
+///
+/// All keys are 2 characters (same-length-keys invariant).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairRoundPayload {
+    #[serde(rename = "ci", with = "serde_bytes")]
+    pub ceremony_id: [u8; 32],
+    #[serde(rename = "rn")]
+    pub round_num: u8,
+    /// Committee epoch this repair targets (must equal the observer's
+    /// `current_epoch` at apply time).
+    #[serde(rename = "ep")]
+    pub epoch: u64,
+    /// `rn=1` only: declared helper set (sorted bytewise, deduplicated).
+    #[serde(rename = "hl", skip_serializing_if = "Option::is_none", default)]
+    pub helpers: Option<Vec<OwnerAddr>>,
+    /// `rn=1` only: mint stamp, wall half (feeds
+    /// `derive_repair_ceremony_id`; stable across re-mints).
+    #[serde(rename = "wm", skip_serializing_if = "Option::is_none", default)]
+    pub minted_wall_ms: Option<u64>,
+    /// `rn=1` only: mint stamp, logical half.
+    #[serde(rename = "lg", skip_serializing_if = "Option::is_none", default)]
+    pub minted_logical: Option<u32>,
+    /// `rn=2`/`rn=3` only: sealed RTS material (deltas to helpers /
+    /// sigma to the participant).
+    #[serde(rename = "rc", skip_serializing_if = "Option::is_none", default)]
+    pub recipient_ciphertexts: Option<Vec<RecipientCiphertext>>,
 }
 
 /// ZEB-1022: deterministic DKG ceremony-ID derivation, shared by the
@@ -324,6 +401,79 @@ pub fn derive_dkg_ceremony_id(
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(&minted_wall_ms.to_le_bytes());
     hasher_input.extend_from_slice(&minted_logical.to_le_bytes());
+    hasher_input.extend_from_slice(&space_id.0);
+    blake3::hash(&hasher_input).into()
+}
+
+/// ZEB-1027 (lifted from `dfrost_propose_refresh`, where it lived
+/// inline since R9): deterministic refresh ceremony-ID derivation:
+/// `blake3(sorted_members || proposed_epoch_le8 || threshold_le2 ||
+/// b"refresh-v1" || space_id)`.
+///
+/// DETERMINISTIC by design — every committee member computes the same
+/// ceremony_id from inputs they all observe (active committee shape,
+/// agreed next epoch, scoped to this community), which is what lets
+/// peer members independently propose and converge on ONE shared
+/// ceremony (R9 Cursor HIGH "Refresh blocks second member"). The HLC
+/// is INTENTIONALLY excluded: with HLC each proposer would mint a
+/// distinct id and peers couldn't share one ceremony.
+///
+/// Each `(members, threshold, proposed_epoch, space_id)` tuple
+/// identifies at most one refresh ceremony: `proposed_epoch` is
+/// `current_epoch + 1`, and refresh COMPLETION advances `current_epoch`
+/// before any next refresh can derive a new id. Also recomputed by the
+/// engine's rf rn=1 ingest gate (ZEB-1027) so a stale or forged rn=1
+/// whose id does not match the shape it would seed can never wedge the
+/// singleton `pending_refresh` slot.
+pub fn derive_refresh_ceremony_id(
+    members: &[OwnerAddr],
+    threshold: u16,
+    proposed_epoch: u64,
+    space_id: &SpaceId,
+) -> [u8; 32] {
+    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 16);
+    for a in members {
+        hasher_input.extend_from_slice(&a.0);
+    }
+    hasher_input.extend_from_slice(&proposed_epoch.to_le_bytes());
+    hasher_input.extend_from_slice(&threshold.to_le_bytes());
+    hasher_input.extend_from_slice(b"refresh-v1");
+    hasher_input.extend_from_slice(&space_id.0);
+    blake3::hash(&hasher_input).into()
+}
+
+/// ZEB-1027: deterministic repair ceremony-ID derivation:
+/// `blake3(participant || epoch_le8 || sorted_helpers ||
+/// minted_wall_ms_le8 || minted_logical_le4 || b"repair-v1" ||
+/// space_id)`.
+///
+/// Unlike refresh, repair has ONE authoritative initiator — the
+/// participant whose share was lost — so the id does not need to be
+/// derivable without its request event. The mint stamp (payload-carried
+/// `wm`/`lg`, NOT the envelope HLC — re-mint rationale as
+/// `derive_dkg_ceremony_id`) makes a RETRY after a failed ceremony a
+/// fresh id, while a re-broadcast of the same request keeps its id.
+/// The helper set is hashed in so a relayed request can never have its
+/// helper set substituted without changing the id (engine rn=1 ingest
+/// gate recomputes and rejects mismatches).
+pub fn derive_repair_ceremony_id(
+    participant: &OwnerAddr,
+    epoch: u64,
+    helpers: &[OwnerAddr],
+    minted_wall_ms: u64,
+    minted_logical: u32,
+    space_id: &SpaceId,
+) -> [u8; 32] {
+    let mut hasher_input: Vec<u8> =
+        Vec::with_capacity(16 + 8 + helpers.len() * 16 + 8 + 4 + 9 + 16);
+    hasher_input.extend_from_slice(&participant.0);
+    hasher_input.extend_from_slice(&epoch.to_le_bytes());
+    for h in helpers {
+        hasher_input.extend_from_slice(&h.0);
+    }
+    hasher_input.extend_from_slice(&minted_wall_ms.to_le_bytes());
+    hasher_input.extend_from_slice(&minted_logical.to_le_bytes());
+    hasher_input.extend_from_slice(b"repair-v1");
     hasher_input.extend_from_slice(&space_id.0);
     blake3::hash(&hasher_input).into()
 }
@@ -393,6 +543,7 @@ mod tests {
             (DfrostEventKind::ThresholdSign, "ts"),
             (DfrostEventKind::VrfBeacon, "vb"),
             (DfrostEventKind::ProactiveRefresh, "rf"),
+            (DfrostEventKind::RepairShare, "rp"),
         ] {
             let mut buf = Vec::new();
             ciborium::into_writer(&kind, &mut buf).unwrap();
@@ -481,6 +632,63 @@ mod tests {
         assert_ne!(
             base,
             derive_dkg_ceremony_id(&members, 2, 1_000, 0, &SpaceId([0xbb; 16]))
+        );
+    }
+
+    #[test]
+    fn derive_refresh_ceremony_id_binds_all_inputs_zeb1027() {
+        use crate::owner_state_types::{OwnerAddr, SpaceId};
+        let members = [OwnerAddr([0x11; 16]), OwnerAddr([0x22; 16])];
+        let space = SpaceId([0xaa; 16]);
+        let base = derive_refresh_ceremony_id(&members, 2, 5, &space);
+        assert_eq!(base, derive_refresh_ceremony_id(&members, 2, 5, &space));
+        let other_members = [OwnerAddr([0x11; 16]), OwnerAddr([0x33; 16])];
+        assert_ne!(
+            base,
+            derive_refresh_ceremony_id(&other_members, 2, 5, &space)
+        );
+        assert_ne!(base, derive_refresh_ceremony_id(&members, 3, 5, &space));
+        assert_ne!(base, derive_refresh_ceremony_id(&members, 2, 6, &space));
+        assert_ne!(
+            base,
+            derive_refresh_ceremony_id(&members, 2, 5, &SpaceId([0xbb; 16]))
+        );
+    }
+
+    #[test]
+    fn derive_repair_ceremony_id_binds_all_inputs_zeb1027() {
+        use crate::owner_state_types::{OwnerAddr, SpaceId};
+        let participant = OwnerAddr([0x11; 16]);
+        let helpers = [OwnerAddr([0x22; 16]), OwnerAddr([0x33; 16])];
+        let space = SpaceId([0xaa; 16]);
+        let base = derive_repair_ceremony_id(&participant, 4, &helpers, 1_000, 0, &space);
+        assert_eq!(
+            base,
+            derive_repair_ceremony_id(&participant, 4, &helpers, 1_000, 0, &space)
+        );
+        assert_ne!(
+            base,
+            derive_repair_ceremony_id(&OwnerAddr([0x99; 16]), 4, &helpers, 1_000, 0, &space)
+        );
+        assert_ne!(
+            base,
+            derive_repair_ceremony_id(&participant, 5, &helpers, 1_000, 0, &space)
+        );
+        assert_ne!(
+            base,
+            derive_repair_ceremony_id(&participant, 4, &helpers[..1], 1_000, 0, &space)
+        );
+        assert_ne!(
+            base,
+            derive_repair_ceremony_id(&participant, 4, &helpers, 1_001, 0, &space)
+        );
+        assert_ne!(
+            base,
+            derive_repair_ceremony_id(&participant, 4, &helpers, 1_000, 1, &space)
+        );
+        assert_ne!(
+            base,
+            derive_repair_ceremony_id(&participant, 4, &helpers, 1_000, 0, &SpaceId([0xbb; 16]))
         );
     }
 

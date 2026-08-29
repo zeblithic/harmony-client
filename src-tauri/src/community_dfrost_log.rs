@@ -149,17 +149,16 @@ pub struct DfrostLog {
     pub local_dkg_secret2: Option<dkg_r2::SecretPackage>,
 
     /// Local FROST `KeyPackage` (this node's signing share). Materialised
-    /// at DKG completion or refresh completion. NOT persisted — ZEB-753
-    /// kept the signing share out of the `dfrost.cbor` snapshot
-    /// deliberately (identity-switch teardown contract: local secret
-    /// material dies with the process). A restarted node knows the
-    /// committee (restored public state: it verifies beacons and binds
-    /// oracles) but is VERIFICATION-ONLY for signing until it receives
-    /// a fresh share — which requires refresh resharing rounds 2-3 +
-    /// finalization, tracked as ZEB-1027 (the Phase 4a-foundation
-    /// refresh IPC ships rn=1 only). Pre-#774 a restart lost the
-    /// public state too, so this narrows the loss; it does not yet
-    /// close it.
+    /// at DKG completion, refresh completion, or repair completion. NOT
+    /// persisted — ZEB-753 kept the signing share out of the
+    /// `dfrost.cbor` snapshot deliberately (identity-switch teardown
+    /// contract: local secret material dies with the process). A
+    /// restarted node knows the committee (restored public state: it
+    /// verifies beacons and binds oracles) but is VERIFICATION-ONLY for
+    /// signing until it recovers a share — ZEB-1027's RTS share repair
+    /// (`rp` events): the node requests repair, ≥ threshold helpers
+    /// respond, and `settle_repair_after_round3` reinstalls the share
+    /// without any secret ever touching disk.
     pub local_key_package: Option<KeyPackage>,
 
     /// Local FROST `PublicKeyPackage` (joint verifying key + per-member
@@ -287,6 +286,13 @@ pub struct CommitteeState {
     pub pending_sign: BTreeMap<[u8; 32], PendingSignSession>,
     /// In-flight proactive-refresh ceremony, if any. Cleared on completion.
     pub pending_refresh: Option<PendingCeremony>,
+    /// ZEB-1027: in-flight RTS share repair, if any. Cleared on
+    /// completion (participant), on full sigma distribution (helpers),
+    /// and on refresh promotion (epoch moved ⇒ ceremony void).
+    /// `serde(default)` so pre-ZEB-1027 `dfrost.cbor` snapshots (which
+    /// lack the key) still load.
+    #[serde(default)]
+    pub pending_repair: Option<PendingRepair>,
 }
 
 /// Wire shape used solely as a `serde(from = ...)` shim: identical to
@@ -304,6 +310,8 @@ struct CommitteeStateRaw {
     pub pending_dkg: Option<PendingCeremony>,
     pub pending_sign: BTreeMap<[u8; 32], PendingSignSession>,
     pub pending_refresh: Option<PendingCeremony>,
+    #[serde(default)]
+    pub pending_repair: Option<PendingRepair>,
 }
 
 impl From<CommitteeStateRaw> for CommitteeState {
@@ -321,6 +329,7 @@ impl From<CommitteeStateRaw> for CommitteeState {
             pending_dkg: raw.pending_dkg,
             pending_sign: raw.pending_sign,
             pending_refresh: raw.pending_refresh,
+            pending_repair: raw.pending_repair,
         }
     }
 }
@@ -429,6 +438,69 @@ pub struct PendingSignSession {
     /// secret nonces onto the disk substrate.
     #[serde(skip, default)]
     pub local_nonces: Option<Vec<u8>>,
+}
+
+/// ZEB-1027: in-flight RTS share-repair ceremony state (the `rp` event
+/// family). One at a time per community — repair restores exactly one
+/// member's lost share at the current epoch.
+///
+/// Public halves (who requested, who has contributed which round) are
+/// observable by every replica; the decrypted delta/sigma material is
+/// local-only and `serde(skip)`ped for exactly the reasons
+/// `PendingCeremony::round2_packages` is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingRepair {
+    pub ceremony_id: [u8; 32],
+    /// The member whose share is being repaired. Structurally the rn=1
+    /// event's actor — a member can only ever request repair of its OWN
+    /// share (sigmas reconstruct a share the participant is entitled
+    /// to; nothing leaks that it could not already know).
+    pub participant: OwnerAddr,
+    /// Committee epoch the repair targets. A refresh completion bumps
+    /// the epoch and clears this slot — shares from different epochs
+    /// must never mix into one reconstruction.
+    pub epoch: u64,
+    /// Declared helper set (sorted, ⊆ members ∖ {participant}, len ≥
+    /// threshold). RTS Lagrange coefficients are computed over exactly
+    /// this set, so EVERY listed helper must contribute rounds 2–3.
+    pub helpers: Vec<OwnerAddr>,
+    /// Helpers whose rn=2 (delta distribution) has been observed.
+    /// Public protocol progress — safe to persist (though restarts
+    /// clear the whole slot via `from_restored`).
+    pub round2_seen: std::collections::BTreeSet<OwnerAddr>,
+    /// Helpers whose rn=3 (sigma to participant) has been observed.
+    pub round3_seen: std::collections::BTreeSet<OwnerAddr>,
+    /// LOCAL (helper) only: decrypted RTS delta bytes per sender,
+    /// populated via `apply_with_identity`. SECRET — a full delta set
+    /// plus a helper's share reconstructs nothing extra, but deltas are
+    /// blinding material and must never touch disk. `serde(skip)`.
+    #[serde(skip, default)]
+    pub deltas: BTreeMap<OwnerAddr, Vec<u8>>,
+    /// LOCAL (participant) only: decrypted RTS sigma bytes per helper.
+    /// SECRET — the sigma sum IS the signing share. `serde(skip)`.
+    #[serde(skip, default)]
+    pub sigmas: BTreeMap<OwnerAddr, Vec<u8>>,
+}
+
+impl PendingRepair {
+    /// Fresh ceremony state (no rounds observed, no local material).
+    pub fn new(
+        ceremony_id: [u8; 32],
+        participant: OwnerAddr,
+        epoch: u64,
+        helpers: Vec<OwnerAddr>,
+    ) -> Self {
+        Self {
+            ceremony_id,
+            participant,
+            epoch,
+            helpers,
+            round2_seen: Default::default(),
+            round3_seen: Default::default(),
+            deltas: Default::default(),
+            sigmas: Default::default(),
+        }
+    }
 }
 
 /// Which pending-ceremony slot a `dk` event resolves to. R1 fix: refresh
@@ -622,6 +694,7 @@ impl DfrostLog {
             DfrostEventKind::ThresholdSign => self.apply_threshold_sign(&event),
             DfrostEventKind::VrfBeacon => self.apply_vrf_beacon(&event),
             DfrostEventKind::ProactiveRefresh => self.apply_proactive_refresh(&event),
+            DfrostEventKind::RepairShare => self.apply_repair_round(&event),
         };
         result?;
 
@@ -683,7 +756,7 @@ impl DfrostLog {
     /// re-verification (they were verified when first applied), no
     /// handler replay (replaying through the handlers would REJECT
     /// history the live engine admitted under engine-only context,
-    /// e.g. a stale-replace `di` — see the module doc). The three
+    /// e.g. a stale-replace `di` — see the module doc). The four
     /// pending slots are CLEARED: interactive ceremony rounds do not
     /// survive a restart by design ("a node that missed a round cannot
     /// retroactively join"), their secret halves were never persisted,
@@ -699,6 +772,7 @@ impl DfrostLog {
         committee_state.pending_dkg = None;
         committee_state.pending_sign.clear();
         committee_state.pending_refresh = None;
+        committee_state.pending_repair = None;
         Self {
             log: VerifiedLog::from_verified_events(events),
             committee_state,
@@ -1095,6 +1169,22 @@ impl DfrostLog {
                 PendingSlot::Dkg => self.committee_state.pending_dkg = None,
                 PendingSlot::Refresh => self.committee_state.pending_refresh = None,
             }
+            // ZEB-1027: promotion ends the ceremony on this node — the
+            // in-memory round secrets are dead transcript material and
+            // MUST NOT leak into the next ceremony's part2/part3 inputs
+            // (they also key the "round already submitted" idempotency
+            // guards, which would otherwise false-trip on the first
+            // post-completion refresh). Note the pre-existing straggler
+            // race is unchanged by this: a node whose promote arrives
+            // via peer dks before its own part3 already lost the
+            // transcript when the pending slot cleared above; share
+            // repair (`rp`) is now its recovery path.
+            self.local_dkg_secret = None;
+            self.local_dkg_secret2 = None;
+            // Epoch moved: any in-flight repair targets the OLD
+            // polynomial; its deltas/sigmas must never finalize. The
+            // participant re-requests at the new epoch.
+            self.committee_state.pending_repair = None;
         }
 
         Ok(())
@@ -1291,13 +1381,17 @@ impl DfrostLog {
         Ok(())
     }
 
-    /// Apply an `rf` event: proactive committee refresh round.
+    /// Apply an `rf` event: one round of the fully-distributed
+    /// zero-sharing refresh DKG (ZEB-1027 — pre-1027 rn=1 was a sealed
+    /// placeholder; see `RefreshRoundPayload` for the round shapes).
     ///
-    /// rn=1: initialise `pending_refresh` with `proposed_epoch =
-    ///   current_epoch + 1`. Recipient ciphertext storage is reserved for
-    ///   the local node's apply path (`apply_with_identity`).
-    /// rn=2: store the broadcast round-2 package alongside the pending
-    ///   refresh state.
+    /// rn=1: initialise `pending_refresh` (once) with `proposed_epoch =
+    ///   current_epoch + 1` and record the actor's PUBLIC round-1
+    ///   commitment in `round1_packages` — exactly `apply_dkg_round`
+    ///   rn=1's shape.
+    /// rn=2: sealed per-recipient share packages; the broadcast path
+    ///   validates shape only. Local decryption into
+    ///   `round2_packages[actor]` happens in `apply_with_identity`.
     ///
     /// The refresh ceremony FINISHES via a `dk` event whose
     /// `joint_verifying_key` MUST equal the existing active vk
@@ -1318,9 +1412,7 @@ impl DfrostLog {
         // signature-valid community member could seed a phantom
         // `pending_refresh` — a singleton slot with (currently) no
         // abort/deadline machinery, so a phantom wedges real refreshes
-        // until restart. Placed before the rn=1 init so the local
-        // `apply_with_identity` path (which routes through here before
-        // its `round2_packages` insert) is covered by the same gate.
+        // until restart.
         if !self.committee_state.members.contains(&event.actor) {
             return Err(ApplyError::InvariantViolation);
         }
@@ -1330,16 +1422,20 @@ impl DfrostLog {
         // with InvariantViolation rather than silently appended.
         match payload.round_num {
             1 => {
-                // rn=1 of refresh requires recipient_ciphertexts — the
-                // proposer is distributing new shares.
-                if payload.recipient_ciphertexts.is_none() {
-                    return Err(ApplyError::InvariantViolation);
+                // ZEB-1027: rn=1 carries the public zero-sharing
+                // round-1 commitment (refresh_dkg_part1 package bytes).
+                let pkg = payload.package.ok_or(ApplyError::InvariantViolation)?;
+                // A DKG and a refresh must never run concurrently — a
+                // dk for one could cross-finalize state seeded by the
+                // other's transcript expectations. `dfrost_initiate_dkg`
+                // is already blocked by `active`; this guards the
+                // inverse ordering (rf arriving while a stray
+                // pending_dkg exists on an active committee).
+                if self.committee_state.pending_dkg.is_some() {
+                    return Err(ApplyError::CeremonyInFlight);
                 }
                 // Initialise the pending refresh once on the first rn=1
-                // event. Subsequent rn=1 events (from other actors)
-                // reuse the existing pending_refresh — only the local
-                // node's per-recipient ciphertext decode happens in
-                // `apply_with_identity`.
+                // event; every member's rn=1 accumulates into it.
                 if self.committee_state.pending_refresh.is_none() {
                     self.committee_state.pending_refresh = Some(PendingCeremony {
                         ceremony_id: payload.ceremony_id,
@@ -1353,21 +1449,25 @@ impl DfrostLog {
                 // Subsequent enforcement: ceremony_id must match. A
                 // divergent ceremony_id within the same refresh epoch
                 // indicates a forked proposer; reject to surface the
-                // protocol bug rather than silently apply.
-                if let Some(pr) = &self.committee_state.pending_refresh {
-                    if pr.ceremony_id != payload.ceremony_id {
-                        return Err(ApplyError::InvariantViolation);
-                    }
+                // protocol bug rather than silently apply. (The engine's
+                // ingest gate additionally recomputes
+                // `derive_refresh_ceremony_id` so a stale rn=1 replay
+                // can never seed the slot with a dead id.)
+                let pr = self
+                    .committee_state
+                    .pending_refresh
+                    .as_mut()
+                    .expect("seeded above");
+                if pr.ceremony_id != payload.ceremony_id {
+                    return Err(ApplyError::InvariantViolation);
                 }
+                // First-wins per actor, mirroring apply_dkg_round rn=1.
+                pr.round1_packages.entry(event.actor).or_insert(pkg);
             }
             2 => {
-                // Round-2 is broadcast in the spec's wire shape but the
-                // actual share material is per-recipient encrypted via
-                // recipient_ciphertexts; the global apply path stores
-                // nothing here. Local decryption happens in
-                // `apply_with_identity`. Require the round2 package
-                // field shape to be present even if we don't process
-                // it here, so a wholly-malformed rn=2 is rejected.
+                // Sealed per-recipient share material; the broadcast
+                // path validates shape only (local decryption in
+                // `apply_with_identity`).
                 let pr = self
                     .committee_state
                     .pending_refresh
@@ -1376,8 +1476,162 @@ impl DfrostLog {
                 if pr.ceremony_id != payload.ceremony_id {
                     return Err(ApplyError::UnknownCeremony);
                 }
-                if payload.round2_package.is_none() && payload.recipient_ciphertexts.is_none() {
+                if payload.recipient_ciphertexts.is_none() {
                     return Err(ApplyError::InvariantViolation);
+                }
+            }
+            _ => return Err(ApplyError::InvariantViolation),
+        }
+        Ok(())
+    }
+
+    /// ZEB-1027: apply an `rp` event — one round of the RTS share
+    /// repair. Broadcast-path halves only (public progress tracking);
+    /// sealed delta/sigma decryption lives in `apply_with_identity`.
+    ///
+    /// rn=1 (request): `event.actor` IS the participant. Validates the
+    ///   declared helper set (sorted, deduplicated, ⊆ members ∖
+    ///   {actor}, ≥ threshold — RTS cannot run with fewer helpers than
+    ///   the threshold, which also makes a t-of-n committee with
+    ///   t == n structurally unrepairable), the payload mint stamp, and
+    ///   epoch == current_epoch. Seeds `pending_repair`. A same-id
+    ///   re-mint is an idempotent no-op; a DIFFERENT ceremony from the
+    ///   SAME participant supersedes its own earlier request (the
+    ///   participant is the sole authority on its own repair — this is
+    ///   the retry path after a failed/stalled ceremony); anyone else's
+    ///   request while one is in flight is `CeremonyInFlight`.
+    /// rn=2 (helper deltas): records the helper in `round2_seen`.
+    /// rn=3 (helper sigma): records the helper in `round3_seen`.
+    fn apply_repair_round(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+        use crate::community_dfrost_types::RepairRoundPayload;
+
+        let payload: RepairRoundPayload =
+            ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
+
+        if !self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+        if !self.committee_state.members.contains(&event.actor) {
+            return Err(ApplyError::InvariantViolation);
+        }
+        // Epoch binding: every round must target the CURRENT epoch.
+        // A refresh completing mid-repair bumps the epoch and clears
+        // the slot; straggler rounds from the old epoch then land here.
+        if payload.epoch != self.committee_state.current_epoch {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        match payload.round_num {
+            1 => {
+                let helpers = payload.helpers.ok_or(ApplyError::InvariantViolation)?;
+                let mut sorted = helpers.clone();
+                sorted.sort();
+                sorted.dedup();
+                if sorted != helpers || helpers.is_empty() {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                if helpers.contains(&event.actor) {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                if helpers
+                    .iter()
+                    .any(|h| !self.committee_state.members.contains(h))
+                {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                if helpers.len() < self.committee_state.threshold as usize {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                if payload.minted_wall_ms.is_none() || payload.minted_logical.is_none() {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                // Mutual exclusion with share-mutating ceremonies: a
+                // repair reconstructs a point on the CURRENT polynomial;
+                // running it concurrently with a DKG/refresh transcript
+                // would mix polynomials. Refresh wins (its promotion
+                // clears `pending_repair`); a repair request waits.
+                if self.committee_state.pending_dkg.is_some()
+                    || self.committee_state.pending_refresh.is_some()
+                {
+                    return Err(ApplyError::CeremonyInFlight);
+                }
+                match self.committee_state.pending_repair.as_ref() {
+                    None => {
+                        self.committee_state.pending_repair = Some(PendingRepair::new(
+                            payload.ceremony_id,
+                            event.actor,
+                            payload.epoch,
+                            helpers,
+                        ));
+                    }
+                    Some(p) if p.ceremony_id == payload.ceremony_id => {
+                        // Idempotent re-mint: same participant, same
+                        // shape, or it's a forged/colliding request.
+                        if p.participant != event.actor
+                            || p.helpers != helpers
+                            || p.epoch != payload.epoch
+                        {
+                            return Err(ApplyError::InvariantViolation);
+                        }
+                    }
+                    Some(p) if p.participant == event.actor => {
+                        // Participant supersedes its own earlier
+                        // ceremony (retry with a fresh mint stamp or a
+                        // smaller responsive helper set).
+                        self.committee_state.pending_repair = Some(PendingRepair::new(
+                            payload.ceremony_id,
+                            event.actor,
+                            payload.epoch,
+                            helpers,
+                        ));
+                    }
+                    Some(p)
+                        if p.round2_seen.is_empty()
+                            && (event.actor, payload.ceremony_id)
+                                < (p.participant, p.ceremony_id) =>
+                    {
+                        // Deterministic tie-break for RACING requests
+                        // from different participants (two members
+                        // restarting together): while NO helper has
+                        // progressed the incumbent, the smaller
+                        // (participant, ceremony_id) wins on every
+                        // replica — without this, helpers could split
+                        // between the two ceremonies and both would
+                        // starve (each needs its full declared helper
+                        // set). The displaced participant's automatic
+                        // request re-arms once the winner's ceremony
+                        // settles and clears the slot.
+                        self.committee_state.pending_repair = Some(PendingRepair::new(
+                            payload.ceremony_id,
+                            event.actor,
+                            payload.epoch,
+                            helpers,
+                        ));
+                    }
+                    Some(_) => return Err(ApplyError::CeremonyInFlight),
+                }
+            }
+            2 | 3 => {
+                let p = self
+                    .committee_state
+                    .pending_repair
+                    .as_mut()
+                    .ok_or(ApplyError::UnknownCeremony)?;
+                if p.ceremony_id != payload.ceremony_id {
+                    return Err(ApplyError::UnknownCeremony);
+                }
+                // Only DECLARED helpers advance rounds 2–3 (the
+                // participant itself contributes nothing after rn=1).
+                if !p.helpers.contains(&event.actor) {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                if payload.recipient_ciphertexts.is_none() {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                if payload.round_num == 2 {
+                    p.round2_seen.insert(event.actor);
+                } else {
+                    p.round3_seen.insert(event.actor);
                 }
             }
             _ => return Err(ApplyError::InvariantViolation),
@@ -1402,7 +1656,9 @@ impl DfrostLog {
         self_addr: &OwnerAddr,
         self_x25519_priv: &[u8; 32],
     ) -> Result<(), ApplyError> {
-        use crate::community_dfrost_types::{DkgRoundPayload, RefreshRoundPayload};
+        use crate::community_dfrost_types::{
+            DkgRoundPayload, RefreshRoundPayload, RepairRoundPayload,
+        };
         use crate::dm_signing;
 
         // Same envelope gate as `apply` (single-sourced, ZEB-753) so
@@ -1470,21 +1726,16 @@ impl DfrostLog {
             DfrostEventKind::ProactiveRefresh => {
                 let payload: RefreshRoundPayload = ciborium::de::from_reader(&event.payload[..])
                     .map_err(|_| ApplyError::PayloadDecode)?;
-                if payload.round_num == 1 {
-                    // R3 (CodeRabbit Major): stage the local decrypt
-                    // BEFORE mutating pending_refresh. Previously
-                    // `apply_proactive_refresh(&event)` was called
-                    // first (which initializes pending_refresh), then
-                    // decrypt was attempted — if decrypt failed, the
-                    // event would be rejected but pending_refresh had
-                    // already advanced, leaving the materialized state
-                    // out of sync with the (rejected) event log.
+                if payload.round_num == 2 {
+                    // ZEB-1027: rn=2 carries the sealed refresh round-2
+                    // share packages — the exact shape of DkgRound rn=2
+                    // (pre-1027, rn=1 carried the sealed placeholder
+                    // and decrypted here instead).
                     //
-                    // The broadcast `apply_proactive_refresh` already
-                    // requires recipient_ciphertexts.is_some() for rn=1,
-                    // so we can take that requirement here too — and
-                    // do the decrypt early so a decrypt failure short-
-                    // circuits before mutation.
+                    // R3 (CodeRabbit Major) lineage: stage the local
+                    // decrypt BEFORE any state mutation so a decrypt
+                    // failure rejects the event without leaving the
+                    // materialized state out of sync with the log.
                     let cts = payload
                         .recipient_ciphertexts
                         .as_ref()
@@ -1497,9 +1748,9 @@ impl DfrostLog {
                         .map_err(|_| ApplyError::PayloadDecode)?;
 
                     // Decrypt succeeded (or no ciphertext targeted self
-                    // — non-committee replicas in this refresh round
-                    // legitimately have nothing to decrypt). Safe to
-                    // mutate state now.
+                    // — non-committee replicas legitimately have
+                    // nothing to decrypt). Run the broadcast-path
+                    // validation, then store the plaintext.
                     self.apply_proactive_refresh(&event)?;
                     if let Some(plaintext) = decrypted_for_self {
                         let pending = self
@@ -1517,8 +1768,174 @@ impl DfrostLog {
                 }
                 self.apply(event)
             }
+            DfrostEventKind::RepairShare => {
+                let payload: RepairRoundPayload = ciborium::de::from_reader(&event.payload[..])
+                    .map_err(|_| ApplyError::PayloadDecode)?;
+                match payload.round_num {
+                    // rn=2: sealed deltas, one per declared helper.
+                    // Decrypt the entry addressed to self (if this node
+                    // is a declared helper) into `deltas[sender]`.
+                    //
+                    // rn=3: sealed sigma addressed to the participant.
+                    // Decrypt into `sigmas[helper]` and, once every
+                    // declared helper's sigma is in, finalize the
+                    // repair INLINE — reconstruction is pure local
+                    // arithmetic over material already in this struct,
+                    // so no follow-up IPC round-trip is needed for the
+                    // recovery-critical step.
+                    2 | 3 => {
+                        let cts = payload
+                            .recipient_ciphertexts
+                            .as_ref()
+                            .ok_or(ApplyError::InvariantViolation)?;
+                        let decrypted_for_self: Option<Vec<u8>> = cts
+                            .iter()
+                            .find(|ct| ct.recipient == *self_addr)
+                            .map(|ct| dm_signing::open_from_owner(self_x25519_priv, &ct.sealed))
+                            .transpose()
+                            .map_err(|_| ApplyError::PayloadDecode)?;
+
+                        // Broadcast-path validation + round2/3_seen
+                        // bookkeeping (also rejects non-helpers, wrong
+                        // epoch, unknown ceremony — before any local
+                        // mutation below).
+                        self.apply_repair_round(&event)?;
+
+                        if let Some(plaintext) = decrypted_for_self {
+                            let pending = self
+                                .committee_state
+                                .pending_repair
+                                .as_mut()
+                                .ok_or(ApplyError::UnknownCeremony)?;
+                            if payload.round_num == 2 {
+                                pending.deltas.entry(event.actor).or_insert(plaintext);
+                            } else {
+                                pending.sigmas.entry(event.actor).or_insert(plaintext);
+                            }
+                        }
+                        self.insert_applied(event);
+                        if payload.round_num == 3 {
+                            self.settle_repair_after_round3(self_addr);
+                        }
+                        Ok(())
+                    }
+                    // rn=1 (and malformed rounds) carry no sealed
+                    // material — the broadcast path handles them.
+                    _ => self.apply(event),
+                }
+            }
             _ => self.apply(event),
         }
+    }
+
+    /// ZEB-1027: post-rn=3 settlement, run on the identity-aware apply
+    /// path (the only place `self_addr` is known).
+    ///
+    /// * PARTICIPANT with a full sigma set → reconstruct the share via
+    ///   RTS part 3, verify the derived verifying share against the
+    ///   committee's consensus `verifying_shares[self]` (part 3 itself
+    ///   verifies NOTHING — without this check a single malicious
+    ///   helper installs a garbage share), install
+    ///   `local_key_package` + `local_pub_key_package`, clear the slot.
+    ///   A failed reconstruction also clears the slot (terminal for
+    ///   this ceremony) so the participant can re-request with a fresh
+    ///   mint stamp; the error is logged loudly.
+    /// * NON-participant once `round3_seen` covers every declared
+    ///   helper → the ceremony is over from this replica's view; clear
+    ///   the slot (dropping helper delta material) so the singleton
+    ///   does not wedge the next repair.
+    fn settle_repair_after_round3(&mut self, self_addr: &OwnerAddr) {
+        let Some(p) = self.committee_state.pending_repair.as_ref() else {
+            return;
+        };
+        if p.participant != *self_addr {
+            if p.round3_seen.len() == p.helpers.len() {
+                self.committee_state.pending_repair = None;
+            }
+            return;
+        }
+        if p.sigmas.len() != p.helpers.len() {
+            return;
+        }
+
+        // Full sigma set — reconstruct. Everything below is pure local
+        // computation; any failure is terminal for THIS ceremony.
+        let outcome = (|| -> Result<(), String> {
+            let self_id = *self
+                .committee_state
+                .identifier_map
+                .get(self_addr)
+                .ok_or("self not in identifier_map")?;
+            let joint_vk = self
+                .committee_state
+                .joint_verifying_key
+                .as_ref()
+                .ok_or("no joint verifying key on an active committee")?;
+            let mut shares_by_id = BTreeMap::new();
+            for (addr, bytes) in &self.committee_state.verifying_shares {
+                let id = *self
+                    .committee_state
+                    .identifier_map
+                    .get(addr)
+                    .ok_or("verifying-share holder not in identifier_map")?;
+                shares_by_id.insert(id, *bytes);
+            }
+            let pub_pkg = crate::community_dfrost_crypto::pub_key_package_from_bytes(
+                &shares_by_id,
+                joint_vk,
+                self.committee_state.threshold,
+            )?;
+            let p = self
+                .committee_state
+                .pending_repair
+                .as_ref()
+                .expect("checked above");
+            let sigma_bytes: Vec<Vec<u8>> = p.sigmas.values().cloned().collect();
+            let repaired = crate::community_dfrost_crypto::repair_part3_local(
+                &sigma_bytes,
+                self_id,
+                &pub_pkg,
+            )?;
+            // THE check (see repair_part3_local's doc): consensus
+            // verifying share must match what the reconstruction
+            // derives, or some sigma was wrong/malicious.
+            let derived = crate::community_dfrost_crypto::verifying_share_to_bytes(
+                repaired.verifying_share(),
+            );
+            let consensus = self
+                .committee_state
+                .verifying_shares
+                .get(self_addr)
+                .ok_or("self has no consensus verifying share")?;
+            if derived != *consensus {
+                return Err(
+                    "reconstructed share's verifying share does not match the committee's \
+                     consensus entry — a helper contributed a wrong or epoch-skewed sigma"
+                        .to_string(),
+                );
+            }
+            self.local_key_package = Some(repaired);
+            self.local_pub_key_package = Some(pub_pkg);
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => {
+                tracing::info!(
+                    "dfrost repair complete: signing share reconstructed and verified \
+                     against the committee consensus (ZEB-1027)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "dfrost repair finalization FAILED — ceremony aborted; the participant \
+                     may re-request with a fresh mint stamp (ZEB-1027)"
+                );
+            }
+        }
+        // Terminal either way for this ceremony on this node.
+        self.committee_state.pending_repair = None;
     }
 }
 
@@ -2586,7 +3003,6 @@ mod tests {
         use crate::community_dfrost_types::{
             DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
         };
-        use crate::community_membership::RecipientCiphertext;
         use crate::owner_state_types::Hlc;
 
         let alice = OwnerAddr([0x01; 16]);
@@ -2599,14 +3015,13 @@ mod tests {
         log.committee_state.threshold = 1;
         log.committee_state.max_signers = 1;
 
+        // ZEB-1027: rn=1 carries the PUBLIC zero-sharing round-1
+        // commitment (pre-1027 it sealed a placeholder per recipient).
         let payload = RefreshRoundPayload {
             ceremony_id,
             round_num: 1,
-            recipient_ciphertexts: Some(vec![RecipientCiphertext {
-                recipient: alice,
-                sealed: vec![0xde, 0xad],
-            }]),
-            round2_package: None,
+            recipient_ciphertexts: None,
+            package: Some(vec![0xde, 0xad]),
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -2631,6 +3046,11 @@ mod tests {
         let pr = log.committee_state.pending_refresh.as_ref().unwrap();
         assert_eq!(pr.ceremony_id, ceremony_id);
         assert_eq!(pr.proposed_epoch, 2);
+        assert_eq!(
+            pr.round1_packages.get(&alice),
+            Some(&vec![0xde, 0xad]),
+            "rn=1 must record the actor's public round-1 package (ZEB-1027)"
+        );
     }
 
     /// ZEB-1025: a `ts` from a signature-valid actor OUTSIDE the active
@@ -2694,7 +3114,6 @@ mod tests {
         use crate::community_dfrost_types::{
             DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
         };
-        use crate::community_membership::RecipientCiphertext;
         use crate::owner_state_types::Hlc;
 
         let alice = OwnerAddr([0x01; 16]);
@@ -2710,11 +3129,8 @@ mod tests {
         let payload = RefreshRoundPayload {
             ceremony_id: [0x77u8; 32],
             round_num: 1,
-            recipient_ciphertexts: Some(vec![RecipientCiphertext {
-                recipient: alice,
-                sealed: vec![0xde, 0xad],
-            }]),
-            round2_package: None,
+            recipient_ciphertexts: None,
+            package: Some(vec![0xde, 0xad]),
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -2771,8 +3187,8 @@ mod tests {
         let payload = RefreshRoundPayload {
             ceremony_id,
             round_num: 2,
-            recipient_ciphertexts: None,
-            round2_package: Some(vec![0xbe, 0xef]),
+            recipient_ciphertexts: Some(vec![]),
+            package: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -2794,18 +3210,20 @@ mod tests {
         assert_eq!(result, Err(ApplyError::InvariantViolation));
     }
 
-    /// ZEB-1025: the LOCAL apply path (`apply_with_identity`) for rf rn=1
-    /// routes through `apply_proactive_refresh` before any
+    /// ZEB-1025: the LOCAL apply path (`apply_with_identity`) for rf
+    /// events routes through `apply_proactive_refresh` before any
     /// `round2_packages` insert, so the same membership gate must cover
     /// it — a non-member's rf must not seed pending_refresh via the local
     /// path either (the dr rn=2 local path needed its own mirror gate in
     /// #771; this test pins that rf does NOT regress the same way).
+    /// ZEB-1027: the decrypting local rf round is now rn=2; rn=1 falls
+    /// through to the broadcast apply — this test exercises the rn=1
+    /// fall-through with a non-member actor.
     #[test]
     fn rf_rn1_with_identity_from_non_committee_actor_rejected_zeb1025() {
         use crate::community_dfrost_types::{
             DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
         };
-        use crate::community_membership::RecipientCiphertext;
         use crate::owner_state_types::Hlc;
 
         let alice = OwnerAddr([0x01; 16]);
@@ -2819,17 +3237,11 @@ mod tests {
         log.committee_state.threshold = 2;
         log.committee_state.max_signers = 2;
 
-        // Ciphertext targets bob, not self (alice) — the decrypt-staging
-        // step finds nothing for self and proceeds to the shared apply,
-        // where the membership gate must reject.
         let payload = RefreshRoundPayload {
             ceremony_id: [0x77u8; 32],
             round_num: 1,
-            recipient_ciphertexts: Some(vec![RecipientCiphertext {
-                recipient: bob,
-                sealed: vec![0xde, 0xad],
-            }]),
-            round2_package: None,
+            recipient_ciphertexts: None,
+            package: Some(vec![0xde, 0xad]),
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&payload, &mut pd).unwrap();
@@ -3763,6 +4175,8 @@ mod tests {
             .pending_sign
             .insert([0x33; 32], PendingSignSession::default());
         log.committee_state.pending_refresh = Some(PendingCeremony::default());
+        log.committee_state.pending_repair =
+            Some(PendingRepair::new([0x55; 32], bob, 1, vec![alice]));
         log.beacon_index.insert([0x11; 32], [0x22; 32]);
 
         let restored = DfrostLog::from_restored(
@@ -3779,7 +4193,976 @@ mod tests {
         assert!(restored.committee_state.pending_dkg.is_none());
         assert!(restored.committee_state.pending_sign.is_empty());
         assert!(restored.committee_state.pending_refresh.is_none());
+        assert!(
+            restored.committee_state.pending_repair.is_none(),
+            "ZEB-1027: the repair slot is the fourth cleared pending slot"
+        );
         assert!(restored.local_dkg_secret.is_none());
         assert!(restored.local_key_package.is_none());
+    }
+
+    // ── ZEB-1027: refresh rn=2 local decrypt ─────────────────────────────
+
+    /// The decrypting local refresh round is rn=2 (mirroring DkgRound
+    /// rn=2); a sealed-to-self package lands in
+    /// `pending_refresh.round2_packages[sender]`.
+    #[test]
+    fn rf_rn2_with_identity_decrypts_share_package_zeb1027() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::community_membership::RecipientCiphertext;
+        use crate::dm_signing;
+        use crate::owner_state_types::Hlc;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let alice_priv = [0x42u8; 32];
+        let alice_x25519_pub = *PublicKey::from(&StaticSecret::from(alice_priv)).as_bytes();
+        let ceremony_id = [0x77u8; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice, bob];
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+        log.committee_state.pending_refresh = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+
+        let plain = vec![0xca, 0xfe];
+        let sealed = dm_signing::seal_to_owner(&alice_x25519_pub, &plain).expect("seal");
+        let payload = RefreshRoundPayload {
+            ceremony_id,
+            round_num: 2,
+            recipient_ciphertexts: Some(vec![RecipientCiphertext {
+                recipient: alice,
+                sealed,
+            }]),
+            package: None,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        log.apply_with_identity(
+            SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: DfrostEventKind::ProactiveRefresh,
+                hlc: Hlc {
+                    wall_ms: 7000,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: bob,
+                payload: pd,
+                sig: vec![0u8; 64],
+            },
+            &alice,
+            &alice_priv,
+        )
+        .expect("rf rn=2 applies");
+
+        assert_eq!(
+            log.committee_state
+                .pending_refresh
+                .as_ref()
+                .unwrap()
+                .round2_packages
+                .get(&bob),
+            Some(&plain)
+        );
+    }
+
+    /// An rf rn=1 while a (stray) DKG occupies its slot is refused —
+    /// the two transcripts must never interleave.
+    #[test]
+    fn rf_rn1_while_pending_dkg_rejected_zeb1027() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice];
+        log.committee_state.threshold = 1;
+        log.committee_state.max_signers = 1;
+        log.committee_state.pending_dkg = Some(PendingCeremony::default());
+
+        let payload = RefreshRoundPayload {
+            ceremony_id: [0x77u8; 32],
+            round_num: 1,
+            recipient_ciphertexts: None,
+            package: Some(vec![0x01]),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ProactiveRefresh,
+            hlc: Hlc {
+                wall_ms: 7100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::CeremonyInFlight));
+    }
+
+    // ── ZEB-1027: share-repair (`rp`) unit tests ─────────────────────────
+
+    fn rp_event(
+        actor: OwnerAddr,
+        ceremony_id: [u8; 32],
+        round_num: u8,
+        epoch: u64,
+        helpers: Option<Vec<OwnerAddr>>,
+        rc: Option<Vec<crate::community_membership::RecipientCiphertext>>,
+        wall_ms: u64,
+    ) -> SignedCommitteeEvent {
+        use crate::community_dfrost_types::RepairRoundPayload;
+        use crate::owner_state_types::Hlc;
+        let payload = RepairRoundPayload {
+            ceremony_id,
+            round_num,
+            epoch,
+            helpers,
+            minted_wall_ms: if round_num == 1 { Some(1_000) } else { None },
+            minted_logical: if round_num == 1 { Some(0) } else { None },
+            recipient_ciphertexts: rc,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::RepairShare,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor,
+            payload: pd,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// Three-member committee scaffold for repair tests: alice, bob,
+    /// carol; threshold 2; epoch 1; no key material (tests seed what
+    /// they need).
+    fn repair_committee_log() -> (DfrostLog, OwnerAddr, OwnerAddr, OwnerAddr) {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice, bob, carol];
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 3;
+        log.committee_state.identifier_map =
+            CommitteeState::build_identifier_map(&[alice, bob, carol]);
+        (log, alice, bob, carol)
+    }
+
+    #[test]
+    fn rp_rn1_seeds_pending_repair_zeb1027() {
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.apply(rp_event(
+            alice,
+            [0xab; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            8_000,
+        ))
+        .expect("rn=1 applies");
+        let p = log.committee_state.pending_repair.as_ref().unwrap();
+        assert_eq!(p.participant, alice);
+        assert_eq!(p.epoch, 1);
+        assert_eq!(p.helpers, vec![bob, carol]);
+        assert!(p.round2_seen.is_empty() && p.round3_seen.is_empty());
+    }
+
+    #[test]
+    fn rp_rn1_rejections_zeb1027() {
+        // Non-member actor.
+        let (mut log, _alice, bob, carol) = repair_committee_log();
+        let mallory = OwnerAddr([0x66; 16]);
+        assert_eq!(
+            log.apply(rp_event(
+                mallory,
+                [0xab; 32],
+                1,
+                1,
+                Some(vec![bob, carol]),
+                None,
+                8_001,
+            )),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Helpers below threshold (t=2, one declared helper).
+        let (mut log, alice, bob, _carol) = repair_committee_log();
+        assert_eq!(
+            log.apply(rp_event(
+                alice,
+                [0xab; 32],
+                1,
+                1,
+                Some(vec![bob]),
+                None,
+                8_002
+            )),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Wrong epoch.
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        assert_eq!(
+            log.apply(rp_event(
+                alice,
+                [0xab; 32],
+                1,
+                7,
+                Some(vec![bob, carol]),
+                None,
+                8_003,
+            )),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Participant listed as its own helper.
+        let (mut log, alice, _bob, carol) = repair_committee_log();
+        assert_eq!(
+            log.apply(rp_event(
+                alice,
+                [0xab; 32],
+                1,
+                1,
+                Some(vec![alice, carol]),
+                None,
+                8_004,
+            )),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Refresh in flight → repair waits.
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.committee_state.pending_refresh = Some(PendingCeremony::default());
+        assert_eq!(
+            log.apply(rp_event(
+                alice,
+                [0xab; 32],
+                1,
+                1,
+                Some(vec![bob, carol]),
+                None,
+                8_005,
+            )),
+            Err(ApplyError::CeremonyInFlight)
+        );
+        assert!(
+            log.committee_state.pending_repair.is_none(),
+            "no rejected rn=1 may seed the slot"
+        );
+    }
+
+    #[test]
+    fn rp_rn1_supersede_and_tiebreak_zeb1027() {
+        // Participant supersedes its OWN earlier ceremony.
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.apply(rp_event(
+            alice,
+            [0xab; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            8_100,
+        ))
+        .expect("first request");
+        log.apply(rp_event(
+            alice,
+            [0xac; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            8_101,
+        ))
+        .expect("participant supersedes its own ceremony");
+        assert_eq!(
+            log.committee_state
+                .pending_repair
+                .as_ref()
+                .unwrap()
+                .ceremony_id,
+            [0xac; 32]
+        );
+
+        // Racing requests from DIFFERENT participants: smaller
+        // (participant, id) wins while no helper has progressed…
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.apply(rp_event(
+            bob,
+            [0xab; 32],
+            1,
+            1,
+            Some(vec![alice, carol]),
+            None,
+            8_102,
+        ))
+        .expect("bob's request");
+        log.apply(rp_event(
+            alice,
+            [0xad; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            8_103,
+        ))
+        .expect("alice (smaller addr) wins the tie-break");
+        assert_eq!(
+            log.committee_state
+                .pending_repair
+                .as_ref()
+                .unwrap()
+                .participant,
+            alice
+        );
+        // …and the larger loses against an incumbent smaller one.
+        assert_eq!(
+            log.apply(rp_event(
+                carol,
+                [0xae; 32],
+                1,
+                1,
+                Some(vec![alice, bob]),
+                None,
+                8_104,
+            )),
+            Err(ApplyError::CeremonyInFlight)
+        );
+        // Once a helper progressed, even a smaller newcomer is refused.
+        let (mut log, _alice, bob, carol) = repair_committee_log();
+        log.apply(rp_event(
+            carol,
+            [0xab; 32],
+            1,
+            1,
+            Some(vec![_alice, bob]),
+            None,
+            8_105,
+        ))
+        .expect("carol's request");
+        log.committee_state
+            .pending_repair
+            .as_mut()
+            .unwrap()
+            .round2_seen
+            .insert(bob);
+        assert_eq!(
+            log.apply(rp_event(
+                _alice,
+                [0xaf; 32],
+                1,
+                1,
+                Some(vec![bob, carol]),
+                None,
+                8_106,
+            )),
+            Err(ApplyError::CeremonyInFlight)
+        );
+    }
+
+    #[test]
+    fn rp_round_tracking_and_helper_gates_zeb1027() {
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.apply(rp_event(
+            alice,
+            [0xab; 32],
+            1,
+            1,
+            Some(vec![bob, carol]),
+            None,
+            8_200,
+        ))
+        .expect("request");
+        // rn=2 from a declared helper tracks.
+        log.apply(rp_event(bob, [0xab; 32], 2, 1, None, Some(vec![]), 8_201))
+            .expect("helper rn=2");
+        assert!(log
+            .committee_state
+            .pending_repair
+            .as_ref()
+            .unwrap()
+            .round2_seen
+            .contains(&bob));
+        // The PARTICIPANT is not a helper — its rn=2 is malformed.
+        assert_eq!(
+            log.apply(rp_event(alice, [0xab; 32], 2, 1, None, Some(vec![]), 8_202)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Missing ciphertext vector is malformed.
+        assert_eq!(
+            log.apply(rp_event(carol, [0xab; 32], 2, 1, None, None, 8_203)),
+            Err(ApplyError::InvariantViolation)
+        );
+        // Unknown ceremony.
+        assert_eq!(
+            log.apply(rp_event(carol, [0xff; 32], 2, 1, None, Some(vec![]), 8_204)),
+            Err(ApplyError::UnknownCeremony)
+        );
+    }
+
+    /// Real 2-of-3 DKG via the crypto wrappers, shared by the ZEB-1027
+    /// repair tests. Returns (members, ids, per-id KeyPackages, joint
+    /// PublicKeyPackage).
+    #[allow(clippy::type_complexity)]
+    fn dkg_2of3_material() -> (
+        Vec<OwnerAddr>,
+        Vec<frost_ristretto255::Identifier>,
+        std::collections::BTreeMap<
+            frost_ristretto255::Identifier,
+            frost_ristretto255::keys::KeyPackage,
+        >,
+        frost_ristretto255::keys::PublicKeyPackage,
+    ) {
+        use crate::community_dfrost_crypto as dc;
+        let members: Vec<OwnerAddr> = vec![
+            OwnerAddr([0x01; 16]),
+            OwnerAddr([0x02; 16]),
+            OwnerAddr([0x03; 16]),
+        ];
+        let ids: Vec<frost_ristretto255::Identifier> =
+            (0..3).map(dc::identifier_for_index).collect();
+        let mut r1_secrets = std::collections::BTreeMap::new();
+        let mut r1_pkgs: BTreeMap<frost_ristretto255::Identifier, Vec<u8>> = BTreeMap::new();
+        for id in &ids {
+            let (sec, pkg) = dc::dkg_part1_local(*id, 3, 2).unwrap();
+            r1_secrets.insert(*id, sec);
+            r1_pkgs.insert(*id, pkg);
+        }
+        let mut r2_secrets = std::collections::BTreeMap::new();
+        let mut r2_out: BTreeMap<
+            frost_ristretto255::Identifier,
+            BTreeMap<frost_ristretto255::Identifier, Vec<u8>>,
+        > = BTreeMap::new();
+        for id in &ids {
+            let sec = r1_secrets.remove(id).unwrap();
+            let recv: BTreeMap<_, _> = r1_pkgs
+                .iter()
+                .filter(|(o, _)| *o != id)
+                .map(|(o, b)| (*o, b.clone()))
+                .collect();
+            let (s2, out) = dc::dkg_part2_local(sec, &recv).unwrap();
+            r2_secrets.insert(*id, s2);
+            r2_out.insert(*id, out);
+        }
+        let mut key_packages = std::collections::BTreeMap::new();
+        let mut pub_pkg = None;
+        for id in &ids {
+            let recv_r1: BTreeMap<_, _> = r1_pkgs
+                .iter()
+                .filter(|(o, _)| *o != id)
+                .map(|(o, b)| (*o, b.clone()))
+                .collect();
+            let mut recv_r2 = BTreeMap::new();
+            for (sender, out) in &r2_out {
+                if sender != id {
+                    recv_r2.insert(*sender, out.get(id).cloned().unwrap());
+                }
+            }
+            let (kp, pkp) =
+                dc::dkg_part3_local(r2_secrets.get(id).unwrap(), &recv_r1, &recv_r2).unwrap();
+            key_packages.insert(*id, kp);
+            pub_pkg = Some(pkp);
+        }
+        (members, ids, key_packages, pub_pkg.unwrap())
+    }
+
+    /// Committee public state as a restored (post-snapshot-load) log
+    /// would hold it — everything but local secret material.
+    fn committee_log_from_material(
+        members: &[OwnerAddr],
+        ids: &[frost_ristretto255::Identifier],
+        pub_pkg: &frost_ristretto255::keys::PublicKeyPackage,
+        kp: Option<frost_ristretto255::keys::KeyPackage>,
+    ) -> DfrostLog {
+        use crate::community_dfrost_crypto as dc;
+        let joint_vk = dc::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let mut verifying_shares: BTreeMap<OwnerAddr, [u8; 32]> = BTreeMap::new();
+        for (i, addr) in members.iter().enumerate() {
+            let vs = pub_pkg.verifying_shares().get(&ids[i]).unwrap();
+            verifying_shares.insert(*addr, dc::verifying_share_to_bytes(vs));
+        }
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = members.to_vec();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 3;
+        log.committee_state.joint_verifying_key = Some(joint_vk);
+        log.committee_state.verifying_shares = verifying_shares;
+        log.committee_state.identifier_map = CommitteeState::build_identifier_map(members);
+        log.local_key_package = kp;
+        log
+    }
+
+    /// ZEB-1027 headline flow, real crypto end-to-end at the log layer:
+    /// a 2-of-3 committee where alice LOST her share (fresh log, public
+    /// state only — the restored-from-snapshot shape). Bob and carol
+    /// help; every event flows through `apply_with_identity` on all
+    /// three logs exactly as engine ingest would deliver it. Alice's
+    /// finalization runs inline on the last sigma and must reinstall
+    /// the EXACT original signing share; helper slots self-clear.
+    #[test]
+    fn repair_full_flow_reconstructs_and_installs_share_zeb1027() {
+        use crate::community_dfrost_crypto as dc;
+        use crate::community_membership::RecipientCiphertext;
+        use crate::dm_signing;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let make_log = |kp: Option<frost_ristretto255::keys::KeyPackage>| {
+            committee_log_from_material(&members, &ids, &pub_pkg, kp)
+        };
+        let alice = members[0];
+        let bob = members[1];
+        let carol = members[2];
+        // Alice lost her share (restart shape); bob + carol still hold
+        // theirs.
+        let mut log_a = make_log(None);
+        let mut log_b = make_log(Some(key_packages.get(&ids[1]).unwrap().clone()));
+        let mut log_c = make_log(Some(key_packages.get(&ids[2]).unwrap().clone()));
+
+        // Per-member X25519 identities for the sealed rounds.
+        let privs: BTreeMap<OwnerAddr, [u8; 32]> = [
+            (alice, [0x41u8; 32]),
+            (bob, [0x42u8; 32]),
+            (carol, [0x43u8; 32]),
+        ]
+        .into();
+        let pub_of = |addr: &OwnerAddr| -> [u8; 32] {
+            *PublicKey::from(&StaticSecret::from(*privs.get(addr).unwrap())).as_bytes()
+        };
+
+        let ceremony = [0xabu8; 32];
+        let helpers = vec![bob, carol];
+        let helper_ids = [ids[1], ids[2]];
+
+        // rn=1: alice requests; everyone applies.
+        let rn1 = rp_event(alice, ceremony, 1, 1, Some(helpers.clone()), None, 9_000);
+        for (log, me) in [(&mut log_a, alice), (&mut log_b, bob), (&mut log_c, carol)] {
+            log.apply_with_identity(rn1.clone(), &me, privs.get(&me).unwrap())
+                .expect("rn=1 applies");
+        }
+
+        // rn=2: each helper deals deltas over the DECLARED set (self
+        // included), sealed per helper.
+        let mut wall = 9_001u64;
+        for (helper, helper_id) in [(bob, ids[1]), (carol, ids[2])] {
+            let kp = key_packages.get(&helper_id).unwrap();
+            let deltas = dc::repair_part1_local(&helper_ids, kp, ids[0]).expect("part1");
+            let mut rc = Vec::new();
+            for (id, delta) in &deltas {
+                let addr = if *id == ids[1] { bob } else { carol };
+                rc.push(RecipientCiphertext {
+                    recipient: addr,
+                    sealed: dm_signing::seal_to_owner(&pub_of(&addr), delta).unwrap(),
+                });
+            }
+            let ev = rp_event(helper, ceremony, 2, 1, None, Some(rc), wall);
+            wall += 1;
+            for (log, me) in [(&mut log_a, alice), (&mut log_b, bob), (&mut log_c, carol)] {
+                log.apply_with_identity(ev.clone(), &me, privs.get(&me).unwrap())
+                    .expect("rn=2 applies");
+            }
+        }
+        assert_eq!(
+            log_b
+                .committee_state
+                .pending_repair
+                .as_ref()
+                .unwrap()
+                .deltas
+                .len(),
+            2,
+            "each helper decrypted a delta from BOTH helpers (own included)"
+        );
+
+        // rn=3: each helper sums its deltas into a sigma sealed to alice.
+        for helper in [bob, carol] {
+            let sigma = {
+                let log = if helper == bob { &log_b } else { &log_c };
+                let deltas: Vec<Vec<u8>> = log
+                    .committee_state
+                    .pending_repair
+                    .as_ref()
+                    .unwrap()
+                    .deltas
+                    .values()
+                    .cloned()
+                    .collect();
+                dc::repair_part2_local(&deltas).expect("part2")
+            };
+            let rc = vec![RecipientCiphertext {
+                recipient: alice,
+                sealed: dm_signing::seal_to_owner(&pub_of(&alice), &sigma).unwrap(),
+            }];
+            let ev = rp_event(helper, ceremony, 3, 1, None, Some(rc), wall);
+            wall += 1;
+            for (log, me) in [(&mut log_a, alice), (&mut log_b, bob), (&mut log_c, carol)] {
+                log.apply_with_identity(ev.clone(), &me, privs.get(&me).unwrap())
+                    .expect("rn=3 applies");
+            }
+        }
+
+        // Alice: share reconstructed, verified, installed; slot cleared.
+        let repaired = log_a
+            .local_key_package
+            .as_ref()
+            .expect("inline finalize must install the repaired share");
+        assert_eq!(
+            repaired.signing_share().serialize(),
+            key_packages
+                .get(&ids[0])
+                .unwrap()
+                .signing_share()
+                .serialize(),
+            "reconstruction must yield alice's EXACT original signing share"
+        );
+        assert!(log_a.local_pub_key_package.is_some());
+        assert!(log_a.committee_state.pending_repair.is_none());
+        // Helpers: slot self-cleared once every declared sigma was seen.
+        assert!(log_b.committee_state.pending_repair.is_none());
+        assert!(log_c.committee_state.pending_repair.is_none());
+    }
+
+    /// A corrupt sigma must NOT install a share: the consensus
+    /// verifying-share check fails, the ceremony aborts terminally, and
+    /// the participant stays shareless (free to re-request).
+    #[test]
+    fn repair_corrupt_sigma_aborts_without_installing_zeb1027() {
+        use crate::community_membership::RecipientCiphertext;
+        use crate::dm_signing;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        // Give the committee a REAL-shaped vk + verifying shares so the
+        // finalize path gets to the mismatch check (garbage sigmas
+        // still sum to a valid scalar → valid point).
+        let sk = frost_ristretto255::SigningKey::deserialize(&[7u8; 32]).unwrap();
+        let vk = frost_ristretto255::VerifyingKey::from(&sk);
+        log.committee_state.joint_verifying_key =
+            Some(crate::community_dfrost_crypto::verifying_key_to_bytes(&vk));
+        for m in [alice, bob, carol] {
+            log.committee_state.verifying_shares.insert(
+                m,
+                crate::community_dfrost_crypto::verifying_key_to_bytes(&vk),
+            );
+        }
+
+        let alice_priv = [0x41u8; 32];
+        let alice_pub = *PublicKey::from(&StaticSecret::from(alice_priv)).as_bytes();
+        let ceremony = [0xabu8; 32];
+        log.apply_with_identity(
+            rp_event(alice, ceremony, 1, 1, Some(vec![bob, carol]), None, 9_100),
+            &alice,
+            &alice_priv,
+        )
+        .expect("request applies");
+
+        // Two "sigmas" that are canonical scalars but garbage values.
+        let mut wall = 9_101u64;
+        for helper in [bob, carol] {
+            let mut sigma = [0u8; 32];
+            sigma[0] = if helper == bob { 3 } else { 5 };
+            let rc = vec![RecipientCiphertext {
+                recipient: alice,
+                sealed: dm_signing::seal_to_owner(&alice_pub, &sigma).unwrap(),
+            }];
+            log.apply_with_identity(
+                rp_event(helper, ceremony, 3, 1, None, Some(rc), wall),
+                &alice,
+                &alice_priv,
+            )
+            .expect("rn=3 event itself applies (it is evidence)");
+            wall += 1;
+        }
+
+        assert!(
+            log.local_key_package.is_none(),
+            "a mismatched reconstruction must never be installed"
+        );
+        assert!(
+            log.committee_state.pending_repair.is_none(),
+            "the failed ceremony is terminal — cleared for a fresh re-request"
+        );
+    }
+
+    /// ZEB-1027 regression (the ticket's mandated test): restore an
+    /// ACTIVE committee member through the REAL snapshot-restore path
+    /// (`from_restored` — public state only, share gone), run the
+    /// repair protocol, then prove the restored member can produce a
+    /// threshold-signing contribution that aggregates into a valid VRF
+    /// beacon signature under the committee's joint verifying key.
+    #[test]
+    fn restored_member_regains_signing_after_repair_zeb1027() {
+        use crate::community_dfrost_crypto as dc;
+        use crate::community_membership::RecipientCiphertext;
+        use crate::dm_signing;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let carol = members[2];
+
+        // Alice's node BEFORE restart: full state including her share.
+        let pre_restart = committee_log_from_material(
+            &members,
+            &ids,
+            &pub_pkg,
+            Some(key_packages[&ids[0]].clone()),
+        );
+        // The restart: exactly what `load_dfrost` hands back — events +
+        // committee state + beacon index; every local secret gone.
+        let mut log_a = DfrostLog::from_restored(
+            pre_restart.export_events(),
+            pre_restart.committee_state.clone(),
+            pre_restart.beacon_index.clone(),
+        );
+        assert!(
+            log_a.local_key_package.is_none(),
+            "restored member starts VERIFICATION-ONLY"
+        );
+        assert!(log_a.committee_state.active, "public state restored");
+
+        let mut log_b = committee_log_from_material(
+            &members,
+            &ids,
+            &pub_pkg,
+            Some(key_packages[&ids[1]].clone()),
+        );
+        let mut log_c = committee_log_from_material(
+            &members,
+            &ids,
+            &pub_pkg,
+            Some(key_packages[&ids[2]].clone()),
+        );
+
+        let privs: BTreeMap<OwnerAddr, [u8; 32]> = [
+            (alice, [0x41u8; 32]),
+            (bob, [0x42u8; 32]),
+            (carol, [0x43u8; 32]),
+        ]
+        .into();
+        let pub_of = |addr: &OwnerAddr| -> [u8; 32] {
+            *PublicKey::from(&StaticSecret::from(*privs.get(addr).unwrap())).as_bytes()
+        };
+
+        // ── Repair: request + helper rounds, every event through the
+        //    identity-aware apply on all three logs. ─────────────────────
+        let ceremony = [0xcdu8; 32];
+        let helpers = vec![bob, carol];
+        let helper_ids = [ids[1], ids[2]];
+        let rn1 = rp_event(alice, ceremony, 1, 1, Some(helpers.clone()), None, 9_500);
+        for (log, me) in [(&mut log_a, alice), (&mut log_b, bob), (&mut log_c, carol)] {
+            log.apply_with_identity(rn1.clone(), &me, privs.get(&me).unwrap())
+                .expect("rn=1 applies");
+        }
+        let mut wall = 9_501u64;
+        for (helper, helper_id) in [(bob, ids[1]), (carol, ids[2])] {
+            let deltas =
+                dc::repair_part1_local(&helper_ids, &key_packages[&helper_id], ids[0]).unwrap();
+            let mut rc = Vec::new();
+            for (id, delta) in &deltas {
+                let addr = if *id == ids[1] { bob } else { carol };
+                rc.push(RecipientCiphertext {
+                    recipient: addr,
+                    sealed: dm_signing::seal_to_owner(&pub_of(&addr), delta).unwrap(),
+                });
+            }
+            let ev = rp_event(helper, ceremony, 2, 1, None, Some(rc), wall);
+            wall += 1;
+            for (log, me) in [(&mut log_a, alice), (&mut log_b, bob), (&mut log_c, carol)] {
+                log.apply_with_identity(ev.clone(), &me, privs.get(&me).unwrap())
+                    .expect("rn=2 applies");
+            }
+        }
+        for helper in [bob, carol] {
+            let sigma = {
+                let log = if helper == bob { &log_b } else { &log_c };
+                let deltas: Vec<Vec<u8>> = log
+                    .committee_state
+                    .pending_repair
+                    .as_ref()
+                    .unwrap()
+                    .deltas
+                    .values()
+                    .cloned()
+                    .collect();
+                dc::repair_part2_local(&deltas).unwrap()
+            };
+            let ev = rp_event(
+                helper,
+                ceremony,
+                3,
+                1,
+                None,
+                Some(vec![RecipientCiphertext {
+                    recipient: alice,
+                    sealed: dm_signing::seal_to_owner(&pub_of(&alice), &sigma).unwrap(),
+                }]),
+                wall,
+            );
+            wall += 1;
+            for (log, me) in [(&mut log_a, alice), (&mut log_b, bob), (&mut log_c, carol)] {
+                log.apply_with_identity(ev.clone(), &me, privs.get(&me).unwrap())
+                    .expect("rn=3 applies");
+            }
+        }
+
+        let repaired = log_a
+            .local_key_package
+            .clone()
+            .expect("repair reinstalls the signing share");
+        let repaired_pub = log_a
+            .local_pub_key_package
+            .clone()
+            .expect("repair reinstalls the public package");
+
+        // ── The restored member CONTRIBUTES: 2-of-2 signing set
+        //    {alice (repaired share), bob}, verified under the
+        //    committee's joint vk + derived into a VRF output. ──────────
+        let seed = crate::community_dfrost_types::derive_vrf_seed(&[0x11; 32], 1);
+        let mut rng = frost_ristretto255::rand_core::OsRng;
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for (id, kp) in [(ids[0], &repaired), (ids[1], &key_packages[&ids[1]])] {
+            let (n, c) = frost_ristretto255::round1::commit(kp.signing_share(), &mut rng);
+            nonces.insert(id, n);
+            commitments.insert(id, c);
+        }
+        let signing_package = frost_ristretto255::SigningPackage::new(commitments, &seed);
+        let mut shares = BTreeMap::new();
+        for (id, kp) in [(ids[0], &repaired), (ids[1], &key_packages[&ids[1]])] {
+            shares.insert(
+                id,
+                frost_ristretto255::round2::sign(&signing_package, nonces.get(&id).unwrap(), kp)
+                    .expect("the RESTORED member's share signs"),
+            );
+        }
+        let sig = frost_ristretto255::aggregate(&signing_package, &shares, &repaired_pub)
+            .expect("aggregate with the repaired share");
+        let sig_bytes = sig.serialize().expect("sig serialize");
+        dc::verify_schnorr_signature(
+            &log_a.committee_state.joint_verifying_key.unwrap(),
+            &seed,
+            &sig_bytes,
+        )
+        .expect("beacon signature verifies under the committee's joint vk");
+        // And the VRF output derives — the full beacon shape.
+        let r: [u8; 32] = sig_bytes[..32].try_into().unwrap();
+        let _vrf_output = crate::community_dfrost_types::derive_vrf_output(&r);
+    }
+
+    /// Refresh promotion (`dk` quorum on `pending_refresh`) clears the
+    /// round secrets AND any in-flight repair — epoch moved, both are
+    /// dead transcript material (ZEB-1027).
+    #[test]
+    fn refresh_promotion_clears_secrets_and_repair_zeb1027() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+        use crate::owner_state_types::Hlc;
+
+        let (mut log, alice, bob, carol) = repair_committee_log();
+        log.committee_state.joint_verifying_key = Some([0x44; 32]);
+        let ceremony = [0x99u8; 32];
+        log.committee_state.pending_refresh = Some(PendingCeremony {
+            ceremony_id: ceremony,
+            members: vec![alice, bob, carol],
+            threshold: 2,
+            max_signers: 3,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+        log.committee_state.pending_repair =
+            Some(PendingRepair::new([0x55; 32], alice, 1, vec![bob, carol]));
+        let (r1_secret, _) =
+            crate::community_dfrost_crypto::dkg_part1_local(identifier_1(), 3, 2).unwrap();
+        log.local_dkg_secret = Some(r1_secret);
+
+        let payload = DkgCompletePayload {
+            ceremony_id: ceremony,
+            joint_verifying_key: [0x44; 32],
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: alice,
+                    verifying_share: [0xa1; 32],
+                },
+                MemberVerifyingShare {
+                    member: bob,
+                    verifying_share: [0xb1; 32],
+                },
+                MemberVerifyingShare {
+                    member: carol,
+                    verifying_share: [0xc1; 32],
+                },
+            ],
+            epoch: 2,
+            members: vec![alice, bob, carol],
+            threshold: 2,
+            max_signers: 3,
+        };
+        let mut wall = 9_200u64;
+        for confirmer in [alice, bob] {
+            let mut pd = Vec::new();
+            ciborium::into_writer(&payload, &mut pd).unwrap();
+            log.apply(SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: DfrostEventKind::DkgComplete,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: confirmer,
+                payload: pd,
+                sig: vec![0u8; 64],
+            })
+            .expect("dk applies");
+            wall += 1;
+        }
+
+        assert_eq!(log.committee_state.current_epoch, 2, "promoted");
+        assert!(log.committee_state.pending_refresh.is_none());
+        assert!(
+            log.committee_state.pending_repair.is_none(),
+            "promotion voids the in-flight repair (epoch moved)"
+        );
+        assert!(log.local_dkg_secret.is_none() && log.local_dkg_secret2.is_none());
+    }
+
+    fn identifier_1() -> frost_ristretto255::Identifier {
+        crate::community_dfrost_crypto::identifier_for_index(0)
     }
 }

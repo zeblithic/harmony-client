@@ -175,6 +175,7 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
             pending_dkg: None,
             pending_sign: BTreeMap::new(),
             pending_refresh: None,
+            pending_repair: None,
         };
         Arc::new(Mutex::new(log))
     };
@@ -500,6 +501,7 @@ async fn no_kd_ts_emission_when_not_committee_member() {
             pending_dkg: None,
             pending_sign: BTreeMap::new(),
             pending_refresh: None,
+            pending_repair: None,
         };
         Arc::new(Mutex::new(log))
     };

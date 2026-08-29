@@ -7,15 +7,16 @@
 
 use crate::community_dfrost_log::{verify_signed_committee_event, DfrostLog};
 use crate::community_dfrost_types::{
-    derive_dkg_ceremony_id, CeremonyInitPayload, DfrostEventKind, DkgRoundPayload,
-    RefreshRoundPayload, SignedCommitteeEvent, VrfBeaconPayload,
+    derive_dkg_ceremony_id, derive_refresh_ceremony_id, derive_repair_ceremony_id,
+    CeremonyInitPayload, DfrostEventKind, DkgRoundPayload, RefreshRoundPayload, RepairRoundPayload,
+    SignedCommitteeEvent, VrfBeaconPayload,
 };
 use crate::community_state_sync::IdentityResolver;
 use crate::community_voting_log::MembershipSnapshotResolver;
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use crate::{
     DfrostBeaconReadyPayload, DfrostDkgAbortedPayload, DfrostDkgProgressPayload,
-    DfrostRefreshProgressPayload,
+    DfrostRefreshProgressPayload, DfrostRepairProgressPayload,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -146,6 +147,44 @@ pub trait DkgDriver: Send + Sync {
         members: Vec<OwnerAddr>,
         threshold: u16,
     ) -> Result<String, String>;
+
+    /// ZEB-1027: produce + apply + broadcast this node's proactive-
+    /// refresh contribution. `round_num=1` joins/proposes (the core
+    /// derives the deterministic ceremony id itself — `ceremony_id`
+    /// here is the observed one, used for logging/verification);
+    /// rounds 2–3 contribute to the pending ceremony. Default: refuse
+    /// — pre-1027 driver impls (tests) keep compiling and simply don't
+    /// auto-drive refresh.
+    async fn contribute_refresh_round(
+        &self,
+        community_id: SpaceId,
+        ceremony_id: [u8; 32],
+        round_num: u8,
+    ) -> Result<(), String> {
+        let _ = (community_id, ceremony_id, round_num);
+        Err("contribute_refresh_round not supported by this driver".to_string())
+    }
+
+    /// ZEB-1027: produce + apply + broadcast this node's helper
+    /// contribution (rounds 2–3) to the pending share repair.
+    async fn contribute_repair_round(
+        &self,
+        community_id: SpaceId,
+        ceremony_id: [u8; 32],
+        round_num: u8,
+    ) -> Result<(), String> {
+        let _ = (community_id, ceremony_id, round_num);
+        Err("contribute_repair_round not supported by this driver".to_string())
+    }
+
+    /// ZEB-1027: publish this node's own share-repair REQUEST (rn=1,
+    /// default helper set). Fired by the orchestrator when it observes
+    /// a restored, shareless member on an otherwise-idle active
+    /// committee. Returns the ceremony id (hex).
+    async fn request_repair(&self, community_id: SpaceId) -> Result<String, String> {
+        let _ = community_id;
+        Err("request_repair not supported by this driver".to_string())
+    }
 }
 
 /// Timer + retry policy for the ceremony orchestration layer. All
@@ -224,6 +263,19 @@ struct OrchestratorState {
     /// already promoted. Rate-limits the heal to one per
     /// `rebroadcast_interval`.
     last_straggler_heal: Option<Instant>,
+    /// ZEB-1027: recovery-drive (refresh/repair) fires currently in
+    /// flight, keyed `(ceremony_id, kind_round)` where `kind_round`
+    /// packs the drive kind and round. Guards ingest + tick racing the
+    /// same fire; entries are removed when the spawned task completes.
+    recovery_inflight: HashSet<([u8; 32], u8)>,
+    /// ZEB-1027: latch for the automatic share-repair REQUEST. Set when
+    /// a request fires; reset whenever a pending repair is observed
+    /// (i.e. the request seeded a ceremony — so a LATER aborted ceremony
+    /// re-arms exactly one more automatic request). A request that
+    /// fails outright (e.g. threshold == committee size, which is
+    /// permanently unrepairable) leaves the latch set — no per-tick
+    /// retry spam; the manual IPC remains available.
+    repair_request_attempted: bool,
 }
 
 struct CeremonyActivity {
@@ -252,6 +304,42 @@ struct CeremonyActivity {
 struct DriveSnapshot {
     active: bool,
     pending: Option<PendingDriveView>,
+    /// ZEB-1027: in-flight refresh ceremony view, if any.
+    refresh: Option<RefreshDriveView>,
+    /// ZEB-1027: in-flight share-repair view, if any.
+    repair: Option<RepairDriveView>,
+    /// ZEB-1027: self is a member of the ACTIVE committee.
+    self_is_member: bool,
+    /// ZEB-1027: this node currently holds its signing share.
+    has_key_package: bool,
+    /// ZEB-1027: active-committee size (0 when inactive) — with
+    /// `threshold`, gates whether an automatic repair request can
+    /// possibly succeed (needs members − 1 ≥ threshold helpers).
+    member_count: usize,
+    threshold: u16,
+}
+
+/// ZEB-1027: refresh-ceremony drive view — the zero-sharing DKG's round
+/// progress, mirroring `PendingDriveView`'s broadcast-level fields.
+struct RefreshDriveView {
+    ceremony_id: [u8; 32],
+    n: usize,
+    r1_count: usize,
+    r1_has_self: bool,
+    r2_recv_count: usize,
+    dk_has_self: bool,
+    has_secret1: bool,
+    has_secret2: bool,
+}
+
+/// ZEB-1027: share-repair drive view.
+struct RepairDriveView {
+    ceremony_id: [u8; 32],
+    helpers_len: usize,
+    self_is_helper: bool,
+    r2_has_self: bool,
+    r3_has_self: bool,
+    deltas_count: usize,
 }
 
 struct PendingDriveView {
@@ -288,9 +376,41 @@ fn drive_snapshot(log: &DfrostLog, self_addr: &OwnerAddr) -> DriveSnapshot {
             has_secret1: log.local_dkg_secret.is_some(),
             has_secret2: log.local_dkg_secret2.is_some(),
         });
+    let refresh = log
+        .committee_state
+        .pending_refresh
+        .as_ref()
+        .map(|p| RefreshDriveView {
+            ceremony_id: p.ceremony_id,
+            n: p.members.len(),
+            r1_count: p.round1_packages.len(),
+            r1_has_self: p.round1_packages.contains_key(self_addr),
+            r2_recv_count: p.round2_packages.len(),
+            dk_has_self: p.dk_confirmations.contains_key(self_addr),
+            has_secret1: log.local_dkg_secret.is_some(),
+            has_secret2: log.local_dkg_secret2.is_some(),
+        });
+    let repair = log
+        .committee_state
+        .pending_repair
+        .as_ref()
+        .map(|p| RepairDriveView {
+            ceremony_id: p.ceremony_id,
+            helpers_len: p.helpers.len(),
+            self_is_helper: p.helpers.contains(self_addr),
+            r2_has_self: p.round2_seen.contains(self_addr),
+            r3_has_self: p.round3_seen.contains(self_addr),
+            deltas_count: p.deltas.len(),
+        });
     DriveSnapshot {
         active: log.committee_state.active,
         pending,
+        refresh,
+        repair,
+        self_is_member: log.committee_state.members.contains(self_addr),
+        has_key_package: log.local_key_package.is_some(),
+        member_count: log.committee_state.members.len(),
+        threshold: log.committee_state.threshold,
     }
 }
 
@@ -318,6 +438,67 @@ fn decide_round(v: &PendingDriveView, self_addr: &OwnerAddr) -> Option<u8> {
         return Some(3);
     }
     None
+}
+
+/// ZEB-1027: which refresh round (if any) this node should
+/// auto-contribute next. Mirrors `decide_round`'s ladder with one extra
+/// gate: finalization (round 3) requires the OLD signing share
+/// (`new = old + Σ deltas`), so a shareless member participates through
+/// round 2 only — its recovery is repair, after the refresh settles.
+fn decide_refresh_round(s: &DriveSnapshot) -> Option<u8> {
+    let v = s.refresh.as_ref()?;
+    if !s.self_is_member {
+        return None;
+    }
+    if !v.r1_has_self {
+        return Some(1);
+    }
+    if v.dk_has_self {
+        return None;
+    }
+    if v.r1_count == v.n && v.has_secret1 && !v.has_secret2 {
+        return Some(2);
+    }
+    if v.r1_count == v.n
+        && v.has_secret2
+        && v.r2_recv_count == v.n.saturating_sub(1)
+        && s.has_key_package
+    {
+        return Some(3);
+    }
+    None
+}
+
+/// ZEB-1027: which repair round (if any) this node owes as a HELPER.
+/// The participant contributes nothing after its rn=1 request — its
+/// finalization runs inline in the apply path.
+fn decide_repair_round(s: &DriveSnapshot) -> Option<u8> {
+    let v = s.repair.as_ref()?;
+    if !v.self_is_helper || !s.has_key_package {
+        return None;
+    }
+    if !v.r2_has_self {
+        return Some(2);
+    }
+    if !v.r3_has_self && v.deltas_count == v.helpers_len {
+        return Some(3);
+    }
+    None
+}
+
+/// ZEB-1027: should this node automatically REQUEST share repair? True
+/// for a member of an active committee that holds no signing share (a
+/// restored node, or a straggler that lost the DKG promote race) while
+/// no other ceremony is in flight and enough helpers exist for RTS to
+/// be possible at all (members − 1 ≥ threshold).
+fn should_request_repair(s: &DriveSnapshot) -> bool {
+    s.active
+        && s.self_is_member
+        && !s.has_key_package
+        && s.pending.is_none()
+        && s.refresh.is_none()
+        && s.repair.is_none()
+        && s.member_count.saturating_sub(1) >= s.threshold as usize
 }
 
 /// Shared orchestration context: one per engine, cloned into the
@@ -713,6 +894,89 @@ async fn process_inbound<R: tauri::Runtime>(
         }
     }
 
+    // 3c. ZEB-1027: `rf`/`rp` rn=1 ceremony-id binding gates — the
+    //     engine-level recompute the sans-I/O log cannot perform (it
+    //     has no `SpaceId`). Without these, a stale or forged rn=1
+    //     whose id does not derive from the shape it would seed could
+    //     wedge the singleton `pending_refresh`/`pending_repair` slots
+    //     (both reject divergent-id rounds once seeded).
+    if event.kind == DfrostEventKind::ProactiveRefresh {
+        if let Ok(payload) = ciborium::de::from_reader::<RefreshRoundPayload, _>(&event.payload[..])
+        {
+            if payload.round_num == 1 {
+                let expected: Option<[u8; 32]> = {
+                    let log = dfrost_log.lock().await;
+                    if log.committee_state.active {
+                        log.committee_state
+                            .current_epoch
+                            .checked_add(1)
+                            .map(|next| {
+                                derive_refresh_ceremony_id(
+                                    &log.committee_state.members,
+                                    log.committee_state.threshold,
+                                    next,
+                                    &community_id,
+                                )
+                            })
+                    } else {
+                        // Inactive committee: apply rejects the event
+                        // anyway; nothing to recompute against.
+                        None
+                    }
+                };
+                if let Some(expected) = expected {
+                    if expected != payload.ceremony_id {
+                        tracing::warn!(
+                            community_id = %hex::encode(community_id.0),
+                            actor = ?event.actor,
+                            claimed = %hex::encode(payload.ceremony_id),
+                            "dfrost inbound: rf rn=1 ceremony_id does not recompute from the \
+                             active committee's next epoch — dropped (stale or forged proposal)",
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if event.kind == DfrostEventKind::RepairShare {
+        if let Ok(payload) = ciborium::de::from_reader::<RepairRoundPayload, _>(&event.payload[..])
+        {
+            if payload.round_num == 1 {
+                let (Some(helpers), Some(wm), Some(lg)) = (
+                    payload.helpers.as_ref(),
+                    payload.minted_wall_ms,
+                    payload.minted_logical,
+                ) else {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        actor = ?event.actor,
+                        "dfrost inbound: rp rn=1 missing helpers/mint stamp — dropped",
+                    );
+                    return;
+                };
+                let expected = derive_repair_ceremony_id(
+                    &event.actor,
+                    payload.epoch,
+                    helpers,
+                    wm,
+                    lg,
+                    &community_id,
+                );
+                if expected != payload.ceremony_id {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        actor = ?event.actor,
+                        claimed = %hex::encode(payload.ceremony_id),
+                        "dfrost inbound: rp rn=1 ceremony_id does not recompute from its \
+                         claimed shape — dropped",
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     // 4. Apply. Hold the log lock only across the apply call itself.
     //    (The stale-replace path above already applied the event inside
     //    the abort's lock scope — don't re-apply.)
@@ -880,6 +1144,49 @@ async fn process_inbound<R: tauri::Runtime>(
                 }
             }
         }
+        DfrostEventKind::RepairShare => {
+            match ciborium::de::from_reader::<RepairRoundPayload, _>(&event.payload[..]) {
+                Ok(payload) => {
+                    // rn=1's actor IS the participant; rounds 2–3 read
+                    // it from the (just-updated) pending slot.
+                    let participant_hex = if payload.round_num == 1 {
+                        hex::encode(event.actor.0)
+                    } else {
+                        let log = dfrost_log.lock().await;
+                        log.committee_state
+                            .pending_repair
+                            .as_ref()
+                            .map(|p| hex::encode(p.participant.0))
+                            // The slot self-clears when the final rn=3
+                            // settles — fall back to empty rather than
+                            // guessing.
+                            .unwrap_or_default()
+                    };
+                    let evt = DfrostRepairProgressPayload {
+                        community_id: hex::encode(community_id.0),
+                        ceremony_id: hex::encode(payload.ceremony_id),
+                        round_num: payload.round_num,
+                        participant: participant_hex,
+                    };
+                    if let Some(app) = app_handle {
+                        if let Err(e) = app.emit("dfrost-repair-progress", &evt) {
+                            tracing::warn!(
+                                community_id = %hex::encode(community_id.0),
+                                error = %e,
+                                "dfrost-repair-progress emit failed (inbound)",
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        error = %e,
+                        "dfrost inbound: RepairShare payload decode failed post-apply",
+                    );
+                }
+            }
+        }
         // DkgComplete (`dk`), ThresholdSign (`ts`), Close — no event mirror.
         // DkgComplete is the silent finalisation handled by `apply`; ts is
         // per-member share collection that aggregates into the VrfBeacon
@@ -1040,6 +1347,103 @@ async fn after_successful_apply(
         reconcile_activity(&mut o, &snapshot, self_addr, true);
     }
     maybe_auto_drive(community_id, self_addr, orchestrator, &snapshot).await;
+    maybe_auto_drive_recovery(community_id, orchestrator, &snapshot).await;
+}
+
+/// ZEB-1027: fire the next refresh/repair action this node owes, using
+/// the same spawn-and-log shape as `maybe_auto_drive` but a simpler
+/// guard model — recovery ceremonies get no deadline/re-broadcast
+/// machinery in v1 (a lost round stalls the ceremony until a restart
+/// clears the slot or the participant re-requests; the mutual-exclusion
+/// rules keep a stalled recovery from wedging DKG or refresh).
+async fn maybe_auto_drive_recovery(
+    community_id: SpaceId,
+    orchestrator: &Arc<OrchestratorHandle>,
+    snapshot: &DriveSnapshot,
+) {
+    let Some(driver) = orchestrator.driver.as_ref() else {
+        return;
+    };
+
+    // Drive kinds packed into the inflight key (low nibble = round).
+    const KIND_REFRESH: u8 = 0x10;
+    const KIND_REPAIR: u8 = 0x20;
+    const KIND_REQUEST: u8 = 0x30;
+
+    enum Fire {
+        Refresh([u8; 32], u8),
+        Repair([u8; 32], u8),
+        Request,
+    }
+    let mut fires: Vec<Fire> = Vec::new();
+    {
+        let mut o = orchestrator.state.lock().await;
+        // Observing a pending repair means the last request seeded a
+        // ceremony — re-arm the automatic request so an ABORTED ceremony
+        // (failed finalize, superseded set) gets exactly one fresh try.
+        if snapshot.repair.is_some() {
+            o.repair_request_attempted = false;
+        }
+        if let Some(rn) = decide_refresh_round(snapshot) {
+            let cid = snapshot
+                .refresh
+                .as_ref()
+                .expect("decided above")
+                .ceremony_id;
+            if o.recovery_inflight.insert((cid, KIND_REFRESH | rn)) {
+                fires.push(Fire::Refresh(cid, rn));
+            }
+        }
+        if let Some(rn) = decide_repair_round(snapshot) {
+            let cid = snapshot.repair.as_ref().expect("decided above").ceremony_id;
+            if o.recovery_inflight.insert((cid, KIND_REPAIR | rn)) {
+                fires.push(Fire::Repair(cid, rn));
+            }
+        }
+        if should_request_repair(snapshot) && !o.repair_request_attempted {
+            o.repair_request_attempted = true;
+            if o.recovery_inflight.insert(([0u8; 32], KIND_REQUEST | 1)) {
+                fires.push(Fire::Request);
+            }
+        }
+    }
+
+    for fire in fires {
+        let driver = Arc::clone(driver);
+        let orch = Arc::clone(orchestrator);
+        tokio::spawn(async move {
+            let (key, result, what) = match &fire {
+                Fire::Refresh(cid, rn) => (
+                    (*cid, KIND_REFRESH | rn),
+                    driver
+                        .contribute_refresh_round(community_id, *cid, *rn)
+                        .await,
+                    "contribute_refresh_round",
+                ),
+                Fire::Repair(cid, rn) => (
+                    (*cid, KIND_REPAIR | rn),
+                    driver
+                        .contribute_repair_round(community_id, *cid, *rn)
+                        .await,
+                    "contribute_repair_round",
+                ),
+                Fire::Request => (
+                    ([0u8; 32], KIND_REQUEST | 1),
+                    driver.request_repair(community_id).await.map(|_| ()),
+                    "request_repair",
+                ),
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    community_id = %hex::encode(community_id.0),
+                    error = %e,
+                    "dfrost recovery-drive: {what} failed (retried on next trigger)",
+                );
+            }
+            let mut o = orch.state.lock().await;
+            o.recovery_inflight.remove(&key);
+        });
+    }
 }
 
 /// ZEB-1022: fire `DkgDriver::contribute_round` for the next round this
@@ -1116,6 +1520,11 @@ async fn orchestrator_tick<R: tauri::Runtime>(
         let mut o = orchestrator.state.lock().await;
         reconcile_activity(&mut o, &snapshot, self_addr, false);
     }
+
+    // ZEB-1027: recovery drive runs every tick REGARDLESS of the DKG
+    // slot — refresh/repair progress on active committees, where
+    // `pending` is None by construction.
+    maybe_auto_drive_recovery(community_id, orchestrator, &snapshot).await;
 
     let Some(v) = snapshot.pending.as_ref() else {
         // No pending ceremony. If our own deadline abort's re-initiate
@@ -3134,6 +3543,9 @@ mod tests {
         contributions: tokio::sync::Mutex<Vec<(SpaceId, [u8; 32], u8)>>,
         rebroadcasts: tokio::sync::Mutex<Vec<[u8; 32]>>,
         reinitiates: tokio::sync::Mutex<Vec<(Vec<OwnerAddr>, u16)>>,
+        refresh_contributions: tokio::sync::Mutex<Vec<(SpaceId, [u8; 32], u8)>>,
+        repair_contributions: tokio::sync::Mutex<Vec<(SpaceId, [u8; 32], u8)>>,
+        repair_requests: tokio::sync::Mutex<Vec<SpaceId>>,
     }
 
     #[async_trait::async_trait]
@@ -3166,6 +3578,34 @@ mod tests {
         ) -> Result<String, String> {
             self.reinitiates.lock().await.push((members, threshold));
             Ok("replacement".into())
+        }
+        async fn contribute_refresh_round(
+            &self,
+            community_id: SpaceId,
+            ceremony_id: [u8; 32],
+            round_num: u8,
+        ) -> Result<(), String> {
+            self.refresh_contributions
+                .lock()
+                .await
+                .push((community_id, ceremony_id, round_num));
+            Ok(())
+        }
+        async fn contribute_repair_round(
+            &self,
+            community_id: SpaceId,
+            ceremony_id: [u8; 32],
+            round_num: u8,
+        ) -> Result<(), String> {
+            self.repair_contributions
+                .lock()
+                .await
+                .push((community_id, ceremony_id, round_num));
+            Ok(())
+        }
+        async fn request_repair(&self, community_id: SpaceId) -> Result<String, String> {
+            self.repair_requests.lock().await.push(community_id);
+            Ok("repair-ceremony".into())
         }
     }
 
@@ -3547,6 +3987,281 @@ mod tests {
                 .any(|(cid, cer, rn)| *cid == community_id && *cer == ceremony_id && *rn == 1)
         })
         .await;
+    }
+
+    // ── ZEB-1027: recovery drive (refresh + repair) ──────────────────────
+
+    /// Seed an active 2-of-3 committee (alice, bob, carol — self is the
+    /// caller's pick) directly into the engine's log.
+    async fn seed_active_committee(
+        log: &Arc<tokio::sync::Mutex<crate::community_dfrost_log::DfrostLog>>,
+        members: &[OwnerAddr],
+        threshold: u16,
+    ) {
+        let mut sorted = members.to_vec();
+        sorted.sort();
+        let mut g = log.lock().await;
+        g.committee_state.active = true;
+        g.committee_state.current_epoch = 1;
+        g.committee_state.members = sorted.clone();
+        g.committee_state.threshold = threshold;
+        g.committee_state.max_signers = sorted.len() as u16;
+        g.committee_state.joint_verifying_key = Some([0x44; 32]);
+        g.committee_state.identifier_map =
+            crate::community_dfrost_log::CommitteeState::build_identifier_map(&sorted);
+    }
+
+    /// Any real `KeyPackage` (dealer-generated) for tests that only
+    /// need `local_key_package.is_some()`.
+    fn dealer_key_package() -> frost_ristretto255::keys::KeyPackage {
+        let (shares, _pkp) = frost_ristretto255::keys::generate_with_dealer(
+            3,
+            2,
+            frost_ristretto255::keys::IdentifierList::Default,
+            frost_ristretto255::rand_core::OsRng,
+        )
+        .expect("dealer keygen");
+        frost_ristretto255::keys::KeyPackage::try_from(shares.values().next().unwrap().clone())
+            .expect("key package")
+    }
+
+    /// The tick's recovery drive fires the refresh JOIN (rn=1) for a
+    /// member that has not yet contributed to an observed ceremony.
+    #[tokio::test]
+    async fn engine_tick_drives_refresh_join_zeb1027() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xC1);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xC2);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xD8; 16]);
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        seed_active_committee(&log, &[alice_addr, bob_addr], 2).await;
+        let ceremony = [0xE1u8; 32];
+        {
+            let mut g = log.lock().await;
+            let members = g.committee_state.members.clone();
+            g.committee_state.pending_refresh =
+                Some(crate::community_dfrost_log::PendingCeremony {
+                    ceremony_id: ceremony,
+                    members,
+                    threshold: 2,
+                    max_signers: 2,
+                    proposed_epoch: 2,
+                    ..Default::default()
+                });
+            // Alice already contributed; self (bob) has not.
+            g.committee_state
+                .pending_refresh
+                .as_mut()
+                .unwrap()
+                .round1_packages
+                .insert(alice_addr, vec![0x01]);
+        }
+
+        wait_until("recovery drive fires refresh rn=1 join", || async {
+            driver
+                .refresh_contributions
+                .lock()
+                .await
+                .iter()
+                .any(|(cid, cer, rn)| *cid == community_id && *cer == ceremony && *rn == 1)
+        })
+        .await;
+    }
+
+    /// A helper holding its share auto-fires repair rn=2 for an
+    /// observed repair request; a shareless node does NOT (it cannot
+    /// deal deltas).
+    #[tokio::test]
+    async fn engine_tick_drives_repair_helper_round_zeb1027() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xC3);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xC4);
+        let (_carol_sk, carol_addr, _c) = fixture_identity(0xC5);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xD9; 16]);
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        seed_active_committee(&log, &[alice_addr, bob_addr, carol_addr], 2).await;
+        let ceremony = [0xE2u8; 32];
+        {
+            let mut g = log.lock().await;
+            g.local_key_package = Some(dealer_key_package());
+            let mut helpers = vec![bob_addr, carol_addr];
+            helpers.sort();
+            g.committee_state.pending_repair = Some(
+                crate::community_dfrost_log::PendingRepair::new(ceremony, alice_addr, 1, helpers),
+            );
+        }
+
+        wait_until("recovery drive fires repair rn=2", || async {
+            driver
+                .repair_contributions
+                .lock()
+                .await
+                .iter()
+                .any(|(cid, cer, rn)| *cid == community_id && *cer == ceremony && *rn == 2)
+        })
+        .await;
+    }
+
+    /// A restored, shareless member of an idle active committee
+    /// auto-fires ONE repair request — and the latch keeps it from
+    /// re-firing every tick when the request doesn't seed a ceremony.
+    #[tokio::test]
+    async fn engine_tick_auto_requests_repair_once_zeb1027() {
+        let (_alice_sk, alice_addr, _a) = fixture_identity(0xC6);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xC7);
+        let (_carol_sk, carol_addr, _c) = fixture_identity(0xC8);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let community_id = SpaceId([0xDA; 16]);
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Active committee, self is a member, NO local key package
+        // (the restored shape), no ceremony in flight.
+        seed_active_committee(&log, &[alice_addr, bob_addr, carol_addr], 2).await;
+
+        wait_until("recovery drive fires the repair request", || async {
+            !driver.repair_requests.lock().await.is_empty()
+        })
+        .await;
+        // Latch: several ticks later, still exactly one request (the
+        // recording driver never seeds pending_repair, so an unlatched
+        // impl would fire every tick).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            driver.repair_requests.lock().await.len(),
+            1,
+            "the automatic repair request must fire exactly once (latched)"
+        );
+    }
+
+    /// The rf rn=1 ingest gate drops a proposal whose ceremony id does
+    /// not recompute from the active committee's next epoch, and admits
+    /// the correctly-derived one.
+    #[tokio::test]
+    async fn engine_ingest_gate_binds_rf_rn1_ceremony_id_zeb1027() {
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xC9);
+        let (_bob_sk, bob_addr, _b) = fixture_identity(0xCA);
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+        let community_id = SpaceId([0xDB; 16]);
+        let (_engine, log, sub_tx) = start_orchestrated_engine(
+            community_id,
+            bob_addr,
+            [0u8; 32],
+            resolver,
+            None,
+            None,
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_secs(30),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        seed_active_committee(&log, &[alice_addr, bob_addr], 2).await;
+        let members = {
+            let g = log.lock().await;
+            g.committee_state.members.clone()
+        };
+
+        let build_rf1 = |ceremony_id: [u8; 32], wall: u64| {
+            let payload = crate::community_dfrost_types::RefreshRoundPayload {
+                ceremony_id,
+                round_num: 1,
+                recipient_ciphertexts: None,
+                package: Some(vec![0x01]),
+            };
+            crate::community_dfrost_log::build_signed_dfrost_event(
+                &alice_sk,
+                alice_addr,
+                DfrostEventKind::ProactiveRefresh,
+                &payload,
+                Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "alice".into(),
+                },
+            )
+            .expect("build rf1")
+        };
+
+        // Forged/stale id first…
+        sub_tx
+            .send(encode_packet(&build_rf1([0xEE; 32], 1_000)))
+            .await
+            .unwrap();
+        // …then the correctly-derived one.
+        let good_id = crate::community_dfrost_types::derive_refresh_ceremony_id(
+            &members,
+            2,
+            2,
+            &community_id,
+        );
+        sub_tx
+            .send(encode_packet(&build_rf1(good_id, 1_100)))
+            .await
+            .unwrap();
+
+        wait_until(
+            "correctly-derived rf rn=1 seeds pending_refresh",
+            || async {
+                let g = log.lock().await;
+                g.committee_state
+                    .pending_refresh
+                    .as_ref()
+                    .map(|p| p.ceremony_id == good_id)
+                    .unwrap_or(false)
+            },
+        )
+        .await;
+        // Had the forged one been admitted, the slot would hold [0xEE;32]
+        // and the good rn=1 would have been rejected as divergent — the
+        // wait above doubles as the negative assertion.
     }
 
     #[tokio::test]

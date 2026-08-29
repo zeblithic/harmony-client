@@ -158,6 +158,197 @@ pub fn verify_schnorr_signature(
     vk.verify(msg, &sig).map_err(|e| format!("verify: {e}"))
 }
 
+// ── ZEB-1027: proactive-refresh (zero-sharing DKG) wrappers ──────────────────
+//
+// The refresh DKG is structurally the regular DKG with a ZERO constant
+// term: each participant deals a random polynomial whose secret is 0, so
+// summing the resulting shares onto the OLD shares rotates every share
+// while preserving the joint secret (and therefore the joint verifying
+// key). frost-core's `keys::refresh` module implements it over the same
+// `round1`/`round2` package types as `dkg`, so the wire shapes below are
+// byte-compatible with the `dkg_part*_local` wrappers above.
+//
+// CRYPTOGRAPHIC CONSTRAINT (drives ZEB-1027's repair flow): the
+// finalization (`refresh_dkg_shares`) computes
+// `new_share = old_share + Σ deltas` — it ROTATES a share the member
+// still holds; it cannot mint one for a member who lost theirs. Lost
+// shares are recovered by the RTS wrappers further down.
+
+/// Run refresh-DKG round 1 locally (zero-constant-term commitment).
+/// Same output shape as `dkg_part1_local`: the secret state stays on
+/// this node, the CBOR-encoded round-1 package is broadcast publicly.
+pub fn refresh_part1_local(
+    identifier: Identifier,
+    max_signers: u16,
+    min_signers: u16,
+) -> Result<(round1::SecretPackage, Vec<u8>), String> {
+    let (secret, package) = frost_ristretto255::keys::refresh::refresh_dkg_part1(
+        identifier,
+        max_signers,
+        min_signers,
+        rand_core::OsRng,
+    )
+    .map_err(|e| format!("refresh_dkg_part1: {e}"))?;
+    let mut buf = Vec::new();
+    ciborium::into_writer(&package, &mut buf).map_err(|e| format!("encode refresh r1 pkg: {e}"))?;
+    Ok((secret, buf))
+}
+
+/// Run refresh-DKG round 2 locally. Mirrors `dkg_part2_local`: takes the
+/// round-1 packages from every OTHER member, returns the round-2 secret
+/// plus per-recipient round-2 package bytes (sent sealed, pairwise).
+pub fn refresh_part2_local(
+    round1_secret: round1::SecretPackage,
+    round1_packages_received: &BTreeMap<Identifier, Vec<u8>>,
+) -> Result<(round2::SecretPackage, BTreeMap<Identifier, Vec<u8>>), String> {
+    let mut decoded: BTreeMap<Identifier, round1::Package> = BTreeMap::new();
+    for (id, bytes) in round1_packages_received {
+        let pkg: round1::Package =
+            ciborium::from_reader(&bytes[..]).map_err(|e| format!("decode refresh r1 pkg: {e}"))?;
+        decoded.insert(*id, pkg);
+    }
+    let (secret, round2_packages) =
+        frost_ristretto255::keys::refresh::refresh_dkg_part2(round1_secret, &decoded)
+            .map_err(|e| format!("refresh_dkg_part2: {e}"))?;
+    let mut encoded: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+    for (id, pkg) in round2_packages {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&pkg, &mut buf).map_err(|e| format!("encode refresh r2 pkg: {e}"))?;
+        encoded.insert(id, buf);
+    }
+    Ok((secret, encoded))
+}
+
+/// Run refresh-DKG finalization locally. Requires this member's OLD
+/// `KeyPackage` (the share being rotated — see the module comment: a
+/// member without its old share cannot finalize a refresh) and the OLD
+/// `PublicKeyPackage`. Returns the rotated `(KeyPackage,
+/// PublicKeyPackage)`; the joint verifying key is preserved by
+/// construction, the per-member verifying shares all change.
+pub fn refresh_part3_local(
+    round2_secret: &round2::SecretPackage,
+    round1_packages_received: &BTreeMap<Identifier, Vec<u8>>,
+    round2_packages_received: &BTreeMap<Identifier, Vec<u8>>,
+    old_pub_key_package: PublicKeyPackage,
+    old_key_package: KeyPackage,
+) -> Result<(KeyPackage, PublicKeyPackage), String> {
+    let mut r1: BTreeMap<Identifier, round1::Package> = BTreeMap::new();
+    for (id, bytes) in round1_packages_received {
+        let pkg: round1::Package =
+            ciborium::from_reader(&bytes[..]).map_err(|e| format!("decode refresh r1 pkg: {e}"))?;
+        r1.insert(*id, pkg);
+    }
+    let mut r2: BTreeMap<Identifier, round2::Package> = BTreeMap::new();
+    for (id, bytes) in round2_packages_received {
+        let pkg: round2::Package =
+            ciborium::from_reader(&bytes[..]).map_err(|e| format!("decode refresh r2 pkg: {e}"))?;
+        r2.insert(*id, pkg);
+    }
+    frost_ristretto255::keys::refresh::refresh_dkg_shares(
+        round2_secret,
+        &r1,
+        &r2,
+        old_pub_key_package,
+        old_key_package,
+    )
+    .map_err(|e| format!("refresh_dkg_shares: {e}"))
+}
+
+// ── ZEB-1027: Repairable Threshold Scheme (RTS) wrappers ─────────────────────
+//
+// RTS (<https://eprint.iacr.org/2017/1155>) restores ONE participant's
+// LOST signing share using ≥ `min_signers` helpers who still hold
+// theirs: the helpers jointly interpolate the current secret polynomial
+// at the participant's identifier without any helper learning another's
+// share. Deltas travel helper→helper, sigmas helper→participant — both
+// sealed. Works at whatever epoch the helpers' shares are at, so it
+// composes with proactive refresh (repair-then-refresh or
+// refresh-then-repair both land on the current polynomial).
+
+/// RTS part 1 (helper): produce one delta per declared helper
+/// (including self). `helpers` is the declared helper identifier set —
+/// the Lagrange coefficients are computed over exactly this set, so
+/// every listed helper must eventually contribute.
+pub fn repair_part1_local(
+    helpers: &[Identifier],
+    key_package: &KeyPackage,
+    participant: Identifier,
+) -> Result<BTreeMap<Identifier, Vec<u8>>, String> {
+    let deltas = frost_ristretto255::keys::repairable::repair_share_part1::<
+        frost_ristretto255::Ristretto255Sha512,
+        _,
+    >(helpers, key_package, &mut rand_core::OsRng, participant)
+    .map_err(|e| format!("repair_share_part1: {e}"))?;
+    Ok(deltas
+        .into_iter()
+        .map(|(id, delta)| (id, delta.serialize()))
+        .collect())
+}
+
+/// RTS part 2 (helper): sum the deltas received from every declared
+/// helper (own included) into the sigma sent sealed to the participant.
+pub fn repair_part2_local(delta_bytes: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    let mut deltas = Vec::with_capacity(delta_bytes.len());
+    for bytes in delta_bytes {
+        deltas.push(
+            frost_ristretto255::keys::repairable::Delta::deserialize(bytes)
+                .map_err(|e| format!("Delta::deserialize: {e}"))?,
+        );
+    }
+    let sigma = frost_ristretto255::keys::repairable::repair_share_part2(&deltas);
+    Ok(sigma.serialize())
+}
+
+/// RTS part 3 (participant): sum the helpers' sigmas into the
+/// reconstructed `KeyPackage`.
+///
+/// SECURITY: `repair_share_part3` performs NO verification — it derives
+/// the verifying share from whatever the sigmas sum to. The caller MUST
+/// check the returned package's verifying share against the committee's
+/// consensus `verifying_shares[self]` before installing it (a single
+/// malicious or epoch-skewed sigma otherwise installs a garbage share
+/// that poisons every future threshold signature this node emits).
+pub fn repair_part3_local(
+    sigma_bytes: &[Vec<u8>],
+    participant: Identifier,
+    pub_key_package: &PublicKeyPackage,
+) -> Result<KeyPackage, String> {
+    let mut sigmas = Vec::with_capacity(sigma_bytes.len());
+    for bytes in sigma_bytes {
+        sigmas.push(
+            frost_ristretto255::keys::repairable::Sigma::deserialize(bytes)
+                .map_err(|e| format!("Sigma::deserialize: {e}"))?,
+        );
+    }
+    frost_ristretto255::keys::repairable::repair_share_part3(&sigmas, participant, pub_key_package)
+        .map_err(|e| format!("repair_share_part3: {e}"))
+}
+
+/// ZEB-1027: rebuild the committee's `PublicKeyPackage` from the
+/// persisted consensus bytes (`CommitteeState.verifying_shares` mapped
+/// to identifiers + `joint_verifying_key` + `threshold`). This is what
+/// lets a RESTARTED node — whose in-memory `local_pub_key_package` died
+/// with the process — run RTS part 3 or serve as the old-package input
+/// elsewhere, entirely from the sealed `dfrost.cbor` snapshot's public
+/// state.
+pub fn pub_key_package_from_bytes(
+    verifying_shares: &BTreeMap<Identifier, [u8; 32]>,
+    joint_vk_bytes: &[u8; 32],
+    threshold: u16,
+) -> Result<PublicKeyPackage, String> {
+    let vk = VerifyingKey::deserialize(joint_vk_bytes)
+        .map_err(|e| format!("VerifyingKey::deserialize: {e}"))?;
+    let mut shares: BTreeMap<Identifier, VerifyingShare> = BTreeMap::new();
+    for (id, bytes) in verifying_shares {
+        shares.insert(
+            *id,
+            VerifyingShare::deserialize(bytes)
+                .map_err(|e| format!("VerifyingShare::deserialize: {e}"))?,
+        );
+    }
+    Ok(PublicKeyPackage::new(shares, vk, Some(threshold)))
+}
+
 // ── ZEB-295 Phase 6: FROST→ElGamal primitive bridges ─────────────────────────
 //
 // The threshold-ElGamal scheme used for ballot-secret ratification (spec §1)
@@ -334,6 +525,207 @@ mod tests {
             out.push((*id, kp, pkp));
         }
         out
+    }
+
+    // ── ZEB-1027: refresh + repair wrapper round-trips ───────────────────
+
+    /// Full 3-party refresh over the wrappers: joint VK preserved,
+    /// every signing share rotated, and the refreshed shares still
+    /// produce a valid FROST signature under the ORIGINAL joint VK.
+    #[test]
+    fn refresh_round_trip_preserves_vk_and_rotates_shares_zeb1027() {
+        let parties = run_3_party_dkg_2_of_3();
+        let ids: Vec<Identifier> = parties.iter().map(|(id, _, _)| *id).collect();
+
+        // Round 1: zero-sharing commitments, broadcast.
+        let mut r1_secrets: BTreeMap<Identifier, dkg::round1::SecretPackage> = BTreeMap::new();
+        let mut r1_pkgs: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+        for id in &ids {
+            let (sec, pkg) = refresh_part1_local(*id, 3, 2).expect("refresh part1");
+            r1_secrets.insert(*id, sec);
+            r1_pkgs.insert(*id, pkg);
+        }
+
+        // Round 2: pairwise refresh shares.
+        let mut r2_secrets: BTreeMap<Identifier, dkg::round2::SecretPackage> = BTreeMap::new();
+        let mut r2_outbound: BTreeMap<Identifier, BTreeMap<Identifier, Vec<u8>>> = BTreeMap::new();
+        for id in &ids {
+            let sec = r1_secrets.remove(id).unwrap();
+            let received: BTreeMap<Identifier, Vec<u8>> = r1_pkgs
+                .iter()
+                .filter(|(o, _)| *o != id)
+                .map(|(o, b)| (*o, b.clone()))
+                .collect();
+            let (r2_sec, r2_out) = refresh_part2_local(sec, &received).expect("refresh part2");
+            r2_secrets.insert(*id, r2_sec);
+            r2_outbound.insert(*id, r2_out);
+        }
+
+        // Finalization: every party rotates its share.
+        let mut refreshed: BTreeMap<Identifier, (KeyPackage, PublicKeyPackage)> = BTreeMap::new();
+        for (id, old_kp, old_pkp) in &parties {
+            let received_r1: BTreeMap<Identifier, Vec<u8>> = r1_pkgs
+                .iter()
+                .filter(|(o, _)| *o != id)
+                .map(|(o, b)| (*o, b.clone()))
+                .collect();
+            let mut received_r2: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+            for (sender, out) in &r2_outbound {
+                if sender != id {
+                    received_r2.insert(*sender, out.get(id).cloned().expect("pairwise pkg"));
+                }
+            }
+            let (new_kp, new_pkp) = refresh_part3_local(
+                r2_secrets.get(id).unwrap(),
+                &received_r1,
+                &received_r2,
+                old_pkp.clone(),
+                old_kp.clone(),
+            )
+            .expect("refresh part3");
+            // VK preserved; signing share rotated.
+            assert_eq!(
+                verifying_key_to_bytes(new_pkp.verifying_key()),
+                verifying_key_to_bytes(old_pkp.verifying_key()),
+                "refresh must preserve the joint verifying key"
+            );
+            assert_ne!(
+                old_kp.signing_share().serialize(),
+                new_kp.signing_share().serialize(),
+                "refresh must rotate the signing share"
+            );
+            refreshed.insert(*id, (new_kp, new_pkp));
+        }
+
+        // The refreshed shares sign under the ORIGINAL joint VK.
+        let signers: Vec<Identifier> = ids.iter().take(2).copied().collect();
+        let mut nonces_map = BTreeMap::new();
+        let mut commitments_map = BTreeMap::new();
+        for id in &signers {
+            let (kp, _) = refreshed.get(id).unwrap();
+            let (nonces, commitments) =
+                frost_ristretto255::round1::commit(kp.signing_share(), &mut rand_core::OsRng);
+            nonces_map.insert(*id, nonces);
+            commitments_map.insert(*id, commitments);
+        }
+        let msg = b"zeb1027 refresh signing check";
+        let signing_package = frost_ristretto255::SigningPackage::new(commitments_map, msg);
+        let mut shares = BTreeMap::new();
+        for id in &signers {
+            let (kp, _) = refreshed.get(id).unwrap();
+            let share =
+                frost_ristretto255::round2::sign(&signing_package, nonces_map.get(id).unwrap(), kp)
+                    .expect("round2 sign");
+            shares.insert(*id, share);
+        }
+        let (_, _, old_pkp) = &parties[0];
+        let (_, new_pkp) = refreshed.get(&ids[0]).unwrap();
+        let sig = frost_ristretto255::aggregate(&signing_package, &shares, new_pkp)
+            .expect("aggregate under refreshed package");
+        old_pkp
+            .verifying_key()
+            .verify(msg, &sig)
+            .expect("signature must verify under the ORIGINAL joint verifying key");
+    }
+
+    /// RTS round-trip: two helpers reconstruct the third party's share
+    /// exactly, and `pub_key_package_from_bytes` rebuilds a package that
+    /// part 3 accepts (the restart path uses exactly that input).
+    #[test]
+    fn repair_round_trip_reconstructs_lost_share_zeb1027() {
+        let parties = run_3_party_dkg_2_of_3();
+        let (lost_id, lost_kp, _) = &parties[2];
+        let helpers: Vec<Identifier> = vec![parties[0].0, parties[1].0];
+
+        // Each helper produces deltas for every declared helper.
+        let mut deltas_by_helper: BTreeMap<Identifier, BTreeMap<Identifier, Vec<u8>>> =
+            BTreeMap::new();
+        for (id, kp, _) in parties.iter().take(2) {
+            let deltas = repair_part1_local(&helpers, kp, *lost_id).expect("repair part1");
+            assert_eq!(deltas.len(), helpers.len(), "one delta per declared helper");
+            deltas_by_helper.insert(*id, deltas);
+        }
+
+        // Each helper sums the deltas addressed to it into a sigma.
+        let mut sigmas: Vec<Vec<u8>> = Vec::new();
+        for helper in &helpers {
+            let received: Vec<Vec<u8>> = deltas_by_helper
+                .values()
+                .map(|m| m.get(helper).cloned().expect("delta for helper"))
+                .collect();
+            sigmas.push(repair_part2_local(&received).expect("repair part2"));
+        }
+
+        // Participant rebuilds the public package from persisted-shaped
+        // bytes (the restart path) and reconstructs its share.
+        let (_, _, pkp) = &parties[0];
+        let shares_bytes: BTreeMap<Identifier, [u8; 32]> = pkp
+            .verifying_shares()
+            .iter()
+            .map(|(id, vs)| (*id, verifying_share_to_bytes(vs)))
+            .collect();
+        let rebuilt = pub_key_package_from_bytes(
+            &shares_bytes,
+            &verifying_key_to_bytes(pkp.verifying_key()),
+            2,
+        )
+        .expect("pub_key_package_from_bytes");
+        let repaired = repair_part3_local(&sigmas, *lost_id, &rebuilt).expect("repair part3");
+
+        assert_eq!(
+            repaired.signing_share().serialize(),
+            lost_kp.signing_share().serialize(),
+            "RTS must reconstruct the exact lost signing share"
+        );
+        assert_eq!(
+            verifying_share_to_bytes(repaired.verifying_share()),
+            verifying_share_to_bytes(lost_kp.verifying_share()),
+            "reconstructed verifying share must match the committee's consensus entry"
+        );
+    }
+
+    /// A corrupted sigma is NOT caught by part 3 itself — the derived
+    /// verifying share simply diverges from the consensus entry. Pins
+    /// the exact check the log's finalize path must perform before
+    /// installing a repaired share.
+    #[test]
+    fn repair_with_corrupt_sigma_yields_mismatched_verifying_share_zeb1027() {
+        let parties = run_3_party_dkg_2_of_3();
+        let (lost_id, lost_kp, _) = &parties[2];
+        let helpers: Vec<Identifier> = vec![parties[0].0, parties[1].0];
+
+        let mut deltas_by_helper: BTreeMap<Identifier, BTreeMap<Identifier, Vec<u8>>> =
+            BTreeMap::new();
+        for (id, kp, _) in parties.iter().take(2) {
+            deltas_by_helper.insert(
+                *id,
+                repair_part1_local(&helpers, kp, *lost_id).expect("repair part1"),
+            );
+        }
+        let mut sigmas: Vec<Vec<u8>> = Vec::new();
+        for helper in &helpers {
+            let received: Vec<Vec<u8>> = deltas_by_helper
+                .values()
+                .map(|m| m.get(helper).cloned().unwrap())
+                .collect();
+            sigmas.push(repair_part2_local(&received).expect("repair part2"));
+        }
+        // Corrupt one sigma: replace with a canonical-but-wrong scalar
+        // (1). Deserialization succeeds; only the verifying-share check
+        // can catch it.
+        sigmas[1] = {
+            let mut one = [0u8; 32];
+            one[0] = 1;
+            one.to_vec()
+        };
+
+        let (_, _, pkp) = &parties[0];
+        let repaired = repair_part3_local(&sigmas, *lost_id, pkp).expect("part3 does not verify");
+        assert_ne!(
+            verifying_share_to_bytes(repaired.verifying_share()),
+            verifying_share_to_bytes(lost_kp.verifying_share()),
+            "corrupt sigma must surface as a verifying-share mismatch"
+        );
     }
 
     #[test]
