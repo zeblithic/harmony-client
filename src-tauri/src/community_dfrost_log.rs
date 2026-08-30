@@ -152,19 +152,21 @@ pub struct DfrostLog {
     /// at DKG completion, refresh completion, or repair completion.
     ///
     /// Persistence (ZEB-1029, revising ZEB-753's original exclusion):
-    /// the signing-share SCALAR is sealed at rest in the per-community
-    /// `dfrost_share.cbor` sidecar (device cipher, written by the same
-    /// persist funnel as `dfrost.cbor`) — Jake's 2026-08-29 product call
-    /// closing the full-committee-restart dead end, where repair (needs
-    /// ≥ t live share-holders) and refresh (needs every member's old
-    /// share) are both structurally unreachable. On restore the share is
-    /// installed only after `install_restored_share` re-derives `G·x`
-    /// and matches it against the committee's consensus verifying-share
-    /// entry; any mismatch falls back to ZEB-1027's RTS repair. The
-    /// in-memory identity-switch teardown contract is unchanged (the
-    /// `dfrost_logs` map is still cleared; the sidecar is per-identity-
-    /// dir and sealed under that identity's derived key), and every
-    /// OTHER secret on this struct remains never-persisted.
+    /// the signing-share SCALAR is sealed at rest EMBEDDED in the
+    /// per-community `dfrost.cbor` snapshot (one atomic rename — state
+    /// and share can never skew on disk; #777 round 2) — Jake's
+    /// 2026-08-29 product call closing the full-committee-restart dead
+    /// end, where repair (needs ≥ t live share-holders) and refresh
+    /// (needs every member's old share) are both structurally
+    /// unreachable. On restore the share is installed only after
+    /// `install_restored_share` re-derives `G·x` and matches it against
+    /// the committee's consensus verifying-share entry; any mismatch
+    /// falls back to ZEB-1027's RTS repair. The in-memory
+    /// identity-switch teardown contract is unchanged (the `dfrost_logs`
+    /// map is still cleared; the snapshot is per-identity-dir and sealed
+    /// under that identity's derived key, and `reset_local_identity`
+    /// moves it into the reset backup), and every OTHER secret on this
+    /// struct remains never-persisted.
     pub local_key_package: Option<KeyPackage>,
 
     /// Local FROST `PublicKeyPackage` (joint verifying key + per-member

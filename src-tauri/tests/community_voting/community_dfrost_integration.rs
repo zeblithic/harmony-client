@@ -958,7 +958,8 @@ fn full_committee_restart_signs_after_sealed_share_restore_zeb1029() {
     let dir_a = tempfile::tempdir().expect("alice identity dir");
     let dir_b = tempfile::tempdir().expect("bob identity dir");
 
-    // ── Persist both nodes exactly as the engine funnel does ─────────────
+    // ── Persist both nodes exactly as the engine funnel does: ONE sealed
+    // image carrying committee state and the signing share atomically ────
     let persist_node = |dir: &std::path::Path, log: &mut DfrostLog, kp| {
         log.local_key_package = Some(kp);
         persist::write_snapshot(
@@ -967,12 +968,6 @@ fn full_committee_restart_signs_after_sealed_share_restore_zeb1029() {
             &persist::snapshot_for_persist(log, &cid),
         )
         .expect("write snapshot");
-        persist::write_share_snapshot(
-            &cipher,
-            &persist::dfrost_share_path_for(dir, &cid),
-            &persist::share_snapshot_for_persist(log, &cid).expect("share captured"),
-        )
-        .expect("write share");
     };
     let mut log_a = c.engine_a;
     let mut log_b = c.engine_b;
@@ -984,15 +979,13 @@ fn full_committee_restart_signs_after_sealed_share_restore_zeb1029() {
     drop(log_b);
 
     let restore_node = |dir: &std::path::Path, self_addr: &OwnerAddr| -> DfrostLog {
-        let mut log = persist::load_dfrost(&cipher, &persist::dfrost_path_for(dir, &cid), &cid)
-            .expect("snapshot loads");
-        let (epoch, scalar) =
-            persist::load_share(&cipher, &persist::dfrost_share_path_for(dir, &cid), &cid)
-                .expect("share load ok")
-                .expect("share present");
-        log.install_restored_share(self_addr, epoch, &scalar)
-            .expect("restored share validates against consensus");
-        log
+        persist::load_dfrost(
+            &cipher,
+            &persist::dfrost_path_for(dir, &cid),
+            &cid,
+            Some(self_addr),
+        )
+        .expect("snapshot loads and embedded share installs")
     };
     let mut restored_a = restore_node(dir_a.path(), &ALICE);
     let mut restored_b = restore_node(dir_b.path(), &BOB);
