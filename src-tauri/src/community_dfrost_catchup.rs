@@ -259,8 +259,9 @@ pub struct CatchupSelection {
     /// actor in synthesized-id order). May be sub-threshold — the
     /// requester decides adoptability.
     pub dk_events: Vec<SignedCommitteeEvent>,
-    /// `vb` events with envelope HLC strictly above the watermark,
-    /// OLDEST-first, capped at `max_beacons`.
+    /// `vb` events with envelope HLC strictly above the watermark, plus
+    /// (ZEB-1036) every member of a TIED beacon group regardless of
+    /// watermark. OLDEST-first, capped at `max_beacons`.
     pub beacons: Vec<SignedCommitteeEvent>,
 }
 
@@ -277,31 +278,48 @@ pub struct CatchupSelection {
 /// forever — re-served and re-verified every round, and permanently
 /// defeating the fully-current → `None` short-circuit below. The event
 /// stays retained (view-not-store); it is only excluded from serving.
+///
+/// ZEB-1036 (tied beacons): concurrent threshold-sign quorums can each
+/// produce a VALID beacon for one `message_hash` (partition-separated
+/// signer subsets → different aggregate commitments R → different
+/// `vrf_output`s; the ceremony id is already deterministic and does not
+/// prevent this). The requester's watermark is a scalar high-water, so
+/// a replica that retained only the LARGER-output sibling of such a tie
+/// can never be served the smaller one it needs for min-wins
+/// convergence — the hole sits below its watermark by construction. So:
+/// every member of a tied group (≥ 2 distinct `vrf_output`s among this
+/// responder's skew-admitted `vb` events for one `message_hash`) is
+/// served REGARDLESS of watermark; `adopt_beacons` is idempotent and
+/// min-wins, so the requester heals. Cost: while a responder retains a
+/// tie, its tied events ride every response (bounded: ties require the
+/// concurrent-quorum race, and re-adoption is a no-op) — with no ties
+/// retained, selection and the fully-current → `None` short-circuit
+/// behave exactly as before.
 pub fn select_catchup(
     log: &DfrostLog,
     req: &CatchupRequest,
     max_beacons: usize,
     now_wall_ms: u64,
 ) -> Option<CatchupSelection> {
+    use crate::community_dfrost_types::VrfBeaconPayload;
+
     // Rule 1: inactive responder has nothing to serve.
     if !log.committee_state.active {
         return None;
     }
     let current_epoch = log.committee_state.current_epoch;
 
-    // Beacons: envelope HLC strictly above the watermark (no watermark
-    // ⇒ all), oldest-first, capped at `max_beacons`. `log.events()` is
-    // already HLC-ordered, so a simple forward scan with an early break
-    // yields the oldest matches first.
-    let watermark = req
-        .beacon_watermark
-        .as_ref()
-        .map(|w| (w.wall_ms, w.logical, w.device_id.clone()));
-    let mut beacons = Vec::new();
+    // Beacons: one scan skew-admits each `vb` event and decodes its
+    // payload once (an undecodable payload keeps pre-ZEB-1036 handling:
+    // servable above the watermark, never tie-eligible). `log.events()`
+    // is already HLC-ordered, so selection below stays oldest-first.
+    struct AdmittedBeacon<'a> {
+        event: &'a SignedCommitteeEvent,
+        /// Decoded `(message_hash, vrf_output)`; `None` ⇒ undecodable.
+        hash_output: Option<([u8; 32], [u8; 32])>,
+    }
+    let mut admitted: Vec<AdmittedBeacon<'_>> = Vec::new();
     for ev in log.events() {
-        if beacons.len() >= max_beacons {
-            break;
-        }
         if ev.kind != DfrostEventKind::VrfBeacon {
             continue;
         }
@@ -316,18 +334,55 @@ pub fn select_catchup(
         {
             continue;
         }
+        let hash_output = ciborium::de::from_reader::<VrfBeaconPayload, _>(&ev.payload[..])
+            .ok()
+            .map(|p| (p.message_hash, p.vrf_output));
+        admitted.push(AdmittedBeacon {
+            event: ev,
+            hash_output,
+        });
+    }
+
+    // ZEB-1036: message hashes with ≥ 2 distinct outputs — see fn doc.
+    let mut outputs_by_hash: BTreeMap<[u8; 32], std::collections::BTreeSet<[u8; 32]>> =
+        BTreeMap::new();
+    for beacon in &admitted {
+        if let Some((hash, output)) = beacon.hash_output {
+            outputs_by_hash.entry(hash).or_default().insert(output);
+        }
+    }
+    let tied_hashes: std::collections::BTreeSet<[u8; 32]> = outputs_by_hash
+        .into_iter()
+        .filter(|(_, outputs)| outputs.len() >= 2)
+        .map(|(hash, _)| hash)
+        .collect();
+
+    let watermark = req
+        .beacon_watermark
+        .as_ref()
+        .map(|w| (w.wall_ms, w.logical, w.device_id.clone()));
+    let mut beacons = Vec::new();
+    for beacon in admitted {
+        if beacons.len() >= max_beacons {
+            break;
+        }
+        let ev = beacon.event;
         let hlc_key = (ev.hlc.wall_ms, ev.hlc.logical, ev.hlc.device_id.clone());
         let above_watermark = match &watermark {
             Some(wm) => &hlc_key > wm,
             None => true,
         };
-        if above_watermark {
+        let tied = beacon
+            .hash_output
+            .is_some_and(|(hash, _)| tied_hashes.contains(&hash));
+        if above_watermark || tied {
             beacons.push(ev.clone());
         }
     }
 
     // Rule 2: requester fully current (active at the current epoch, and
-    // no beacon above its watermark) ⇒ nothing to serve.
+    // no beacon above its watermark — nor any tied group to heal) ⇒
+    // nothing to serve.
     let requester_current = req.active && req.epoch == current_epoch;
     if requester_current && beacons.is_empty() {
         return None;
@@ -463,11 +518,21 @@ mod tests {
     }
 
     fn test_vb_event(hlc: Hlc) -> SignedCommitteeEvent {
+        test_vb_event_with(hlc, [0u8; 32], [0u8; 32])
+    }
+
+    /// ZEB-1036: `vb` builder with explicit `message_hash`/`vrf_output`
+    /// so tests can construct tied beacon groups.
+    fn test_vb_event_with(
+        hlc: Hlc,
+        message_hash: [u8; 32],
+        vrf_output: [u8; 32],
+    ) -> SignedCommitteeEvent {
         let payload = VrfBeaconPayload {
             ceremony_id: [0u8; 32],
-            message_hash: [0u8; 32],
+            message_hash,
             signature: vec![0u8; 64],
-            vrf_output: [0u8; 32],
+            vrf_output,
         };
         let mut payload_bytes = Vec::new();
         ciborium::ser::into_writer(&payload, &mut payload_bytes).unwrap();
@@ -885,6 +950,124 @@ mod tests {
         let sel_disabled =
             select_catchup(&log, &req_fresh, MAX_CATCHUP_BEACONS_PER_ROUND, 0).expect("selection");
         assert_eq!(sel_disabled.beacons.len(), 3, "gate disabled at now == 0");
+    }
+
+    /// ZEB-1036: a replica that retained only the LARGER-output sibling
+    /// of a tied beacon group has that group's HLC range at-or-below its
+    /// watermark, so the strictly-above rule alone can never serve it
+    /// the smaller sibling it needs for min-wins convergence. Tied
+    /// groups are therefore served regardless of watermark — and a
+    /// no-tie log keeps the fully-current → `None` short-circuit.
+    #[test]
+    fn select_catchup_serves_tied_beacons_below_watermark_zeb1036() {
+        let now: u64 = 1_000_000_000;
+        let hash_tied = [0x11; 32];
+        let hash_solo = [0x22; 32];
+
+        let mut log = test_active_log(1);
+        let vb_tied_lo = test_vb_event_with(test_hlc(1000, 0, "dev1"), hash_tied, [0x01; 32]);
+        let vb_tied_hi = test_vb_event_with(test_hlc(2000, 0, "dev1"), hash_tied, [0x02; 32]);
+        let vb_solo = test_vb_event_with(test_hlc(3000, 0, "dev1"), hash_solo, [0x03; 32]);
+        log.insert_event_for_test(vb_tied_lo.clone());
+        log.insert_event_for_test(vb_tied_hi.clone());
+        log.insert_event_for_test(vb_solo.clone());
+
+        // Fully-current requester (watermark = newest retained vb, 3000):
+        // nothing sorts strictly above it, but the tied pair is served
+        // anyway — this requester may be the one holding only the larger
+        // sibling. The untied vb_solo is NOT re-served.
+        let req_current = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: Some(beacon_watermark_of(&log, now).expect("watermark")),
+        };
+        let sel = select_catchup(&log, &req_current, MAX_CATCHUP_BEACONS_PER_ROUND, now)
+            .expect("tied group must be served despite a covering watermark");
+        assert_eq!(
+            sel.beacons,
+            vec![vb_tied_lo.clone(), vb_tied_hi.clone()],
+            "exactly the tied group, oldest-first, watermark ignored for it"
+        );
+
+        // Same shape without the tie: short-circuit intact.
+        let mut no_tie_log = test_active_log(1);
+        no_tie_log.insert_event_for_test(vb_tied_lo.clone());
+        no_tie_log.insert_event_for_test(vb_solo.clone());
+        let req_current_no_tie = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: Some(beacon_watermark_of(&no_tie_log, now).expect("watermark")),
+        };
+        assert!(
+            select_catchup(
+                &no_tie_log,
+                &req_current_no_tie,
+                MAX_CATCHUP_BEACONS_PER_ROUND,
+                now
+            )
+            .is_none(),
+            "distinct-hash beacons are not a tie — fully-current stays None"
+        );
+
+        // A behind requester (no watermark) still gets everything once,
+        // with no duplicates from the tie rule.
+        let req_fresh = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 0,
+            active: false,
+            beacon_watermark: None,
+        };
+        let sel_fresh = select_catchup(&log, &req_fresh, MAX_CATCHUP_BEACONS_PER_ROUND, now)
+            .expect("selection");
+        assert_eq!(sel_fresh.beacons, vec![vb_tied_lo, vb_tied_hi, vb_solo]);
+    }
+
+    /// ZEB-1036 × ZEB-1035: the tie rule never overrides the skew gate.
+    /// A forward-skewed sibling is excluded from serving AND from tie
+    /// detection — one plausible output plus one skewed output is not a
+    /// servable tie, so the fully-current short-circuit still fires.
+    #[test]
+    fn select_catchup_tied_beacons_still_skew_gated_zeb1036() {
+        let now: u64 = 1_000_000_000;
+        let max = crate::clock_trust::MAX_FORWARD_SKEW_MS;
+        let hash_tied = [0x33; 32];
+
+        let mut log = test_active_log(1);
+        let vb_plausible = test_vb_event_with(test_hlc(1000, 0, "dev1"), hash_tied, [0x01; 32]);
+        let vb_skewed_sibling =
+            test_vb_event_with(test_hlc(now + max + 1, 0, "dev1"), hash_tied, [0x02; 32]);
+        log.insert_event_for_test(vb_plausible.clone());
+        log.insert_event_for_test(vb_skewed_sibling);
+
+        let req_current = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: Some(beacon_watermark_of(&log, now).expect("watermark")),
+        };
+        assert!(
+            select_catchup(&log, &req_current, MAX_CATCHUP_BEACONS_PER_ROUND, now).is_none(),
+            "a tie completed only by a forward-skewed event must not defeat the short-circuit"
+        );
+
+        // With the gate disabled (now == 0) the pair IS a tie again and
+        // both members are served past the watermark.
+        let req_current_disabled = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: Some(beacon_watermark_of(&log, 0).expect("watermark")),
+        };
+        let sel = select_catchup(
+            &log,
+            &req_current_disabled,
+            MAX_CATCHUP_BEACONS_PER_ROUND,
+            0,
+        )
+        .expect("gate disabled: tie visible again");
+        assert_eq!(sel.beacons.len(), 2);
     }
 
     /// ZEB-1030 final-review I4 / PR#778 round-1 regression: capping is
