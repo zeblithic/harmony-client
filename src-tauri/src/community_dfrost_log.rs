@@ -1018,7 +1018,19 @@ impl DfrostLog {
     /// and reach any target epoch anyway. Bounding the jump size would
     /// therefore buy no additional security while breaking the catch-up
     /// feature for anyone far enough behind.
-    pub fn adopt_refresh_quorum(&mut self, events: &[SignedCommitteeEvent]) -> Result<u64, String> {
+    ///
+    /// ZEB-1034 (`expected_space`): a payload that CARRIES a community
+    /// binding must name this community; a payload without one (legacy
+    /// pre-ZEB-1034 event) is still accepted HERE because the held-vk
+    /// pin above already blocks cross-community replay on this path — a
+    /// foreign quorum would have to share this community's joint vk.
+    /// Contrast `adopt_initial_quorum`, where no held state exists and
+    /// the binding is REQUIRED.
+    pub fn adopt_refresh_quorum(
+        &mut self,
+        events: &[SignedCommitteeEvent],
+        expected_space: &crate::owner_state_types::SpaceId,
+    ) -> Result<u64, String> {
         use crate::community_dfrost_types::DkgCompletePayload;
 
         if !self.committee_state.active {
@@ -1041,6 +1053,15 @@ impl DfrostLog {
             }
             let payload: DkgCompletePayload = ciborium::de::from_reader(&ev.payload[..])
                 .map_err(|e| format!("adopt_refresh_quorum: payload decode failed: {e}"))?;
+            if let Some(sp) = payload.space_id {
+                if sp != *expected_space {
+                    return Err(
+                        "adopt_refresh_quorum: dk payload is bound to a different community \
+                         (ZEB-1034)"
+                            .into(),
+                    );
+                }
+            }
             payloads.push(payload);
         }
 
@@ -1214,7 +1235,31 @@ impl DfrostLog {
     /// A quorum of honest actors can otherwise faithfully vouch for a
     /// payload that names an additional member who was never actually
     /// in the community.
-    pub fn adopt_initial_quorum(&mut self, events: &[SignedCommitteeEvent]) -> Result<u64, String> {
+    ///
+    /// ZEB-1034 (`expected_space`): a fresh joiner has NO held state to
+    /// pin the evidence against, so every payload MUST carry a community
+    /// binding naming this community. Catch-up frames are sealed under
+    /// the target community's epoch key, so the attacker of record is a
+    /// dual-community responder replaying community X's GENUINE,
+    /// validly-signed dk quorum into community Y — with overlapping
+    /// membership the Y-membership gate passes, and pre-ZEB-1034 the
+    /// joiner adopted X's committee/vk into Y (then wedged permanently
+    /// against Y's real committee via vk-immutability). The binding is
+    /// inside the signed payload, so it cannot be re-labelled without
+    /// breaking every envelope signature.
+    ///
+    /// REJECTING unbound (legacy pre-ZEB-1034) payloads is deliberate:
+    /// accept-if-absent would leave the replay open via any community's
+    /// retained legacy dk events. Cost: a fresh joiner cannot
+    /// catch-up-bootstrap into a community whose newest dk quorum
+    /// predates this change until that community completes one
+    /// post-upgrade DKG or refresh (whose dk events carry the binding)
+    /// — the upgrade-before-adopt rollout posture from the ticket.
+    pub fn adopt_initial_quorum(
+        &mut self,
+        events: &[SignedCommitteeEvent],
+        expected_space: &crate::owner_state_types::SpaceId,
+    ) -> Result<u64, String> {
         use crate::community_dfrost_types::DkgCompletePayload;
 
         if self.committee_state.active {
@@ -1234,6 +1279,24 @@ impl DfrostLog {
             }
             let payload: DkgCompletePayload = ciborium::de::from_reader(&ev.payload[..])
                 .map_err(|e| format!("adopt_initial_quorum: payload decode failed: {e}"))?;
+            match payload.space_id {
+                Some(sp) if sp == *expected_space => {}
+                Some(_) => {
+                    return Err(
+                        "adopt_initial_quorum: dk payload is bound to a different community \
+                         (ZEB-1034)"
+                            .into(),
+                    );
+                }
+                None => {
+                    return Err(
+                        "adopt_initial_quorum: dk payload carries no community binding — \
+                         legacy pre-ZEB-1034 evidence is not adoptable by a fresh joiner; \
+                         the community must complete one post-upgrade DKG/refresh first"
+                            .into(),
+                    );
+                }
+            }
             payloads.push(payload);
         }
 
@@ -2890,6 +2953,12 @@ pub fn resign_dfrost_event_with_fresh_hlc(
 
 #[cfg(test)]
 mod tests {
+    /// ZEB-1034: the community every adopt-path test binds its dk
+    /// evidence to (and passes as `expected_space`).
+    fn zeb1034_space() -> crate::owner_state_types::SpaceId {
+        crate::owner_state_types::SpaceId([0x5A; 16])
+    }
+
     use super::*;
     use crate::owner_state_types::OwnerAddr;
 
@@ -3223,6 +3292,7 @@ mod tests {
             members: vec![alice, bob],
             threshold: 2,
             max_signers: 2,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd).unwrap();
@@ -3393,6 +3463,7 @@ mod tests {
             members: vec![alice],
             threshold: 1,
             max_signers: 1,
+            space_id: None,
         };
         let mut pd2 = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd2).unwrap();
@@ -4209,6 +4280,7 @@ mod tests {
             members: vec![alice],
             threshold: 1,
             max_signers: 1,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd).unwrap();
@@ -4280,6 +4352,7 @@ mod tests {
             members: vec![alice, bob],
             threshold: 1, // ← MISMATCH against pending.threshold=2
             max_signers: 2,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd).unwrap();
@@ -4469,6 +4542,7 @@ mod tests {
             members: vec![alice],
             threshold: 1,
             max_signers: 1,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd).unwrap();
@@ -4538,6 +4612,7 @@ mod tests {
             members: vec![alice, bob],
             threshold: 2,
             max_signers: 2,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&alice_dk, &mut pd).unwrap();
@@ -4575,6 +4650,7 @@ mod tests {
             members: vec![alice, bob],
             threshold: 2,
             max_signers: 2,
+            space_id: None,
         };
         let mut pd2 = Vec::new();
         ciborium::into_writer(&bob_dk, &mut pd2).unwrap();
@@ -4636,6 +4712,7 @@ mod tests {
             members: vec![alice, bob],
             threshold: 2,
             max_signers: 2,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd).unwrap();
@@ -4686,6 +4763,7 @@ mod tests {
             members: vec![alice, bob],
             threshold: 2,
             max_signers: 2,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd).unwrap();
@@ -4846,6 +4924,7 @@ mod tests {
             members: vec![OwnerAddr([0x01; 16])],
             threshold: 1,
             max_signers: 1,
+            space_id: None,
         };
         let mut pd = Vec::new();
         ciborium::into_writer(&dk_payload, &mut pd).unwrap();
@@ -6634,6 +6713,7 @@ mod tests {
             members: vec![alice, bob, carol],
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
         let mut wall = 9_200u64;
         for confirmer in [alice, bob] {
@@ -6722,6 +6802,7 @@ mod tests {
             members: vec![alice, bob, carol],
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
         let mut wall = 9_300u64;
         for confirmer in [alice, bob] {
@@ -6815,6 +6896,7 @@ mod tests {
                 members: members.to_vec(),
                 threshold: 2,
                 max_signers: 3,
+                space_id: None,
             };
             let mut wall = wall0;
             for confirmer in [members[0], members[1]] {
@@ -6978,6 +7060,7 @@ mod tests {
             members: members.clone(),
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
 
         let events = vec![
@@ -6985,7 +7068,7 @@ mod tests {
             signed_dk(bob, 10_001, "b", &payload),
         ];
 
-        assert_eq!(log.adopt_refresh_quorum(&events), Ok(2));
+        assert_eq!(log.adopt_refresh_quorum(&events, &zeb1034_space()), Ok(2));
         assert_eq!(log.committee_state.current_epoch, 2);
         let expected: BTreeMap<OwnerAddr, [u8; 32]> = new_shares
             .into_iter()
@@ -7055,12 +7138,13 @@ mod tests {
                 members: members.clone(),
                 threshold: 2,
                 max_signers: 3,
+                space_id: None,
             };
             let events = vec![
                 signed_dk(alice, 40_000, "a", &payload),
                 signed_dk(bob, 40_001, "b", &payload),
             ];
-            assert_eq!(log.adopt_refresh_quorum(&events), Ok(2));
+            assert_eq!(log.adopt_refresh_quorum(&events, &zeb1034_space()), Ok(2));
             let installed = log
                 .local_key_package
                 .as_ref()
@@ -7112,12 +7196,13 @@ mod tests {
                 members: members.clone(),
                 threshold: 2,
                 max_signers: 3,
+                space_id: None,
             };
             let events = vec![
                 signed_dk(alice, 41_000, "a", &payload),
                 signed_dk(bob, 41_001, "b", &payload),
             ];
-            assert_eq!(log.adopt_refresh_quorum(&events), Ok(2));
+            assert_eq!(log.adopt_refresh_quorum(&events, &zeb1034_space()), Ok(2));
             assert!(
                 log.local_key_package.is_none(),
                 "mismatched stage discarded"
@@ -7155,6 +7240,7 @@ mod tests {
             members: members.clone(),
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
 
         let mut cases: Vec<(&str, Vec<SignedCommitteeEvent>)> = Vec::new();
@@ -7276,7 +7362,7 @@ mod tests {
             let mut log =
                 committee_log_from_material(&members, &ids, &pub_pkg, Some(alice_kp.clone()));
             let original_shares = log.committee_state.verifying_shares.clone();
-            let result = log.adopt_refresh_quorum(events);
+            let result = log.adopt_refresh_quorum(events, &zeb1034_space());
             assert!(result.is_err(), "case {name} should reject: {result:?}");
             assert_eq!(
                 log.committee_state.current_epoch, 1,
@@ -7297,7 +7383,9 @@ mod tests {
             signed_dk(alice, 20_000, "a", &p),
             signed_dk(bob, 20_001, "b", &p),
         ];
-        assert!(inactive.adopt_refresh_quorum(&events).is_err());
+        assert!(inactive
+            .adopt_refresh_quorum(&events, &zeb1034_space())
+            .is_err());
         assert_eq!(inactive.event_count(), 0);
     }
 
@@ -7329,6 +7417,7 @@ mod tests {
             members: members.clone(),
             threshold: 2,
             max_signers: 3,
+            space_id: Some(zeb1034_space()),
         };
 
         let ev_a = signed_dk(alice, 1_000, "a", &payload);
@@ -7336,7 +7425,7 @@ mod tests {
         let events = vec![ev_a.clone(), ev_b];
 
         let mut log = DfrostLog::new();
-        assert_eq!(log.adopt_initial_quorum(&events), Ok(1));
+        assert_eq!(log.adopt_initial_quorum(&events, &zeb1034_space()), Ok(1));
         assert!(log.committee_state.active);
         assert_eq!(log.committee_state.joint_verifying_key, Some(joint_vk));
         let expected_shares: BTreeMap<OwnerAddr, [u8; 32]> = verifying_shares
@@ -7374,6 +7463,160 @@ mod tests {
         assert_eq!(log.event_count(), before_count);
     }
 
+    /// ZEB-1034: the fresh-joiner path REQUIRES a community binding
+    /// matching the adopting community — the dual-community-responder
+    /// replay (community X's genuine quorum served into community Y)
+    /// and legacy unbound evidence are both rejected, with no state
+    /// written.
+    #[test]
+    fn adopt_initial_quorum_community_binding_zeb1034() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let joint_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let verifying_shares: Vec<MemberVerifyingShare> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MemberVerifyingShare {
+                member: *m,
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pub_pkg.verifying_shares().get(&ids[i]).unwrap(),
+                ),
+            })
+            .collect();
+        let payload = DkgCompletePayload {
+            ceremony_id: [0x34; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares,
+            epoch: 1,
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 3,
+            space_id: Some(zeb1034_space()),
+        };
+
+        // Community X's GENUINE quorum (validly built, bound to X =
+        // zeb1034_space) replayed at community Y → rejected, nothing
+        // adopted.
+        let events = vec![
+            signed_dk(alice, 1_000, "a", &payload),
+            signed_dk(bob, 1_001, "b", &payload),
+        ];
+        let community_y = crate::owner_state_types::SpaceId([0x0E; 16]);
+        let mut log = DfrostLog::new();
+        let err = log
+            .adopt_initial_quorum(&events, &community_y)
+            .expect_err("cross-community dk quorum must be rejected");
+        assert!(
+            err.contains("bound to a different community"),
+            "unexpected error: {err}"
+        );
+        assert!(!log.committee_state.active);
+        assert_eq!(log.event_count(), 0);
+
+        // Legacy unbound (pre-ZEB-1034, space_id absent) evidence →
+        // rejected on the joiner path.
+        let mut legacy_payload = payload.clone();
+        legacy_payload.space_id = None;
+        let legacy_events = vec![
+            signed_dk(alice, 1_000, "a", &legacy_payload),
+            signed_dk(bob, 1_001, "b", &legacy_payload),
+        ];
+        let err = log
+            .adopt_initial_quorum(&legacy_events, &zeb1034_space())
+            .expect_err("unbound legacy dk quorum must be rejected");
+        assert!(
+            err.contains("no community binding"),
+            "unexpected error: {err}"
+        );
+        assert!(!log.committee_state.active);
+
+        // Correctly-bound evidence at the right community still adopts.
+        assert_eq!(log.adopt_initial_quorum(&events, &zeb1034_space()), Ok(1));
+        assert!(log.committee_state.active);
+    }
+
+    /// ZEB-1034: the straggler path tolerates legacy unbound evidence
+    /// (held-vk pinning already blocks cross-community replay there)
+    /// but still rejects an EXPLICIT foreign binding.
+    #[test]
+    fn adopt_refresh_quorum_community_binding_zeb1034() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let joint_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let verifying_shares: Vec<MemberVerifyingShare> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MemberVerifyingShare {
+                member: *m,
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pub_pkg.verifying_shares().get(&ids[i]).unwrap(),
+                ),
+            })
+            .collect();
+
+        // Activate a committee at epoch 1 via the (strict) joiner path.
+        let initial = DkgCompletePayload {
+            ceremony_id: [0x35; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares: verifying_shares.clone(),
+            epoch: 1,
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 3,
+            space_id: Some(zeb1034_space()),
+        };
+        let initial_events = vec![
+            signed_dk(alice, 1_000, "a", &initial),
+            signed_dk(bob, 1_001, "b", &initial),
+        ];
+        let mut log = DfrostLog::new();
+        assert_eq!(
+            log.adopt_initial_quorum(&initial_events, &zeb1034_space()),
+            Ok(1)
+        );
+
+        // Epoch-2 refresh evidence bound to a DIFFERENT community →
+        // rejected even though the vk matches.
+        let mut foreign = initial.clone();
+        foreign.epoch = 2;
+        foreign.ceremony_id = [0x36; 32];
+        foreign.space_id = Some(crate::owner_state_types::SpaceId([0x0F; 16]));
+        let foreign_events = vec![
+            signed_dk(alice, 2_000, "a", &foreign),
+            signed_dk(bob, 2_001, "b", &foreign),
+        ];
+        let err = log
+            .adopt_refresh_quorum(&foreign_events, &zeb1034_space())
+            .expect_err("foreign-bound refresh quorum must be rejected");
+        assert!(
+            err.contains("bound to a different community"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(log.committee_state.current_epoch, 1);
+
+        // Legacy unbound refresh evidence is still adoptable (vk pin
+        // carries the binding on this path).
+        let mut legacy = foreign.clone();
+        legacy.space_id = None;
+        let legacy_events = vec![
+            signed_dk(alice, 2_000, "a", &legacy),
+            signed_dk(bob, 2_001, "b", &legacy),
+        ];
+        assert_eq!(
+            log.adopt_refresh_quorum(&legacy_events, &zeb1034_space()),
+            Ok(2)
+        );
+        assert_eq!(log.committee_state.current_epoch, 2);
+    }
+
     #[test]
     fn adopt_initial_quorum_reject_matrix_zeb1030() {
         use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
@@ -7401,6 +7644,7 @@ mod tests {
             members: members.clone(),
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
 
         let mut cases: Vec<(&str, Vec<SignedCommitteeEvent>)> = Vec::new();
@@ -7498,7 +7742,7 @@ mod tests {
 
         for (name, events) in &cases {
             let mut log = DfrostLog::new();
-            let result = log.adopt_initial_quorum(events);
+            let result = log.adopt_initial_quorum(events, &zeb1034_space());
             assert!(result.is_err(), "case {name} should reject: {result:?}");
             assert!(!log.committee_state.active, "case {name}: stays inactive");
             assert_eq!(log.event_count(), 0, "case {name}: no partial insert");
@@ -7512,7 +7756,9 @@ mod tests {
             signed_dk(alice, 1_000, "a", &p),
             signed_dk(bob, 1_001, "b", &p),
         ];
-        assert!(active_log.adopt_initial_quorum(&events).is_err());
+        assert!(active_log
+            .adopt_initial_quorum(&events, &zeb1034_space())
+            .is_err());
         assert_eq!(active_log.event_count(), 0);
     }
 
@@ -8085,12 +8331,13 @@ mod tests {
             members: members.clone(),
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
         let events = vec![
             signed_dk(alice, 30_000, "a", &payload),
             signed_dk(bob, 30_001, "b", &payload),
         ];
-        assert_eq!(log.adopt_refresh_quorum(&events), Ok(2));
+        assert_eq!(log.adopt_refresh_quorum(&events, &zeb1034_space()), Ok(2));
 
         assert_eq!(
             log.find_vrf_beacon_output_by_seed(&seed, log.committee_state.current_epoch),

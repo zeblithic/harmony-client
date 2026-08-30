@@ -3254,7 +3254,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             }
             let result = {
                 let mut log = self.dfrost_log.lock().await;
-                log.adopt_refresh_quorum(&g.dk_events)
+                log.adopt_refresh_quorum(&g.dk_events, &self.community_id)
             };
             match result {
                 Ok(epoch) => {
@@ -3467,7 +3467,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
 
             let result = {
                 let mut log = self.dfrost_log.lock().await;
-                log.adopt_initial_quorum(&chosen.dk_events)
+                log.adopt_initial_quorum(&chosen.dk_events, &self.community_id)
             };
             match result {
                 Ok(epoch) => {
@@ -7836,7 +7836,12 @@ mod tests {
         verifying_shares: std::collections::BTreeMap<OwnerAddr, [u8; 32]>,
     }
 
-    async fn build_dk_quorum_fixture(epoch: u64, seed_base: u8, vk_byte: u8) -> DkQuorumFixture {
+    async fn build_dk_quorum_fixture(
+        epoch: u64,
+        seed_base: u8,
+        vk_byte: u8,
+        space: crate::owner_state_types::SpaceId,
+    ) -> DkQuorumFixture {
         use crate::community_dfrost_log::build_signed_dfrost_event;
         use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
 
@@ -7868,6 +7873,9 @@ mod tests {
             members: members.clone(),
             threshold: 2,
             max_signers: 3,
+            // ZEB-1034: bind the evidence to the consuming test's engine
+            // community — adopt_initial_quorum now REQUIRES the match.
+            space_id: Some(space),
         };
         let alice_dk = build_signed_dfrost_event(
             &alice_sk,
@@ -7950,7 +7958,9 @@ mod tests {
     /// `B.catchup_ingest` must land B on A's epoch with A's shares.
     #[tokio::test]
     async fn catchup_respond_then_ingest_straggler_adopts_zeb1030() {
-        let fixture = build_dk_quorum_fixture(2, 0xC1, 0x77).await;
+        let fixture =
+            build_dk_quorum_fixture(2, 0xC1, 0x77, crate::owner_state_types::SpaceId([0xB0; 16]))
+                .await;
 
         let mut b_log = crate::community_dfrost_log::DfrostLog::new();
         b_log.committee_state.active = true;
@@ -8015,7 +8025,9 @@ mod tests {
     #[tokio::test]
     async fn catchup_ingest_joiner_adopts_and_disagreement_aborts_zeb1030() {
         // Part A: a single dk-bearing responder group → joiner adopts.
-        let fixture = build_dk_quorum_fixture(1, 0xD1, 0x66).await;
+        let fixture =
+            build_dk_quorum_fixture(1, 0xD1, 0x66, crate::owner_state_types::SpaceId([0xDC; 16]))
+                .await;
 
         let mut c_resolver_map = HashMap::new();
         c_resolver_map.insert(fixture.alice_addr, fixture.alice_pub64);
@@ -8069,8 +8081,12 @@ mod tests {
         // Part B: two responder groups with DIFFERENT joint vks (two
         // wholly separate committees, each with its own valid quorum) →
         // Disagreement, and the joiner must stay untouched.
-        let fixture_g1 = build_dk_quorum_fixture(1, 0xE1, 0x11).await;
-        let fixture_g2 = build_dk_quorum_fixture(1, 0xE5, 0x22).await;
+        let fixture_g1 =
+            build_dk_quorum_fixture(1, 0xE1, 0x11, crate::owner_state_types::SpaceId([0xDD; 16]))
+                .await;
+        let fixture_g2 =
+            build_dk_quorum_fixture(1, 0xE5, 0x22, crate::owner_state_types::SpaceId([0xDD; 16]))
+                .await;
 
         let mut d_resolver_map = HashMap::new();
         d_resolver_map.insert(fixture_g1.alice_addr, fixture_g1.alice_pub64);
@@ -8130,7 +8146,9 @@ mod tests {
     async fn catchup_ingest_drops_unverified_events_zeb1030() {
         use crate::community_dfrost_catchup::CatchupBody;
 
-        let fixture = build_dk_quorum_fixture(2, 0xF1, 0x33).await;
+        let fixture =
+            build_dk_quorum_fixture(2, 0xF1, 0x33, crate::owner_state_types::SpaceId([0xF9; 16]))
+                .await;
 
         let mut b_log = crate::community_dfrost_log::DfrostLog::new();
         b_log.committee_state.active = true;
@@ -8661,7 +8679,9 @@ mod tests {
     async fn catchup_ingest_joiner_membership_gate_accepts_known_members_zeb1030() {
         use crate::community_voting_log::MembershipSnapshotResolver;
 
-        let fixture = build_dk_quorum_fixture(1, 0xA1, 0xBC).await;
+        let fixture =
+            build_dk_quorum_fixture(1, 0xA1, 0xBC, crate::owner_state_types::SpaceId([0xA2; 16]))
+                .await;
 
         let membership: Arc<dyn MembershipSnapshotResolver> =
             Arc::new(StaticMembership(fixture.members.clone()));
@@ -8709,7 +8729,9 @@ mod tests {
     async fn catchup_ingest_joiner_membership_gate_rejects_unknown_member_zeb1030() {
         use crate::community_voting_log::MembershipSnapshotResolver;
 
-        let fixture = build_dk_quorum_fixture(1, 0xA5, 0xBD).await;
+        let fixture =
+            build_dk_quorum_fixture(1, 0xA5, 0xBD, crate::owner_state_types::SpaceId([0xA6; 16]))
+                .await;
 
         let known_members: Vec<OwnerAddr> = fixture
             .members
@@ -8779,7 +8801,9 @@ mod tests {
         use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
 
         // Honest group: A holds a real 2-of-3 quorum at epoch 1.
-        let fixture_h = build_dk_quorum_fixture(1, 0x91, 0xAB).await;
+        let fixture_h =
+            build_dk_quorum_fixture(1, 0x91, 0xAB, crate::owner_state_types::SpaceId([0x9D; 16]))
+                .await;
 
         // Attacker group: claims an inflated epoch (99) with the SAME
         // joint vk (so vk-agreement holds, ruling out Disagreement) but
@@ -8807,6 +8831,7 @@ mod tests {
             members: attacker_members.clone(),
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
         let attacker_dk = build_signed_dfrost_event(
             &eve_sk,

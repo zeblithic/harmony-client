@@ -446,6 +446,7 @@ mod tests {
             members: vec![],
             threshold: 2,
             max_signers: 3,
+            space_id: None,
         };
         let mut payload_bytes = Vec::new();
         ciborium::ser::into_writer(&payload, &mut payload_bytes).unwrap();

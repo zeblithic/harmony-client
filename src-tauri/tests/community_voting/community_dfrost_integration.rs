@@ -494,6 +494,7 @@ fn dkg_2of2_setup_for(
         members: members.clone(),
         threshold: 2,
         max_signers,
+        space_id: None,
     };
     let dk_alice = build_dk_event(alice, 3_000, "alice", dk_payload.clone());
     let dk_bob = build_dk_event(bob, 3_100, "bob", dk_payload);
@@ -816,6 +817,7 @@ fn dk_rejected_after_active_with_pending_dkg_slot() {
             members: members(),
             threshold: 2,
             max_signers: 2,
+            space_id: None,
         },
     );
 
@@ -992,6 +994,7 @@ fn refresh_two_engine_preserves_joint_vk() {
         members: members(),
         threshold: 2,
         max_signers: 2,
+        space_id: None,
     };
     let dk_alice = build_dk_event(ALICE, 7_000, "alice", dk_payload.clone());
     let dk_bob = build_dk_event(BOB, 7_100, "bob", dk_payload);
@@ -1413,6 +1416,7 @@ async fn straggler_catches_up_after_missed_refresh_zeb1030() {
         members: members.clone(),
         threshold: 2,
         max_signers: 3,
+        space_id: None,
     };
     let dk_alice_e2 = build_signed_dfrost_event(
         &alice_sk,
@@ -1695,6 +1699,9 @@ async fn fresh_joiner_adopts_committee_state_zeb1030() {
         members: c.engine_a.committee_state.members.clone(),
         threshold: c.engine_a.committee_state.threshold,
         max_signers: c.engine_a.committee_state.max_signers,
+        // ZEB-1034: bind to the community both engines below run as —
+        // `adopt_initial_quorum` now requires the match on the joiner.
+        space_id: Some(SpaceId([0x7A; 16])),
     };
     let dk_alice_signed = build_signed_dfrost_event(
         &alice_sk,
@@ -1887,6 +1894,7 @@ async fn fresh_joiner_adopts_committee_state_zeb1030() {
         members: vec![mallory_addr],
         threshold: 1,
         max_signers: 1,
+        space_id: None,
     };
     let hostile_dk = build_signed_dfrost_event(
         &mallory_sk,

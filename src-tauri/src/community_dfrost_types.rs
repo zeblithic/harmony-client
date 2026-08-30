@@ -247,6 +247,20 @@ pub struct DkgCompletePayload {
     pub threshold: u16,
     #[serde(rename = "mx")]
     pub max_signers: u16,
+    /// ZEB-1034: the community this ceremony belongs to. Signed into the
+    /// payload (the envelope Ed25519 signature covers the payload bytes),
+    /// so a dual-community responder cannot re-label another community's
+    /// genuine `dk` quorum — `adopt_initial_quorum` REQUIRES it to match
+    /// the adopting community, closing the cross-community replay on the
+    /// fresh-joiner path (`adopt_refresh_quorum` was never exposed: the
+    /// held joint vk already pins it).
+    ///
+    /// `None` = legacy pre-ZEB-1034 event. The key is omitted entirely
+    /// (`skip_serializing_if`), keeping legacy events byte-identical
+    /// (zeb303 pins unaffected — same wire-evolution shape as
+    /// `RefreshRoundPayload.attempt`). New mints always populate it.
+    #[serde(rename = "sp", skip_serializing_if = "Option::is_none", default)]
+    pub space_id: Option<crate::owner_state_types::SpaceId>,
 }
 
 /// Payload for `DfrostEventKind::ThresholdSign` (`ts`). One per

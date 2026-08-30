@@ -386,6 +386,7 @@ fn contribute_dkg_round3_local(
         members: members.to_vec(),
         threshold,
         max_signers,
+        space_id: None,
     };
     let event = build_signed_dfrost_event(
         signing_key,
