@@ -1725,6 +1725,13 @@ impl DfrostLog {
         if payload.epoch != self.committee_state.current_epoch + 1 {
             return Err(ApplyError::InvariantViolation);
         }
+        // ZEB-1031 §5.3: if a reset is pending, the di must claim exactly
+        // the pinned successor member set and threshold.
+        if let Some(pin) = &self.committee_state.pending_reset {
+            if payload.members != pin.new_members || payload.threshold != pin.new_threshold {
+                return Err(ApplyError::InvariantViolation);
+            }
+        }
         Ok(())
     }
 
@@ -2153,6 +2160,10 @@ impl DfrostLog {
                 PendingSlot::Dkg => self.committee_state.pending_dkg = None,
                 PendingSlot::Refresh => self.committee_state.pending_refresh = None,
             }
+            // ZEB-1031 §5.3: if a reset was pending (only a post-reset DKG
+            // can reach this point when active=false and pending_reset=Some),
+            // clear the pin now that promotion is complete.
+            self.committee_state.pending_reset = None;
             // ZEB-1027: promotion ends the ceremony on this node — the
             // in-memory round secrets are dead transcript material and
             // MUST NOT leak into the next ceremony's part2/part3 inputs
@@ -8949,5 +8960,281 @@ mod tests {
             Err(ApplyError::UnexpectedEnvelope)
         );
         assert_reset_marker_state_untouched(&log, old_vk);
+    }
+
+    // ZEB-1031 Task 4: successor-DKG pin tests
+    //
+    // After a reset marker is applied, the DfrostLog's pending_reset is set
+    // with the pinned new_members and new_threshold. A successor di must
+    // claim exactly this shape, else it is rejected. On dk promotion, the
+    // pending_reset is cleared.
+
+    #[test]
+    fn reset_dkg_pin_di_wrong_members_rejected_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        assert!(log.committee_state.pending_reset.is_some());
+
+        // Try to apply di with wrong members (alice + carol instead of
+        // carol + dave) — should be rejected as InvariantViolation.
+        assert_eq!(
+            log.check_ceremony_init_admissible(
+                &crate::community_dfrost_types::CeremonyInitPayload {
+                    ceremony_id: [0x42; 32],
+                    members: vec![alice, carol],
+                    threshold: 2,
+                    max_signers: 2,
+                    epoch: 4,
+                    minted_wall_ms: 6_000,
+                    minted_logical: 0,
+                },
+                &alice
+            ),
+            Err(ApplyError::InvariantViolation),
+            "di with wrong members should be rejected when pending_reset is set"
+        );
+    }
+
+    #[test]
+    fn reset_dkg_pin_di_wrong_threshold_rejected_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        assert!(log.committee_state.pending_reset.is_some());
+
+        // Try to apply di with correct members but wrong threshold
+        // (1 instead of 2) — should be rejected as InvariantViolation.
+        let payload = crate::community_dfrost_types::CeremonyInitPayload {
+            ceremony_id: [0x42; 32],
+            members: new_members.clone(),
+            threshold: 1, // Wrong!
+            max_signers: 2,
+            epoch: 4,
+            minted_wall_ms: 6_000,
+            minted_logical: 0,
+        };
+
+        assert_eq!(
+            log.check_ceremony_init_admissible(&payload, &carol),
+            Err(ApplyError::InvariantViolation),
+            "di with wrong threshold should be rejected when pending_reset is set"
+        );
+    }
+
+    #[test]
+    fn reset_dkg_pin_di_exact_shape_admitted_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        assert!(log.committee_state.pending_reset.is_some());
+
+        // Apply di with exact pinned shape — should be admitted.
+        let payload = crate::community_dfrost_types::CeremonyInitPayload {
+            ceremony_id: [0x42; 32],
+            members: new_members.clone(),
+            threshold: 2,
+            max_signers: 2,
+            epoch: 4,
+            minted_wall_ms: 6_000,
+            minted_logical: 0,
+        };
+
+        assert_eq!(
+            log.check_ceremony_init_admissible(&payload, &carol),
+            Ok(()),
+            "di with exact pinned shape should be admitted"
+        );
+    }
+
+    #[test]
+    fn reset_dkg_pin_promotion_clears_pending_reset_zeb1031() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_vk = [0xbb; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let rs_ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&rs_ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        // Verify state after marker: deactivated, pending_reset set, vk_history recorded.
+        assert!(!log.committee_state.active);
+        assert!(log.committee_state.joint_verifying_key.is_none());
+        assert_eq!(log.committee_state.current_epoch, 3);
+        assert_eq!(log.committee_state.vk_history.len(), 1);
+        let pin = log
+            .committee_state
+            .pending_reset
+            .as_ref()
+            .expect("pending_reset set");
+        assert_eq!(pin.new_members, new_members);
+        assert_eq!(pin.new_threshold, 2);
+
+        // Seed a di (ceremony init) with exact pinned shape.
+        let ceremony_id = [0x42u8; 32];
+        log.apply(di_event(
+            carol,
+            new_members.clone(),
+            2,
+            4,
+            ceremony_id,
+            6_000,
+        ))
+        .expect("di seeds pending_dkg");
+
+        assert!(log.committee_state.pending_dkg.is_some());
+
+        // Build and apply dk (DKG complete) events to reach quorum and promote.
+        let payload = DkgCompletePayload {
+            ceremony_id,
+            joint_verifying_key: new_vk,
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: carol,
+                    verifying_share: [0xc1; 32],
+                },
+                MemberVerifyingShare {
+                    member: dave,
+                    verifying_share: [0xd1; 32],
+                },
+            ],
+            epoch: 4,
+            members: new_members.clone(),
+            threshold: 2,
+            max_signers: 2,
+            space_id: None,
+        };
+
+        let mut wall = 7_000u64;
+        // Apply dk events from carol and dave to reach quorum (threshold=2).
+        for confirmer in [carol, dave] {
+            let mut pd = Vec::new();
+            ciborium::into_writer(&payload, &mut pd).unwrap();
+            log.apply(crate::community_dfrost_types::SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: crate::community_dfrost_types::DfrostEventKind::DkgComplete,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: confirmer,
+                payload: pd,
+                sig: vec![0u8; 64],
+            })
+            .expect("dk applies");
+            wall += 1;
+        }
+
+        // Verify state after promotion:
+        assert!(log.committee_state.active, "committee promoted");
+        assert_eq!(
+            log.committee_state.joint_verifying_key,
+            Some(new_vk),
+            "new vk installed"
+        );
+        assert_eq!(log.committee_state.current_epoch, 4, "epoch advanced");
+        assert_eq!(
+            log.committee_state.members, new_members,
+            "new members installed"
+        );
+        assert_eq!(log.committee_state.threshold, 2, "new threshold installed");
+
+        // The critical assertion: pending_reset is cleared on promotion.
+        assert_eq!(
+            log.committee_state.pending_reset, None,
+            "pending_reset cleared on dk promotion"
+        );
+
+        // Verify vk_history lineage is still present.
+        assert_eq!(
+            log.committee_state.vk_history.len(),
+            1,
+            "vk_history still carries the lineage entry"
+        );
+        let lineage = &log.committee_state.vk_history[0];
+        assert_eq!(lineage.old_vk, old_vk, "lineage records old vk");
+        assert_eq!(lineage.old_epoch, 3, "lineage records old epoch");
+        assert_eq!(
+            lineage.reset_id, RESET_PROPOSAL_ID,
+            "lineage records reset_id"
+        );
     }
 }
