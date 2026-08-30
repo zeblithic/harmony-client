@@ -56,6 +56,21 @@ pub const MAX_CATCHUP_BEACONS_PER_ROUND: usize = 64;
 /// independent responders to make its case.
 pub const MAX_CATCHUP_RESPONDER_GROUPS: usize = 16;
 
+/// ZEB-1030 PR#778 round-1: margin subtracted from
+/// [`MAX_DFROST_CATCHUP_FRAME_BYTES`] when capping PLAINTEXT frame/request
+/// bytes at encode time. `MAX_DFROST_CATCHUP_FRAME_BYTES` is the cap the
+/// RECEIVER enforces against the raw bytes it reads off the wire —
+/// `dfrost_catchup_open_plaintext` in `event_loop.rs`, checked BEFORE
+/// decrypt — and those raw bytes are the SEALED envelope: this module's
+/// plaintext plus an AEAD nonce, an authentication tag, and the
+/// `EncryptedEnvelope`'s own CBOR framing. A plaintext frame or request
+/// encoded right up to the raw cap would pass `encode_frame`/
+/// `encode_request` here but exceed the raw cap once sealed, so it would
+/// be silently dropped by the receiver — never even reaching decrypt. 256
+/// bytes is generous headroom over the actual sealing overhead (a 12-byte
+/// nonce, a 16-byte AEAD tag, and a handful of CBOR map/length bytes).
+pub const DFROST_CATCHUP_SEAL_MARGIN_BYTES: usize = 256;
+
 /// Envelope HLC of the newest `vb` event the requester holds. 2-char keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeaconWatermark {
@@ -113,12 +128,24 @@ pub struct CatchupFrame {
     pub body: CatchupBody,
 }
 
-/// Encode a [`CatchupRequest`]. No size cap on encode — a request has no
-/// event payload, so it cannot grow unbounded.
+/// Encode a [`CatchupRequest`]. Size cap is checked AFTER encoding, at the
+/// [`DFROST_CATCHUP_SEAL_MARGIN_BYTES`]-adjusted bound (mirrors
+/// `encode_frame`) — `BeaconWatermark.device_id` is operator-controlled
+/// `Hlc` string data, not a fixed-size field, so a request's encoded size
+/// is not actually bounded by construction the way this comment used to
+/// claim.
 pub fn encode_request(req: &CatchupRequest) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     ciborium::ser::into_writer(req, &mut out)
         .map_err(|e| format!("dfrost catchup request encode: {e}"))?;
+    let cap = MAX_DFROST_CATCHUP_FRAME_BYTES - DFROST_CATCHUP_SEAL_MARGIN_BYTES;
+    if out.len() > cap {
+        return Err(format!(
+            "dfrost catchup request exceeds {cap}-byte cap \
+             ({} bytes)",
+            out.len()
+        ));
+    }
     Ok(out)
 }
 
@@ -145,14 +172,19 @@ pub fn decode_request(bytes: &[u8]) -> Result<CatchupRequest, String> {
 
 /// Encode a [`CatchupFrame`]. Size cap is checked AFTER encoding — the
 /// frame's `dk`/`vb` body carries a verbatim event, so the cap can only
-/// be evaluated on the encoded bytes.
+/// be evaluated on the encoded bytes. Enforced at the
+/// [`DFROST_CATCHUP_SEAL_MARGIN_BYTES`]-adjusted bound, not the raw
+/// [`MAX_DFROST_CATCHUP_FRAME_BYTES`] — see that constant's doc: sealing
+/// this plaintext adds bytes the receiver's raw-bytes cap also has to
+/// absorb.
 pub fn encode_frame(frame: &CatchupFrame) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     ciborium::ser::into_writer(frame, &mut out)
         .map_err(|e| format!("dfrost catchup frame encode: {e}"))?;
-    if out.len() > MAX_DFROST_CATCHUP_FRAME_BYTES {
+    let cap = MAX_DFROST_CATCHUP_FRAME_BYTES - DFROST_CATCHUP_SEAL_MARGIN_BYTES;
+    if out.len() > cap {
         return Err(format!(
-            "dfrost catchup frame exceeds {MAX_DFROST_CATCHUP_FRAME_BYTES}-byte cap \
+            "dfrost catchup frame exceeds {cap}-byte cap \
              ({} bytes)",
             out.len()
         ));
@@ -315,18 +347,36 @@ pub fn select_catchup(
 
 /// Group frames by responder_id, DISCARDING any group without exactly
 /// one Status frame. Order: groups in first-seen order.
-pub fn group_frames(frames: Vec<CatchupFrame>) -> Vec<(CatchupStatus, Vec<CatchupFrame>)> {
+///
+/// ZEB-1030 PR#778 round-1: `cap` is enforced DURING insertion, not by
+/// truncating the grouped result afterward — a flood of frames carrying
+/// distinct, never-before-seen `responder_id`s would otherwise make the
+/// per-frame `grouped.iter_mut().find(...)` linear scan itself
+/// O(frames × distinct_rids) before any cap ever applied, since a new
+/// entry was pushed onto `grouped` (and so lengthened the scan) for
+/// every unseen id. Once `cap` distinct responder ids have been admitted,
+/// a frame for a still-unseen id is dropped on sight (counted, not
+/// pushed) — bounding both the scan and the final group count — while a
+/// frame for an already-admitted id still appends normally, without
+/// limit. Returns `(groups, dropped_frame_count)` for the caller's
+/// truncation warning.
+pub fn group_frames(
+    frames: Vec<CatchupFrame>,
+    cap: usize,
+) -> (Vec<(CatchupStatus, Vec<CatchupFrame>)>, usize) {
     let mut grouped: Vec<([u8; 8], Vec<CatchupFrame>)> = Vec::new();
+    let mut dropped = 0usize;
     for frame in frames {
         match grouped
-            .iter_mut()
-            .find(|(rid, _)| *rid == frame.responder_id)
+            .iter()
+            .position(|(rid, _)| *rid == frame.responder_id)
         {
-            Some((_, group)) => group.push(frame),
-            None => grouped.push((frame.responder_id, vec![frame])),
+            Some(idx) => grouped[idx].1.push(frame),
+            None if grouped.len() < cap => grouped.push((frame.responder_id, vec![frame])),
+            None => dropped += 1,
         }
     }
-    grouped
+    let groups = grouped
         .into_iter()
         .filter_map(|(_, group)| {
             let mut status = None;
@@ -343,22 +393,8 @@ pub fn group_frames(frames: Vec<CatchupFrame>) -> Vec<(CatchupStatus, Vec<Catchu
                 None
             }
         })
-        .collect()
-}
-
-/// ZEB-1030 final-review I4: cap the number of responder groups a
-/// requester will process in one `catchup_ingest` round, at
-/// [`MAX_CATCHUP_RESPONDER_GROUPS`]. Excess groups are dropped;
-/// `group_frames`'s first-seen order determines which groups survive.
-/// Kept separate from — and after — `group_frames` so `group_frames`
-/// itself stays a pure, uncapped grouping function; this is the seam
-/// that makes the cap independently testable without an engine.
-pub fn cap_catchup_groups(
-    mut groups: Vec<(CatchupStatus, Vec<CatchupFrame>)>,
-    cap: usize,
-) -> Vec<(CatchupStatus, Vec<CatchupFrame>)> {
-    groups.truncate(cap);
-    groups
+        .collect();
+    (groups, dropped)
 }
 
 #[cfg(test)]
@@ -770,36 +806,76 @@ mod tests {
         );
     }
 
-    /// ZEB-1030 final-review I4 regression: 17 legal single-status
-    /// groups in, at most `MAX_CATCHUP_RESPONDER_GROUPS` (16) survive.
+    /// ZEB-1030 final-review I4 / PR#778 round-1 regression: capping is
+    /// enforced DURING insertion, not by truncating the grouped result
+    /// afterward. 16 responder ids fill the cap; a 17th arriving after
+    /// that is dropped on sight (and counted); a LATE follow-up frame for
+    /// an already-admitted id (rid 0) still lands in its existing group,
+    /// proving the cap gates new groups, not frames for an existing one.
     #[test]
-    fn cap_catchup_groups_truncates_to_the_limit_zeb1030() {
+    fn group_frames_caps_at_insertion_time_zeb1030() {
         let status = CatchupStatus {
             epoch: 1,
             active: true,
         };
-        let groups: Vec<(CatchupStatus, Vec<CatchupFrame>)> = (0..17u16)
-            .map(|i| {
-                let mut rid = [0u8; 8];
-                rid[..2].copy_from_slice(&i.to_be_bytes());
-                (
-                    status,
-                    vec![CatchupFrame {
-                        version: CATCHUP_VERSION,
-                        responder_id: rid,
-                        body: CatchupBody::Status(status),
-                    }],
-                )
+        fn rid_for(i: u16) -> [u8; 8] {
+            let mut rid = [0u8; 8];
+            rid[..2].copy_from_slice(&i.to_be_bytes());
+            rid
+        }
+
+        // 16 distinct responder ids, each with its Status frame — fills
+        // the cap exactly.
+        let mut frames: Vec<CatchupFrame> = (0..16u16)
+            .map(|i| CatchupFrame {
+                version: CATCHUP_VERSION,
+                responder_id: rid_for(i),
+                body: CatchupBody::Status(status),
             })
             .collect();
-        assert_eq!(groups.len(), 17, "seeded 17 groups");
 
-        let capped = cap_catchup_groups(groups, MAX_CATCHUP_RESPONDER_GROUPS);
+        // The 17th distinct responder id arrives AFTER the cap is
+        // already full — its frame must be dropped at insertion time.
+        frames.push(CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: rid_for(16),
+            body: CatchupBody::Status(status),
+        });
+
+        // A follow-up frame for an ALREADY-admitted id (rid 0), arriving
+        // after the dropped 17th-group frame, must still land.
+        let followup_dk_rid0 = CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: rid_for(0),
+            body: CatchupBody::DkEvidence(vec![9, 9, 9]),
+        };
+        frames.push(followup_dk_rid0.clone());
+
+        let (groups, dropped) = group_frames(frames, MAX_CATCHUP_RESPONDER_GROUPS);
         assert_eq!(
-            capped.len(),
+            groups.len(),
             MAX_CATCHUP_RESPONDER_GROUPS,
-            "at most MAX_CATCHUP_RESPONDER_GROUPS groups are processed"
+            "at most MAX_CATCHUP_RESPONDER_GROUPS groups survive"
         );
+        assert_eq!(
+            dropped, 1,
+            "the 17th group's single Status frame was dropped"
+        );
+        assert!(
+            groups.iter().all(|(_, g)| g[0].responder_id != rid_for(16)),
+            "no group exists for the capped-out 17th responder id"
+        );
+        let rid0_group = &groups
+            .iter()
+            .find(|(_, g)| g[0].responder_id == rid_for(0))
+            .expect("rid 0's group survived")
+            .1;
+        assert_eq!(
+            rid0_group.len(),
+            2,
+            "rid 0's late follow-up frame still landed in its existing group"
+        );
+        assert_eq!(rid0_group[1], followup_dk_rid0);
     }
 
     #[test]
@@ -847,7 +923,8 @@ mod tests {
             frame_status_z1,
             frame_status_z2,
         ];
-        let groups = group_frames(frames);
+        let (groups, dropped) = group_frames(frames, MAX_CATCHUP_RESPONDER_GROUPS);
+        assert_eq!(dropped, 0, "well under the cap — nothing dropped");
         assert_eq!(groups.len(), 1, "only rid X's group survives");
         assert_eq!(groups[0].0, status);
         assert_eq!(groups[0].1, vec![frame_status_x, frame_dk_x]);

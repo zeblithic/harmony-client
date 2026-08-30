@@ -71,8 +71,21 @@ fn hlc_at(wall_ms: u64, device_id: &str) -> Hlc {
 
 /// Poll `predicate(log)` at 10ms intervals up to `secs`. Mirrors the
 /// transport test's `wait_for` (sleep-based waits are CI-fragile).
-async fn wait_for<F>(label: &str, log: &Arc<Mutex<DfrostLog>>, secs: u64, mut predicate: F)
-where
+///
+/// ZEB-1030 PR#778 round-1: `hint`, when given, is notified on every
+/// iteration — nudging a requester task parked in its hint-or-interval
+/// wait to retry its GET immediately rather than sleep out the full
+/// `DFROST_CATCHUP_INTERVAL` (300s, far past this helper's bounded
+/// deadline). Self-heals an early miss caused by queryable-discovery lag
+/// surviving past the fixed warm-up sleep, so the deadline below — not
+/// the warm-up sleep — is what determinism actually rests on.
+async fn wait_for<F>(
+    label: &str,
+    log: &Arc<Mutex<DfrostLog>>,
+    secs: u64,
+    hint: Option<&Arc<tokio::sync::Notify>>,
+    mut predicate: F,
+) where
     F: FnMut(&DfrostLog) -> bool,
 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
@@ -82,6 +95,9 @@ where
             if predicate(&guard) {
                 return;
             }
+        }
+        if let Some(h) = hint {
+            h.notify_one();
         }
         if std::time::Instant::now() >= deadline {
             panic!("wait_for({label}) timed out after {secs}s");
@@ -270,6 +286,7 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         "bob applies alice's dr rn=1 via zenoh",
         &bob_log,
         15,
+        None,
         |log| {
             log.committee_state
                 .pending_dkg
@@ -367,6 +384,7 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         "bob's dr rn=1 applies under the good epoch",
         &bob_log,
         15,
+        None,
         |log| {
             log.committee_state
                 .pending_dkg
@@ -564,6 +582,15 @@ async fn dfrost_catchup_round_crosses_real_zenoh_session_zeb1030() {
     // the pub/sub warm-up in the sibling test above, but there is no
     // equivalent "throwaway GET" to warm a queryable with, so this is a
     // plain bounded sleep rather than an observable loop.
+    //
+    // ZEB-1030 PR#778 round-1: this sleep is a best-effort head start, not
+    // the determinism backstop — on slow CI, discovery can still lag past
+    // it, and the joiner's requester task would otherwise wait out the
+    // full 300s `DFROST_CATCHUP_INTERVAL` before its next attempt (past
+    // the 25s `wait_for` deadline below). `wait_for`'s hint-nudge loop is
+    // what actually self-heals that: it wakes the requester every poll
+    // tick, so a late-discovered queryable still gets retried well within
+    // the deadline.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     // ── Fresh joiner's engine + adapter (requester) ─────────────────────
@@ -607,6 +634,11 @@ async fn dfrost_catchup_round_crosses_real_zenoh_session_zeb1030() {
             hint: c_engine.catchup_hint(),
         }
     };
+    // Kept separately from `c_hooks` (which is moved into the adapter
+    // below) so `wait_for` can nudge the joiner's requester task directly
+    // — same underlying `Arc<Notify>` as the hint the hooks/orchestrator
+    // hold.
+    let c_hint = c_engine.catchup_hint();
     let _adapter_c = spawn_dfrost_log_zenoh_adapter(
         Arc::clone(&session_c),
         community_id_hex,
@@ -619,10 +651,14 @@ async fn dfrost_catchup_round_crosses_real_zenoh_session_zeb1030() {
     );
 
     // ── The bytes MUST cross the real session: bounded poll, no sleep ──
+    // The hint nudge (via `c_hint`) drives retries if the joiner's first
+    // GET missed Alice's queryable due to discovery lag past the warm-up
+    // sleep above.
     wait_for(
         "joiner adopts alice's committee via a real zenoh catchup round",
         &c_log,
         25,
+        Some(&c_hint),
         |log| log.committee_state.active,
     )
     .await;

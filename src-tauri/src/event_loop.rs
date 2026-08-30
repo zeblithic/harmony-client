@@ -12122,7 +12122,11 @@ const DFROST_CATCHUP_FRAME_OVERHEAD: usize = 64;
 /// ZEB-1030: issue one catch-up round GET and drain RAW reply payloads —
 /// pattern-B: collect bytes only, never open/decode/ingest inside the zenoh
 /// reply arm (mirrors `rbsr_get_frames`, the channel-log's pattern-B drain).
-/// Charges each frame as `payload.len() + DFROST_CATCHUP_FRAME_OVERHEAD`
+/// A reply over `MAX_DFROST_CATCHUP_FRAME_BYTES` (the same per-frame cap
+/// `dfrost_catchup_open_frame` would reject it against later) is skipped
+/// BEFORE it is copied or charged against the round budget — one oversized
+/// reply must not burn the shared budget on bytes that could never open.
+/// Otherwise charges each frame as `payload.len() + DFROST_CATCHUP_FRAME_OVERHEAD`
 /// against `MAX_DFROST_CATCHUP_ROUND_BYTES`; over the cap, abandons the
 /// round (empty vec, warn-logged) rather than hold an unbounded allocation
 /// — the caller gives up on this round and waits for the next tick.
@@ -12155,6 +12159,27 @@ async fn dfrost_catchup_get_round(
             res = receiver.recv_async() => {
                 let Ok(reply) = res else { break; };
                 let Ok(sample) = reply.into_result() else { continue; };
+                // ZEB-1030 PR#778 round-1: check the raw reply length
+                // BEFORE copying it or charging it against the round
+                // budget. `dfrost_catchup_open_frame` would reject an
+                // over-cap payload later anyway (same
+                // `MAX_DFROST_CATCHUP_FRAME_BYTES` bound), but only after
+                // this function had already paid the allocation and,
+                // worse, spent part of the shared round-byte budget on a
+                // frame that could never open — one oversized reply could
+                // otherwise burn enough of `total_bytes` to abort the
+                // whole round (discarding every frame collected so far)
+                // over bytes that were never going anywhere.
+                let payload_len = sample.payload().len();
+                if payload_len > crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_FRAME_BYTES {
+                    tracing::warn!(
+                        %topic,
+                        payload_len,
+                        "dfrost catchup reply exceeds per-frame cap; skipping without charging \
+                         the round budget",
+                    );
+                    continue;
+                }
                 let payload = sample.payload().to_bytes().to_vec();
                 total_bytes = total_bytes.saturating_add(
                     payload.len().saturating_add(DFROST_CATCHUP_FRAME_OVERHEAD)

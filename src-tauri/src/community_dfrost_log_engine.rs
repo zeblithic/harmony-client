@@ -6,9 +6,9 @@
 //! `ensure_dfrost_engine_for` requests when it registers an engine.
 
 use crate::community_dfrost_catchup::{
-    beacon_watermark_of, cap_catchup_groups, group_frames, select_catchup, CatchupBody,
-    CatchupFrame, CatchupRequest, CatchupStatus, CATCHUP_VERSION, MAX_CATCHUP_BEACONS_PER_ROUND,
-    MAX_CATCHUP_RESPONDER_GROUPS, MAX_DFROST_CATCHUP_FRAME_BYTES,
+    beacon_watermark_of, group_frames, select_catchup, CatchupBody, CatchupFrame, CatchupRequest,
+    CatchupStatus, CATCHUP_VERSION, MAX_CATCHUP_BEACONS_PER_ROUND, MAX_CATCHUP_RESPONDER_GROUPS,
+    MAX_DFROST_CATCHUP_FRAME_BYTES,
 };
 use crate::community_dfrost_log::{
     check_envelope, dfrost_event_id, verify_signed_committee_event, ApplyError, DfrostLog,
@@ -3084,29 +3084,26 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// adopt an inbound catch-up frame set. See the Task 3 brief for the
     /// full straggler/joiner flow this implements verbatim.
     pub async fn catchup_ingest(&self, frames: Vec<CatchupFrame>) -> CatchupOutcome {
-        let groups = group_frames(frames);
-        if groups.is_empty() {
-            return CatchupOutcome::NothingUsable;
-        }
-
-        // ZEB-1030 final-review I4: `group_frames` is pure and applies no
-        // cap — a responder legally fitting well under
-        // `MAX_DFROST_CATCHUP_ROUND_BYTES` can still pack ~10^5
-        // single-status-single-`dk` groups into one reply. Every group
-        // processed below pays an `Ed25519::verify_strict` per
-        // non-status frame (`catchup_decode_and_verify`), and on the
+        // ZEB-1030 final-review I4 / PR#778 round-1: a responder legally
+        // fitting well under `MAX_DFROST_CATCHUP_ROUND_BYTES` can still
+        // pack ~10^5 single-status-single-`dk` groups into one reply.
+        // Every group processed below pays an `Ed25519::verify_strict`
+        // per non-status frame (`catchup_decode_and_verify`), and on the
         // joiner path a membership-resolver `snapshot_at` per `dk` event
-        // — so bound the groups actually processed here, not just the
-        // reply's byte size. Excess groups are simply dropped: a
-        // legitimate round never needs more than a handful.
-        let received_groups = groups.len();
-        let groups = cap_catchup_groups(groups, MAX_CATCHUP_RESPONDER_GROUPS);
-        if groups.len() < received_groups {
+        // — so `group_frames` itself enforces `MAX_CATCHUP_RESPONDER_GROUPS`
+        // DURING insertion (not just on the grouped result afterward),
+        // bounding the grouping scan's own cost too, not just what gets
+        // processed here.
+        let (groups, dropped_frames) = group_frames(frames, MAX_CATCHUP_RESPONDER_GROUPS);
+        if dropped_frames > 0 {
             tracing::warn!(
-                received_groups,
                 processed_groups = groups.len(),
+                dropped_frames,
                 "dfrost catchup ingest: too many responder groups in one round — dropping excess",
             );
+        }
+        if groups.is_empty() {
+            return CatchupOutcome::NothingUsable;
         }
 
         let mut verified_groups = Vec::with_capacity(groups.len());
