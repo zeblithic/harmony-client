@@ -631,12 +631,29 @@ async fn persist_dfrost_snapshot(
     // (Qodo; snapshot-then-write-outside-the-protocol-lock precedent).
     let persist_order = log.lock().await.persist_order.clone();
     let _order_guard = persist_order.lock().await;
-    let snapshot = {
+    // ZEB-1029: the share sidecar is captured under the SAME log lock as
+    // the main snapshot (the two files are mutually consistent on disk)
+    // and written under the SAME persist_order tenure (rename order holds
+    // for both). `None` means "nothing durable" — the writer then leaves
+    // any existing file ALONE: a session that failed to load the share
+    // must never delete a file a later boot could still validate. A crash
+    // between the two renames degrades safely (a share the restored
+    // consensus rejects falls back to RTS repair).
+    let share_path =
+        crate::community_dfrost_persist::dfrost_share_path_for(&target.identity_dir, &community_id);
+    let (snapshot, share_snapshot) = {
         let g = log.lock().await;
-        crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id)
+        (
+            crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id),
+            crate::community_dfrost_persist::share_snapshot_for_persist(&g, &community_id),
+        )
     };
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::community_dfrost_persist::write_snapshot(&cipher, &path, &snapshot)
+        crate::community_dfrost_persist::write_snapshot(&cipher, &path, &snapshot)?;
+        if let Some(share) = share_snapshot.as_ref() {
+            crate::community_dfrost_persist::write_share_snapshot(&cipher, &share_path, share)?;
+        }
+        Ok::<(), crate::community_state_persist::PersistError>(())
     })
     .await;
     match outcome {
@@ -6962,6 +6979,64 @@ mod tests {
         assert!(
             restored.committee_state.pending_dkg.is_none(),
             "restore clears the pending ceremony"
+        );
+    }
+
+    /// ZEB-1029: the persist funnel writes the sealed share sidecar
+    /// alongside `dfrost.cbor` when a signing share is installed on an
+    /// active committee — and NEVER deletes it when the share is absent
+    /// (a session that failed to load the share must not clobber a file
+    /// a later boot could still validate).
+    #[tokio::test]
+    async fn persist_funnel_writes_share_sidecar_never_deletes_zeb1029() {
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = crate::device_dataset_file::test_cipher();
+        let community_id = SpaceId([0x78; 16]);
+        let target = crate::community_dfrost_persist::DfrostPersistTarget {
+            identity_dir: dir.path().to_path_buf(),
+            cipher: cipher.clone(),
+        };
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        {
+            let mut g = log.lock().await;
+            g.committee_state.active = true;
+            g.committee_state.current_epoch = 4;
+            g.local_key_package = Some(dealer_key_package());
+        }
+
+        super::persist_dfrost_snapshot(&log, &target, community_id).await;
+        let share_path =
+            crate::community_dfrost_persist::dfrost_share_path_for(dir.path(), &community_id);
+        let (epoch, scalar) =
+            crate::community_dfrost_persist::load_share(&cipher, &share_path, &community_id)
+                .expect("share load ok")
+                .expect("share file written by the funnel");
+        assert_eq!(epoch, 4, "share bound to the committee epoch");
+        let expected = log
+            .lock()
+            .await
+            .local_key_package
+            .as_ref()
+            .unwrap()
+            .signing_share()
+            .serialize();
+        assert_eq!(&scalar[..], &expected[..], "sealed scalar matches");
+
+        // Share gone from memory (e.g. CR-2 stale-drop, or simply never
+        // loaded this session): the funnel leaves the file ALONE.
+        log.lock().await.local_key_package = None;
+        super::persist_dfrost_snapshot(&log, &target, community_id).await;
+        assert!(
+            share_path.exists(),
+            "share sidecar must survive a flush with no share in memory"
+        );
+        assert!(
+            crate::community_dfrost_persist::load_share(&cipher, &share_path, &community_id)
+                .expect("share still loads")
+                .is_some(),
+            "surviving share file still valid"
         );
     }
 }

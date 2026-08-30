@@ -9,7 +9,7 @@
 use frost_ristretto255::{
     keys::{
         dkg::{self, round1, round2},
-        KeyPackage, PublicKeyPackage, VerifyingShare,
+        KeyPackage, PublicKeyPackage, SigningShare, VerifyingShare,
     },
     rand_core, Identifier, VerifyingKey,
 };
@@ -347,6 +347,48 @@ pub fn pub_key_package_from_bytes(
         );
     }
     Ok(PublicKeyPackage::new(shares, vk, Some(threshold)))
+}
+
+/// ZEB-1029: derive the public verifying share `Y_i = G·x_i` from a stored
+/// 32-byte signing-share scalar. Rejects non-canonical encodings (a sealed
+/// share file that fails this is corrupt — FROST only ever emits canonical
+/// scalars). The compressed-Ristretto output is byte-compatible with
+/// `verifying_share_to_bytes` / `VerifyingShare::serialize`, so callers can
+/// compare it directly against `CommitteeState.verifying_shares` — the same
+/// consensus check `settle_repair_after_round3` runs on reconstructed shares.
+pub fn derive_verifying_share_bytes(signing_share_bytes: &[u8; 32]) -> Result<[u8; 32], String> {
+    let scalar: curve25519_dalek::scalar::Scalar = Option::from(
+        curve25519_dalek::scalar::Scalar::from_canonical_bytes(*signing_share_bytes),
+    )
+    .ok_or("stored signing share is not a canonical Ristretto scalar")?;
+    let point = curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT * scalar;
+    Ok(point.compress().to_bytes())
+}
+
+/// ZEB-1029: rebuild this node's `KeyPackage` from a restored signing-share
+/// scalar plus the committee's PUBLIC consensus bytes. The caller MUST have
+/// already proven `derive_verifying_share_bytes(share) == verifying_share_bytes`
+/// against the committee's consensus entry — this function only assembles.
+pub fn key_package_from_parts(
+    identifier: Identifier,
+    signing_share_bytes: &[u8; 32],
+    verifying_share_bytes: &[u8; 32],
+    joint_vk_bytes: &[u8; 32],
+    threshold: u16,
+) -> Result<KeyPackage, String> {
+    let signing_share = SigningShare::deserialize(signing_share_bytes)
+        .map_err(|e| format!("SigningShare::deserialize: {e}"))?;
+    let verifying_share = VerifyingShare::deserialize(verifying_share_bytes)
+        .map_err(|e| format!("VerifyingShare::deserialize: {e}"))?;
+    let verifying_key = VerifyingKey::deserialize(joint_vk_bytes)
+        .map_err(|e| format!("VerifyingKey::deserialize: {e}"))?;
+    Ok(KeyPackage::new(
+        identifier,
+        signing_share,
+        verifying_share,
+        verifying_key,
+        threshold,
+    ))
 }
 
 // ── ZEB-295 Phase 6: FROST→ElGamal primitive bridges ─────────────────────────

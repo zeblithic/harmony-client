@@ -149,16 +149,22 @@ pub struct DfrostLog {
     pub local_dkg_secret2: Option<dkg_r2::SecretPackage>,
 
     /// Local FROST `KeyPackage` (this node's signing share). Materialised
-    /// at DKG completion, refresh completion, or repair completion. NOT
-    /// persisted — ZEB-753 kept the signing share out of the
-    /// `dfrost.cbor` snapshot deliberately (identity-switch teardown
-    /// contract: local secret material dies with the process). A
-    /// restarted node knows the committee (restored public state: it
-    /// verifies beacons and binds oracles) but is VERIFICATION-ONLY for
-    /// signing until it recovers a share — ZEB-1027's RTS share repair
-    /// (`rp` events): the node requests repair, ≥ threshold helpers
-    /// respond, and `settle_repair_after_round3` reinstalls the share
-    /// without any secret ever touching disk.
+    /// at DKG completion, refresh completion, or repair completion.
+    ///
+    /// Persistence (ZEB-1029, revising ZEB-753's original exclusion):
+    /// the signing-share SCALAR is sealed at rest in the per-community
+    /// `dfrost_share.cbor` sidecar (device cipher, written by the same
+    /// persist funnel as `dfrost.cbor`) — Jake's 2026-08-29 product call
+    /// closing the full-committee-restart dead end, where repair (needs
+    /// ≥ t live share-holders) and refresh (needs every member's old
+    /// share) are both structurally unreachable. On restore the share is
+    /// installed only after `install_restored_share` re-derives `G·x`
+    /// and matches it against the committee's consensus verifying-share
+    /// entry; any mismatch falls back to ZEB-1027's RTS repair. The
+    /// in-memory identity-switch teardown contract is unchanged (the
+    /// `dfrost_logs` map is still cleared; the sidecar is per-identity-
+    /// dir and sealed under that identity's derived key), and every
+    /// OTHER secret on this struct remains never-persisted.
     pub local_key_package: Option<KeyPackage>,
 
     /// Local FROST `PublicKeyPackage` (joint verifying key + per-member
@@ -860,6 +866,88 @@ impl DfrostLog {
             beacon_index,
             ..Self::default()
         }
+    }
+
+    /// ZEB-1029: install a signing share restored from the sealed
+    /// `dfrost_share.cbor` sidecar into a freshly-restored log.
+    ///
+    /// The stored artifact is ONLY the 32-byte signing-share scalar plus
+    /// the epoch it was minted at — everything else is rebuilt from the
+    /// restored PUBLIC consensus state, which makes the install
+    /// self-authenticating: `G·x` is recomputed from the secret and must
+    /// equal the committee's consensus `verifying_shares[self]` entry
+    /// (the same check `settle_repair_after_round3` runs on
+    /// reconstructed shares). A share that missed a refresh (epoch or
+    /// consensus mismatch), belongs to a different member, or rotted on
+    /// disk fails closed — the caller discards the file and the node
+    /// proceeds shareless, exactly where ZEB-1027's RTS repair picks up.
+    ///
+    /// Errors never leave partial state: both `local_key_package` and
+    /// `local_pub_key_package` are written together at the end.
+    pub fn install_restored_share(
+        &mut self,
+        self_addr: &OwnerAddr,
+        stored_epoch: u64,
+        signing_share_bytes: &[u8; 32],
+    ) -> Result<(), String> {
+        if !self.committee_state.active {
+            return Err("committee is not active — a stored share has nothing to sign for".into());
+        }
+        if stored_epoch != self.committee_state.current_epoch {
+            return Err(format!(
+                "stored share epoch {} != committee epoch {} — the committee refreshed past \
+                 this share; RTS repair is the recovery path",
+                stored_epoch, self.committee_state.current_epoch
+            ));
+        }
+        let consensus = self
+            .committee_state
+            .verifying_shares
+            .get(self_addr)
+            .ok_or("self has no consensus verifying share — not a committee member")?;
+        let derived =
+            crate::community_dfrost_crypto::derive_verifying_share_bytes(signing_share_bytes)?;
+        if derived != *consensus {
+            return Err(
+                "stored share's derived verifying share does not match the committee's \
+                 consensus entry — stale (missed refresh), foreign, or corrupt"
+                    .to_string(),
+            );
+        }
+        let joint_vk = self
+            .committee_state
+            .joint_verifying_key
+            .as_ref()
+            .ok_or("no joint verifying key on an active committee")?;
+        let self_id = *self
+            .committee_state
+            .identifier_map
+            .get(self_addr)
+            .ok_or("self not in identifier_map")?;
+        let mut shares_by_id = BTreeMap::new();
+        for (addr, bytes) in &self.committee_state.verifying_shares {
+            let id = *self
+                .committee_state
+                .identifier_map
+                .get(addr)
+                .ok_or("verifying-share holder not in identifier_map")?;
+            shares_by_id.insert(id, *bytes);
+        }
+        let pub_pkg = crate::community_dfrost_crypto::pub_key_package_from_bytes(
+            &shares_by_id,
+            joint_vk,
+            self.committee_state.threshold,
+        )?;
+        let kp = crate::community_dfrost_crypto::key_package_from_parts(
+            self_id,
+            signing_share_bytes,
+            consensus,
+            joint_vk,
+            self.committee_state.threshold,
+        )?;
+        self.local_key_package = Some(kp);
+        self.local_pub_key_package = Some(pub_pkg);
+        Ok(())
     }
 
     /// ZEB-1022: apply a `di` (CeremonyInit) event — seed `pending_dkg`
@@ -5523,6 +5611,123 @@ mod tests {
         log.committee_state.identifier_map = CommitteeState::build_identifier_map(members);
         log.local_key_package = kp;
         log
+    }
+
+    /// ZEB-1029: this member's signing-share scalar bytes, as the sealed
+    /// sidecar stores them.
+    fn share_scalar_bytes(kp: &frost_ristretto255::keys::KeyPackage) -> [u8; 32] {
+        let v = kp.signing_share().serialize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&v);
+        out
+    }
+
+    /// ZEB-1029 happy path: a stored signing-share scalar from a real
+    /// DKG validates against the restored consensus (G·x check) and
+    /// reinstalls BOTH key packages on a restored-shape log.
+    #[test]
+    fn install_restored_share_happy_path_zeb1029() {
+        use crate::community_dfrost_crypto as dc;
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let share = share_scalar_bytes(key_packages.get(&ids[0]).unwrap());
+
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        log.install_restored_share(&alice, 1, &share)
+            .expect("install succeeds");
+        let installed = log.local_key_package.as_ref().expect("share installed");
+        assert_eq!(
+            dc::verifying_share_to_bytes(installed.verifying_share()),
+            *log.committee_state.verifying_shares.get(&alice).unwrap(),
+            "installed share's verifying share matches consensus"
+        );
+        let pkp = log
+            .local_pub_key_package
+            .as_ref()
+            .expect("pub key package rebuilt from public state");
+        assert_eq!(
+            dc::verifying_key_to_bytes(pkp.verifying_key()),
+            log.committee_state.joint_verifying_key.unwrap(),
+            "rebuilt pub package carries the joint vk"
+        );
+    }
+
+    /// ZEB-1029: a share minted at an older epoch (the committee
+    /// refreshed while this node was down) is refused before any
+    /// crypto — repair is the recovery, not a stale share.
+    #[test]
+    fn install_restored_share_rejects_epoch_mismatch_zeb1029() {
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let share = share_scalar_bytes(key_packages.get(&ids[0]).unwrap());
+
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        log.committee_state.current_epoch = 2; // committee moved on
+        let err = log
+            .install_restored_share(&alice, 1, &share)
+            .expect_err("stale epoch must be rejected");
+        assert!(
+            err.contains("epoch"),
+            "error names the epoch mismatch: {err}"
+        );
+        assert!(log.local_key_package.is_none(), "nothing installed");
+        assert!(log.local_pub_key_package.is_none());
+    }
+
+    /// ZEB-1029: a share whose derived `G·x` does not match this
+    /// member's consensus verifying share (foreign share, or the
+    /// verifying shares rotated under an unchanged epoch counter) is
+    /// refused — the settle_repair consensus check, applied at restore.
+    #[test]
+    fn install_restored_share_rejects_consensus_mismatch_zeb1029() {
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        // Bob's perfectly valid share is NOT alice's share.
+        let bob_share = share_scalar_bytes(key_packages.get(&ids[1]).unwrap());
+
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        let err = log
+            .install_restored_share(&alice, 1, &bob_share)
+            .expect_err("foreign share must be rejected");
+        assert!(
+            err.contains("consensus"),
+            "error names the consensus mismatch: {err}"
+        );
+        assert!(log.local_key_package.is_none(), "nothing installed");
+    }
+
+    /// ZEB-1029: no install on an inactive committee — a share with
+    /// nothing to sign for is refused (e.g. the committee snapshot was
+    /// quarantined and the log spawned fresh, but the share file
+    /// survived).
+    #[test]
+    fn install_restored_share_rejects_inactive_committee_zeb1029() {
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let share = share_scalar_bytes(key_packages.get(&ids[0]).unwrap());
+
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        log.committee_state.active = false;
+        assert!(log.install_restored_share(&alice, 1, &share).is_err());
+        assert!(log.local_key_package.is_none());
+    }
+
+    /// ZEB-1029: bit-rot that survives the AEAD (only reachable through
+    /// a bug, but the check is one line) — a non-canonical scalar is
+    /// rejected by the G·x derivation, never fed to FROST.
+    #[test]
+    fn install_restored_share_rejects_noncanonical_scalar_zeb1029() {
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        let err = log
+            .install_restored_share(&alice, 1, &[0xff; 32])
+            .expect_err("non-canonical scalar must be rejected");
+        assert!(
+            err.contains("canonical"),
+            "error names the canonicality failure: {err}"
+        );
+        assert!(log.local_key_package.is_none());
     }
 
     /// ZEB-1027 headline flow, real crypto end-to-end at the log layer:

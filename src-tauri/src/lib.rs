@@ -1397,14 +1397,19 @@ pub struct NodeState {
     /// serde-skipped secrets, beacon index) survives restarts via the
     /// sealed `dfrost.cbor` snapshot (`community_dfrost_persist`),
     /// restored by `ensure_dfrost_engine_for` and saved by the engine's
-    /// debounced task (flushed at registry shutdown). Everything ELSE is
-    /// in-memory only BY DESIGN: local DKG secrets/nonces and the four
+    /// debounced task (flushed at registry shutdown). ZEB-1029 adds ONE
+    /// deliberate secret to that durable subset: the signing-share
+    /// scalar, sealed in the `dfrost_share.cbor` sidecar and installed
+    /// on restore only after consensus validation
+    /// (`DfrostLog::install_restored_share`) — full-committee restart
+    /// otherwise has NO recovery path (repair needs ≥ t live
+    /// share-holders). Everything ELSE is in-memory only BY DESIGN:
+    /// local DKG transcript secrets/nonces and the four
     /// pending-ceremony slots die with the process (interactive rounds
-    /// are not restartable). ZEB-1027 closes the resulting signing gap
-    /// PROTOCOL-side: a restored member auto-requests RTS share repair
-    /// (`rp` events) and regains its signing share from ≥ threshold
-    /// helpers without any secret touching disk. Engine + Zenoh-adapter
-    /// teardown is owned by
+    /// are not restartable). ZEB-1027's RTS share repair (`rp` events)
+    /// remains the recovery for a share the sidecar cannot serve (stale
+    /// after a missed refresh, rejected, or the file is gone). Engine +
+    /// Zenoh-adapter teardown is owned by
     /// `dfrost_log_registry` shutdown in stop_inner / the start_node
     /// restart path, and BOTH clear this map right after the engines stop
     /// (PR #768 review) — retaining it would leak pending ceremonies and
@@ -59902,6 +59907,208 @@ mod zeb718_voting_reconcile_tests {
         );
     }
 
+    /// ZEB-1029 fixture: a dealer-generated 2-of-2 committee whose
+    /// second (bytewise-larger) member is `actor`. Returns the log
+    /// carrying the full public committee state AND actor's installed
+    /// KeyPackage, ready for both persist captures.
+    fn dealer_committee_log_for_actor(
+        actor: crate::owner_state_types::OwnerAddr,
+        other: crate::owner_state_types::OwnerAddr,
+        epoch: u64,
+    ) -> crate::community_dfrost_log::DfrostLog {
+        assert!(other.0 < actor.0, "fixture premise: actor sorts second");
+        let (shares, pkp) = frost_ristretto255::keys::generate_with_dealer(
+            2,
+            2,
+            frost_ristretto255::keys::IdentifierList::Default,
+            frost_ristretto255::rand_core::OsRng,
+        )
+        .expect("dealer keygen");
+        let id1 = crate::community_dfrost_crypto::identifier_for_index(0);
+        let id2 = crate::community_dfrost_crypto::identifier_for_index(1);
+        let actor_kp = frost_ristretto255::keys::KeyPackage::try_from(
+            shares.get(&id2).expect("share for id 2").clone(),
+        )
+        .expect("actor key package");
+
+        let mut log = crate::community_dfrost_log::DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = epoch;
+        log.committee_state.joint_verifying_key = Some(
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pkp.verifying_key()),
+        );
+        log.committee_state.members = vec![other, actor];
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+        for (addr, id) in [(other, id1), (actor, id2)] {
+            log.committee_state.verifying_shares.insert(
+                addr,
+                crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pkp.verifying_shares().get(&id).expect("verifying share"),
+                ),
+            );
+        }
+        log.local_key_package = Some(actor_kp);
+        log
+    }
+
+    /// ZEB-1029: `ensure_dfrost_engine_for` restores the sealed signing
+    /// share alongside the committee snapshot — the full-committee-
+    /// restart recovery this ticket exists for, exercised through the
+    /// production restore path.
+    #[tokio::test]
+    async fn ensure_dfrost_engine_restores_sealed_share_zeb1029() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
+        let cid = SpaceId([0x97; 16]);
+        let actor = OwnerAddr([0xcd; 16]);
+        let other = OwnerAddr([0x0d; 16]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+
+        // Persist both files, exactly as the engine's funnel writes them.
+        {
+            let log = dealer_committee_log_for_actor(actor, other, 3);
+            let cipher = crate::device_dataset_file::test_cipher();
+            crate::community_dfrost_persist::write_snapshot(
+                &cipher,
+                &crate::community_dfrost_persist::dfrost_path_for(dir.path(), &cid),
+                &crate::community_dfrost_persist::snapshot_for_persist(&log, &cid),
+            )
+            .unwrap();
+            crate::community_dfrost_persist::write_share_snapshot(
+                &cipher,
+                &crate::community_dfrost_persist::dfrost_share_path_for(dir.path(), &cid),
+                &crate::community_dfrost_persist::share_snapshot_for_persist(&log, &cid)
+                    .expect("share captured"),
+            )
+            .unwrap();
+        }
+
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let dfrost_registry: Arc<
+            crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>,
+        > = Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::new());
+        let dfrost_logs: DfrostLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        ensure_dfrost_engine_for(
+            &dfrost_logs,
+            &dfrost_registry,
+            cid,
+            None,
+            &signing_key,
+            actor,
+            crdt_state,
+            [0u8; 64],
+            None,
+            None,
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("ensure with persisted snapshot + share succeeds");
+
+        let log_arc = dfrost_logs
+            .lock()
+            .await
+            .get(&cid)
+            .cloned()
+            .expect("log inserted for community");
+        let g = log_arc.lock().await;
+        let kp = g
+            .local_key_package
+            .as_ref()
+            .expect("sealed signing share reinstalled on restore");
+        assert_eq!(
+            crate::community_dfrost_crypto::verifying_share_to_bytes(kp.verifying_share()),
+            *g.committee_state.verifying_shares.get(&actor).unwrap(),
+            "installed share matches the restored consensus"
+        );
+        assert!(
+            g.local_pub_key_package.is_some(),
+            "pub key package rebuilt from public state"
+        );
+    }
+
+    /// ZEB-1029: a sealed share the restored consensus rejects (here:
+    /// minted at an older epoch) is NOT installed — the node comes up
+    /// shareless (the RTS-repair posture) and the useless file is
+    /// removed.
+    #[tokio::test]
+    async fn ensure_dfrost_engine_rejects_stale_sealed_share_zeb1029() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
+        let cid = SpaceId([0x98; 16]);
+        let actor = OwnerAddr([0xcd; 16]);
+        let other = OwnerAddr([0x0d; 16]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+
+        let share_path = crate::community_dfrost_persist::dfrost_share_path_for(dir.path(), &cid);
+        {
+            let mut log = dealer_committee_log_for_actor(actor, other, 2);
+            let cipher = crate::device_dataset_file::test_cipher();
+            // Share captured at epoch 2 …
+            crate::community_dfrost_persist::write_share_snapshot(
+                &cipher,
+                &share_path,
+                &crate::community_dfrost_persist::share_snapshot_for_persist(&log, &cid)
+                    .expect("share captured"),
+            )
+            .unwrap();
+            // … but the committee snapshot says the epoch moved to 3
+            // (a refresh completed after the share flush).
+            log.committee_state.current_epoch = 3;
+            crate::community_dfrost_persist::write_snapshot(
+                &cipher,
+                &crate::community_dfrost_persist::dfrost_path_for(dir.path(), &cid),
+                &crate::community_dfrost_persist::snapshot_for_persist(&log, &cid),
+            )
+            .unwrap();
+        }
+
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let dfrost_registry: Arc<
+            crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>,
+        > = Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::new());
+        let dfrost_logs: DfrostLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        ensure_dfrost_engine_for(
+            &dfrost_logs,
+            &dfrost_registry,
+            cid,
+            None,
+            &signing_key,
+            actor,
+            crdt_state,
+            [0u8; 64],
+            None,
+            None,
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("ensure succeeds despite the stale share");
+
+        let log_arc = dfrost_logs
+            .lock()
+            .await
+            .get(&cid)
+            .cloned()
+            .expect("log inserted for community");
+        let g = log_arc.lock().await;
+        assert!(g.committee_state.active, "committee state restored fine");
+        assert_eq!(g.committee_state.current_epoch, 3);
+        assert!(
+            g.local_key_package.is_none(),
+            "stale share must NOT be installed"
+        );
+        assert!(
+            !share_path.exists(),
+            "rejected share file removed — it is provably useless"
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_replays_persisted_voting_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -60716,10 +60923,59 @@ async fn ensure_dfrost_engine_for(
                 &target.identity_dir,
                 &community_id,
             );
+            let share_path = crate::community_dfrost_persist::dfrost_share_path_for(
+                &target.identity_dir,
+                &community_id,
+            );
             let cipher = target.cipher.clone();
             let cid = community_id;
+            let self_owner = local_owner;
             match tokio::task::spawn_blocking(move || {
-                crate::community_dfrost_persist::load_dfrost(&cipher, &path, &cid)
+                let mut restored =
+                    crate::community_dfrost_persist::load_dfrost(&cipher, &path, &cid)?;
+                // ZEB-1029: try the sealed signing-share sidecar. Every
+                // failure below leaves the node shareless — exactly the
+                // pre-1029 posture, with RTS repair as the recovery — so
+                // none of them may fail the committee-state restore.
+                match crate::community_dfrost_persist::load_share(&cipher, &share_path, &cid) {
+                    Ok(Some((epoch, share))) => {
+                        match restored.install_restored_share(&self_owner, epoch, &share) {
+                            Ok(()) => tracing::info!(
+                                ?cid,
+                                epoch,
+                                "dfrost restore: sealed signing share validated against \
+                                 committee consensus and reinstalled (ZEB-1029)"
+                            ),
+                            Err(e) => {
+                                // Stale (missed refresh), foreign, or corrupt:
+                                // provably useless, delete so it is not
+                                // re-judged forever. Repair re-mints the share
+                                // AND rewrites the file on its next persist.
+                                tracing::warn!(
+                                    ?cid,
+                                    err = %e,
+                                    "dfrost restore: persisted signing share rejected; \
+                                     removing it and falling back to RTS repair"
+                                );
+                                crate::community_dfrost_persist::remove_share_file(&share_path);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Present-but-unreadable (I/O) or misrouted (id
+                        // mismatch): leave the file in place — the writer
+                        // never deletes, and only overwrites once a share is
+                        // legitimately re-installed.
+                        tracing::warn!(
+                            ?cid,
+                            err = %e,
+                            "dfrost restore: signing-share sidecar unreadable; \
+                             continuing shareless (RTS repair is the recovery)"
+                        );
+                    }
+                }
+                Ok::<_, crate::community_state_persist::PersistError>(restored)
             })
             .await
             {
@@ -64602,8 +64858,10 @@ pub async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime, H: tauri::Runti
         // failure here doesn't leave the share material un-stashed
         // (it'd require re-running the entire DKG to recover).
         //
-        // R4 doc-comment guarantee: never persisted to disk (see
-        // DfrostLog::local_key_package field doc). The PublicKeyPackage
+        // Durability: the signing-share scalar reaches the sealed
+        // `dfrost_share.cbor` sidecar on the next persist flush
+        // (ZEB-1029; see DfrostLog::local_key_package field doc — the
+        // dk apply below fires the dirty signal). The PublicKeyPackage
         // half is duplicated into CommitteeState.verifying_shares +
         // joint_verifying_key by apply_dkg_complete once quorum lands,
         // so non-committee replicas don't need this stash.
