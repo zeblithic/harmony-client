@@ -9,7 +9,9 @@ use crate::community_dfrost_catchup::{
     beacon_watermark_of, group_frames, select_catchup, CatchupBody, CatchupFrame, CatchupRequest,
     CatchupStatus, CATCHUP_VERSION, MAX_CATCHUP_BEACONS_PER_ROUND, MAX_DFROST_CATCHUP_FRAME_BYTES,
 };
-use crate::community_dfrost_log::{verify_signed_committee_event, ApplyError, DfrostLog};
+use crate::community_dfrost_log::{
+    check_envelope, dfrost_event_id, verify_signed_committee_event, ApplyError, DfrostLog,
+};
 use crate::community_dfrost_types::{
     derive_dkg_ceremony_id, derive_refresh_ceremony_id, derive_repair_ceremony_id,
     CeremonyInitPayload, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, RefreshRoundPayload,
@@ -2849,6 +2851,14 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         self.receive_handle.is_finished()
     }
 
+    /// Test-only helper: observe whether the replay tracker has recorded
+    /// `event`. ZEB-1030 review round 1 (I1) regression pin — an event
+    /// that never landed in the log must never advance the tracker.
+    #[cfg(test)]
+    pub(crate) async fn tracker_contains_for_test(&self, event: &SignedCommitteeEvent) -> bool {
+        self.tracker.lock().await.contains(event)
+    }
+
     /// Publish a locally-signed event onto the Zenoh-bridged publisher
     /// channel. Records the event in the dedup tracker BEFORE sending,
     /// so the inevitable loopback (Zenoh adapter subscribes to its own
@@ -2990,6 +3000,23 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                     continue;
                 }
             };
+            // ZEB-1030 review round 1 (I3): the same envelope shape gate
+            // every live apply goes through (`check_envelope` —
+            // `tag == 'd' && committee_tier == 0`). Without this, a
+            // structurally-wrong-envelope event could pass the kind +
+            // signature checks below and still get adopted into
+            // committee state, only for `insert_applied`'s own policy
+            // verify to reject it on retention — silently breaking the
+            // transitive-healing property (an adopter that can't retain
+            // what it adopted can't re-serve it to the next straggler).
+            if let Err(e) = check_envelope(&event) {
+                tracing::warn!(
+                    frame = bucket,
+                    error = ?e,
+                    "dfrost catchup ingest: event envelope shape invalid — dropped",
+                );
+                continue;
+            }
             if event.kind != want_kind {
                 tracing::warn!(
                     frame = bucket,
@@ -3052,6 +3079,42 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         }
     }
 
+    /// `adopt_beacons` is per-event: a garbage Schnorr sig, a
+    /// wrong-epoch vk, or a bad `vrf_output` binding skips that ONE
+    /// event without inserting it into the log — it does not fail the
+    /// whole call. ZEB-1030 review round 1 (I1): recording an event in
+    /// the replay tracker that never actually landed is a self-wedge —
+    /// `DfrostReplayTracker::contains` drops anything at-or-below the
+    /// recorded HLC for that `(actor, device_id)`, so a bogus high-HLC
+    /// beacon (e.g. a malicious/corrupted `wall_ms = u64::MAX`) would
+    /// permanently block every future legitimate event from that
+    /// signer. So: adopt first, then record only the subset that
+    /// `log.contains_event` confirms actually landed — mirrors
+    /// `process_inbound`'s "record AFTER apply" invariant, just applied
+    /// per-event instead of per-call.
+    async fn catchup_adopt_and_record_beacons(&self, beacons: &[SignedCommitteeEvent]) -> usize {
+        if beacons.is_empty() {
+            return 0;
+        }
+        let (adopted, landed) = {
+            let mut log = self.dfrost_log.lock().await;
+            let adopted = log.adopt_beacons(beacons);
+            let landed: Vec<SignedCommitteeEvent> = beacons
+                .iter()
+                .filter(|ev| log.contains_event(&dfrost_event_id(ev)))
+                .cloned()
+                .collect();
+            (adopted, landed)
+        };
+        if !landed.is_empty() {
+            let mut t = self.tracker.lock().await;
+            for ev in &landed {
+                t.record(ev);
+            }
+        }
+        adopted
+    }
+
     /// Straggler half of `catchup_ingest`: this node already holds an
     /// active committee at `local_epoch` and is looking for a newer
     /// epoch's evidence quorum, falling back to beacons-only adoption
@@ -3077,22 +3140,17 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             };
             match result {
                 Ok(epoch) => {
+                    // `adopt_refresh_quorum` is atomic (all-or-nothing on
+                    // `Ok`) and inserts every supplied event — safe to
+                    // record the whole batch unconditionally, unlike
+                    // beacons below.
                     {
                         let mut t = self.tracker.lock().await;
                         for ev in &g.dk_events {
                             t.record(ev);
                         }
                     }
-                    let beacons_adopted = {
-                        let mut log = self.dfrost_log.lock().await;
-                        log.adopt_beacons(&g.beacons)
-                    };
-                    if !g.beacons.is_empty() {
-                        let mut t = self.tracker.lock().await;
-                        for ev in &g.beacons {
-                            t.record(ev);
-                        }
-                    }
+                    let beacons_adopted = self.catchup_adopt_and_record_beacons(&g.beacons).await;
                     return CatchupOutcome::AdoptedRefresh {
                         epoch,
                         beacons: beacons_adopted,
@@ -3114,17 +3172,8 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             .iter()
             .flat_map(|g| g.beacons.iter().cloned())
             .collect();
-        let beacons_adopted = if all_beacons.is_empty() {
-            0
-        } else {
-            let mut log = self.dfrost_log.lock().await;
-            log.adopt_beacons(&all_beacons)
-        };
+        let beacons_adopted = self.catchup_adopt_and_record_beacons(&all_beacons).await;
         if beacons_adopted > 0 {
-            let mut t = self.tracker.lock().await;
-            for ev in &all_beacons {
-                t.record(ev);
-            }
             return CatchupOutcome::BeaconsOnly(beacons_adopted);
         }
         if verified_groups
@@ -3137,19 +3186,100 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         }
     }
 
+    /// Membership gate (spec §5.3) for ONE candidate joiner group: every
+    /// claimed member of every `dk` event's payload must resolve at
+    /// that event's OWN envelope HLC (`dk` carries no payload mint
+    /// stamp — mirrors the `di` gate at lines 877-908). `None` resolver
+    /// ⇒ skip (test engines). Returns `false` (warn already logged) on
+    /// any failure — the caller tries the next-best group rather than
+    /// aborting the whole ingest (ZEB-1030 review round 1 M7: a single
+    /// group failing this gate must not deny catch-up when another
+    /// agreeing group would pass it).
+    async fn catchup_joiner_membership_gate_ok(&self, group: &VerifiedCatchupGroup) -> bool {
+        let Some(resolver) = self.orchestrator.membership_resolver.as_ref() else {
+            return true;
+        };
+        for ev in &group.dk_events {
+            let payload: DkgCompletePayload = match ciborium::de::from_reader(&ev.payload[..]) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "dfrost catchup ingest: joiner membership gate — payload decode failed",
+                    );
+                    return false;
+                }
+            };
+            let snapshot = match resolver.snapshot_at(self.community_id, &ev.hlc).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "dfrost catchup ingest: joiner membership snapshot unavailable — dropped",
+                    );
+                    return false;
+                }
+            };
+            if !snapshot.members.contains_key(&ev.actor) {
+                tracing::warn!(
+                    actor = ?ev.actor,
+                    "dfrost catchup ingest: joiner dk actor is not a member at its own HLC — dropped",
+                );
+                return false;
+            }
+            if let Some(non_member) = payload
+                .members
+                .iter()
+                .find(|m| !snapshot.members.contains_key(m))
+            {
+                tracing::warn!(
+                    non_member = ?non_member,
+                    "dfrost catchup ingest: joiner dk names a non-member in the committee — dropped",
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     /// Joiner half of `catchup_ingest`: this node has no active
     /// committee state. Requires every dk-bearing responder group to
-    /// agree on the joint verifying key, then adopts the highest-epoch
-    /// such group after the membership gate.
+    /// agree on the joint verifying key, then tries agreeing groups in
+    /// DESCENDING `status.epoch` order (mirrors the straggler path)
+    /// until one clears the membership gate and `adopt_initial_quorum`.
     async fn catchup_ingest_joiner(
         &self,
         verified_groups: Vec<VerifiedCatchupGroup>,
     ) -> CatchupOutcome {
+        // ZEB-1030 review round 1 (M6): `adopt_initial_quorum` rejects
+        // unconditionally when the committee is already active or a DKG
+        // ceremony is already pending — a verdict that doesn't depend on
+        // which responder group we'd pick. Check it once, up front,
+        // instead of paying N membership-resolver round-trips (one per
+        // dk event, per candidate group) for a result that's already
+        // determined. Purely an optimization: the authoritative check
+        // still lives inside `adopt_initial_quorum`, and a state flip
+        // between this snapshot and the final adopt call just surfaces
+        // as an `Err` there, handled below like any other rejection.
+        {
+            let log = self.dfrost_log.lock().await;
+            if log.committee_state.active || log.committee_state.pending_dkg.is_some() {
+                return CatchupOutcome::NothingUsable;
+            }
+        }
+
         let mut vk_groups: Vec<(&VerifiedCatchupGroup, [u8; 32])> = Vec::new();
         for g in &verified_groups {
             let Some(first_dk) = g.dk_events.first() else {
                 continue;
             };
+            // Excluding a group whose FIRST dk payload doesn't decode is
+            // safe for vk-agreement purposes: a real dissenting vk still
+            // registers via every OTHER (decodable) group, so
+            // `distinct_vks` still catches genuine disagreement; an
+            // undecodable payload could never pass `adopt_initial_quorum`
+            // either, so dropping the group here costs nothing it could
+            // have won later.
             let payload: DkgCompletePayload = match ciborium::de::from_reader(&first_dk.payload[..])
             {
                 Ok(p) => p,
@@ -3174,90 +3304,53 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             return CatchupOutcome::Disagreement;
         }
 
-        let (chosen, _vk) = vk_groups
-            .into_iter()
-            .max_by_key(|(g, _)| g.status.epoch)
-            .expect("vk_groups non-empty (checked above)");
+        // All agreeing groups are candidates now (ZEB-1030 review round
+        // 1 M7 / Ruling 8): `status.epoch` is responder-controlled, so a
+        // single group claiming an inflated epoch must not be able to
+        // permanently deny catch-up if ITS dk evidence turns out
+        // sub-threshold or otherwise invalid — descending order tries
+        // the most-current-looking evidence first, same as the
+        // straggler path.
+        let mut candidates: Vec<&VerifiedCatchupGroup> =
+            vk_groups.into_iter().map(|(g, _)| g).collect();
+        candidates.sort_by(|a, b| b.status.epoch.cmp(&a.status.epoch));
 
-        // Membership gate (spec §5.3): every claimed member of every dk
-        // event's payload must resolve at that event's OWN envelope HLC
-        // (`dk` carries no payload mint stamp — mirrors the `di` gate at
-        // lines 877-908). `None` resolver ⇒ skip (test engines).
-        if let Some(resolver) = self.orchestrator.membership_resolver.as_ref() {
-            for ev in &chosen.dk_events {
-                let payload: DkgCompletePayload = match ciborium::de::from_reader(&ev.payload[..]) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "dfrost catchup ingest: joiner membership gate — payload decode failed",
-                        );
-                        return CatchupOutcome::NothingUsable;
+        for chosen in candidates {
+            if !self.catchup_joiner_membership_gate_ok(chosen).await {
+                continue;
+            }
+
+            let result = {
+                let mut log = self.dfrost_log.lock().await;
+                log.adopt_initial_quorum(&chosen.dk_events)
+            };
+            match result {
+                Ok(epoch) => {
+                    // Atomic on `Ok`, same reasoning as the straggler's
+                    // dk recording above.
+                    {
+                        let mut t = self.tracker.lock().await;
+                        for ev in &chosen.dk_events {
+                            t.record(ev);
+                        }
                     }
-                };
-                let snapshot = match resolver.snapshot_at(self.community_id, &ev.hlc).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = ?e,
-                            "dfrost catchup ingest: joiner membership snapshot unavailable — dropped",
-                        );
-                        return CatchupOutcome::NothingUsable;
-                    }
-                };
-                if !snapshot.members.contains_key(&ev.actor) {
-                    tracing::warn!(
-                        actor = ?ev.actor,
-                        "dfrost catchup ingest: joiner dk actor is not a member at its own HLC — dropped",
-                    );
-                    return CatchupOutcome::NothingUsable;
+                    let beacons_adopted =
+                        self.catchup_adopt_and_record_beacons(&chosen.beacons).await;
+                    return CatchupOutcome::AdoptedInitial {
+                        epoch,
+                        beacons: beacons_adopted,
+                    };
                 }
-                if let Some(non_member) = payload
-                    .members
-                    .iter()
-                    .find(|m| !snapshot.members.contains_key(m))
-                {
+                Err(e) => {
                     tracing::warn!(
-                        non_member = ?non_member,
-                        "dfrost catchup ingest: joiner dk names a non-member in the committee — dropped",
+                        epoch = chosen.status.epoch,
+                        reason = %e,
+                        "dfrost catchup ingest: joiner group failed to adopt — trying next group",
                     );
-                    return CatchupOutcome::NothingUsable;
                 }
             }
         }
-
-        let result = {
-            let mut log = self.dfrost_log.lock().await;
-            log.adopt_initial_quorum(&chosen.dk_events)
-        };
-        match result {
-            Ok(epoch) => {
-                {
-                    let mut t = self.tracker.lock().await;
-                    for ev in &chosen.dk_events {
-                        t.record(ev);
-                    }
-                }
-                let beacons_adopted = {
-                    let mut log = self.dfrost_log.lock().await;
-                    log.adopt_beacons(&chosen.beacons)
-                };
-                if !chosen.beacons.is_empty() {
-                    let mut t = self.tracker.lock().await;
-                    for ev in &chosen.beacons {
-                        t.record(ev);
-                    }
-                }
-                CatchupOutcome::AdoptedInitial {
-                    epoch,
-                    beacons: beacons_adopted,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(reason = %e, "dfrost catchup ingest: joiner adoption failed");
-                CatchupOutcome::NothingUsable
-            }
-        }
+        CatchupOutcome::NothingUsable
     }
 }
 
@@ -8146,5 +8239,350 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(200), hint.notified())
             .await
             .expect("InvariantViolation+ThresholdSign after the interval must fire");
+    }
+
+    // ── ZEB-1030 Task 3 review round 1 fixes ────────────────────────────
+
+    /// I1 regression pin: a `vb` event that envelope-verifies but fails
+    /// `adopt_beacons`'s internal Schnorr check must NOT advance the
+    /// replay tracker. `hlc.wall_ms = u64::MAX` makes the failure mode
+    /// concrete — if this were (wrongly) recorded, it would permanently
+    /// block every future legitimate event from this actor+device.
+    #[tokio::test]
+    async fn catchup_ingest_beacon_adoption_failure_does_not_record_tracker_zeb1030() {
+        use crate::community_dfrost_log::build_signed_dfrost_event;
+        use crate::community_dfrost_types::VrfBeaconPayload;
+
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x61);
+
+        // A: active committee at epoch 1 holding one garbage-signature
+        // `vb` event from alice. `select_catchup` never crypto-verifies
+        // beacons (pure selection) — the garbage inner signature is only
+        // caught by `adopt_beacons` on the requester side.
+        let garbage_payload = VrfBeaconPayload {
+            ceremony_id: [0x01; 32],
+            message_hash: [0x02; 32],
+            signature: vec![0u8; 64],
+            vrf_output: [0x03; 32],
+        };
+        let garbage_beacon = build_signed_dfrost_event(
+            &alice_sk,
+            alice_addr,
+            DfrostEventKind::VrfBeacon,
+            &garbage_payload,
+            Hlc {
+                wall_ms: u64::MAX,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        )
+        .expect("build garbage vb");
+
+        let mut a_log = crate::community_dfrost_log::DfrostLog::new();
+        a_log.committee_state.active = true;
+        a_log.committee_state.current_epoch = 1;
+        a_log.insert_event_for_test(garbage_beacon.clone());
+        let a_log = Arc::new(tokio::sync::Mutex::new(a_log));
+
+        let mut a_resolver_map = HashMap::new();
+        a_resolver_map.insert(alice_addr, alice_pub64);
+        let a_resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(a_resolver_map));
+        let (a_pub_tx, _a_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_a_sub_tx, a_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let a = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0x61; 16]),
+            dfrost_log: a_log,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            app_handle: None,
+            self_addr: alice_addr,
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: a_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        // B: active at the SAME epoch — no dk candidates, so ingest goes
+        // straight to the beacons-only fallthrough.
+        let mut b_log = crate::community_dfrost_log::DfrostLog::new();
+        b_log.committee_state.active = true;
+        b_log.committee_state.current_epoch = 1;
+        b_log.committee_state.joint_verifying_key = Some([0x77; 32]);
+        let b_log = Arc::new(tokio::sync::Mutex::new(b_log));
+
+        let mut b_resolver_map = HashMap::new();
+        b_resolver_map.insert(alice_addr, alice_pub64);
+        let b_resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(b_resolver_map));
+        let (b_pub_tx, _b_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_b_sub_tx, b_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let b = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0x62; 16]),
+            dfrost_log: b_log.clone(),
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: b_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let req = b.catchup_build_request().await;
+        let frames = a.catchup_respond(req).await.expect("A serves its beacon");
+        let outcome = b.catchup_ingest(frames).await;
+        assert_eq!(
+            outcome,
+            CatchupOutcome::UpToDate,
+            "same-epoch group with a beacon that fails to adopt reports UpToDate, not an adoption"
+        );
+
+        assert!(
+            !b.tracker_contains_for_test(&garbage_beacon).await,
+            "an unadopted beacon must not advance the replay tracker — recording it would \
+             permanently wedge every future event from this actor+device behind hlc::MAX",
+        );
+    }
+
+    /// I2 positive: every claimed committee member (including one whose
+    /// `dk` event isn't itself in the quorum, e.g. carol) resolves in
+    /// the membership snapshot at its own HLC → joiner adopts.
+    #[tokio::test]
+    async fn catchup_ingest_joiner_membership_gate_accepts_known_members_zeb1030() {
+        use crate::community_voting_log::MembershipSnapshotResolver;
+
+        let fixture = build_dk_quorum_fixture(1, 0xA1, 0xBC).await;
+
+        let membership: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(StaticMembership(fixture.members.clone()));
+
+        let mut c_resolver_map = HashMap::new();
+        c_resolver_map.insert(fixture.alice_addr, fixture.alice_pub64);
+        c_resolver_map.insert(fixture.bob_addr, fixture.bob_pub64);
+        let c_resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(c_resolver_map));
+        let c_log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let (c_pub_tx, _c_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_c_sub_tx, c_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let c = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0xA2; 16]),
+            dfrost_log: c_log.clone(),
+            publisher_tx: c_pub_tx,
+            subscriber_rx: c_sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: c_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(membership),
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let req = c.catchup_build_request().await;
+        let frames = fixture.engine.catchup_respond(req).await.expect("A serves");
+        let outcome = c.catchup_ingest(frames).await;
+        assert!(
+            matches!(outcome, CatchupOutcome::AdoptedInitial { epoch: 1, .. }),
+            "expected AdoptedInitial when every claimed member resolves, got {outcome:?}"
+        );
+    }
+
+    /// I2 negative: the community's membership snapshot omits carol, who
+    /// IS named in the dk payload's `members` list — the whole group
+    /// must be dropped, and the joiner's state must stay untouched.
+    #[tokio::test]
+    async fn catchup_ingest_joiner_membership_gate_rejects_unknown_member_zeb1030() {
+        use crate::community_voting_log::MembershipSnapshotResolver;
+
+        let fixture = build_dk_quorum_fixture(1, 0xA5, 0xBD).await;
+
+        let known_members: Vec<OwnerAddr> = fixture
+            .members
+            .iter()
+            .copied()
+            .filter(|m| *m != fixture.carol_addr)
+            .collect();
+        let membership: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(StaticMembership(known_members));
+
+        let mut d_resolver_map = HashMap::new();
+        d_resolver_map.insert(fixture.alice_addr, fixture.alice_pub64);
+        d_resolver_map.insert(fixture.bob_addr, fixture.bob_pub64);
+        let d_resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(d_resolver_map));
+        let d_log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let (d_pub_tx, _d_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_d_sub_tx, d_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let d = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0xA6; 16]),
+            dfrost_log: d_log.clone(),
+            publisher_tx: d_pub_tx,
+            subscriber_rx: d_sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: d_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(membership),
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let req = d.catchup_build_request().await;
+        let frames = fixture.engine.catchup_respond(req).await.expect("A serves");
+        let outcome = d.catchup_ingest(frames).await;
+        assert_eq!(
+            outcome,
+            CatchupOutcome::NothingUsable,
+            "a payload naming a non-member must drop the whole group"
+        );
+        let d_guard = d_log.lock().await;
+        assert!(!d_guard.committee_state.active, "D must remain inactive");
+        assert_eq!(
+            d_guard.event_count(),
+            0,
+            "D must not retain any event from a dropped group"
+        );
+    }
+
+    /// M7/Ruling 8: a responder claiming an inflated `status.epoch` with
+    /// an agreeing joint vk but sub-threshold `dk` evidence must not be
+    /// able to deny catch-up outright — the joiner falls back to the
+    /// next-best agreeing group (descending epoch order, mirroring the
+    /// straggler path) instead of stopping at the first (highest-epoch)
+    /// candidate.
+    #[tokio::test]
+    async fn catchup_ingest_joiner_falls_back_to_next_agreeing_group_zeb1030() {
+        use crate::community_dfrost_catchup::{
+            CatchupBody, CatchupFrame, CatchupStatus, CATCHUP_VERSION,
+        };
+        use crate::community_dfrost_log::build_signed_dfrost_event;
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        // Honest group: A holds a real 2-of-3 quorum at epoch 1.
+        let fixture_h = build_dk_quorum_fixture(1, 0x91, 0xAB).await;
+
+        // Attacker group: claims an inflated epoch (99) with the SAME
+        // joint vk (so vk-agreement holds, ruling out Disagreement) but
+        // only ONE signed dk event — sub-threshold for a threshold-2
+        // committee, so `adopt_initial_quorum` must reject it.
+        // Hand-built (not via the shared fixture, which always mints a
+        // full quorum) with a fixed responder_id distinct from
+        // fixture_h's randomly-chosen one, so `group_frames` keeps them
+        // as two separate groups.
+        let (eve_sk, eve_addr, eve_pub64) = fixture_identity(0x95);
+        let mut attacker_members = vec![eve_addr, OwnerAddr([0xEE; 16]), OwnerAddr([0xEF; 16])];
+        attacker_members.sort();
+        let attacker_payload = DkgCompletePayload {
+            ceremony_id: [0xAAu8; 32],
+            joint_verifying_key: fixture_h.joint_vk,
+            verifying_shares: attacker_members
+                .iter()
+                .enumerate()
+                .map(|(i, m)| MemberVerifyingShare {
+                    member: *m,
+                    verifying_share: [0x60 + i as u8; 32],
+                })
+                .collect(),
+            epoch: 99,
+            members: attacker_members.clone(),
+            threshold: 2,
+            max_signers: 3,
+        };
+        let attacker_dk = build_signed_dfrost_event(
+            &eve_sk,
+            eve_addr,
+            DfrostEventKind::DkgComplete,
+            &attacker_payload,
+            Hlc {
+                wall_ms: 9000,
+                logical: 0,
+                device_id: "eve-dev".into(),
+            },
+        )
+        .expect("build attacker dk");
+        let mut attacker_dk_bytes = Vec::new();
+        ciborium::ser::into_writer(&attacker_dk, &mut attacker_dk_bytes).unwrap();
+        let attacker_frames = vec![
+            CatchupFrame {
+                version: CATCHUP_VERSION,
+                responder_id: [0x77u8; 8],
+                body: CatchupBody::Status(CatchupStatus {
+                    epoch: 99,
+                    active: true,
+                }),
+            },
+            CatchupFrame {
+                version: CATCHUP_VERSION,
+                responder_id: [0x77u8; 8],
+                body: CatchupBody::DkEvidence(attacker_dk_bytes),
+            },
+        ];
+
+        let mut d_resolver_map = HashMap::new();
+        d_resolver_map.insert(fixture_h.alice_addr, fixture_h.alice_pub64);
+        d_resolver_map.insert(fixture_h.bob_addr, fixture_h.bob_pub64);
+        d_resolver_map.insert(eve_addr, eve_pub64);
+        let d_resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(d_resolver_map));
+        let d_log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let (d_pub_tx, _d_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_d_sub_tx, d_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let d = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0x9D; 16]),
+            dfrost_log: d_log.clone(),
+            publisher_tx: d_pub_tx,
+            subscriber_rx: d_sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: d_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let req = d.catchup_build_request().await;
+        let mut frames = fixture_h
+            .engine
+            .catchup_respond(req)
+            .await
+            .expect("honest group serves");
+        frames.extend(attacker_frames);
+
+        let outcome = d.catchup_ingest(frames).await;
+        assert!(
+            matches!(outcome, CatchupOutcome::AdoptedInitial { epoch: 1, .. }),
+            "expected fallback adoption of the honest epoch-1 group, got {outcome:?}"
+        );
+        let d_guard = d_log.lock().await;
+        assert_eq!(
+            d_guard.committee_state.joint_verifying_key,
+            Some(fixture_h.joint_vk)
+        );
     }
 }
