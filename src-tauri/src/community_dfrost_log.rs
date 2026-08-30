@@ -7644,7 +7644,11 @@ mod tests {
             members: members.clone(),
             threshold: 2,
             max_signers: 3,
-            space_id: None,
+            // ZEB-1034 (PR#780 round-1): keep the base payload BOUND to
+            // the expected community — with `None` every matrix case
+            // would fail on the binding gate before reaching the
+            // malformed shape it exists to test.
+            space_id: Some(zeb1034_space()),
         };
 
         let mut cases: Vec<(&str, Vec<SignedCommitteeEvent>)> = Vec::new();
@@ -7744,6 +7748,15 @@ mod tests {
             let mut log = DfrostLog::new();
             let result = log.adopt_initial_quorum(events, &zeb1034_space());
             assert!(result.is_err(), "case {name} should reject: {result:?}");
+            // ZEB-1034 (PR#780 round-1): each case must fail on ITS OWN
+            // defect — a binding-gate error here means the base fixture
+            // regressed to unbound and the matrix stopped testing what
+            // it exists to test.
+            let err = result.unwrap_err();
+            assert!(
+                !err.contains("community binding") && !err.contains("different community"),
+                "case {name} must fail on its own defect, not the ZEB-1034 binding gate: {err}"
+            );
             assert!(!log.committee_state.active, "case {name}: stays inactive");
             assert_eq!(log.event_count(), 0, "case {name}: no partial insert");
         }

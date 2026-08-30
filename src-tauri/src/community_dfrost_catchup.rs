@@ -361,10 +361,32 @@ pub fn select_catchup(
         .beacon_watermark
         .as_ref()
         .map(|w| (w.wall_ms, w.logical, w.device_id.clone()));
-    let mut beacons = Vec::new();
-    for beacon in admitted {
-        if beacons.len() >= max_beacons {
+    // PR#780 round-1 (CodeAnt): tied members are the healing payload, so
+    // they claim cap budget FIRST — a single interleaved pass could spend
+    // the whole cap on above-watermark backlog and truncate a tie group
+    // mid-pair, serving a requester only the sibling it already has. Two
+    // index passes over the HLC-ordered `admitted` list, emitted in index
+    // (= HLC) order, keep the served ordering identical to before. A tie
+    // population larger than the cap itself still truncates — that would
+    // take `max_beacons` distinct tied events at once.
+    let mut selected: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (i, beacon) in admitted.iter().enumerate() {
+        if selected.len() >= max_beacons {
             break;
+        }
+        if beacon
+            .hash_output
+            .is_some_and(|(hash, _)| tied_hashes.contains(&hash))
+        {
+            selected.insert(i);
+        }
+    }
+    for (i, beacon) in admitted.iter().enumerate() {
+        if selected.len() >= max_beacons {
+            break;
+        }
+        if selected.contains(&i) {
+            continue;
         }
         let ev = beacon.event;
         let hlc_key = (ev.hlc.wall_ms, ev.hlc.logical, ev.hlc.device_id.clone());
@@ -372,13 +394,14 @@ pub fn select_catchup(
             Some(wm) => &hlc_key > wm,
             None => true,
         };
-        let tied = beacon
-            .hash_output
-            .is_some_and(|(hash, _)| tied_hashes.contains(&hash));
-        if above_watermark || tied {
-            beacons.push(ev.clone());
+        if above_watermark {
+            selected.insert(i);
         }
     }
+    let beacons: Vec<SignedCommitteeEvent> = selected
+        .iter()
+        .map(|&i| admitted[i].event.clone())
+        .collect();
 
     // Rule 2: requester fully current (active at the current epoch, and
     // no beacon above its watermark — nor any tied group to heal) ⇒
@@ -1022,6 +1045,42 @@ mod tests {
         let sel_fresh = select_catchup(&log, &req_fresh, MAX_CATCHUP_BEACONS_PER_ROUND, now)
             .expect("selection");
         assert_eq!(sel_fresh.beacons, vec![vb_tied_lo, vb_tied_hi, vb_solo]);
+    }
+
+    /// PR#780 round-1 (CodeAnt): the beacon cap must never truncate a
+    /// tie group mid-pair — tied members claim cap budget first, and the
+    /// served order stays HLC (oldest-first).
+    #[test]
+    fn select_catchup_cap_never_splits_tied_group_zeb1036() {
+        let now: u64 = 1_000_000_000;
+        let hash_tied = [0x44; 32];
+
+        let mut log = test_active_log(1);
+        let vb_old_a = test_vb_event_with(test_hlc(1000, 0, "dev1"), [0x55; 32], [0x0A; 32]);
+        let vb_old_b = test_vb_event_with(test_hlc(2000, 0, "dev1"), [0x66; 32], [0x0B; 32]);
+        let vb_tied_lo = test_vb_event_with(test_hlc(3000, 0, "dev1"), hash_tied, [0x01; 32]);
+        let vb_tied_hi = test_vb_event_with(test_hlc(4000, 0, "dev1"), hash_tied, [0x02; 32]);
+        log.insert_event_for_test(vb_old_a.clone());
+        log.insert_event_for_test(vb_old_b.clone());
+        log.insert_event_for_test(vb_tied_lo.clone());
+        log.insert_event_for_test(vb_tied_hi.clone());
+
+        // Cold requester, cap 3: an interleaved oldest-first selection
+        // would spend the cap on [old_a, old_b, tied_lo] and cut the tie
+        // in half. Tied-first budgeting keeps the pair whole and fills
+        // the remainder with the oldest backlog, emitted in HLC order.
+        let req_fresh = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 0,
+            active: false,
+            beacon_watermark: None,
+        };
+        let sel = select_catchup(&log, &req_fresh, 3, now).expect("selection");
+        assert_eq!(
+            sel.beacons,
+            vec![vb_old_a, vb_tied_lo, vb_tied_hi],
+            "tie pair whole under the cap, remainder oldest-first, HLC order"
+        );
     }
 
     /// ZEB-1036 × ZEB-1035: the tie rule never overrides the skew gate.
