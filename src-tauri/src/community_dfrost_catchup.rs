@@ -267,10 +267,21 @@ pub struct CatchupSelection {
 /// Pure responder selection. `None` ⇒ nothing to serve (inactive
 /// responder, or requester already fully current) — transport answers
 /// with silence.
+///
+/// ZEB-1035: `now_wall_ms` (responder's trusted wall clock; `0` = clock
+/// unreadable ⇒ gate disabled) applies the same forward-skew rejection
+/// the requester's `beacon_watermark_of` applies at its view: a
+/// retained `vb` whose envelope HLC is implausibly future is never
+/// SERVED. Without this, one future-stamped beacon in a responder's
+/// log sorts above every requester's (correctly capped) watermark
+/// forever — re-served and re-verified every round, and permanently
+/// defeating the fully-current → `None` short-circuit below. The event
+/// stays retained (view-not-store); it is only excluded from serving.
 pub fn select_catchup(
     log: &DfrostLog,
     req: &CatchupRequest,
     max_beacons: usize,
+    now_wall_ms: u64,
 ) -> Option<CatchupSelection> {
     // Rule 1: inactive responder has nothing to serve.
     if !log.committee_state.active {
@@ -292,6 +303,17 @@ pub fn select_catchup(
             break;
         }
         if ev.kind != DfrostEventKind::VrfBeacon {
+            continue;
+        }
+        // ZEB-1035: never serve a forward-skewed beacon — see the fn doc.
+        if now_wall_ms != 0
+            && crate::clock_trust::reject_future_logged(
+                ev.hlc.wall_ms,
+                now_wall_ms,
+                crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                "dfrost_catchup.select.envelope_hlc",
+            )
+        {
             continue;
         }
         let hlc_key = (ev.hlc.wall_ms, ev.hlc.logical, ev.hlc.device_id.clone());
@@ -646,7 +668,7 @@ mod tests {
             active: false,
             beacon_watermark: None,
         };
-        let sel = select_catchup(&log, &req, MAX_CATCHUP_BEACONS_PER_ROUND).expect("selection");
+        let sel = select_catchup(&log, &req, MAX_CATCHUP_BEACONS_PER_ROUND, 0).expect("selection");
         assert_eq!(
             sel.status,
             CatchupStatus {
@@ -688,7 +710,7 @@ mod tests {
             }),
         };
         assert!(
-            select_catchup(&log, &req_last_wm, MAX_CATCHUP_BEACONS_PER_ROUND).is_none(),
+            select_catchup(&log, &req_last_wm, MAX_CATCHUP_BEACONS_PER_ROUND, 0).is_none(),
             "fully current requester gets None"
         );
 
@@ -705,8 +727,8 @@ mod tests {
                 device_id: "dev1".into(),
             }),
         };
-        let sel2 =
-            select_catchup(&log, &req_first_wm, MAX_CATCHUP_BEACONS_PER_ROUND).expect("selection");
+        let sel2 = select_catchup(&log, &req_first_wm, MAX_CATCHUP_BEACONS_PER_ROUND, 0)
+            .expect("selection");
         assert!(
             sel2.dk_events.is_empty(),
             "requester already at current epoch"
@@ -723,7 +745,7 @@ mod tests {
             active: false,
             beacon_watermark: None,
         };
-        assert!(select_catchup(&log, &req, MAX_CATCHUP_BEACONS_PER_ROUND).is_none());
+        assert!(select_catchup(&log, &req, MAX_CATCHUP_BEACONS_PER_ROUND, 0).is_none());
     }
 
     #[test]
@@ -741,12 +763,12 @@ mod tests {
             active: false,
             beacon_watermark: None,
         };
-        let sel = select_catchup(&log, &req, 2).expect("selection");
+        let sel = select_catchup(&log, &req, 2, 0).expect("selection");
         assert_eq!(sel.beacons, vec![beacons[0].clone(), beacons[1].clone()]);
 
         // max_beacons = 0 boundary: the cap must be checked BEFORE the
         // push, not after, or a beacon slips through on the first match.
-        let sel_zero = select_catchup(&log, &req, 0).expect("selection");
+        let sel_zero = select_catchup(&log, &req, 0, 0).expect("selection");
         assert!(
             sel_zero.beacons.is_empty(),
             "max_beacons=0 yields zero beacons"
@@ -804,6 +826,64 @@ mod tests {
             u64::MAX,
             "now_wall_ms=0 disables the forward-skew gate (apply-all)"
         );
+    }
+
+    /// ZEB-1035: a retained `vb` whose envelope HLC is implausibly
+    /// future must never be SERVED. Requesters cap their watermark at
+    /// the view (`beacon_watermark_of`, ZEB-1030 final-review C1), so a
+    /// future-stamped retained beacon sorts above every watermark
+    /// forever — without this gate it is re-served and re-verified
+    /// every round, and the fully-current → `None` short-circuit never
+    /// fires for any affected requester.
+    #[test]
+    fn select_catchup_skips_forward_skewed_beacons_zeb1035() {
+        let now: u64 = 1_000_000_000;
+        let max = crate::clock_trust::MAX_FORWARD_SKEW_MS;
+
+        let mut log = test_active_log(1);
+        let vb_ok = test_vb_event(test_hlc(2000, 0, "dev1"));
+        // Exactly at the tolerance bound: still plausible, still served.
+        let vb_edge = test_vb_event(test_hlc(now + max, 0, "dev1"));
+        let vb_skewed = test_vb_event(test_hlc(now + max + 1, 0, "dev1"));
+        log.insert_event_for_test(vb_ok.clone());
+        log.insert_event_for_test(vb_edge.clone());
+        log.insert_event_for_test(vb_skewed.clone());
+
+        // Fully-current requester whose watermark covers every PLAUSIBLE
+        // beacon: only the skewed event sorts above it, the gate withholds
+        // it, and the short-circuit fires again (pre-fix, this requester
+        // was served the skewed beacon every round, forever).
+        let req_current = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: Some(beacon_watermark_of(&log, now).expect("watermark")),
+        };
+        assert!(
+            select_catchup(&log, &req_current, MAX_CATCHUP_BEACONS_PER_ROUND, now).is_none(),
+            "forward-skewed retained beacon must not defeat the fully-current short-circuit"
+        );
+
+        // A behind requester (no watermark) receives the plausible
+        // beacons — never the skewed one.
+        let req_fresh = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 0,
+            active: false,
+            beacon_watermark: None,
+        };
+        let sel = select_catchup(&log, &req_fresh, MAX_CATCHUP_BEACONS_PER_ROUND, now)
+            .expect("selection");
+        assert_eq!(
+            sel.beacons,
+            vec![vb_ok.clone(), vb_edge.clone()],
+            "at-bound beacon served; beyond-bound beacon withheld"
+        );
+
+        // now == 0 (responder clock unreadable) disables the gate.
+        let sel_disabled =
+            select_catchup(&log, &req_fresh, MAX_CATCHUP_BEACONS_PER_ROUND, 0).expect("selection");
+        assert_eq!(sel_disabled.beacons.len(), 3, "gate disabled at now == 0");
     }
 
     /// ZEB-1030 final-review I4 / PR#778 round-1 regression: capping is

@@ -1582,6 +1582,18 @@ async fn process_inbound<R: tauri::Runtime>(
 /// pre-empt, without reintroducing the amplification.
 const DFROST_CATCHUP_HINT_FLOOR: Duration = Duration::from_secs(60);
 
+/// This node's trusted wall clock in epoch-ms, `0` on unreadable — the
+/// convention every forward-skew gate on this plane shares (mirrors
+/// `community_voting_log_engine.rs`'s `receiver_now_ms` reads). Always
+/// `SystemTime`-derived, never a peer/HLC-adopt value: a skew bound
+/// only holds when measured against a clock the sender cannot move.
+fn trusted_now_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// ZEB-1030: an apply failure that smells like "the committee moved
 /// without us" (or "a committee exists we never saw") pulls the next
 /// catch-up attempt forward. Rate-limited; never fires for di/dk
@@ -2920,15 +2932,10 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// under one log lock, for use as a catch-up request.
     pub async fn catchup_build_request(&self) -> CatchupRequest {
         // ZEB-1030 final-review C1: this node's own trusted wall clock,
-        // fed to `beacon_watermark_of`'s forward-skew gate — same
-        // `SystemTime::now()`-only, 0-on-unreadable convention as
-        // `community_voting_log_engine.rs`'s `receiver_now_ms` reads.
-        // Never a peer/HLC-adopt value: the bound only holds if measured
+        // fed to `beacon_watermark_of`'s forward-skew gate. Never a
+        // peer/HLC-adopt value: the bound only holds if measured
         // against a clock the sender cannot move.
-        let now_wall_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_wall_ms = trusted_now_wall_ms();
         let log = self.dfrost_log.lock().await;
         CatchupRequest {
             version: CATCHUP_VERSION,
@@ -2946,7 +2953,14 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         let responder_id: [u8; 8] = rand::random();
         let sel = {
             let log = self.dfrost_log.lock().await;
-            select_catchup(&log, &req, MAX_CATCHUP_BEACONS_PER_ROUND)?
+            // ZEB-1035: the responder's trusted clock gates serving of
+            // forward-skewed retained beacons.
+            select_catchup(
+                &log,
+                &req,
+                MAX_CATCHUP_BEACONS_PER_ROUND,
+                trusted_now_wall_ms(),
+            )?
         };
 
         let mut frames = Vec::with_capacity(1 + sel.dk_events.len() + sel.beacons.len());
@@ -3151,7 +3165,9 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         }
         let (adopted, landed) = {
             let mut log = self.dfrost_log.lock().await;
-            let adopted = log.adopt_beacons(beacons);
+            // ZEB-1035: reject (skip, don't retain) forward-skewed
+            // envelopes at ingest admission — see `adopt_beacons`.
+            let adopted = log.adopt_beacons(beacons, trusted_now_wall_ms());
             let landed: Vec<SignedCommitteeEvent> = beacons
                 .iter()
                 .filter(|ev| log.contains_event(&dfrost_event_id(ev)))
@@ -8358,10 +8374,14 @@ mod tests {
 
         let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x61);
 
-        // A: active committee at epoch 1 holding one garbage-signature
-        // `vb` event from alice. `select_catchup` never crypto-verifies
-        // beacons (pure selection) — the garbage inner signature is only
-        // caught by `adopt_beacons` on the requester side.
+        // A garbage-signature `vb` event from alice, envelope-stamped at
+        // wall_ms = u64::MAX. Delivered below as HAND-CRAFTED frames
+        // modeling a malicious responder: an honest responder no longer
+        // ships it (ZEB-1035 — `select_catchup`'s forward-skew gate
+        // withholds it) and the requester's `adopt_beacons` rejects it
+        // at ingest admission for the same reason — but a hostile
+        // responder controls its own frame set, so the tracker
+        // non-recording invariant must hold independently of both gates.
         let garbage_payload = VrfBeaconPayload {
             ceremony_id: [0x01; 32],
             message_hash: [0x02; 32],
@@ -8380,35 +8400,6 @@ mod tests {
             },
         )
         .expect("build garbage vb");
-
-        let mut a_log = crate::community_dfrost_log::DfrostLog::new();
-        a_log.committee_state.active = true;
-        a_log.committee_state.current_epoch = 1;
-        a_log.insert_event_for_test(garbage_beacon.clone());
-        let a_log = Arc::new(tokio::sync::Mutex::new(a_log));
-
-        let mut a_resolver_map = HashMap::new();
-        a_resolver_map.insert(alice_addr, alice_pub64);
-        let a_resolver: Arc<dyn IdentityResolver + Send + Sync> =
-            Arc::new(StaticResolver(a_resolver_map));
-        let (a_pub_tx, _a_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let (_a_sub_tx, a_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let a = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
-            community_id: crate::owner_state_types::SpaceId([0x61; 16]),
-            dfrost_log: a_log,
-            publisher_tx: a_pub_tx,
-            subscriber_rx: a_sub_rx,
-            app_handle: None,
-            self_addr: alice_addr,
-            self_x25519_priv: [0u8; 32],
-            identity_resolver: a_resolver,
-            registry_weak: None,
-            driver: None,
-            membership_resolver: None,
-            orchestrator_config: Default::default(),
-            persist: None,
-        })
-        .await;
 
         // B: active at the SAME epoch — no dk candidates, so ingest goes
         // straight to the beacons-only fallthrough.
@@ -8441,8 +8432,26 @@ mod tests {
         })
         .await;
 
-        let req = b.catchup_build_request().await;
-        let frames = a.catchup_respond(req).await.expect("A serves its beacon");
+        let mut ev_bytes = Vec::new();
+        ciborium::ser::into_writer(&garbage_beacon, &mut ev_bytes).expect("encode garbage vb");
+        let rid = [0x5c; 8];
+        let frames = vec![
+            crate::community_dfrost_catchup::CatchupFrame {
+                version: crate::community_dfrost_catchup::CATCHUP_VERSION,
+                responder_id: rid,
+                body: crate::community_dfrost_catchup::CatchupBody::Status(
+                    crate::community_dfrost_catchup::CatchupStatus {
+                        epoch: 1,
+                        active: true,
+                    },
+                ),
+            },
+            crate::community_dfrost_catchup::CatchupFrame {
+                version: crate::community_dfrost_catchup::CATCHUP_VERSION,
+                responder_id: rid,
+                body: crate::community_dfrost_catchup::CatchupBody::Beacon(ev_bytes),
+            },
+        ];
         let outcome = b.catchup_ingest(frames).await;
         assert_eq!(
             outcome,
