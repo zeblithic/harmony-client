@@ -364,6 +364,7 @@ fn quarantine_corrupted(path: &Path, decode_err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::community_dfrost_log::{PendingReset, VkLineageEntry};
     use crate::community_dfrost_types::{
         CeremonyInitPayload, DfrostEventKind, SignedCommitteeEvent,
     };
@@ -404,7 +405,11 @@ mod tests {
     }
 
     /// A log with one accepted event, an active committee, a completed
-    /// beacon, and a pending ceremony (to prove restore clears it).
+    /// beacon, a pending ceremony (to prove restore clears it), and a
+    /// ZEB-1031 lineage entry + pending reset pin (to prove restore
+    /// PRESERVES them — I3: they carry no secrets and the successor pin
+    /// must survive a restart, unlike the four in-flight ceremony
+    /// slots).
     fn sample_log() -> DfrostLog {
         let alice = OwnerAddr([0x01; 16]);
         let bob = OwnerAddr([0x02; 16]);
@@ -422,6 +427,22 @@ mod tests {
             .insert(alice, [0xA1; 32]);
         log.committee_state.verifying_shares.insert(bob, [0xB1; 32]);
         log.beacon_index.insert([0x11; 32], [0x22; 32]);
+        log.committee_state.vk_history.push(VkLineageEntry {
+            old_vk: [0xC5; 32],
+            old_epoch: 0,
+            reset_id: [0x33; 16],
+            digest: [0x66; 32],
+            at: Hlc {
+                wall_ms: 500,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        });
+        log.committee_state.pending_reset = Some(PendingReset {
+            reset_id: [0x77; 16],
+            new_members: vec![alice, bob],
+            new_threshold: 2,
+        });
         log
     }
 
@@ -468,6 +489,18 @@ mod tests {
             "pending ceremony cleared on restore"
         );
         assert!(restored.local_key_package.is_none());
+
+        // I3 (ZEB-1031): `vk_history` and `pending_reset` are durable
+        // pins, not in-flight ceremony state — they MUST survive
+        // restore, unlike the four `pending_*` slots cleared above.
+        assert_eq!(
+            restored.committee_state.vk_history, log.committee_state.vk_history,
+            "vk_history survives the snapshot round trip"
+        );
+        assert_eq!(
+            restored.committee_state.pending_reset, log.committee_state.pending_reset,
+            "pending_reset survives the snapshot round trip"
+        );
     }
 
     #[test]

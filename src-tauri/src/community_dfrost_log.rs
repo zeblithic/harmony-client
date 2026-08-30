@@ -139,23 +139,6 @@ pub struct DfrostLog {
     /// deserialization via the `serde(from = "CommitteeStateRaw")` shim.
     pub committee_state: CommitteeState,
 
-    /// ZEB-1031: this log's own community, when the caller has bound
-    /// one. `apply_reset_marker`'s RS-M1 gate compares an `rs` marker's
-    /// `sp` against this value and is a no-op — the whole check is
-    /// vacuously satisfied — when `None`. Every EXISTING call site
-    /// leaves this at the `Default` (`None`); a caller that wants RS-M1
-    /// enforced sets it once, immediately after the log is created for
-    /// a specific community (registry construction). Not (yet) wired
-    /// into `community_dfrost_persist.rs` or the `dfrost_logs` registry
-    /// — production enforcement of RS-M1 is either this field getting
-    /// wired at registration time, or an engine-side check ahead of the
-    /// call (mirroring the `di` admission gate's ceremony-id check in
-    /// `process_inbound`); RS-M4's digest recomputation already binds
-    /// `space_id` cryptographically (`dfrost_reset_digest`'s input
-    /// includes it), so RS-M1 here is defence-in-depth, not the only
-    /// backstop. Flagged for Task 5 to confirm/wire.
-    pub community_id: Option<crate::owner_state_types::SpaceId>,
-
     /// In-memory DKG round-1 secret (this node's). Held only between the
     /// `dr(rn=1)` post and the `dr(rn=2)` send; never persisted to disk
     /// because it lets a recovered attacker reconstruct the local share.
@@ -274,7 +257,6 @@ impl std::fmt::Debug for DfrostLog {
         f.debug_struct("DfrostLog")
             .field("events", &self.log.events().collect::<Vec<_>>())
             .field("committee_state", &self.committee_state)
-            .field("community_id", &self.community_id)
             .field("local_dkg_secret", &self.local_dkg_secret.is_some())
             .field("local_dkg_secret2", &self.local_dkg_secret2.is_some())
             .field("local_key_package", &self.local_key_package.is_some())
@@ -1805,25 +1787,43 @@ impl DfrostLog {
     /// Apply an `rs` (ResetMarker) event, closing out a
     /// membership-authorized committee reset (ZEB-1031 spec §5).
     ///
-    /// `new_members`/`new_threshold` are the successor committee's
-    /// pinned shape, resolved by the ENGINE from membership state
-    /// (RS-M3/M4/M5 — membership phase, digest recomputation, actor
-    /// authorization — are all verified there, against membership-log
-    /// state this dfrost log never sees, keeping the log
-    /// membership-blind). This function verifies only RS-M1 (space),
-    /// RS-M2 (held-state match), and RS-M6 (idempotent re-delivery) —
-    /// the three gates checkable from held dfrost state alone.
+    /// `expected_space` is this log's own community — the caller
+    /// (engine) always has it in scope, exactly like
+    /// `adopt_initial_quorum`/`adopt_refresh_quorum`'s `expected_space`
+    /// parameter ten screens up; unlike a stored field, a parameter
+    /// can't silently re-default on a restore path. `new_members`/
+    /// `new_threshold` are the successor committee's pinned shape,
+    /// resolved by the ENGINE from membership state (RS-M3/M4/M5 —
+    /// membership phase, digest recomputation, actor authorization —
+    /// are all verified there, against membership-log state this
+    /// dfrost log never sees, keeping the log membership-blind). This
+    /// function verifies only RS-M1 (space), RS-M2 (held-state match),
+    /// and RS-M6 (idempotent re-delivery) — the three gates checkable
+    /// from held dfrost state alone.
     ///
-    /// Gate order: decode → RS-M1 → RS-M2/RS-M6 → effects. No partial
-    /// state is written on any rejection — every check runs before the
-    /// mutation block.
+    /// Gate order: envelope/kind → decode → RS-M1 → RS-M2/RS-M6 →
+    /// effects. No partial state is written on any rejection — every
+    /// check runs before the mutation block.
     pub fn apply_reset_marker(
         &mut self,
         event: &SignedCommitteeEvent,
+        expected_space: &crate::owner_state_types::SpaceId,
         new_members: Vec<OwnerAddr>,
         new_threshold: u16,
     ) -> Result<ResetMarkerApplied, ApplyError> {
         use crate::community_dfrost_types::ResetMarkerPayload;
+
+        // Same envelope gate as `apply`/`apply_with_identity` (single-
+        // sourced, ZEB-753), plus the kind guard `adopt_initial_quorum`
+        // runs for `dk` (`:1399-1401`-equivalent): without both, a
+        // malformed-envelope or wrong-kind event can mutate committee
+        // state here while `insert_applied`'s policy verify rejects it
+        // ONE STEP LATER — deactivation with no event behind it to
+        // explain it on catch-up.
+        check_envelope(event)?;
+        if event.kind != DfrostEventKind::ResetMarker {
+            return Err(ApplyError::UnexpectedEnvelope);
+        }
 
         let payload: ResetMarkerPayload =
             ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
@@ -1833,12 +1833,9 @@ impl DfrostLog {
         // mandatory field, vs. `adopt_refresh_quorum`'s lenient
         // tolerance for `dk`'s OPTIONAL legacy binding: `rs` is a
         // brand-new kind with no pre-ZEB-1034 history, so there is no
-        // absent-binding case to tolerate). A no-op when this log has
-        // no bound community — see the `community_id` field doc.
-        if let Some(expected) = self.community_id {
-            if payload.space_id != expected {
-                return Err(ApplyError::InvariantViolation);
-            }
+        // absent-binding case to tolerate).
+        if payload.space_id != *expected_space {
+            return Err(ApplyError::InvariantViolation);
         }
 
         // RS-M2: does the held state still match what this marker
@@ -8634,10 +8631,10 @@ mod tests {
         }
     }
 
-    /// ZEB-1031: a log bound to `zeb1034_space()` with an active
-    /// committee at `(vk, epoch)` — the fixture every reset-marker test
-    /// starts from. Binding the community makes RS-M1 non-vacuous for
-    /// every test except the dedicated wrong-space one.
+    /// ZEB-1031: an active committee at `(vk, epoch)` — the fixture
+    /// every reset-marker test starts from. Every test passes
+    /// `&zeb1034_space()` as `apply_reset_marker`'s `expected_space`
+    /// except the dedicated wrong-space one.
     fn active_committee_for_reset(
         vk: [u8; 32],
         epoch: u64,
@@ -8645,7 +8642,6 @@ mod tests {
         threshold: u16,
     ) -> DfrostLog {
         let mut log = DfrostLog::new();
-        log.community_id = Some(zeb1034_space());
         log.committee_state.active = true;
         log.committee_state.joint_verifying_key = Some(vk);
         log.committee_state.current_epoch = epoch;
@@ -8689,7 +8685,7 @@ mod tests {
             5_000,
         );
 
-        let result = log.apply_reset_marker(&ev, new_members.clone(), 2);
+        let result = log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2);
         assert_eq!(
             result,
             Ok(ResetMarkerApplied::Applied {
@@ -8733,19 +8729,23 @@ mod tests {
         let alice = OwnerAddr([0x01; 16]);
         let old_vk = [0xaa; 32];
         let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
-        let wrong_space = crate::owner_state_types::SpaceId([0x99; 16]);
+        // The marker itself carries a VALID `sp` — the mismatch is
+        // between the marker's claim and the caller's own ground truth
+        // (`expected_space`), which is what RS-M1 actually guards
+        // against (a marker minted for a different community).
         let ev = rs_event(
             alice,
             RESET_PROPOSAL_ID,
             RESET_DIGEST,
             old_vk,
             3,
-            wrong_space,
+            zeb1034_space(),
             5_000,
         );
+        let wrong_space = crate::owner_state_types::SpaceId([0x99; 16]);
 
         assert_eq!(
-            log.apply_reset_marker(&ev, vec![alice], 1),
+            log.apply_reset_marker(&ev, &wrong_space, vec![alice], 1),
             Err(ApplyError::InvariantViolation)
         );
         // No partial state change.
@@ -8774,7 +8774,7 @@ mod tests {
         );
 
         assert_eq!(
-            log.apply_reset_marker(&ev, vec![alice], 1),
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
             Err(ApplyError::InvariantViolation)
         );
         assert!(log.committee_state.vk_history.is_empty());
@@ -8799,7 +8799,7 @@ mod tests {
         );
 
         assert_eq!(
-            log.apply_reset_marker(&ev, vec![alice], 1),
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
             Err(ApplyError::InvariantViolation)
         );
         assert!(log.committee_state.active);
@@ -8828,7 +8828,7 @@ mod tests {
         );
 
         assert_eq!(
-            log.apply_reset_marker(&ev, vec![alice], 1),
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
             Err(ApplyError::InvariantViolation)
         );
         assert!(log.committee_state.active);
@@ -8853,7 +8853,7 @@ mod tests {
             5_000,
         );
 
-        let first = log.apply_reset_marker(&ev, new_members.clone(), 1);
+        let first = log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 1);
         assert_eq!(
             first,
             Ok(ResetMarkerApplied::Applied {
@@ -8864,12 +8864,90 @@ mod tests {
 
         // Catch-up replay legitimately re-delivers the SAME marker —
         // benign no-op, not an error.
-        let second = log.apply_reset_marker(&ev, new_members, 1);
+        let second = log.apply_reset_marker(&ev, &zeb1034_space(), new_members, 1);
         assert_eq!(second, Ok(ResetMarkerApplied::AlreadyMoved));
 
         // The replay leaves state exactly as the first apply left it.
         assert_eq!(log.committee_state.vk_history.len(), 1);
         assert!(log.committee_state.pending_reset.is_some());
         assert_eq!(log.event_count(), 1, "the replay is not re-inserted");
+    }
+
+    /// Asserts committee state is byte-unchanged from a freshly-built
+    /// `active_committee_for_reset(old_vk, 3, [alice], 1)` fixture — the
+    /// shared assertion for I2's envelope/kind-guard regression tests
+    /// (both must reject BEFORE any mutation, not one step later inside
+    /// `insert_applied`'s policy verify).
+    fn assert_reset_marker_state_untouched(log: &DfrostLog, old_vk: [u8; 32]) {
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(old_vk));
+        assert_eq!(log.committee_state.current_epoch, 3);
+        assert!(log.committee_state.vk_history.is_empty());
+        assert!(log.committee_state.pending_reset.is_none());
+        assert!(log.committee_state.pending_dkg.is_none());
+        assert!(log.committee_state.pending_refresh.is_none());
+        assert!(log.committee_state.pending_repair.is_none());
+        assert!(log.committee_state.pending_sign.is_empty());
+        assert_eq!(log.event_count(), 0);
+    }
+
+    #[test]
+    fn reset_marker_bad_tier_rejected_before_mutation_zeb1031() {
+        // I2: a non-zero `committee_tier` must be rejected by the SAME
+        // envelope gate `apply`/`apply_with_identity` run — BEFORE any
+        // state mutation. Without it, `committee_tier`/`tag` (both
+        // attacker-chosen fields on a signed event) let a malformed
+        // envelope deactivate the committee while
+        // `insert_applied`'s policy verify rejects the event one step
+        // later — a `tracing::warn!`, never surfaced to the caller, and
+        // no event lands in the log to explain the mutation.
+        let alice = OwnerAddr([0x01; 16]);
+        let old_vk = [0xaa; 32];
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
+        let mut ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        ev.committee_tier = 7;
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
+            Err(ApplyError::UnexpectedEnvelope)
+        );
+        assert_reset_marker_state_untouched(&log, old_vk);
+    }
+
+    #[test]
+    fn reset_marker_wrong_kind_rejected_before_mutation_zeb1031() {
+        // I2: an event carrying an `rs`-shaped payload under a
+        // DIFFERENT `kind` (e.g. `DkgComplete`) must be rejected —
+        // without the kind guard it applies AND is stored under the
+        // wrong kind, so the log holds a `DkgComplete` event whose
+        // payload cannot decode as `DkgCompletePayload`, which fails
+        // `PayloadDecode` for every peer on catch-up.
+        let alice = OwnerAddr([0x01; 16]);
+        let old_vk = [0xaa; 32];
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
+        let mut ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        ev.kind = crate::community_dfrost_types::DfrostEventKind::DkgComplete;
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
+            Err(ApplyError::UnexpectedEnvelope)
+        );
+        assert_reset_marker_state_untouched(&log, old_vk);
     }
 }
