@@ -144,6 +144,7 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         Arc::clone(&crdt_state),
         alice_pub_rx,
         alice_sub_tx,
+        None,
         Arc::clone(&closing),
     );
 
@@ -156,6 +157,7 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         Arc::clone(&crdt_state),
         bob_pub_rx,
         bob_sub_tx,
+        None,
         Arc::clone(&closing),
     );
 
@@ -299,6 +301,7 @@ async fn dfrost_event_flows_through_two_zenoh_sessions_with_epoch_gate() {
         stale_state,
         stale_pub_rx,
         stale_sub_tx_unused,
+        None,
         Arc::clone(&closing),
     );
 

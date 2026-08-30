@@ -432,6 +432,13 @@ pub const VOTING_RBSR_AAD: &[u8] = b"harmony-voting-rbsr-v1";
 /// in-flight DKG/refresh/threshold-sign rounds.
 pub const DFROST_TOPIC_AAD: &[u8] = b"harmony-dfrost-v1";
 
+/// ZEB-1030: AAD for sealed D-FROST catch-up request/reply/frame messages.
+/// Domain-separated from [`DFROST_TOPIC_AAD`] so a sealed catch-up message
+/// and a live/backfill committee event — both sealed under the same
+/// community epoch key — can never be opened as one another. Mirrors
+/// [`VOTING_RBSR_AAD`]'s rationale for the voting plane.
+pub const DFROST_CATCHUP_AAD: &[u8] = b"harmony-dfrost-catchup-v1";
+
 /// Encrypt `plaintext` under the community's current epoch key,
 /// wrapping the AEAD output in an `EncryptedEnvelope` that tags the
 /// epoch for receiver-side key selection.
@@ -15930,6 +15937,34 @@ mod envelope_tests {
         assert!(
             decrypt_for_topic_with_aad(&space, &ev_env, VOTING_RBSR_AAD).is_err(),
             "a voting-event packet must not open under the RBSR AAD"
+        );
+    }
+
+    /// ZEB-1030: a D-FROST catch-up message and a live/backfill committee
+    /// event share the community epoch key but bind different AADs, so
+    /// neither opens as the other — mirrors `voting_rbsr_aad_is_domain_separated`.
+    #[test]
+    fn dfrost_catchup_aad_is_domain_separated_zeb1030() {
+        let space = build_test_community_space(1, EpochKey::new([0x5a; 32]));
+        let plaintext = b"a-dfrost-catchup-message".to_vec();
+
+        let env = encrypt_for_topic_with_aad(&space, &plaintext, DFROST_CATCHUP_AAD)
+            .expect("seal catchup");
+        assert_eq!(
+            decrypt_for_topic_with_aad(&space, &env, DFROST_CATCHUP_AAD).expect("open catchup"),
+            plaintext,
+            "correct AAD must round-trip"
+        );
+        assert!(
+            decrypt_for_topic_with_aad(&space, &env, DFROST_TOPIC_AAD).is_err(),
+            "a catch-up message must not open under the dfrost live-event AAD"
+        );
+
+        let ev_env =
+            encrypt_for_topic_with_aad(&space, &plaintext, DFROST_TOPIC_AAD).expect("seal event");
+        assert!(
+            decrypt_for_topic_with_aad(&space, &ev_env, DFROST_CATCHUP_AAD).is_err(),
+            "a dfrost live-event packet must not open under the catch-up AAD"
         );
     }
 
