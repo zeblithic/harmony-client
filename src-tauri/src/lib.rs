@@ -126,6 +126,7 @@ pub mod community_device_intro_crdt;
 pub mod community_device_intro_ingest;
 pub mod community_device_intro_persist;
 pub mod community_device_retire_deposit;
+pub mod community_dfrost_catchup;
 pub mod community_dfrost_crypto;
 pub mod community_dfrost_log;
 pub mod community_dfrost_log_engine;
@@ -61050,6 +61051,31 @@ async fn ensure_dfrost_engine_for(
         );
         return Ok(());
     };
+
+    // ZEB-1030: catch-up protocol closures over the same engine Arc — the
+    // adapter's catchup responder drives `respond`, the periodic requester
+    // drives `build_request`/`ingest`. Mirrors the voting RBSR hook
+    // construction in `ensure_voting_engine_for` (clone-per-closure over
+    // one shared engine).
+    let engine_for_catchup_build = std::sync::Arc::clone(&engine);
+    let engine_for_catchup_respond = std::sync::Arc::clone(&engine);
+    let engine_for_catchup_ingest = std::sync::Arc::clone(&engine);
+    let catchup_hooks = crate::event_loop::DfrostCatchupHooks {
+        build_request: std::sync::Arc::new(move || {
+            let e = std::sync::Arc::clone(&engine_for_catchup_build);
+            Box::pin(async move { e.catchup_build_request().await })
+        }),
+        respond: std::sync::Arc::new(move |request| {
+            let e = std::sync::Arc::clone(&engine_for_catchup_respond);
+            Box::pin(async move { e.catchup_respond(request).await })
+        }),
+        ingest: std::sync::Arc::new(move |frames| {
+            let e = std::sync::Arc::clone(&engine_for_catchup_ingest);
+            Box::pin(async move { e.catchup_ingest(frames).await })
+        }),
+        hint: engine.catchup_hint(),
+    };
+
     // A send failure means the event loop's receiver is gone (shutdown /
     // restart teardown racing this ensure). Unlike the voting path's
     // accepted orphan, roll the registration back (Qodo on #768): the
@@ -61063,6 +61089,7 @@ async fn ensure_dfrost_engine_for(
             crdt_state,
             publisher_rx,
             subscriber_tx,
+            catchup_hooks: Some(catchup_hooks),
         })
         .await
     {

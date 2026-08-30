@@ -264,14 +264,72 @@ pub struct VotingLogAdapterRequest {
     pub rbsr_hooks: Option<VotingRbsrHooks>,
 }
 
+/// ZEB-1030: the catch-up protocol halves the D-FROST adapter drives, as
+/// type-erased closures over the (runtime-generic) engine — mirrors
+/// `VotingRbsrHooks` in shape, but for the request/reply/frame catch-up
+/// protocol instead of RBSR reconcile. `build_request` snapshots this
+/// node's committee epoch/active/watermark for the requester's next round;
+/// `respond` answers an inbound request with a fresh-`responder_id` frame
+/// set (`None` ⇒ nothing to serve — the adapter replies with silence);
+/// `ingest` decodes, envelope-verifies, groups, and adopts an inbound
+/// frame set, returning the outcome for the requester's cadence/logging
+/// decisions. `hint` is the engine's epoch-lag signal (see
+/// `DfrostLogEngine::catchup_hint`) — the requester loop selects on it to
+/// pull its next attempt forward instead of waiting out the full interval.
+#[derive(Clone)]
+pub struct DfrostCatchupHooks {
+    #[allow(clippy::type_complexity)]
+    pub build_request: std::sync::Arc<
+        dyn Fn() -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = crate::community_dfrost_catchup::CatchupRequest,
+                        > + Send,
+                >,
+            > + Send
+            + Sync,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub respond: std::sync::Arc<
+        dyn Fn(
+                crate::community_dfrost_catchup::CatchupRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Option<Vec<crate::community_dfrost_catchup::CatchupFrame>>,
+                        > + Send,
+                >,
+            > + Send
+            + Sync,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub ingest: std::sync::Arc<
+        dyn Fn(
+                Vec<crate::community_dfrost_catchup::CatchupFrame>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = crate::community_dfrost_log_engine::CatchupOutcome,
+                        > + Send,
+                >,
+            > + Send
+            + Sync,
+    >,
+    /// Engine-owned; the requester task selects on it to pull the next
+    /// attempt forward (epoch-lag hint).
+    pub hint: std::sync::Arc<tokio::sync::Notify>,
+}
+
 /// ZEB-1018: per-community D-FROST committee-log adapter request.
-/// Live pub/sub only — committee ceremonies (DKG / threshold-sign /
-/// proactive refresh) are interactive multi-party rounds, so there is
-/// no backfill or RBSR half: a node that missed a round cannot
-/// retroactively join the ceremony. Durable committee state is handled
-/// off-transport, per ZEB-753: the engine snapshots the accepted-event
-/// log + materialized committee state to the sealed `dfrost.cbor`
-/// (`community_dfrost_persist`) and restores it at ensure time.
+/// Live pub/sub, plus (ZEB-1030) an optional catch-up queryable/requester
+/// half: committee ceremonies (DKG / threshold-sign / proactive refresh)
+/// are interactive multi-party rounds, so a node that missed a round
+/// cannot retroactively rejoin it over pub/sub alone — catch-up is a
+/// separate request/reply exchange (`catchup_hooks`), not RBSR reconcile
+/// of the live topic. Durable committee state is handled off-transport,
+/// per ZEB-753: the engine snapshots the accepted-event log + materialized
+/// committee state to the sealed `dfrost.cbor` (`community_dfrost_persist`)
+/// and restores it at ensure time.
 pub struct DfrostLogAdapterRequest {
     /// Hex-encoded community SpaceId — used to form
     /// `harmony/community/{id_hex}/dfrost`.
@@ -288,6 +346,11 @@ pub struct DfrostLogAdapterRequest {
     pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     /// Zenoh subscriber → engine inbound.
     pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// ZEB-1030: optional catch-up protocol halves. When `Some`, the
+    /// adapter also spawns a `dfrost/catchup` responder queryable and a
+    /// periodic requester task; `None` keeps the pre-ZEB-1030 pub/sub-only
+    /// behavior (e.g. ingest-only test adapters).
+    pub catchup_hooks: Option<DfrostCatchupHooks>,
 }
 
 /// ZEB-270 Phase 3 Task 4.5: per-channel adapter request handed from
@@ -7611,6 +7674,7 @@ pub async fn run(
                     req.crdt_state,
                     req.publisher_rx,
                     req.subscriber_tx,
+                    req.catchup_hooks,
                     Arc::clone(&closing),
                 );
             }
@@ -11916,16 +11980,306 @@ pub fn spawn_voting_log_zenoh_adapter(
 /// prevent peer-controlled allocation.
 const MAX_DFROST_PAYLOAD_BYTES: usize = 64 * 1024;
 
+/// ZEB-1030: how often the catch-up requester attempts a round when the
+/// epoch-lag hint doesn't pull it forward.
+const DFROST_CATCHUP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// ZEB-1030: cap-checked-before-alloc, strict-current-epoch decrypt of a
+/// sealed catch-up wire envelope under `DFROST_CATCHUP_AAD` — the shared
+/// core of `dfrost_catchup_open_request`/`dfrost_catchup_open_frame`.
+/// Mirrors `voting_rbsr_open`'s cap/epoch/AAD gates. Decode (request vs
+/// frame) — and with it the transport's VERSION gate, since
+/// `decode_request`/`decode_frame` both reject an unsupported version —
+/// happens in the caller; `catchup_ingest` deliberately does not recheck
+/// versions, so every frame reaching it must have passed through here.
+async fn dfrost_catchup_open_plaintext(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    raw: &[u8],
+) -> Option<Vec<u8>> {
+    if raw.len() > crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_FRAME_BYTES {
+        return None;
+    }
+    let envelope: crate::community_state_sync::EncryptedEnvelope =
+        ciborium::from_reader(raw).ok()?;
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    match space.current_epoch {
+        Some(cur) if cur == envelope.epoch => {}
+        _ => return None,
+    }
+    crate::community_state_sync::decrypt_for_topic_with_aad(
+        space,
+        &envelope,
+        crate::community_state_sync::DFROST_CATCHUP_AAD,
+    )
+    .ok()
+}
+
+/// ZEB-1030: open a sealed [`CatchupRequest`](crate::community_dfrost_catchup::CatchupRequest).
+/// `None` on any cap/epoch/AAD/decode/version failure — the responder
+/// treats that as a malformed GET and replies with silence.
+async fn dfrost_catchup_open_request(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    raw: &[u8],
+) -> Option<crate::community_dfrost_catchup::CatchupRequest> {
+    let plaintext = dfrost_catchup_open_plaintext(crdt_state, community_id, raw).await?;
+    crate::community_dfrost_catchup::decode_request(&plaintext).ok()
+}
+
+/// ZEB-1030: open a sealed [`CatchupFrame`](crate::community_dfrost_catchup::CatchupFrame).
+/// `None` on any cap/epoch/AAD/decode/version failure — the requester
+/// silently drops an unopenable frame from the round (the per-round drain
+/// already bounded how many of these it would ever hold).
+async fn dfrost_catchup_open_frame(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    raw: &[u8],
+) -> Option<crate::community_dfrost_catchup::CatchupFrame> {
+    let plaintext = dfrost_catchup_open_plaintext(crdt_state, community_id, raw).await?;
+    crate::community_dfrost_catchup::decode_frame(&plaintext).ok()
+}
+
+/// ZEB-1030: seal a [`CatchupRequest`](crate::community_dfrost_catchup::CatchupRequest)
+/// under the community's current epoch + `DFROST_CATCHUP_AAD`. Mirrors
+/// `voting_rbsr_seal`. `None` if epoch state is missing or encoding fails.
+async fn dfrost_catchup_seal_request(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    req: &crate::community_dfrost_catchup::CatchupRequest,
+) -> Option<Vec<u8>> {
+    let plaintext = crate::community_dfrost_catchup::encode_request(req).ok()?;
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    let envelope = crate::community_state_sync::encrypt_for_topic_with_aad(
+        space,
+        &plaintext,
+        crate::community_state_sync::DFROST_CATCHUP_AAD,
+    )
+    .ok()?;
+    let mut w = Vec::new();
+    ciborium::into_writer(&envelope, &mut w).ok()?;
+    Some(w)
+}
+
+/// ZEB-1030: seal an entire catch-up reply frame SET under a SINGLE
+/// current-epoch snapshot (ZEB-920 rule — mirrors
+/// `voting_rbsr_seal_reply_and_bodies`'s one-lock-for-the-whole-set shape).
+///
+/// UNLIKE that mirror, one frame's `encode_frame` failure does NOT abort
+/// the whole reply. `encode_frame` re-checks `MAX_DFROST_CATCHUP_FRAME_BYTES`
+/// against the FULL wire envelope (version + responder_id + tagged body),
+/// which is ~30 bytes larger than the engine's own per-event cap check on
+/// the bare `SignedCommitteeEvent` encoding (`DfrostLogEngine::
+/// catchup_respond`) — so a frame that passed the engine's check can still
+/// land right at this margin. Making `encode_frame`'s cap the ONLY hard
+/// gate here — skip the one oversize frame (warn) and keep sealing the
+/// rest — means a boundary-sized event can't silently drop an entire
+/// catch-up reply. Returns `None` only when epoch state itself is
+/// unavailable (nothing in the set could be sealed at all).
+async fn dfrost_catchup_seal_reply(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    frames: &[crate::community_dfrost_catchup::CatchupFrame],
+) -> Option<Vec<Vec<u8>>> {
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let plaintext = match crate::community_dfrost_catchup::encode_frame(frame) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dfrost catchup reply frame exceeds wire cap after envelope; skipped",
+                );
+                continue;
+            }
+        };
+        let Ok(envelope) = crate::community_state_sync::encrypt_for_topic_with_aad(
+            space,
+            &plaintext,
+            crate::community_state_sync::DFROST_CATCHUP_AAD,
+        ) else {
+            continue;
+        };
+        let mut w = Vec::new();
+        if ciborium::into_writer(&envelope, &mut w).is_err() {
+            continue;
+        }
+        out.push(w);
+    }
+    Some(out)
+}
+
+/// ZEB-1030: per-frame overhead charged toward `MAX_DFROST_CATCHUP_ROUND_BYTES`
+/// so a flood of tiny/empty reply frames is bounded by frame COUNT too, not
+/// just total payload bytes — mirrors the channel-log RBSR drain's
+/// `RBSR_FRAME_OVERHEAD` accounting.
+const DFROST_CATCHUP_FRAME_OVERHEAD: usize = 64;
+
+/// ZEB-1030: issue one catch-up round GET and drain RAW reply payloads —
+/// pattern-B: collect bytes only, never open/decode/ingest inside the zenoh
+/// reply arm (mirrors `rbsr_get_frames`, the channel-log's pattern-B drain).
+/// A reply over `MAX_DFROST_CATCHUP_FRAME_BYTES` (the same per-frame cap
+/// `dfrost_catchup_open_frame` would reject it against later) is skipped
+/// BEFORE it is copied or charged against the round budget — one oversized
+/// reply must not burn the shared budget on bytes that could never open.
+/// Otherwise charges each frame as `payload.len() + DFROST_CATCHUP_FRAME_OVERHEAD`
+/// against `MAX_DFROST_CATCHUP_ROUND_BYTES`; over the cap, abandons the
+/// round (empty vec, warn-logged) rather than hold an unbounded allocation
+/// — the caller gives up on this round and waits for the next tick.
+async fn dfrost_catchup_get_round(
+    session: &zenoh::Session,
+    topic: &str,
+    sealed: Vec<u8>,
+    closing: &AtomicBool,
+) -> Vec<Vec<u8>> {
+    let receiver = match session
+        .get(topic)
+        .payload(sealed)
+        // Reconcile only against REMOTE responders — mirrors
+        // `rbsr_get_frames`/`drive_voting_rbsr`: the requester also
+        // declares a `dfrost/catchup` queryable, and its own self-reply
+        // would otherwise be mixed into the round.
+        .allowed_destination(zenoh::sample::Locality::Remote)
+        .consolidation(zenoh::query::ConsolidationMode::None)
+        .timeout(std::time::Duration::from_secs(10))
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut raws = Vec::new();
+    let mut total_bytes = 0usize;
+    loop {
+        tokio::select! {
+            biased;
+            res = receiver.recv_async() => {
+                let Ok(reply) = res else { break; };
+                let Ok(sample) = reply.into_result() else { continue; };
+                // ZEB-1030 PR#778 round-1: check the raw reply length
+                // BEFORE copying it or charging it against the round
+                // budget. `dfrost_catchup_open_frame` would reject an
+                // over-cap payload later anyway (same
+                // `MAX_DFROST_CATCHUP_FRAME_BYTES` bound), but only after
+                // this function had already paid the allocation and,
+                // worse, spent part of the shared round-byte budget on a
+                // frame that could never open — one oversized reply could
+                // otherwise burn enough of `total_bytes` to abort the
+                // whole round (discarding every frame collected so far)
+                // over bytes that were never going anywhere.
+                let payload_len = sample.payload().len();
+                if payload_len > crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_FRAME_BYTES {
+                    tracing::warn!(
+                        %topic,
+                        payload_len,
+                        "dfrost catchup reply exceeds per-frame cap; skipping without charging \
+                         the round budget",
+                    );
+                    continue;
+                }
+                let payload = sample.payload().to_bytes().to_vec();
+                total_bytes = total_bytes.saturating_add(
+                    payload.len().saturating_add(DFROST_CATCHUP_FRAME_OVERHEAD)
+                );
+                if total_bytes > crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_ROUND_BYTES {
+                    tracing::warn!(
+                        %topic,
+                        total_bytes,
+                        "dfrost catchup round exceeded buffer cap; aborting round",
+                    );
+                    return Vec::new();
+                }
+                raws.push(payload);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if closing.load(Ordering::SeqCst) { break; }
+            }
+        }
+    }
+    raws
+}
+
+/// ZEB-1030: outcome of one requester wait slice — extracted so the
+/// interval/hint/closing decision is unit-testable without a live Zenoh
+/// session (mirrors extracting `need_full_dump`/`converge_or_fallback` out
+/// of the voting RBSR requester loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitEnd {
+    /// The full interval elapsed with no early wake.
+    Interval,
+    /// `hint.notified()` fired — pull the next attempt forward.
+    Hint,
+    /// `closing` was observed set — teardown in progress.
+    Closing,
+}
+
+/// ZEB-1030: wait `interval_secs`, polling `closing` every second (same
+/// bounded-shutdown shape as the voting requester's wait, 11699-11711) and
+/// racing a `hint.notified()` select arm so an epoch-lag hint can pull the
+/// next catch-up attempt forward instead of waiting out the full interval.
+pub(crate) async fn catchup_wait(
+    interval_secs: u64,
+    closing: &AtomicBool,
+    hint: &tokio::sync::Notify,
+) -> WaitEnd {
+    let step = std::time::Duration::from_secs(1);
+    let mut remaining = std::time::Duration::from_secs(interval_secs);
+    loop {
+        if closing.load(Ordering::SeqCst) {
+            return WaitEnd::Closing;
+        }
+        if remaining.is_zero() {
+            return WaitEnd::Interval;
+        }
+        let this = remaining.min(step);
+        tokio::select! {
+            biased;
+            _ = hint.notified() => return WaitEnd::Hint,
+            _ = tokio::time::sleep(this) => {}
+        }
+        remaining = remaining.saturating_sub(this);
+    }
+}
+
+/// ZEB-1030 round-2: pace a bounded backoff wait for the catch-up
+/// responder's queryable re-declare loop, polling `closing` every 1s
+/// (same shape as `catchup_wait` above, minus the hint arm — the
+/// responder owns no downstream channel to race the sleep against
+/// directly). Returns `true` if `closing` was observed (caller should
+/// exit), `false` once the full `wait` has elapsed.
+async fn catchup_responder_backoff_wait(wait: std::time::Duration, closing: &AtomicBool) -> bool {
+    let step = std::time::Duration::from_secs(1);
+    let mut remaining = wait;
+    loop {
+        if closing.load(Ordering::SeqCst) {
+            return true;
+        }
+        if remaining.is_zero() {
+            return false;
+        }
+        let this = remaining.min(step);
+        tokio::time::sleep(this).await;
+        remaining = remaining.saturating_sub(this);
+    }
+}
+
 /// ZEB-1018: per-community Zenoh adapter for the D-FROST committee-log
-/// data plane. Topic: `harmony/community/{id_hex}/dfrost` (live pub/sub
-/// only — see `DfrostLogAdapterRequest` for why there is no backfill
-/// half). This is the "swap-in byte-relay glue" the ZEB-307 engine and
-/// its transport integration test were built against: outbound drains
-/// the engine's `publisher_rx` → epoch-encrypt (`DFROST_TOPIC_AAD`) →
-/// `put`; inbound subscribes, current-epoch-only decrypts, and forwards
-/// plaintext `SignedCommitteeEvent` CBOR into the engine's
-/// `subscriber_tx` (the engine's `process_inbound` owns verify / dedup /
-/// apply / emit).
+/// data plane. Topic: `harmony/community/{id_hex}/dfrost` (live pub/sub).
+/// This is the "swap-in byte-relay glue" the ZEB-307 engine and its
+/// transport integration test were built against: outbound drains the
+/// engine's `publisher_rx` → epoch-encrypt (`DFROST_TOPIC_AAD`) → `put`;
+/// inbound subscribes, current-epoch-only decrypts, and forwards plaintext
+/// `SignedCommitteeEvent` CBOR into the engine's `subscriber_tx` (the
+/// engine's `process_inbound` owns verify / dedup / apply / emit).
+///
+/// ZEB-1030: when `catchup_hooks` is `Some`, additionally spawns a
+/// `dfrost/catchup` responder queryable and a periodic requester task — see
+/// `DfrostLogAdapterRequest` for why catch-up is a separate request/reply
+/// exchange rather than RBSR reconcile of the live topic. `None` keeps the
+/// pre-ZEB-1030 pub/sub-only behavior.
 ///
 /// Fire-and-forget like the voting adapter: `event_loop::run`'s select!
 /// arm calls it and drops the `JoinHandle`. Tasks exit when `closing`
@@ -11933,6 +12287,7 @@ const MAX_DFROST_PAYLOAD_BYTES: usize = 64 * 1024;
 /// teardown). A failed or dying Zenoh subscriber is NOT an exit: the
 /// inbound arm re-declares with backoff, because this task is the
 /// registered engine's only transport attach (see the inbound arm).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_dfrost_log_zenoh_adapter(
     session: Arc<zenoh::Session>,
     community_id_hex: String,
@@ -11940,9 +12295,14 @@ pub fn spawn_dfrost_log_zenoh_adapter(
     crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    // ZEB-1030: optional catch-up protocol halves — Some spawns the
+    // catchup responder queryable + periodic requester; None keeps the
+    // pure pub/sub-only adapter (e.g. ingest-only test callers).
+    catchup_hooks: Option<DfrostCatchupHooks>,
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let topic = format!("harmony/community/{community_id_hex}/dfrost");
+    let catchup_topic = format!("harmony/community/{community_id_hex}/dfrost/catchup");
 
     tokio::spawn(async move {
         let key_expr = match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
@@ -12042,6 +12402,214 @@ pub fn spawn_dfrost_log_zenoh_adapter(
                     }
                 }
             }
+        });
+
+        // ── ZEB-1030 catch-up responder (queryable) ─────────────────────
+        // When catch-up hooks are present, answer dfrost/catchup GETs: open
+        // the sealed request (DFROST_CATCHUP_AAD + current-epoch cut), run
+        // the engine's respond half, and stream back the sealed frame set —
+        // all sealed under ONE epoch snapshot (ZEB-920, `dfrost_catchup_
+        // seal_reply`). A payload-less or unopenable GET, or a respond
+        // miss, replies nothing (mirrors the voting rbsr responder,
+        // 11504-11578).
+        //
+        // ZEB-1030 round-2: the queryable is declared inside a retry loop
+        // (voice-signal backoff pattern: 5s → ×2 → 60s cap, the same shape
+        // as the dfrost live subscriber's re-declare below), NOT one-shot —
+        // a transient Zenoh error at declare time would otherwise
+        // permanently disable catch-up serving for this community until
+        // restart (Greptile P1 / Qodo on #778). The responder owns no
+        // downstream channel to race the backoff against (unlike the
+        // pub/sub arms' `*_tx.closed()`), so the wait is paced in 1s
+        // slices against `closing` instead (`catchup_responder_backoff_
+        // wait`). An established queryable whose recv stream ends
+        // unexpectedly returns to this same declaration loop rather than
+        // exiting the task.
+        let catchup_resp_handle = catchup_hooks.as_ref().map(|hooks| {
+            let session_catchup = Arc::clone(&session);
+            let crdt_state_catchup = Arc::clone(&crdt_state);
+            let closing_catchup = Arc::clone(&closing);
+            let catchup_topic_resp = catchup_topic.clone();
+            let respond = hooks.respond.clone();
+            tokio::spawn(async move {
+                let key = match zenoh::key_expr::KeyExpr::try_from(catchup_topic_resp.clone()) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            topic = %catchup_topic_resp,
+                            "dfrost catchup key_expr invalid; responder skipped"
+                        );
+                        return;
+                    }
+                };
+                let mut backoff = std::time::Duration::from_secs(5);
+                const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+                'outer: loop {
+                    if closing_catchup.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let qbl = match session_catchup.declare_queryable(&key).await {
+                        Ok(q) => {
+                            backoff = std::time::Duration::from_secs(5);
+                            q
+                        }
+                        Err(e) => {
+                            if !closing_catchup.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    error = %e,
+                                    topic = %catchup_topic_resp,
+                                    backoff_s = backoff.as_secs(),
+                                    "failed to declare dfrost catchup queryable; retrying \
+                                     after backoff"
+                                );
+                            }
+                            if catchup_responder_backoff_wait(backoff, &closing_catchup).await {
+                                break 'outer;
+                            }
+                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                            continue;
+                        }
+                    };
+                    loop {
+                        tokio::select! {
+                            biased;
+                            res = qbl.recv_async() => {
+                                let Ok(query) = res else {
+                                    if !closing_catchup.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %catchup_topic_resp,
+                                            "dfrost catchup queryable closed; reconnecting"
+                                        );
+                                    }
+                                    break;
+                                };
+                                let Some(payload) = query.payload() else { continue; };
+                                if payload.len()
+                                    > crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_FRAME_BYTES
+                                {
+                                    continue;
+                                }
+                                let raw = payload.to_bytes().to_vec();
+                                let Some(request) = dfrost_catchup_open_request(
+                                    &crdt_state_catchup, community_id, &raw,
+                                ).await else {
+                                    continue;
+                                };
+                                let Some(frames) = (respond)(request).await else {
+                                    continue;
+                                };
+                                let Some(wires) = dfrost_catchup_seal_reply(
+                                    &crdt_state_catchup, community_id, &frames,
+                                )
+                                .await
+                                else {
+                                    continue;
+                                };
+                                for wire in wires {
+                                    if query.reply(query.key_expr(), wire).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                                if closing_catchup.load(Ordering::SeqCst) { break 'outer; }
+                            }
+                        }
+                    }
+                    // Mid-session queryable death: pace the re-declare
+                    // (voice-signal pattern) while still resolving
+                    // promptly on engine teardown.
+                    if catchup_responder_backoff_wait(
+                        std::time::Duration::from_secs(5),
+                        &closing_catchup,
+                    )
+                    .await
+                    {
+                        break 'outer;
+                    }
+                }
+            })
+        });
+
+        // ── ZEB-1030 catch-up requester ──────────────────────────────────
+        // Immediate first attempt, then `DFROST_CATCHUP_INTERVAL` between
+        // attempts (1s closing-poll slices, with a select arm on the
+        // engine's epoch-lag hint that pulls the next attempt forward —
+        // `catchup_wait`). Each attempt: build the request, seal it, GET
+        // with a bounded pattern-B drain (`dfrost_catchup_get_round` — raw
+        // bytes only, never engine work in the zenoh reply arm), THEN
+        // open/decode each frame and hand the set to `ingest`.
+        let catchup_req_handle = catchup_hooks.clone().map(|hooks| {
+            let session_req_c = Arc::clone(&session);
+            let crdt_state_req_c = Arc::clone(&crdt_state);
+            let closing_req_c = Arc::clone(&closing);
+            let catchup_topic_req = catchup_topic.clone();
+            tokio::spawn(async move {
+                loop {
+                    if closing_req_c.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let request = (hooks.build_request)().await;
+                    if let Some(sealed) =
+                        dfrost_catchup_seal_request(&crdt_state_req_c, community_id, &request)
+                            .await
+                    {
+                        let raws = dfrost_catchup_get_round(
+                            &session_req_c,
+                            &catchup_topic_req,
+                            sealed,
+                            &closing_req_c,
+                        )
+                        .await;
+                        if closing_req_c.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if !raws.is_empty() {
+                            let mut frames = Vec::with_capacity(raws.len());
+                            for raw in raws {
+                                if let Some(frame) = dfrost_catchup_open_frame(
+                                    &crdt_state_req_c, community_id, &raw,
+                                )
+                                .await
+                                {
+                                    frames.push(frame);
+                                }
+                            }
+                            if !frames.is_empty() {
+                                let outcome = (hooks.ingest)(frames).await;
+                                match outcome {
+                                    crate::community_dfrost_log_engine::CatchupOutcome::AdoptedRefresh { .. }
+                                    | crate::community_dfrost_log_engine::CatchupOutcome::AdoptedInitial { .. } => {
+                                        tracing::info!(
+                                            topic = %catchup_topic_req,
+                                            ?outcome,
+                                            "dfrost catchup adopted",
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::debug!(
+                                            topic = %catchup_topic_req,
+                                            ?outcome,
+                                            "dfrost catchup round outcome",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match catchup_wait(
+                        DFROST_CATCHUP_INTERVAL.as_secs(),
+                        &closing_req_c,
+                        &hooks.hint,
+                    )
+                    .await
+                    {
+                        WaitEnd::Closing => return,
+                        WaitEnd::Interval | WaitEnd::Hint => {}
+                    }
+                }
+            })
         });
 
         // Inbound: Zenoh subscriber → decrypt (current-epoch-only) →
@@ -12209,6 +12777,12 @@ pub fn spawn_dfrost_log_zenoh_adapter(
 
         let _ = pub_handle.await;
         let _ = sub_handle.await;
+        if let Some(h) = catchup_resp_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = catchup_req_handle {
+            let _ = h.await;
+        }
     })
 }
 
@@ -15531,5 +16105,101 @@ mod zeb932_voting_rbsr_cadence_tests {
         // And need_full_dump agrees the forced Failed triggers a full dump.
         assert!(need_full_dump(converge_or_fallback(true), 0, 12));
         assert!(!need_full_dump(converge_or_fallback(false), 0, 12));
+    }
+}
+
+#[cfg(test)]
+mod zeb1030_dfrost_catchup_transport_tests {
+    use super::{catchup_wait, dfrost_catchup_open_frame, dfrost_catchup_seal_reply, WaitEnd};
+    use crate::community_dfrost_catchup::{CatchupBody, CatchupFrame, CATCHUP_VERSION};
+    use crate::owner_state_types::{EpochKey, SpaceId};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    /// Minimal `OwnerState` holding one community Space with a live epoch
+    /// key, wrapped for the seal/open helpers' `crdt_state` param.
+    fn test_crdt_state(
+        community_id: SpaceId,
+    ) -> tokio::sync::Mutex<crate::owner_state_crdt::OwnerState> {
+        let mut state = crate::owner_state_crdt::OwnerState::default();
+        let space = crate::community_state_sync::test_community_space(
+            community_id,
+            1,
+            EpochKey::new([0x5a; 32]),
+        );
+        state.spaces.insert(community_id, space);
+        tokio::sync::Mutex::new(state)
+    }
+
+    fn test_frame(body: CatchupBody) -> CatchupFrame {
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [7u8; 8],
+            body,
+        }
+    }
+
+    /// A frame seals and opens under the same epoch key (round trip through
+    /// `dfrost_catchup_seal_reply` — the ONE-epoch-snapshot reply path — and
+    /// `dfrost_catchup_open_frame`).
+    #[tokio::test]
+    async fn dfrost_catchup_seal_open_round_trip_and_caps_zeb1030() {
+        let community_id = SpaceId([0xaa; 16]);
+        let crdt_state = test_crdt_state(community_id);
+        let frame = test_frame(CatchupBody::Beacon(vec![1, 2, 3, 4]));
+
+        let sealed =
+            dfrost_catchup_seal_reply(&crdt_state, community_id, std::slice::from_ref(&frame))
+                .await
+                .expect("epoch state present");
+        assert_eq!(sealed.len(), 1, "one frame in, one sealed wire out");
+
+        let opened = dfrost_catchup_open_frame(&crdt_state, community_id, &sealed[0])
+            .await
+            .expect("must open under the same epoch key");
+        assert_eq!(opened, frame, "round trip must be byte-identical");
+
+        // An over-cap RAW payload is rejected before any decode/decrypt work
+        // (cap-checked before alloc).
+        let oversize =
+            vec![0u8; crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_FRAME_BYTES + 1];
+        assert!(
+            dfrost_catchup_open_frame(&crdt_state, community_id, &oversize)
+                .await
+                .is_none(),
+            "an over-cap sealed payload must be rejected before decode"
+        );
+    }
+
+    /// `hint.notified()` ends the wait early, before the interval elapses.
+    #[tokio::test(start_paused = true)]
+    async fn catchup_wait_slices_break_on_hint_zeb1030() {
+        let closing = AtomicBool::new(false);
+        let hint = tokio::sync::Notify::new();
+        hint.notify_one();
+        let end = catchup_wait(2, &closing, &hint).await;
+        assert_eq!(end, WaitEnd::Hint);
+    }
+
+    /// `closing` set ends the wait immediately, even before the first slice.
+    #[tokio::test(start_paused = true)]
+    async fn catchup_wait_slices_break_on_closing_zeb1030() {
+        let closing = AtomicBool::new(true);
+        let hint = tokio::sync::Notify::new();
+        let end = catchup_wait(2, &closing, &hint).await;
+        assert_eq!(end, WaitEnd::Closing);
+    }
+
+    /// With neither `closing` nor a hint, the wait runs the full interval.
+    #[tokio::test(start_paused = true)]
+    async fn catchup_wait_runs_full_interval_when_untouched_zeb1030() {
+        let closing = AtomicBool::new(false);
+        let hint = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        let end = catchup_wait(2, &closing, &hint).await;
+        assert_eq!(end, WaitEnd::Interval);
+        assert!(
+            tokio::time::Instant::now().saturating_duration_since(start) >= Duration::from_secs(2)
+        );
     }
 }
