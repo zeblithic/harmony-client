@@ -11,7 +11,7 @@
 use harmony_app::community_membership::{
     MembershipEventKind, ResetVerdict, SignedMembershipEvent, RESET_VETO_WINDOW_FLOOR_MS,
 };
-use harmony_app::owner_state_crypto::canonical_cbor_encode;
+use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
 fn fixture_hlc() -> Hlc {
@@ -70,6 +70,8 @@ fn signed_event_dfrost_reset_proposal_wire_bytes_pinned() {
         veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
     });
     let bytes = canonical_cbor_encode(&event).expect("encode");
+    let decoded: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, event, "roundtrip identity");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("signed_event_dfrost_reset_proposal hex: {hex}");
     assert_eq!(
@@ -89,6 +91,8 @@ fn signed_event_dfrost_reset_cosign_wire_bytes_pinned() {
         target_event_id: [0x30; 16],
     });
     let bytes = canonical_cbor_encode(&event).expect("encode");
+    let decoded: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, event, "roundtrip identity");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("signed_event_dfrost_reset_cosign hex: {hex}");
     assert_eq!(
@@ -111,6 +115,8 @@ fn signed_event_dfrost_reset_response_endorse_wire_bytes_pinned() {
         new_vk: None,
     });
     let bytes = canonical_cbor_encode(&event).expect("encode");
+    let decoded: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, event, "roundtrip identity");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("signed_event_dfrost_reset_response_endorse hex: {hex}");
     assert_eq!(
@@ -134,6 +140,8 @@ fn signed_event_dfrost_reset_response_consumed_wire_bytes_pinned() {
         new_vk: Some([0xC1; 32]),
     });
     let bytes = canonical_cbor_encode(&event).expect("encode");
+    let decoded: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, event, "roundtrip identity");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("signed_event_dfrost_reset_response_consumed hex: {hex}");
     assert_eq!(

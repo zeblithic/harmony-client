@@ -16763,31 +16763,107 @@ mod reset_verify_tests {
         assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
     }
 
-    // ── RS-P5 (open-proposal spam bound; behavioural coverage is Task 2) ──
+    // ── RS-P5 (open-proposal spam bound) ──
+    //
+    // Fix round 1 (review I1): behaviourally exercise both halves of the
+    // predicate — proposer match AND phase-in-{Collecting,Window,Authorized}
+    // — via `push_target_proposal`, the same hand-constructed-view technique
+    // `rsr1_consumed_actor_not_pinned_member_rejected`/`rsr3_*` already use.
+    // (Materialize still never populates `reset_proposals` in this task —
+    // Task 2 owns that — these tests only prove the static gate logic is
+    // correct against a view constructed by hand.)
 
     #[test]
-    fn rsp5_gate_compiles_against_empty_view() {
-        // ZEB-1031 Task 1: `reset_proposals` is always empty until Task
-        // 2's materialize post-pass lands, so this gate cannot yet
-        // reject a real "actor has an open proposal" case (behavioural
-        // coverage lands in Task 2). Assert the gate compiles cleanly
-        // against the empty view and that the error variant it would
-        // return exists with the exact shape callers rely on.
-        let w = world();
-        assert!(w.prior.reset_proposals.is_empty());
+    fn rsp5_open_proposal_by_same_actor_rejected() {
+        let mut w = world();
+        let admin_owner = w.admin.owner;
+        let new_members = sorted_new_members(&w);
+        push_target_proposal(
+            &mut w,
+            [0x99; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk: [0xAA; 32],
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Collecting,
+        );
         let evt = proposal_event(
             &w.admin,
             [0xAA; 32],
             1,
-            sorted_new_members(&w),
+            new_members,
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalActorHasOpenProposal)
+        );
+    }
+
+    #[test]
+    fn rsp5_terminal_proposal_does_not_block() {
+        let mut w = world();
+        let admin_owner = w.admin.owner;
+        let new_members = sorted_new_members(&w);
+        push_target_proposal(
+            &mut w,
+            [0x99; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk: [0xAA; 32],
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Vetoed,
+        );
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            new_members,
             2,
             RESET_VETO_WINDOW_FLOOR_MS,
         );
         assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
-        assert_ne!(
-            verify_event(&evt, &w.prior, &w.ctx),
-            Err(VerifyError::DfrostResetProposalActorHasOpenProposal)
+    }
+
+    #[test]
+    fn rsp5_open_proposal_by_different_actor_does_not_block() {
+        let mut w = world();
+        // A second power-100 admin whose open proposal must NOT block
+        // w.admin's own proposal — exercises the proposer-match half of
+        // the predicate independently of the phase-set half.
+        let admin2 = mint_test_owner(0x25);
+        w.prior.members.insert(admin2.owner, joined_state(0, "a2"));
+        w.prior.power_levels.insert(admin2.owner, 100);
+        test_enroll_member(&mut w.prior, &admin2);
+        let new_members = sorted_new_members(&w);
+        push_target_proposal(
+            &mut w,
+            [0x99; 16],
+            admin2.owner,
+            TargetProposalFields {
+                target_vk: [0xAA; 32],
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Collecting,
         );
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            new_members,
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
     }
 
     // ── RS-C1 (DfrostResetCosign actor) ──
@@ -16970,6 +17046,74 @@ mod reset_verify_tests {
         assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
     }
 
+    // Fix round 1 (review I2): domain separation across verdicts. A
+    // threshold signature the committee produced under one domain-tagged
+    // message must never verify under another verdict's message — the
+    // whole reason three separate domain tags exist (spec §3.3). Sign
+    // under one domain, submit labelled as a DIFFERENT verdict, and
+    // confirm RS-R3 rejects it (rather than accidentally accepting
+    // because the digest and vk happen to match).
+
+    #[test]
+    fn rsr3_endorse_sig_rejected_when_relabelled_veto() {
+        let mut w = world();
+        let (sk, target_vk) = test_keypair(0x04);
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        let digest = dfrost_reset_digest(&COM, &[0x91; 16], &target_vk, 1, &new_members, 2)
+            .expect("digest encode");
+        // Signed under the ENDORSE domain...
+        let sig = sign_reset_message(&sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        // ...but submitted as a Veto response.
+        let evt = response_event(&w.admin, [0x91; 16], ResetVerdict::Veto, sig, None);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseSigInvalid)
+        );
+    }
+
+    #[test]
+    fn rsr3_veto_sig_rejected_when_relabelled_endorse() {
+        let mut w = world();
+        let (sk, target_vk) = test_keypair(0x05);
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        let digest = dfrost_reset_digest(&COM, &[0x91; 16], &target_vk, 1, &new_members, 2)
+            .expect("digest encode");
+        // Signed under the VETO domain...
+        let sig = sign_reset_message(&sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        // ...but submitted as an Endorse response.
+        let evt = response_event(&w.admin, [0x91; 16], ResetVerdict::Endorse, sig, None);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseSigInvalid)
+        );
+    }
+
     // ── RS-R4 (verdict/new_vk shape) ──
 
     #[test]
@@ -17001,6 +17145,130 @@ mod reset_verify_tests {
         assert_eq!(
             verify_event(&evt, &w.prior, &w.ctx),
             Err(VerifyError::DfrostResetResponseShapeInvalid)
+        );
+    }
+
+    // ── dfrost_reset_digest input-binding matrix (review I3) ──
+    //
+    // Mirrors community_dfrost_types.rs's
+    // `derive_dkg_ceremony_id_binds_all_inputs`: same inputs must produce
+    // the same digest, and perturbing ANY single input must change it.
+    // `space_id` binds against cross-community replay and `proposal_id`
+    // binds a response to one specific proposal (spec §3.3) — neither
+    // was previously exercised.
+
+    #[test]
+    fn dfrost_reset_digest_binds_all_inputs() {
+        let space = COM;
+        let proposal_id: EventId = [0x91; 16];
+        let target_vk = [0xA1; 32];
+        let target_epoch = 7u64;
+        let new_members = vec![OwnerAddr([0x10; 16]), OwnerAddr([0x20; 16])];
+        let new_threshold = 2u16;
+
+        let base = dfrost_reset_digest(
+            &space,
+            &proposal_id,
+            &target_vk,
+            target_epoch,
+            &new_members,
+            new_threshold,
+        )
+        .expect("digest encode");
+
+        // Determinism: same inputs, same digest.
+        assert_eq!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode"),
+            "same inputs must produce the same digest"
+        );
+
+        // space_id (cross-community replay binding).
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &SpaceId([0xBB; 16]),
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // proposal_id (binds a response to one specific proposal).
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &[0x92; 16],
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // target_vk.
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &[0xA2; 32],
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // target_epoch.
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch + 1,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // new_members.
+        let other_members = vec![OwnerAddr([0x10; 16]), OwnerAddr([0x30; 16])];
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &other_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // new_threshold.
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold + 1,
+            )
+            .expect("digest encode")
         );
     }
 }
