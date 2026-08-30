@@ -12244,6 +12244,28 @@ pub(crate) async fn catchup_wait(
     }
 }
 
+/// ZEB-1030 round-2: pace a bounded backoff wait for the catch-up
+/// responder's queryable re-declare loop, polling `closing` every 1s
+/// (same shape as `catchup_wait` above, minus the hint arm — the
+/// responder owns no downstream channel to race the sleep against
+/// directly). Returns `true` if `closing` was observed (caller should
+/// exit), `false` once the full `wait` has elapsed.
+async fn catchup_responder_backoff_wait(wait: std::time::Duration, closing: &AtomicBool) -> bool {
+    let step = std::time::Duration::from_secs(1);
+    let mut remaining = wait;
+    loop {
+        if closing.load(Ordering::SeqCst) {
+            return true;
+        }
+        if remaining.is_zero() {
+            return false;
+        }
+        let this = remaining.min(step);
+        tokio::time::sleep(this).await;
+        remaining = remaining.saturating_sub(this);
+    }
+}
+
 /// ZEB-1018: per-community Zenoh adapter for the D-FROST committee-log
 /// data plane. Topic: `harmony/community/{id_hex}/dfrost` (live pub/sub).
 /// This is the "swap-in byte-relay glue" the ZEB-307 engine and its
@@ -12390,6 +12412,19 @@ pub fn spawn_dfrost_log_zenoh_adapter(
         // seal_reply`). A payload-less or unopenable GET, or a respond
         // miss, replies nothing (mirrors the voting rbsr responder,
         // 11504-11578).
+        //
+        // ZEB-1030 round-2: the queryable is declared inside a retry loop
+        // (voice-signal backoff pattern: 5s → ×2 → 60s cap, the same shape
+        // as the dfrost live subscriber's re-declare below), NOT one-shot —
+        // a transient Zenoh error at declare time would otherwise
+        // permanently disable catch-up serving for this community until
+        // restart (Greptile P1 / Qodo on #778). The responder owns no
+        // downstream channel to race the backoff against (unlike the
+        // pub/sub arms' `*_tx.closed()`), so the wait is paced in 1s
+        // slices against `closing` instead (`catchup_responder_backoff_
+        // wait`). An established queryable whose recv stream ends
+        // unexpectedly returns to this same declaration loop rather than
+        // exiting the task.
         let catchup_resp_handle = catchup_hooks.as_ref().map(|hooks| {
             let session_catchup = Arc::clone(&session);
             let crdt_state_catchup = Arc::clone(&crdt_state);
@@ -12408,55 +12443,90 @@ pub fn spawn_dfrost_log_zenoh_adapter(
                         return;
                     }
                 };
-                let qbl = match session_catchup.declare_queryable(&key).await {
-                    Ok(q) => q,
-                    Err(e) => {
-                        if !closing_catchup.load(Ordering::SeqCst) {
-                            tracing::warn!(
-                                error = %e,
-                                topic = %catchup_topic_resp,
-                                "failed to declare dfrost catchup queryable"
-                            );
-                        }
-                        return;
+                let mut backoff = std::time::Duration::from_secs(5);
+                const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+                'outer: loop {
+                    if closing_catchup.load(Ordering::SeqCst) {
+                        break;
                     }
-                };
-                loop {
-                    tokio::select! {
-                        biased;
-                        res = qbl.recv_async() => {
-                            let Ok(query) = res else { break; };
-                            let Some(payload) = query.payload() else { continue; };
-                            if payload.len()
-                                > crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_FRAME_BYTES
-                            {
-                                continue;
+                    let qbl = match session_catchup.declare_queryable(&key).await {
+                        Ok(q) => {
+                            backoff = std::time::Duration::from_secs(5);
+                            q
+                        }
+                        Err(e) => {
+                            if !closing_catchup.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    error = %e,
+                                    topic = %catchup_topic_resp,
+                                    backoff_s = backoff.as_secs(),
+                                    "failed to declare dfrost catchup queryable; retrying \
+                                     after backoff"
+                                );
                             }
-                            let raw = payload.to_bytes().to_vec();
-                            let Some(request) = dfrost_catchup_open_request(
-                                &crdt_state_catchup, community_id, &raw,
-                            ).await else {
-                                continue;
-                            };
-                            let Some(frames) = (respond)(request).await else {
-                                continue;
-                            };
-                            let Some(wires) = dfrost_catchup_seal_reply(
-                                &crdt_state_catchup, community_id, &frames,
-                            )
-                            .await
-                            else {
-                                continue;
-                            };
-                            for wire in wires {
-                                if query.reply(query.key_expr(), wire).await.is_err() {
+                            if catchup_responder_backoff_wait(backoff, &closing_catchup).await {
+                                break 'outer;
+                            }
+                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                            continue;
+                        }
+                    };
+                    loop {
+                        tokio::select! {
+                            biased;
+                            res = qbl.recv_async() => {
+                                let Ok(query) = res else {
+                                    if !closing_catchup.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %catchup_topic_resp,
+                                            "dfrost catchup queryable closed; reconnecting"
+                                        );
+                                    }
                                     break;
+                                };
+                                let Some(payload) = query.payload() else { continue; };
+                                if payload.len()
+                                    > crate::community_dfrost_catchup::MAX_DFROST_CATCHUP_FRAME_BYTES
+                                {
+                                    continue;
+                                }
+                                let raw = payload.to_bytes().to_vec();
+                                let Some(request) = dfrost_catchup_open_request(
+                                    &crdt_state_catchup, community_id, &raw,
+                                ).await else {
+                                    continue;
+                                };
+                                let Some(frames) = (respond)(request).await else {
+                                    continue;
+                                };
+                                let Some(wires) = dfrost_catchup_seal_reply(
+                                    &crdt_state_catchup, community_id, &frames,
+                                )
+                                .await
+                                else {
+                                    continue;
+                                };
+                                for wire in wires {
+                                    if query.reply(query.key_expr(), wire).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                                if closing_catchup.load(Ordering::SeqCst) { break 'outer; }
+                            }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                            if closing_catchup.load(Ordering::SeqCst) { break; }
-                        }
+                    }
+                    // Mid-session queryable death: pace the re-declare
+                    // (voice-signal pattern) while still resolving
+                    // promptly on engine teardown.
+                    if catchup_responder_backoff_wait(
+                        std::time::Duration::from_secs(5),
+                        &closing_catchup,
+                    )
+                    .await
+                    {
+                        break 'outer;
                     }
                 }
             })

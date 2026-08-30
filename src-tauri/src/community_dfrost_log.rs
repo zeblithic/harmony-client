@@ -1358,6 +1358,21 @@ impl DfrostLog {
             {
                 continue;
             }
+            // ZEB-1030 round-2: the Schnorr check above covers only the
+            // PAYLOAD under the joint verifying key — the envelope `actor`
+            // is just this beacon's re-broadcaster, not itself part of
+            // what gets signed. Without this check, any envelope-valid
+            // identity (an Ed25519 signature over `signing_bytes()`,
+            // unrelated to committee membership) could re-wrap a genuine
+            // beacon under its own envelope and have it retained here.
+            // Beacons are committee output, so only committee members'
+            // envelopes are adoptable — deliberately STRICTER than the
+            // live `apply_vrf_beacon` path, which leans on its
+            // `pending_sign` session gate instead of a membership check
+            // on the envelope actor.
+            if !self.committee_state.members.contains(&event.actor) {
+                continue;
+            }
 
             if let std::collections::hash_map::Entry::Vacant(slot) =
                 self.beacon_index.entry(payload.message_hash)
@@ -7655,6 +7670,84 @@ mod tests {
         assert_eq!(fresh_log.adopt_beacons(&[ev.clone(), bad_ev]), 1);
         assert_eq!(fresh_log.beacon_index.get(&message_hash), Some(&vrf_output));
         assert_eq!(fresh_log.event_count(), 1);
+    }
+
+    /// ZEB-1030 round-2: a genuine, committee-signed beacon PAYLOAD
+    /// re-wrapped in a NON-member's envelope must be rejected — the
+    /// Schnorr check alone (over the payload, under the joint vk) isn't
+    /// enough, because the envelope `actor` is just the re-broadcaster,
+    /// not part of what gets signed. The event-level `sig` here is a
+    /// fabricated all-zero placeholder, which is fine: `adopt_beacons`
+    /// operates at the log layer and never checks it (Ed25519 envelope-
+    /// signature verification against a resolved identity happens at the
+    /// engine's ingest layer) — what this test isolates is the new
+    /// membership check on `event.actor` alone.
+    #[test]
+    fn adopt_beacons_rejects_non_member_envelope_actor_zeb1030() {
+        use crate::community_dfrost_types::{derive_vrf_output, VrfBeaconPayload};
+        use crate::owner_state_types::Hlc;
+
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+
+        let message_hash = [0x55u8; 32];
+        let mut rng = frost_ristretto255::rand_core::OsRng;
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            let (n, c) = frost_ristretto255::round1::commit(kp.signing_share(), &mut rng);
+            nonces.insert(*id, n);
+            commitments.insert(*id, c);
+        }
+        let signing_package = frost_ristretto255::SigningPackage::new(commitments, &message_hash);
+        let mut shares = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            shares.insert(
+                *id,
+                frost_ristretto255::round2::sign(&signing_package, nonces.get(id).unwrap(), kp)
+                    .expect("round2 sign"),
+            );
+        }
+        let sig =
+            frost_ristretto255::aggregate(&signing_package, &shares, &pub_pkg).expect("aggregate");
+        let sig_bytes = sig.serialize().expect("sig serialize");
+        let r: [u8; 32] = sig_bytes[..32].try_into().unwrap();
+        let vrf_output = derive_vrf_output(&r);
+
+        let good_payload = VrfBeaconPayload {
+            ceremony_id: [0xcc; 32],
+            message_hash,
+            signature: sig_bytes,
+            vrf_output,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&good_payload, &mut pd).unwrap();
+
+        let non_member_actor = OwnerAddr([0x99; 16]);
+        assert!(
+            !members.contains(&non_member_actor),
+            "fixture actor must actually be outside the committee"
+        );
+        let ev = SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::VrfBeacon,
+            hlc: Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "x".into(),
+            },
+            actor: non_member_actor,
+            payload: pd,
+            sig: vec![0u8; 64],
+        };
+
+        assert_eq!(log.adopt_beacons(&[ev]), 0);
+        assert_eq!(log.beacon_index.get(&message_hash), None);
+        assert_eq!(log.event_count(), 0);
     }
 
     #[test]
