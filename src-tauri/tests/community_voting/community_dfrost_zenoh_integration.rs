@@ -461,6 +461,9 @@ async fn dfrost_catchup_round_crosses_real_zenoh_session_zeb1030() {
         members: members.clone(),
         threshold: 2,
         max_signers: 2,
+        // ZEB-1034: bind to the community both engines run as — the
+        // joiner's `adopt_initial_quorum` now requires the match.
+        space_id: Some(SpaceId([0xD8; 16])),
     };
     let dk_alice = build_signed_dfrost_event(
         &alice_sk,

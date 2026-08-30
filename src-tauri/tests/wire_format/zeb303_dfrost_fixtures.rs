@@ -125,7 +125,13 @@ const EXPECTED_RF_ROUND1_HEX: &str = "a36263695820666666666666666666666666666666
 // ZEB-1028: rn=1 with a non-zero retry attempt gains the `at` key (a
 // deadline-retry proposal). Attempt 0 omits the key — the unchanged
 // EXPECTED_RF_ROUND1_HEX above IS the wire-stability pin for that.
-const EXPECTED_RF_ROUND1_RETRY_HEX: &str = "a46263695820666666666666666666666666666666666666666666666666666666666666666662726e0162706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee62617402";
+/// ZEB-1034: `dk` with the community binding (`sp`) present — the
+/// 8-key form new mints produce. The legacy 7-key pin (`EXPECTED_DK_HEX`)
+/// is deliberately UNCHANGED: `space_id: None` must stay byte-identical
+/// to pre-1034 events.
+const EXPECTED_DK_BOUND_HEX: &str = "a86263695820666666666666666666666666666666666666666666666666666666666666666662766b5820444444444444444444444444444444444444444444444444444444444444444462767381a262696450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62766b5820333333333333333333333333333333333333333333333333333333333333333362657001626d628150aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62746801626d780162737050dddddddddddddddddddddddddddddddd";
+
+const EXPECTED_RF_ROUND1_RETRY_HEX: &str ="a46263695820666666666666666666666666666666666666666666666666666666666666666662726e0162706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee62617402";
 const EXPECTED_RF_ROUND2_HEX: &str = "a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0262726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd";
 
 const EXPECTED_ENVELOPE_DI_HEX: &str = "a862746761646276720162747200626b64626469626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6270645862a762636958206666666666666666666666666666666666666666666666666666666666666666626d628250aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa50bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62746802626d78026265700162776d1903e8626c6700627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
@@ -192,6 +198,19 @@ fn dk_payload() -> DkgCompletePayload {
         members: vec![FIXTURE_ACTOR],
         threshold: 1,
         max_signers: 1,
+        // ZEB-1034: `None` keeps the legacy 7-key form — the pre-1034
+        // pin above this field's introduction MUST stay byte-identical
+        // (`skip_serializing_if` omits the `sp` key entirely).
+        space_id: None,
+    }
+}
+
+/// ZEB-1034: the community-bound form every post-upgrade mint produces —
+/// same fixture with `sp` populated (appended 8th key, `bstr(16)`).
+fn dk_bound_payload() -> DkgCompletePayload {
+    DkgCompletePayload {
+        space_id: Some(harmony_app::owner_state_types::SpaceId([0xdd; 16])),
+        ..dk_payload()
     }
 }
 
@@ -324,6 +343,32 @@ fn dk_canonical_cbor() {
         actual_hex, EXPECTED_DK_HEX,
         "DkgCompletePayload wire format changed"
     );
+}
+
+#[test]
+fn dk_bound_canonical_cbor_zeb1034() {
+    let actual_hex = hex::encode(encode(&dk_bound_payload()));
+    if EXPECTED_DK_BOUND_HEX.contains("FILL_AFTER") {
+        panic!("REGENERATE EXPECTED_DK_BOUND_HEX = \"{actual_hex}\";");
+    }
+    assert_eq!(
+        actual_hex, EXPECTED_DK_BOUND_HEX,
+        "community-bound DkgCompletePayload wire format changed"
+    );
+}
+
+/// ZEB-1034 roundtrips: the bound form decodes back to `Some(space)`;
+/// legacy 7-key bytes decode with `space_id: None` (the `default`).
+#[test]
+fn dk_space_binding_roundtrip_zeb1034() {
+    let bound = dk_bound_payload();
+    let decoded: DkgCompletePayload =
+        ciborium::de::from_reader(&encode(&bound)[..]).expect("bound dk decodes");
+    assert_eq!(decoded, bound);
+
+    let legacy: DkgCompletePayload =
+        ciborium::de::from_reader(&encode(&dk_payload())[..]).expect("legacy dk decodes");
+    assert_eq!(legacy.space_id, None);
 }
 
 #[test]

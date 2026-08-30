@@ -64814,6 +64814,10 @@ pub async fn dfrost_contribute_dkg_round_core<R: tauri::Runtime, H: tauri::Runti
             members: members.clone(),
             threshold,
             max_signers,
+            // ZEB-1034: sign the community into the dk payload so a fresh
+            // joiner can verify the quorum belongs to the community it is
+            // joining (cross-community replay gate in adopt_initial_quorum).
+            space_id: Some(space_id),
         };
         // R4-2 (Greptile P2) lineage: one signing-key read produces both
         // the signed event AND self's X25519 priv (used by
@@ -66849,6 +66853,8 @@ pub async fn dfrost_contribute_refresh_round_core<R: tauri::Runtime, H: tauri::R
             members: members.clone(),
             threshold,
             max_signers,
+            // ZEB-1034: same community binding as the DKG-completion mint.
+            space_id: Some(space_id),
         };
         let signing_key = handles.signing_key.as_ref();
         let ev = crate::community_dfrost_log::build_signed_dfrost_event(

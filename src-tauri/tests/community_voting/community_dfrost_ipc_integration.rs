@@ -440,6 +440,7 @@ fn contribute_dkg_round3_local(
         members: members.to_vec(),
         threshold,
         max_signers,
+        space_id: None,
     };
     let event = build_signed_dfrost_event(
         signing_key,
@@ -1807,6 +1808,7 @@ async fn refresh_ipc_round_trip_completes_and_preserves_joint_vk() {
         members: members.clone(),
         threshold,
         max_signers,
+        space_id: None,
     };
     // CR-6 (#775 round 1): re-stash round secrets immediately before the
     // dk events so the post-promotion assertion below proves PROMOTION
