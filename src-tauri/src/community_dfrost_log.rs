@@ -970,6 +970,19 @@ impl DfrostLog {
     /// each other and with the held committee shape before committing.
     /// No partial state is written on any rejection — every check runs
     /// before the commit block below.
+    ///
+    /// The epoch jump is deliberately unbounded (`payload.epoch` need
+    /// only be `> current_epoch`, not `== current_epoch + 1`): a
+    /// straggler that missed N sequential refreshes must be able to
+    /// jump N epochs in one adoption, and that is exactly the feature
+    /// this method exists to provide. This adds no attack surface: a
+    /// forged quorum requires ≥ `threshold` colluding CURRENT committee
+    /// members signing a fabricated `dk`, which is full committee
+    /// compromise — and under that compromise, the same colluders could
+    /// instead just run `threshold`-many sequential legitimate refreshes
+    /// and reach any target epoch anyway. Bounding the jump size would
+    /// therefore buy no additional security while breaking the catch-up
+    /// feature for anyone far enough behind.
     pub fn adopt_refresh_quorum(&mut self, events: &[SignedCommitteeEvent]) -> Result<u64, String> {
         use crate::community_dfrost_types::DkgCompletePayload;
 
@@ -1084,11 +1097,44 @@ impl DfrostLog {
         self.committee_state.pending_sign.clear();
         self.local_dkg_secret = None;
         self.local_dkg_secret2 = None;
-        self.pending_rotated = None;
 
-        // Every share rotates on a refresh, so a held kp always matches
-        // the OLD consensus, never the new one — this un-suppresses
-        // `has_key_package` so ZEB-1027 auto-repair recovers the share.
+        // Mirrors `apply_dkg_complete`'s promotion block: install the
+        // STAGED rotated key material (produced by this node's own live
+        // refresh part3, then orphaned when quorum landed via peer dks
+        // before this node's own) iff it matches the ADOPTED consensus
+        // for its identifier. That is exactly the material a node that
+        // finalized part3 and then partitioned before the quorum
+        // arrived would hold — installing it here skips a needless
+        // ZEB-1027 repair round. A mismatch (staged material for a
+        // different, un-adopted ceremony) is dropped with a warn.
+        if let Some((kp, pkp)) = self.pending_rotated.take() {
+            let matches_consensus = self
+                .committee_state
+                .identifier_map
+                .iter()
+                .any(|(addr, id)| {
+                    id == kp.identifier()
+                        && self.committee_state.verifying_shares.get(addr)
+                            == Some(&crate::community_dfrost_crypto::verifying_share_to_bytes(
+                                kp.verifying_share(),
+                            ))
+                });
+            if matches_consensus {
+                self.local_key_package = Some(kp);
+                self.local_pub_key_package = Some(pkp);
+            } else {
+                tracing::warn!(
+                    "dfrost refresh-quorum adoption discarded staged rotated key material that \
+                     does not match the adopted consensus verifying shares (ZEB-1030/ZEB-1027)"
+                );
+            }
+        }
+
+        // Any local kp not freshly installed above is checked against
+        // the ADOPTED consensus — a stale holdover (this node missed
+        // the live ceremony's finalization AND had nothing matching
+        // staged) is dropped, un-suppressing `has_key_package` so
+        // ZEB-1027 auto-repair recovers the share.
         if let Some(kp) = self.local_key_package.as_ref() {
             let matches_consensus = self
                 .committee_state
@@ -1104,6 +1150,11 @@ impl DfrostLog {
             if !matches_consensus {
                 self.local_key_package = None;
                 self.local_pub_key_package = None;
+                tracing::warn!(
+                    "dfrost refresh-quorum adoption invalidated a stale local signing share \
+                     (this node missed the live ceremony's finalization); automatic share \
+                     repair is its recovery path (ZEB-1027)"
+                );
             }
         }
 
@@ -1117,9 +1168,17 @@ impl DfrostLog {
     }
 
     /// ZEB-1030: first-time committee-state adoption for a node with NO
-    /// active state (fresh joiner/observer). Caller has envelope-verified
-    /// AND membership-verified (at each event's own HLC) every event.
-    /// Returns the adopted epoch.
+    /// active state (fresh joiner/observer). Returns the adopted epoch.
+    ///
+    /// Caller obligations: every event's envelope must already be
+    /// signature-verified. The membership obligation is broader than
+    /// "the actors who signed" — it covers EVERY committee member the
+    /// adopted payload claims (`payload.members`), each checked at that
+    /// event's own envelope HLC, not just the (possibly-fewer, quorum-
+    /// sized) set of actors whose `dk` events happen to be in `events`.
+    /// A quorum of honest actors can otherwise faithfully vouch for a
+    /// payload that names an additional member who was never actually
+    /// in the community.
     pub fn adopt_initial_quorum(&mut self, events: &[SignedCommitteeEvent]) -> Result<u64, String> {
         use crate::community_dfrost_types::DkgCompletePayload;
 
@@ -1162,18 +1221,28 @@ impl DfrostLog {
         if first.epoch < 1 {
             return Err("adopt_initial_quorum: epoch must be >= 1".into());
         }
+        // Mirrors `check_ceremony_init_admissible`'s shape gate exactly
+        // (sorted+deduplicated, >= 2 members, max_signers ==
+        // members.len(), 2 <= threshold <= max_signers) — a fabricated
+        // single-member ("committee" of one, self-signed threshold-1
+        // quorum) must be rejected here exactly as the live `di`
+        // admission path rejects it; a lower floor here would let a
+        // single colluding actor mint a legitimate-looking joiner
+        // adoption for a committee that was never actually agreed.
         let mut sorted_members = first.members.clone();
         sorted_members.sort();
         sorted_members.dedup();
-        if sorted_members != first.members {
+        if sorted_members != first.members || first.members.len() < 2 {
             return Err(
-                "adopt_initial_quorum: members must be sorted ascending and deduplicated".into(),
+                "adopt_initial_quorum: members must be sorted ascending, deduplicated, and \
+                 number at least 2"
+                    .into(),
             );
         }
         if first.max_signers as usize != first.members.len() {
             return Err("adopt_initial_quorum: max_signers does not match members.len()".into());
         }
-        if first.threshold < 1 || first.threshold > first.max_signers {
+        if first.threshold < 2 || first.threshold > first.max_signers {
             return Err("adopt_initial_quorum: threshold out of range".into());
         }
 
@@ -1241,6 +1310,18 @@ impl DfrostLog {
     /// committee's joint verifying key is itself sufficient proof, so a
     /// straggler catching up cold (no in-flight sign session of its own)
     /// can still adopt it. `pending_sign` is never touched.
+    ///
+    /// Tie posture: indexing is first-wins (`beacon_index` is never
+    /// overwritten once a `message_hash` is populated), deliberately
+    /// conservative given this path has no session to arbitrate between
+    /// two independently-valid beacons over the same message. Note that
+    /// the LIVE `apply_vrf_beacon` path is last-wins and is already
+    /// arrival-order-dependent across replicas when two concurrent
+    /// signing ceremonies complete over the same seed — so this is not
+    /// a new divergence class, just a differently-shaped instance of a
+    /// pre-existing one. A deterministic tie-break for BOTH paths (e.g.
+    /// min `vrf_output`) is tracked as ZEB-1032; `apply_vrf_beacon` is
+    /// intentionally left unchanged here.
     pub fn adopt_beacons(&mut self, events: &[SignedCommitteeEvent]) -> usize {
         use crate::community_dfrost_types::{derive_vrf_output, VrfBeaconPayload};
 
@@ -1278,9 +1359,10 @@ impl DfrostLog {
                 continue;
             }
 
-            if !self.beacon_index.contains_key(&payload.message_hash) {
-                self.beacon_index
-                    .insert(payload.message_hash, payload.vrf_output);
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.beacon_index.entry(payload.message_hash)
+            {
+                slot.insert(payload.vrf_output);
                 newly_indexed += 1;
             }
             if !self.log.contains(&dfrost_event_id(event)) {
@@ -6797,6 +6879,10 @@ mod tests {
         let alice_kp = key_packages.get(&ids[0]).unwrap().clone();
 
         let mut log = committee_log_from_material(&members, &ids, &pub_pkg, Some(alice_kp));
+        // Seed local_pub_key_package too, so the is_none() assertion
+        // below actually exercises the drop rather than being vacuously
+        // true because it started as None.
+        log.local_pub_key_package = Some(pub_pkg.clone());
         // Pre-seed a pending_sign session to assert adoption clears it.
         log.committee_state.pending_sign.insert(
             [0x77; 32],
@@ -6851,6 +6937,129 @@ mod tests {
         assert_eq!(log.committee_state.max_signers, 3);
     }
 
+    /// ZEB-1030: `pending_rotated` staged material is installed on
+    /// adoption iff it matches the ADOPTED consensus for its identifier
+    /// (mirroring `apply_dkg_complete`'s promotion gate, exercised live
+    /// in `refresh_promotion_installs_staged_rotated_share_zeb1027`) —
+    /// the node that finalized its own live refresh part3 and then
+    /// partitioned before the quorum landed holds exactly matching
+    /// material, and installing it here skips a needless repair round.
+    #[test]
+    fn adopt_refresh_quorum_stages_and_gates_pending_rotated_zeb1030() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let carol = members[2];
+        let held_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+
+        // MATCH side: the staged package's verifying share appears in
+        // the ADOPTED consensus for alice's identifier → adoption
+        // installs it.
+        {
+            let (rotated_kp, rotated_pkp) = dealer_key_material_for_tests();
+            let rotated_share_bytes = crate::community_dfrost_crypto::verifying_share_to_bytes(
+                rotated_kp.verifying_share(),
+            );
+
+            let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+            log.pending_rotated = Some((rotated_kp, rotated_pkp));
+
+            let payload = DkgCompletePayload {
+                ceremony_id: [0x71; 32],
+                joint_verifying_key: held_vk,
+                verifying_shares: vec![
+                    MemberVerifyingShare {
+                        member: alice,
+                        verifying_share: rotated_share_bytes,
+                    },
+                    MemberVerifyingShare {
+                        member: bob,
+                        verifying_share: [0x52; 32],
+                    },
+                    MemberVerifyingShare {
+                        member: carol,
+                        verifying_share: [0x53; 32],
+                    },
+                ],
+                epoch: 2,
+                members: members.clone(),
+                threshold: 2,
+                max_signers: 3,
+            };
+            let events = vec![
+                signed_dk(alice, 40_000, "a", &payload),
+                signed_dk(bob, 40_001, "b", &payload),
+            ];
+            assert_eq!(log.adopt_refresh_quorum(&events), Ok(2));
+            let installed = log
+                .local_key_package
+                .as_ref()
+                .expect("staged material installed");
+            assert_eq!(
+                crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    installed.verifying_share()
+                ),
+                rotated_share_bytes
+            );
+            assert!(log.local_pub_key_package.is_some());
+            assert!(log.pending_rotated.is_none(), "stage consumed");
+        }
+
+        // MISMATCH side: the staged package does NOT match the adopted
+        // consensus for its identifier (an unrelated dealer run) →
+        // discarded — no phantom share blocking ZEB-1027 auto-repair.
+        {
+            let (rotated_kp, rotated_pkp) = dealer_key_material_for_tests();
+            let mismatched_bytes = crate::community_dfrost_crypto::verifying_share_to_bytes(
+                rotated_kp.verifying_share(),
+            );
+            assert_ne!(
+                mismatched_bytes, [0x61u8; 32],
+                "sanity: dealer share not accidentally equal to the adopted fixture value"
+            );
+
+            let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+            log.pending_rotated = Some((rotated_kp, rotated_pkp));
+
+            let payload = DkgCompletePayload {
+                ceremony_id: [0x72; 32],
+                joint_verifying_key: held_vk,
+                verifying_shares: vec![
+                    MemberVerifyingShare {
+                        member: alice,
+                        verifying_share: [0x61; 32],
+                    },
+                    MemberVerifyingShare {
+                        member: bob,
+                        verifying_share: [0x62; 32],
+                    },
+                    MemberVerifyingShare {
+                        member: carol,
+                        verifying_share: [0x63; 32],
+                    },
+                ],
+                epoch: 2,
+                members: members.clone(),
+                threshold: 2,
+                max_signers: 3,
+            };
+            let events = vec![
+                signed_dk(alice, 41_000, "a", &payload),
+                signed_dk(bob, 41_001, "b", &payload),
+            ];
+            assert_eq!(log.adopt_refresh_quorum(&events), Ok(2));
+            assert!(
+                log.local_key_package.is_none(),
+                "mismatched stage discarded"
+            );
+            assert!(log.local_pub_key_package.is_none());
+            assert!(log.pending_rotated.is_none(), "stage consumed either way");
+        }
+    }
+
     #[test]
     fn adopt_refresh_quorum_reject_matrix_zeb1030() {
         use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
@@ -6885,6 +7094,19 @@ mod tests {
         {
             let p = good_payload();
             cases.push(("sub_threshold", vec![signed_dk(alice, 20_000, "a", &p)]));
+        }
+        {
+            // Two dk events from the SAME actor at different HLCs must
+            // NOT inflate the distinct-actor tally — quorum counts
+            // distinct confirming actors, not raw event count.
+            let p = good_payload();
+            cases.push((
+                "duplicate_actor_no_quorum",
+                vec![
+                    signed_dk(alice, 20_000, "a", &p),
+                    signed_dk(alice, 20_002, "a2", &p),
+                ],
+            ));
         }
         {
             let p = good_payload();
@@ -6986,11 +7208,16 @@ mod tests {
         for (name, events) in &cases {
             let mut log =
                 committee_log_from_material(&members, &ids, &pub_pkg, Some(alice_kp.clone()));
+            let original_shares = log.committee_state.verifying_shares.clone();
             let result = log.adopt_refresh_quorum(events);
             assert!(result.is_err(), "case {name} should reject: {result:?}");
             assert_eq!(
                 log.committee_state.current_epoch, 1,
                 "case {name}: epoch unchanged"
+            );
+            assert_eq!(
+                log.committee_state.verifying_shares, original_shares,
+                "case {name}: verifying_shares unchanged"
             );
             assert!(log.local_key_package.is_some(), "case {name}: kp untouched");
             assert_eq!(log.event_count(), 0, "case {name}: no partial insert");
@@ -7133,6 +7360,30 @@ mod tests {
             ));
         }
         {
+            // Ruling: mirrors `check_ceremony_init_admissible`'s
+            // threshold >= 2 floor — a single-signer "quorum" (threshold
+            // 1) must be rejected exactly as the live `di` admission
+            // path rejects it.
+            let mut p = good_payload();
+            p.threshold = 1;
+            cases.push((
+                "threshold_one",
+                vec![
+                    signed_dk(alice, 1_000, "a", &p),
+                    signed_dk(bob, 1_001, "b", &p),
+                ],
+            ));
+        }
+        {
+            // Ruling: mirrors `check_ceremony_init_admissible`'s
+            // members.len() >= 2 floor — a fabricated single-member
+            // "committee" must be rejected exactly as the live `di`
+            // admission path rejects it.
+            let mut p = good_payload();
+            p.members = vec![alice];
+            cases.push(("single_member", vec![signed_dk(alice, 1_000, "a", &p)]));
+        }
+        {
             let mut p = good_payload();
             p.threshold = 4; // > max_signers (3)
             cases.push((
@@ -7205,7 +7456,42 @@ mod tests {
 
         let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
         let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
-        assert!(log.committee_state.pending_sign.is_empty());
+        // Pre-seed a pending_sign session — adopt_beacons must never
+        // touch it (that is the whole reason it doesn't require one).
+        log.committee_state.pending_sign.insert(
+            [0xaa; 32],
+            PendingSignSession {
+                message_hash: [0xbb; 32],
+                contributions: BTreeMap::new(),
+                local_nonces: None,
+            },
+        );
+
+        // Inactive log: adopt_beacons must return 0 without panicking.
+        let inactive_ev_payload = crate::community_dfrost_types::VrfBeaconPayload {
+            ceremony_id: [0xcc; 32],
+            message_hash: [0x11; 32],
+            signature: vec![0u8; 64],
+            vrf_output: [0x22; 32],
+        };
+        let mut inactive_pd = Vec::new();
+        ciborium::into_writer(&inactive_ev_payload, &mut inactive_pd).unwrap();
+        let inactive_ev = SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::VrfBeacon,
+            hlc: crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "z".into(),
+            },
+            actor: members[0],
+            payload: inactive_pd,
+            sig: vec![0u8; 64],
+        };
+        let mut inactive_log = DfrostLog::new();
+        assert_eq!(inactive_log.adopt_beacons(&[inactive_ev]), 0);
 
         let message_hash = [0x33u8; 32];
         let mut rng = frost_ristretto255::rand_core::OsRng;
@@ -7291,6 +7577,71 @@ mod tests {
         };
         let wrong_ev = build_event(5_002, &wrong_payload);
         assert_eq!(log.adopt_beacons(&[wrong_ev]), 0);
+
+        // Wrong-length signature (63 bytes) — rejected before any crypto.
+        let mut short_sig = sig_bytes.clone();
+        short_sig.pop();
+        assert_eq!(short_sig.len(), 63);
+        let short_payload = VrfBeaconPayload {
+            ceremony_id: [0xcc; 32],
+            message_hash: [0x44; 32], // distinct hash — must not collide with the indexed entry
+            signature: short_sig,
+            vrf_output,
+        };
+        let short_ev = build_event(5_004, &short_payload);
+        assert_eq!(log.adopt_beacons(&[short_ev]), 0);
+
+        // A second VALID signature over the SAME message_hash (fresh
+        // FROST nonces → a different R, hence a different vrf_output)
+        // must NOT overwrite the first-wins index entry.
+        let mut rng2 = frost_ristretto255::rand_core::OsRng;
+        let mut nonces2 = BTreeMap::new();
+        let mut commitments2 = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            let (n, c) = frost_ristretto255::round1::commit(kp.signing_share(), &mut rng2);
+            nonces2.insert(*id, n);
+            commitments2.insert(*id, c);
+        }
+        let signing_package2 = frost_ristretto255::SigningPackage::new(commitments2, &message_hash);
+        let mut shares2 = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            shares2.insert(
+                *id,
+                frost_ristretto255::round2::sign(&signing_package2, nonces2.get(id).unwrap(), kp)
+                    .expect("round2 sign"),
+            );
+        }
+        let sig2 = frost_ristretto255::aggregate(&signing_package2, &shares2, &pub_pkg)
+            .expect("aggregate");
+        let sig2_bytes = sig2.serialize().expect("sig2 serialize");
+        let r2: [u8; 32] = sig2_bytes[..32].try_into().unwrap();
+        let vrf_output2 = derive_vrf_output(&r2);
+        assert_ne!(
+            vrf_output2, vrf_output,
+            "fresh nonces must produce a distinct beacon (or this test is not exercising the tie)"
+        );
+        let second_payload = VrfBeaconPayload {
+            ceremony_id: [0xcc; 32],
+            message_hash,
+            signature: sig2_bytes,
+            vrf_output: vrf_output2,
+        };
+        let second_ev = build_event(5_005, &second_payload);
+        assert_eq!(
+            log.adopt_beacons(&[second_ev]),
+            0,
+            "already-indexed message_hash is first-wins"
+        );
+        assert_eq!(
+            log.beacon_index.get(&message_hash),
+            Some(&vrf_output),
+            "index value unchanged by the second, later-arriving valid signature"
+        );
+
+        // pending_sign was never touched by any of the above.
+        assert!(log.committee_state.pending_sign.contains_key(&[0xaa; 32]));
 
         // Batch of [good, bad] adopts exactly the good one.
         let mut fresh_log = committee_log_from_material(&members, &ids, &pub_pkg, None);
