@@ -3184,9 +3184,19 @@ async fn reset_chain_mid_link_failure_preserves_progress_and_retries_zeb1031() {
         .await
         .expect("responder serves the remaining link");
     let outcome2 = straggler.catchup_ingest(wire_cross(frames2)).await;
+    // Review NB1: round 2 re-serves marker2 (still <= the straggler's
+    // resumed request epoch), which the straggler already applied in
+    // round 1 — that re-delivery is RS-M6's `AlreadyMoved` no-op and no
+    // longer counts toward `links` (only a genuine `Applied` does). The
+    // real progress this round is the quorum adoption, reflected in
+    // `epoch` — assert on that and on state, not the link count.
     assert!(
-        matches!(outcome2, CatchupOutcome::AdoptedResetChain { links: 1, .. }),
-        "round 2 completes the remaining link, got {outcome2:?}"
+        matches!(
+            outcome2,
+            CatchupOutcome::AdoptedResetChain { epoch: 3, links: 0 }
+        ),
+        "round 2 completes the remaining quorum via an AlreadyMoved marker \
+         re-delivery + fresh dk adoption, got {outcome2:?}"
     );
     let g = straggler_log.lock().await;
     assert!(g.committee_state.active, "fully healed after round 2");
@@ -3197,4 +3207,236 @@ async fn reset_chain_mid_link_failure_preserves_progress_and_retries_zeb1031() {
         "still exactly 2 — no duplicate marker recorded"
     );
     assert_eq!(g.committee_state.current_epoch, 3);
+}
+
+// ─── Task 5 review round 2 (NB1): AlreadyMoved must not count as progress ──
+
+/// ZEB-1031 review round 2 (NB1): `apply_reset_chain` must NOT report
+/// progress — and must NOT short-circuit `catchup_ingest`'s reset-chain-try
+/// loop (review C2a) — for a group whose only chain link is an
+/// `AlreadyMoved` (RS-M6) re-delivery with an empty `dk_events` list.
+/// `select_reset_chain`'s own doc calls this a normal serve (a responder
+/// that hasn't itself finished the successor DKG yet), so it happens on
+/// every round a straggler talks to a lagging responder. Before the fix,
+/// such a group unconditionally returned `Some(AdoptedResetChain{links:1,..})`,
+/// and `catchup_ingest`'s hoisted loop returns on the FIRST group that
+/// yields `Some` — discarding every OTHER group in the same round,
+/// including one carrying the genuine successor dk evidence this straggler
+/// actually needs. Ordering decides which group goes first, so a single
+/// stale-but-honest responder (or a hostile one, deliberately) could starve
+/// healing indefinitely just by sorting ahead of the group with real
+/// evidence.
+#[tokio::test]
+async fn apply_reset_chain_no_progress_falls_through_to_other_groups_dk_evidence_zeb1031() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x73);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0x74);
+    let alice_x = alice_x25519();
+    let bob_x = bob_x25519();
+    let mut c = dkg_2of2_setup_for(alice_addr, bob_addr, alice_x, bob_x, Vec::new());
+    let old_vk = c.joint_vk;
+    let community_id = SpaceId([0x73; 16]);
+    let mut new_members = vec![alice_addr, bob_addr];
+    new_members.sort();
+    let new_threshold: u16 = 2;
+
+    let reset_id: EventId = [0x93; 16];
+    let digest = dfrost_reset_digest(
+        &community_id,
+        &reset_id,
+        &old_vk,
+        1,
+        &new_members,
+        new_threshold,
+    )
+    .expect("digest");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset_id,
+        proposer: alice_addr,
+        target_vk: old_vk,
+        target_epoch: 1,
+        new_members: new_members.clone(),
+        new_threshold,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+    });
+    let resolver = Arc::new(TestResetResolver::new(new_members.clone(), membership));
+
+    let marker_payload = ResetMarkerPayload {
+        reset_proposal_id: reset_id,
+        reset_digest: digest,
+        old_vk,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker_event = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker");
+
+    let membership_at_marker = resolver.membership.lock().await.clone();
+    let (nm, nt) = verify_reset_marker_admissible(
+        &marker_payload,
+        &alice_addr,
+        &community_id,
+        &membership_at_marker,
+    )
+    .expect("marker admissible");
+
+    // The straggler already applied this marker DIRECTLY — mirrors a
+    // node that made it through link 1 on a PRIOR catch-up round. This
+    // is what makes the SAME marker's re-delivery below an `AlreadyMoved`
+    // no-op rather than a fresh `Applied`.
+    let applied_b = c
+        .engine_b
+        .apply_reset_marker(&marker_event, &community_id, nm, nt)
+        .expect("marker applies to straggler");
+    assert!(
+        matches!(applied_b, ResetMarkerApplied::Applied { .. }),
+        "precondition: straggler must have genuinely applied it once already"
+    );
+    assert!(!c.engine_b.committee_state.active);
+    assert!(c.engine_b.committee_state.pending_reset.is_some());
+
+    // Successor DKG (epoch 2) — the genuine evidence group B will carry.
+    let successor_ceremony_id: [u8; 32] = [0x94; 32];
+    let new_vk = [0x95; 32];
+    let successor_dk_payload = DkgCompletePayload {
+        ceremony_id: successor_ceremony_id,
+        joint_verifying_key: new_vk,
+        verifying_shares: vec![
+            MemberVerifyingShare {
+                member: alice_addr,
+                verifying_share: [0x96; 32],
+            },
+            MemberVerifyingShare {
+                member: bob_addr,
+                verifying_share: [0x97; 32],
+            },
+        ],
+        epoch: 2,
+        members: new_members.clone(),
+        threshold: new_threshold,
+        max_signers: 2,
+        space_id: Some(community_id),
+    };
+    let dk_alice_e2 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &successor_dk_payload,
+        hlc(6_000, "alice"),
+    )
+    .expect("sign dk alice e2");
+    let dk_bob_e2 = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &successor_dk_payload,
+        hlc(6_100, "bob"),
+    )
+    .expect("sign dk bob e2");
+
+    let straggler_log = Arc::new(Mutex::new(c.engine_b));
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+    let (s_pub_tx, _s_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_s_sub_tx, s_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler_engine =
+        DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: straggler_log.clone(),
+            publisher_tx: s_pub_tx,
+            subscriber_rx: s_sub_rx,
+            app_handle: None,
+            self_addr: bob_addr,
+            self_x25519_priv: bob_x.0,
+            identity_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+    // Hand-built round, group A ordered FIRST so a starvation bug fires
+    // deterministically: group A serves ONLY the already-applied marker
+    // with an EMPTY `dk_events` — exactly `select_reset_chain`'s own
+    // documented normal case for a responder that hasn't itself finished
+    // the successor DKG yet. Group B is a SEPARATE, ordinary (non-chain)
+    // responder carrying the genuine successor dk evidence.
+    let group_a_link = ResetChainLink {
+        marker: marker_event.clone(),
+        dk_events: Vec::new(),
+    };
+    let mut group_a_chain_bytes = Vec::new();
+    ciborium::ser::into_writer(&vec![group_a_link], &mut group_a_chain_bytes)
+        .expect("encode group A chain");
+
+    let mut dk_alice_buf = Vec::new();
+    ciborium::ser::into_writer(&dk_alice_e2, &mut dk_alice_buf).expect("encode dk alice e2");
+    let mut dk_bob_buf = Vec::new();
+    ciborium::ser::into_writer(&dk_bob_e2, &mut dk_bob_buf).expect("encode dk bob e2");
+
+    let frames = vec![
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x31; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 1,
+                active: false,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x31; 8],
+            body: CatchupBody::ResetChain(group_a_chain_bytes),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x32; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 2,
+                active: true,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x32; 8],
+            body: CatchupBody::DkEvidence(dk_alice_buf),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x32; 8],
+            body: CatchupBody::DkEvidence(dk_bob_buf),
+        },
+    ];
+
+    let outcome = straggler_engine.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedInitial { epoch: 2, .. }),
+        "group A's no-progress AlreadyMoved link must fall through to group B's \
+         dk evidence via the ordinary joiner path, got {outcome:?}"
+    );
+    let g = straggler_log.lock().await;
+    assert!(
+        g.committee_state.active,
+        "straggler heals via group B despite group A yielding nothing"
+    );
+    assert_eq!(g.committee_state.joint_verifying_key, Some(new_vk));
+    assert_eq!(g.committee_state.current_epoch, 2);
 }

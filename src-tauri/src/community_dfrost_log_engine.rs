@@ -13,6 +13,7 @@ use crate::community_dfrost_catchup::{
 };
 use crate::community_dfrost_log::{
     check_envelope, dfrost_event_id, verify_signed_committee_event, ApplyError, DfrostLog,
+    ResetMarkerApplied,
 };
 use crate::community_dfrost_types::{
     derive_dkg_ceremony_id, derive_refresh_ceremony_id, derive_repair_ceremony_id,
@@ -3731,8 +3732,24 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                 log.apply_reset_marker(&link.marker, &self.community_id, new_members, new_threshold)
             };
             match applied {
-                Ok(_) => {
+                // Review NB1: only a genuine `Applied` counts as progress.
+                // `AlreadyMoved` is RS-M6's idempotent no-op for a marker
+                // this log applied on a prior round — treating it as
+                // progress let a single responder who only ever re-serves
+                // an already-applied marker (accidentally, if lagging; or
+                // deliberately, if hostile) return `Some(..)` every round
+                // and starve the joiner/straggler dispatch for the group
+                // set behind it (review C2a's own hoist made this the
+                // first thing `catchup_ingest` tries). The marker is still
+                // recorded either way — dk-event adoption below still runs
+                // on an `AlreadyMoved` link, since the successor quorum may
+                // not yet be locally adopted even if the marker already is.
+                Ok(ResetMarkerApplied::Applied { .. }) => {
                     markers_applied += 1;
+                    let mut t = self.tracker.lock().await;
+                    t.record(&link.marker);
+                }
+                Ok(ResetMarkerApplied::AlreadyMoved) => {
                     let mut t = self.tracker.lock().await;
                     t.record(&link.marker);
                 }
@@ -3776,7 +3793,13 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             }
         }
 
-        if markers_applied == 0 {
+        // Review NB1: report real progress only. `markers_applied == 0 &&
+        // last_epoch.is_none()` means every link this round was either an
+        // `AlreadyMoved` re-delivery with no adoptable dk evidence, or the
+        // walk broke on link 0 — nothing changed, so fall through to the
+        // ordinary joiner/straggler dispatch rather than returning
+        // `Some(..)` and ending the round on a no-op.
+        if markers_applied == 0 && last_epoch.is_none() {
             return None;
         }
         let epoch = match last_epoch {
@@ -4510,19 +4533,26 @@ mod tests {
         assert!(err.contains("RS-M4"), "unexpected error: {err}");
     }
 
-    /// RS-M5: an actor who is neither power-100 nor a member of the
-    /// pinned successor committee rejects, pinned to its own error.
+    /// RS-M5: an actor who IS a Joined member but is neither power-100
+    /// nor a member of the pinned successor committee rejects, pinned to
+    /// its own error. ZEB-1031 review round 2 (NB2): `bystander` must be
+    /// in `joined` here — otherwise it trips the `!actor_joined` leg
+    /// added by I1 instead of this test's own `power < 100 &&
+    /// !nm.contains(actor)` disjunct, and (since both legs share one
+    /// merged RS-M5 error string) this test becomes indistinguishable
+    /// from `verify_reset_marker_admissible_rejects_kicked_power_100_actor_zeb1031`
+    /// below, leaving the original RS-M5 defect uncovered.
     #[test]
     fn verify_reset_marker_admissible_rejects_unauthorized_actor_zeb1031() {
+        let bystander = OwnerAddr([0x99; 16]);
         let membership = test_membership(
             ResetPhase::Authorized,
             vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])],
             2,
             Vec::new(), // nobody is power-100
-            Vec::new(),
+            vec![bystander],
         );
         let payload = good_marker_payload(&membership);
-        let bystander = OwnerAddr([0x99; 16]);
         let err = verify_reset_marker_admissible(&payload, &bystander, &RESET_SPACE, &membership)
             .expect_err("bystander actor must not be admissible");
         assert!(err.contains("RS-M5"), "unexpected error: {err}");
