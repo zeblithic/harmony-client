@@ -221,6 +221,9 @@ pub fn select_catchup(
         .map(|w| (w.wall_ms, w.logical, w.device_id.clone()));
     let mut beacons = Vec::new();
     for ev in log.events() {
+        if beacons.len() >= max_beacons {
+            break;
+        }
         if ev.kind != DfrostEventKind::VrfBeacon {
             continue;
         }
@@ -231,9 +234,6 @@ pub fn select_catchup(
         };
         if above_watermark {
             beacons.push(ev.clone());
-            if beacons.len() >= max_beacons {
-                break;
-            }
         }
     }
 
@@ -657,6 +657,14 @@ mod tests {
         };
         let sel = select_catchup(&log, &req, 2).expect("selection");
         assert_eq!(sel.beacons, vec![beacons[0].clone(), beacons[1].clone()]);
+
+        // max_beacons = 0 boundary: the cap must be checked BEFORE the
+        // push, not after, or a beacon slips through on the first match.
+        let sel_zero = select_catchup(&log, &req, 0).expect("selection");
+        assert!(
+            sel_zero.beacons.is_empty(),
+            "max_beacons=0 yields zero beacons"
+        );
     }
 
     #[test]
