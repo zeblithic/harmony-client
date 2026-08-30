@@ -1850,6 +1850,12 @@ pub async fn restore_owner_mnemonic_from_words(
 /// fresh mint re-adopts it harmlessly) and the `profiles/` subtree (other
 /// named identities are isolated and must never be touched).
 ///
+/// NOT in this list but swept by a dedicated loop in
+/// [`reset_local_identity_inner`]: `communities/*/dfrost.cbor`, which since
+/// ZEB-1029 embeds this device's FROST signing share and is therefore
+/// owner-secret state living below a per-community subdirectory this
+/// root-relative list cannot express.
+///
 /// Filenames that have a single canonical constant reference it, so a rename
 /// there breaks *this* build (real compile-time coupling, PR #571 review). The
 /// CRDT/replay pair (`owner_state_crdt.cbor` / `state_root_replay.cbor`, joined
@@ -1978,6 +1984,46 @@ pub(crate) fn reset_local_identity_inner(
                     backup_dir.display()
                 )
             })?;
+        }
+
+        // ZEB-1029 (#777 round 2, Qodo): `communities/*/dfrost.cbor` now
+        // embeds this device's FROST signing share, making it owner-secret
+        // state — it moves into the recovery backup with everything else
+        // instead of stranding the old identity's only durable signing
+        // secret in the live tree. The OTHER per-community files stay put
+        // on purpose: they are public/replicated state whose families
+        // self-heal by quarantine-on-first-read, the posture this reset
+        // has always left them to.
+        let communities_dir = identity_dir.join("communities");
+        if let Ok(entries) = std::fs::read_dir(&communities_dir) {
+            for entry in entries.flatten() {
+                let src = entry
+                    .path()
+                    .join(crate::community_dfrost_persist::DFROST_FILENAME);
+                if !src.exists() {
+                    continue;
+                }
+                if !created_backup {
+                    std::fs::create_dir_all(&backup_dir).map_err(|e| {
+                        format!("create reset backup dir {}: {e}", backup_dir.display())
+                    })?;
+                    created_backup = true;
+                }
+                let dst_dir = backup_dir.join("communities").join(entry.file_name());
+                std::fs::create_dir_all(&dst_dir).map_err(|e| {
+                    format!("create reset backup subdir {}: {e}", dst_dir.display())
+                })?;
+                move_file(
+                    &src,
+                    &dst_dir.join(crate::community_dfrost_persist::DFROST_FILENAME),
+                )
+                .map_err(|e| {
+                    format!(
+                        "{e} (partial reset: files already moved are in {})",
+                        backup_dir.display()
+                    )
+                })?;
+            }
         }
         Ok(created_backup.then_some(backup_dir))
     })?;
@@ -2226,6 +2272,13 @@ mod tests {
             b"other-profile-owner",
         )
         .unwrap();
+        // ZEB-1029: a per-community dfrost.cbor (embeds the signing share —
+        // owner-secret state, must move) next to a public sibling that must
+        // stay behind for its family's quarantine self-heal.
+        let community_dir = root.join("communities").join("aa".repeat(16));
+        std::fs::create_dir_all(&community_dir).unwrap();
+        std::fs::write(community_dir.join("dfrost.cbor"), b"sealed-share-image").unwrap();
+        std::fs::write(community_dir.join("crdt.cbor"), b"public-community-state").unwrap();
 
         // Reset returns Some(backup_dir) because there were files to move.
         let backup = reset_local_identity_inner(root, None)
@@ -2250,6 +2303,29 @@ mod tests {
                 "{name} contents must survive the snapshot intact"
             );
         }
+        // ZEB-1029: the community share-bearing snapshot moved into the
+        // backup (nested layout preserved), its public sibling untouched.
+        assert!(
+            !community_dir.join("dfrost.cbor").exists(),
+            "community dfrost.cbor (embeds the signing share) must be removed \
+             from the live identity dir"
+        );
+        assert_eq!(
+            std::fs::read(
+                backup
+                    .join("communities")
+                    .join("aa".repeat(16))
+                    .join("dfrost.cbor")
+            )
+            .unwrap(),
+            b"sealed-share-image".to_vec(),
+            "community dfrost.cbor snapshotted into the backup intact"
+        );
+        assert!(
+            community_dir.join("crdt.cbor").exists(),
+            "public community state must NOT be swept by reset"
+        );
+
         // 3: untouched survivors.
         assert!(
             root.join("identity.key").exists(),

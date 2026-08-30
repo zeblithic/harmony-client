@@ -939,3 +939,181 @@ fn refresh_two_engine_preserves_joint_vk() {
     assert!(c.engine_a.committee_state.pending_refresh.is_none());
     assert!(c.engine_b.committee_state.pending_refresh.is_none());
 }
+
+// ─── ZEB-1029: full-committee restart via sealed share persistence ──────────
+
+/// The ZEB-1029 headline, real crypto end-to-end: BOTH members of a
+/// 2-of-2 committee persist (sealed snapshot + sealed share sidecar),
+/// go down simultaneously — the case where RTS repair (needs ≥ t live
+/// share-holders) and refresh (needs every member's old share) are both
+/// structurally unreachable — and come back from DISK ALONE. The
+/// restored committee must then complete a fresh threshold-sign → vb
+/// cycle with ZERO repair or refresh events.
+#[test]
+fn full_committee_restart_signs_after_sealed_share_restore_zeb1029() {
+    use harmony_app::community_dfrost_persist as persist;
+    let c = dkg_2of2_setup();
+    let cid = harmony_app::owner_state_types::SpaceId([0x29; 16]);
+    let cipher = harmony_app::device_dataset_file::test_cipher();
+    let dir_a = tempfile::tempdir().expect("alice identity dir");
+    let dir_b = tempfile::tempdir().expect("bob identity dir");
+
+    // ── Persist both nodes exactly as the engine funnel does: ONE sealed
+    // image carrying committee state and the signing share atomically ────
+    let persist_node = |dir: &std::path::Path, log: &mut DfrostLog, kp| {
+        log.local_key_package = Some(kp);
+        persist::write_snapshot(
+            &cipher,
+            &persist::dfrost_path_for(dir, &cid),
+            &persist::snapshot_for_persist(log, &cid),
+        )
+        .expect("write snapshot");
+    };
+    let mut log_a = c.engine_a;
+    let mut log_b = c.engine_b;
+    persist_node(dir_a.path(), &mut log_a, c.alice_key_pkg);
+    persist_node(dir_b.path(), &mut log_b, c.bob_key_pkg);
+
+    // ── Full-committee restart: every in-memory share dies at once ───────
+    drop(log_a);
+    drop(log_b);
+
+    let restore_node = |dir: &std::path::Path, self_addr: &OwnerAddr| -> DfrostLog {
+        persist::load_dfrost(
+            &cipher,
+            &persist::dfrost_path_for(dir, &cid),
+            &cid,
+            Some(self_addr),
+        )
+        .expect("snapshot loads and embedded share installs")
+    };
+    let mut restored_a = restore_node(dir_a.path(), &ALICE);
+    let mut restored_b = restore_node(dir_b.path(), &BOB);
+
+    for (label, log) in [("alice", &restored_a), ("bob", &restored_b)] {
+        assert!(log.committee_state.active, "{label}: committee active");
+        assert_eq!(log.committee_state.current_epoch, 1, "{label}: epoch");
+        assert_eq!(
+            log.committee_state.joint_verifying_key,
+            Some(c.joint_vk),
+            "{label}: joint vk preserved"
+        );
+        assert!(
+            log.local_key_package.is_some(),
+            "{label}: signing share reinstalled from the sealed sidecar"
+        );
+    }
+
+    // ── Fresh threshold-sign round on the RESTORED shares ────────────────
+    let kp_a = restored_a.local_key_package.clone().expect("alice kp");
+    let kp_b = restored_b.local_key_package.clone().expect("bob kp");
+    let pub_a = restored_a.local_pub_key_package.clone().expect("alice pkp");
+    // CR-3 (#777): bob's pub package must have been rebuilt too — signing
+    // below only needs kp_b, so without this a restore that installed the
+    // scalar but failed the pub-package rebuild would still pass.
+    let pub_b = restored_b.local_pub_key_package.clone().expect("bob pkp");
+    assert_eq!(
+        pub_b.verifying_key(),
+        pub_a.verifying_key(),
+        "both restored nodes rebuild the same joint verifying key"
+    );
+
+    let sign_ceremony_id: [u8; 32] = [0x29; 32];
+    let message_hash: [u8; 32] = [0x92; 32];
+    let (nonces_a, cm_a) = frost::round1::commit(kp_a.signing_share(), &mut rand_core::OsRng);
+    let (nonces_b, cm_b) = frost::round1::commit(kp_b.signing_share(), &mut rand_core::OsRng);
+    let mut cm_a_bytes = Vec::new();
+    ciborium::into_writer(&cm_a, &mut cm_a_bytes).expect("encode cm");
+    let mut cm_b_bytes = Vec::new();
+    ciborium::into_writer(&cm_b, &mut cm_b_bytes).expect("encode cm b");
+    let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
+        BTreeMap::new();
+    commitments_map.insert(c.id_alice, cm_a);
+    commitments_map.insert(c.id_bob, cm_b);
+    let signing_package = frost::SigningPackage::new(commitments_map, &message_hash);
+    let share_a =
+        frost::round2::sign(&signing_package, &nonces_a, &kp_a).expect("alice round2 sign");
+    let share_b = frost::round2::sign(&signing_package, &nonces_b, &kp_b).expect("bob round2 sign");
+    let mut share_a_bytes = Vec::new();
+    ciborium::into_writer(&share_a, &mut share_a_bytes).expect("encode share");
+    let mut share_b_bytes = Vec::new();
+    ciborium::into_writer(&share_b, &mut share_b_bytes).expect("encode share b");
+    let mut shares_map: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
+    shares_map.insert(c.id_alice, share_a);
+    shares_map.insert(c.id_bob, share_b);
+    let group_signature =
+        frost::aggregate(&signing_package, &shares_map, &pub_a).expect("aggregate under restored");
+    let sig_bytes = group_signature.serialize().expect("serialize sig");
+
+    // The joint vk from BEFORE the restart verifies the post-restart sig.
+    pub_a
+        .verifying_key()
+        .verify(&message_hash, &group_signature)
+        .expect("post-restart signature verifies under the original joint vk");
+
+    // ── vb applies on both restored logs (Schnorr-verified) ──────────────
+    let mut r_compressed = [0u8; 32];
+    r_compressed.copy_from_slice(&sig_bytes[..32]);
+    let vrf_output = derive_vrf_output(&r_compressed);
+    let ts = build_ts_event(
+        ALICE,
+        6_000,
+        "alice",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: cm_a_bytes,
+            share_bytes: share_a_bytes,
+        },
+    );
+    restored_a.apply(ts.clone()).expect("a ts");
+    restored_b.apply(ts).expect("b ts");
+    // CR-4 (#777): apply bob's contribution too, like the sibling
+    // threshold-sign test — the log path must accept a SECOND member's
+    // `ts` after restore, not just tolerate an out-of-band aggregate.
+    let ts_bob = build_ts_event(
+        BOB,
+        6_100,
+        "bob",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: cm_b_bytes,
+            share_bytes: share_b_bytes,
+        },
+    );
+    restored_a.apply(ts_bob.clone()).expect("a ts bob");
+    restored_b.apply(ts_bob).expect("b ts bob");
+    for (label, log) in [("alice", &restored_a), ("bob", &restored_b)] {
+        let pending = log
+            .committee_state
+            .pending_sign
+            .get(&sign_ceremony_id)
+            .expect("pending sign session");
+        assert_eq!(
+            pending.contributions.len(),
+            2,
+            "{label}: both restored members' ts contributions recorded"
+        );
+    }
+    let vb = build_vb_event(
+        ALICE,
+        7_000,
+        "alice",
+        VrfBeaconPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            signature: sig_bytes,
+            vrf_output,
+        },
+    );
+    restored_a.apply(vb.clone()).expect("a vb applies");
+    restored_b.apply(vb).expect("b vb applies");
+    for (label, log) in [("alice", &restored_a), ("bob", &restored_b)] {
+        assert_eq!(
+            log.beacon_index.get(&message_hash),
+            Some(&vrf_output),
+            "{label}: post-restart beacon indexed"
+        );
+    }
+}

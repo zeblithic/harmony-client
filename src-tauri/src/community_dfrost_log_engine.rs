@@ -631,6 +631,10 @@ async fn persist_dfrost_snapshot(
     // (Qodo; snapshot-then-write-outside-the-protocol-lock precedent).
     let persist_order = log.lock().await.persist_order.clone();
     let _order_guard = persist_order.lock().await;
+    // ZEB-1029 (round 2 on #777): the signing share is EMBEDDED in this
+    // snapshot, so state and share commit in one atomic rename — no crash
+    // or partial-flush ordering can pair a new epoch's public state with
+    // an old epoch's secret on disk.
     let snapshot = {
         let g = log.lock().await;
         crate::community_dfrost_persist::snapshot_for_persist(&g, &community_id)
@@ -641,11 +645,20 @@ async fn persist_dfrost_snapshot(
     .await;
     match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(
-            ?community_id,
-            err = %e,
-            "dfrost persist: snapshot write failed; will retry on next dirty signal"
-        ),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                ?community_id,
+                err = %e,
+                "dfrost persist: snapshot write failed; retry re-armed"
+            );
+            // Greptile P1 (#777): a failed write on a committee that then
+            // goes idle would otherwise wait forever for the next apply —
+            // and since ZEB-1029 this file carries the signing share, an
+            // abrupt restart in that gap costs real recovery. Re-arm the
+            // dirty signal so the debounce task retries on its own; the
+            // debounce interval paces a persistently failing substrate.
+            log.lock().await.dirty.notify_one();
+        }
         Err(join_err) => tracing::warn!(
             ?community_id,
             err = %join_err,
@@ -6952,8 +6965,9 @@ mod tests {
             g.apply(di2).expect("re-mint di applies");
         }
         engine.flush_persist().await;
-        let restored = crate::community_dfrost_persist::load_dfrost(&cipher, &path, &community_id)
-            .expect("reload after flush");
+        let restored =
+            crate::community_dfrost_persist::load_dfrost(&cipher, &path, &community_id, None)
+                .expect("reload after flush");
         assert_eq!(
             restored.event_count(),
             2,
@@ -6962,6 +6976,105 @@ mod tests {
         assert!(
             restored.committee_state.pending_dkg.is_none(),
             "restore clears the pending ceremony"
+        );
+    }
+
+    /// ZEB-1029 (round 2): the persist funnel embeds the signing share in
+    /// the sealed snapshot when one is installed on an active committee —
+    /// one atomic image, no share/state skew possible — and a flush after
+    /// the share left memory (e.g. the CR-2 stale-drop) persists the
+    /// in-memory truth: the stored scalar ages off the substrate.
+    #[tokio::test]
+    async fn persist_funnel_embeds_share_and_self_cleans_zeb1029() {
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = crate::device_dataset_file::test_cipher();
+        let community_id = SpaceId([0x78; 16]);
+        let target = crate::community_dfrost_persist::DfrostPersistTarget {
+            identity_dir: dir.path().to_path_buf(),
+            cipher: cipher.clone(),
+        };
+        // Committee state and KeyPackage from ONE dealer run so the
+        // restore-side consensus validation passes. addr ↔ identifier 1.
+        let addr = OwnerAddr([0x0a; 16]);
+        let (shares, pkp) = frost_ristretto255::keys::generate_with_dealer(
+            3,
+            2,
+            frost_ristretto255::keys::IdentifierList::Default,
+            frost_ristretto255::rand_core::OsRng,
+        )
+        .expect("dealer keygen");
+        let id1 = crate::community_dfrost_crypto::identifier_for_index(0);
+        let kp = frost_ristretto255::keys::KeyPackage::try_from(
+            shares.get(&id1).expect("share for id 1").clone(),
+        )
+        .expect("key package");
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        {
+            let mut g = log.lock().await;
+            g.committee_state.active = true;
+            g.committee_state.current_epoch = 4;
+            g.committee_state.joint_verifying_key = Some(
+                crate::community_dfrost_crypto::verifying_key_to_bytes(pkp.verifying_key()),
+            );
+            g.committee_state.members = vec![addr];
+            g.committee_state.threshold = 2;
+            g.committee_state.max_signers = 3;
+            g.committee_state.verifying_shares.insert(
+                addr,
+                crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pkp.verifying_shares().get(&id1).expect("vs"),
+                ),
+            );
+            g.committee_state.identifier_map =
+                crate::community_dfrost_log::CommitteeState::build_identifier_map(&[addr]);
+            g.local_key_package = Some(kp);
+        }
+
+        super::persist_dfrost_snapshot(&log, &target, community_id).await;
+        let path = crate::community_dfrost_persist::dfrost_path_for(dir.path(), &community_id);
+        let restored = crate::community_dfrost_persist::load_dfrost(
+            &cipher,
+            &path,
+            &community_id,
+            Some(&addr),
+        )
+        .expect("reload ok");
+        let restored_kp = restored
+            .local_key_package
+            .as_ref()
+            .expect("share embedded in the snapshot and reinstalled");
+        assert_eq!(
+            restored_kp.signing_share().serialize(),
+            log.lock()
+                .await
+                .local_key_package
+                .as_ref()
+                .unwrap()
+                .signing_share()
+                .serialize(),
+            "sealed scalar matches"
+        );
+
+        // Share gone from memory (CR-2 stale-drop): the next flush writes
+        // the in-memory truth and the stored scalar is gone with it.
+        log.lock().await.local_key_package = None;
+        super::persist_dfrost_snapshot(&log, &target, community_id).await;
+        let recleaned = crate::community_dfrost_persist::load_dfrost(
+            &cipher,
+            &path,
+            &community_id,
+            Some(&addr),
+        )
+        .expect("reload ok");
+        assert!(
+            recleaned.local_key_package.is_none(),
+            "flush without a share persists shareless — the image self-cleans"
+        );
+        assert!(
+            recleaned.committee_state.active,
+            "committee state still intact"
         );
     }
 }

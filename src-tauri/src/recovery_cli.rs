@@ -736,7 +736,10 @@ pub struct ExportResult {
 /// owning family passes to `write_image` — a correct-key probe with the
 /// wrong label fails the AEAD tag and would falsely classify a healthy file
 /// as foreign. Per-owner profile-card stores are matched by prefix in
-/// [`sweep_foreign_sealed_files`] instead (their filename IS their label).
+/// [`sweep_foreign_sealed_files`] instead (their filename IS their label),
+/// and `communities/*/dfrost.cbor` (which embeds the FROST signing share,
+/// ZEB-1029) is enumerated there dynamically with its community-id-derived
+/// label.
 const DEVICE_SEALED_SWEEP_FILES: &[(&str, &str)] = &[
     (
         crate::owner_state::OWNER_STATE_FILENAME,
@@ -803,24 +806,56 @@ pub(crate) fn sweep_foreign_sealed_files(
 ) -> Result<(), String> {
     use crate::device_dataset_file::{read_image, ImageError};
 
-    // Collect (absolute path, AAD label) candidates: the fixed list plus
-    // any per-owner profile-card stores sitting in the identity dir.
-    let mut candidates: Vec<(PathBuf, String)> = DEVICE_SEALED_SWEEP_FILES
+    // Collect (absolute path, AAD label, backup-relative destination)
+    // candidates: the fixed list plus any per-owner profile-card stores
+    // sitting in the identity dir. The relative destination keeps nested
+    // sweeps collision-free in the backup dir.
+    let mut candidates: Vec<(PathBuf, String, PathBuf)> = DEVICE_SEALED_SWEEP_FILES
         .iter()
-        .map(|(rel, label)| (identity_dir.join(rel), (*label).to_string()))
+        .map(|(rel, label)| {
+            (
+                identity_dir.join(rel),
+                (*label).to_string(),
+                PathBuf::from(rel),
+            )
+        })
         .collect();
     if let Ok(entries) = std::fs::read_dir(identity_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.starts_with("profile_cards.") && name.ends_with(".cbor") {
-                candidates.push((entry.path(), name.to_string()));
+                candidates.push((entry.path(), name.to_string(), PathBuf::from(name)));
+            }
+        }
+    }
+    // ZEB-1029 (#777 round 2, Qodo): `communities/*/dfrost.cbor` embeds
+    // the FROST signing share, so a copy sealed under a REPLACED identity
+    // must sweep aside like every other device-sealed dataset rather than
+    // lingering as foreign ciphertext until first-read quarantine. Its
+    // AAD label is derived from the community id, which by construction
+    // is the directory name (`seal_label`: never from the on-disk path —
+    // this rebuild only works because dir name == hex id). The OTHER
+    // per-community files are public/replicated state and keep their
+    // families' quarantine self-heal, as before.
+    if let Ok(entries) = std::fs::read_dir(identity_dir.join("communities")) {
+        for entry in entries.flatten() {
+            let dir_name = entry.file_name();
+            let Some(dir_name) = dir_name.to_str() else {
+                continue;
+            };
+            let path = entry.path().join("dfrost.cbor");
+            if path.exists() {
+                let rel = PathBuf::from("communities")
+                    .join(dir_name)
+                    .join("dfrost.cbor");
+                candidates.push((path, format!("communities/{dir_name}/dfrost.cbor"), rel));
             }
         }
     }
 
     let mut backup_dir: Option<PathBuf> = None;
-    for (path, label) in candidates {
+    for (path, label, rel_dst) in candidates {
         match read_image(cipher, &path, &label) {
             // Absent, or readable (legacy plaintext / sealed under THIS
             // key): nothing to do.
@@ -857,11 +892,16 @@ pub(crate) fn sweep_foreign_sealed_files(
                         candidate
                     }
                 };
-                let file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| label.clone());
-                let dst = dst_dir.join(&file_name);
+                let dst = dst_dir.join(&rel_dst);
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        format!(
+                            "identity restored, but could not create {} to move aside \
+                             stale sealed state (re-run the restore to retry): {e}",
+                            parent.display()
+                        )
+                    })?;
+                }
                 std::fs::rename(&path, &dst).map_err(|e| {
                     format!(
                         "identity restored, but {} is sealed under the previous identity's \
@@ -2717,6 +2757,23 @@ mod tests {
             .path()
             .join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
         std::fs::write(&legacy_path, b"legacy-plaintext").unwrap();
+        // ZEB-1029: a per-community dfrost.cbor sealed under the OLD cipher
+        // (it embeds the signing share, so the sweep must move it aside),
+        // next to a public sibling the sweep must NOT touch (its family
+        // self-heals by quarantine-on-first-read).
+        let hex_id = "bb".repeat(16);
+        let community_dir = dir.path().join("communities").join(&hex_id);
+        std::fs::create_dir_all(&community_dir).unwrap();
+        let dfrost_path = community_dir.join("dfrost.cbor");
+        write_image(
+            &old_cipher,
+            &dfrost_path,
+            &format!("communities/{hex_id}/dfrost.cbor"),
+            b"old-dfrost-with-share",
+        )
+        .unwrap();
+        let community_crdt_path = community_dir.join("crdt.cbor");
+        std::fs::write(&community_crdt_path, b"foreign-public-community-state").unwrap();
 
         // Forced restore of a DIFFERENT identity.
         let restored = RecoveryArtifact::from_seed([0xABu8; 32]);
@@ -2745,8 +2802,28 @@ mod tests {
             .expect("restore backup dir created");
         assert_eq!(
             std::fs::read_dir(&backup_dir).unwrap().count(),
-            3,
-            "all three foreign files preserved in the backup dir"
+            4,
+            "three foreign root files + the communities/ subtree preserved \
+             in the backup dir"
+        );
+        // ZEB-1029: the share-bearing community snapshot swept aside into
+        // the nested backup layout; its public sibling untouched.
+        assert!(
+            !dfrost_path.exists(),
+            "foreign communities/*/dfrost.cbor swept"
+        );
+        assert!(
+            backup_dir
+                .join("communities")
+                .join(&hex_id)
+                .join("dfrost.cbor")
+                .exists(),
+            "swept community snapshot preserved (moved, not deleted) in the \
+             nested backup layout"
+        );
+        assert!(
+            community_crdt_path.exists(),
+            "public community state left for its family's quarantine self-heal"
         );
         // ...while the legacy plaintext file stayed put.
         assert!(legacy_path.exists(), "legacy plaintext left in place");
