@@ -839,6 +839,12 @@ impl DfrostLog {
         self.log.events().cloned().collect()
     }
 
+    /// Test-only seeding of retained history for catch-up tests (ZEB-1030).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn insert_event_for_test(&mut self, ev: SignedCommitteeEvent) {
+        self.insert_applied(ev);
+    }
+
     /// Rebuild a log from a trusted persisted snapshot (ZEB-753).
     ///
     /// Events restore through `VerifiedLog::from_verified_events` — no

@@ -126,6 +126,7 @@ pub mod community_device_intro_crdt;
 pub mod community_device_intro_ingest;
 pub mod community_device_intro_persist;
 pub mod community_device_retire_deposit;
+pub mod community_dfrost_catchup;
 pub mod community_dfrost_crypto;
 pub mod community_dfrost_log;
 pub mod community_dfrost_log_engine;
