@@ -43663,6 +43663,9 @@ where
             // the hint is superseded by CRDT replay once events arrive.
             recovery_designates: None,
             recovery_proposals: Vec::new(),
+            // ZEB-1031: same rationale as recovery_proposals above —
+            // not part of the epoch snapshot, superseded by CRDT replay.
+            reset_proposals: Vec::new(),
         };
         if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
             let state_g = state_arc.lock().await;
@@ -55765,6 +55768,14 @@ pub fn delta_to_change(
         | crate::community_membership::MembershipEventKind::RecoveryProposal { .. }
         | crate::community_membership::MembershipEventKind::RecoveryCosign { .. }
         | crate::community_membership::MembershipEventKind::RecoveryVeto { .. }
+        // ZEB-1031: D-FROST committee-reset events are governance events
+        // with DERIVED effects (evaluated at materialize time), same
+        // reasoning as the ZEB-713 recovery family above — no per-event
+        // MembershipChange is projected. The reset admin-panel UI reads
+        // the materialized reset_proposals view via its own IPC instead.
+        | crate::community_membership::MembershipEventKind::DfrostResetProposal { .. }
+        | crate::community_membership::MembershipEventKind::DfrostResetCosign { .. }
+        | crate::community_membership::MembershipEventKind::DfrostResetResponse { .. }
         // ZEB-495 (ZEB-340 Part 2): DeviceAnnounce only adds a device key to
         // an already-Joined owner's MemberState — it changes no status/power
         // and projects no MembershipChange. (The roster re-renders the owner
@@ -56749,6 +56760,7 @@ mod community_member_dto_tests {
             power_thresholds: crate::community_membership::POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
+            reset_proposals: Vec::new(),
         };
         let dto = member_info_for(&materialized);
 
@@ -56799,6 +56811,7 @@ mod community_member_dto_tests {
             power_thresholds: crate::community_membership::POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
+            reset_proposals: Vec::new(),
         };
         let dto = member_info_for(&materialized);
         assert_eq!(dto.len(), 2);

@@ -53,6 +53,8 @@ mod voice_fixtures;
 mod voting_tier3_fixtures;
 #[path = "wire_format/voting_tier3_secret_fixtures.rs"]
 mod voting_tier3_secret_fixtures;
+#[path = "wire_format/zeb1031_reset_fixtures.rs"]
+mod zeb1031_reset_fixtures;
 #[path = "wire_format/zeb213_fixtures.rs"]
 mod zeb213_fixtures;
 #[path = "wire_format/zeb250_fixtures.rs"]
