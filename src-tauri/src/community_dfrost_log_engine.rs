@@ -3523,13 +3523,19 @@ impl<R: tauri::Runtime> Drop for DfrostLogEngine<R> {
         if let Some(p) = self.persist_handle.as_ref() {
             p.abort();
         }
-        // ZEB-1033: wake a catch-up requester parked on the hint so it
-        // discovers `EngineGone` (Weak upgrade failure in its hooks —
-        // see `catchup_hooks`) now instead of on its next interval
-        // tick. Best-effort: `notify_waiters` stores no permit, so a
-        // requester mid-slice still exits within one
-        // `DFROST_CATCHUP_INTERVAL` at worst.
-        self.orchestrator.catchup_hint.notify_waiters();
+        // ZEB-1033: wake the catch-up requester parked on the hint so
+        // it discovers `EngineGone` (Weak upgrade failure in its hooks
+        // — see `catchup_hooks`) now instead of on its next interval
+        // tick. `notify_one`, not `notify_waiters` (PR #779 round-1):
+        // it STORES a permit when no waiter is registered yet, so a
+        // drop that races ahead of the requester's `notified()`
+        // registration is still observed on its very next wait instead
+        // of after a full `DFROST_CATCHUP_INTERVAL`. One-consumer
+        // invariant: the requester task is this Notify's only awaiter
+        // (`catchup_wait` in event_loop.rs); the live producer
+        // (`maybe_fire_catchup_hint`) already uses `notify_one` for
+        // the same reason.
+        self.orchestrator.catchup_hint.notify_one();
     }
 }
 
@@ -8596,6 +8602,54 @@ mod tests {
         ));
         assert!(matches!(
             (hooks.ingest)(Vec::new()).await,
+            EngineHookResult::EngineGone
+        ));
+    }
+
+    /// ZEB-1033 / PR #779 round-1 (CodeRabbit): the Drop-fired hint
+    /// must survive a drop that lands BEFORE the requester registers
+    /// its `notified()` — `notify_one` stores a permit when no waiter
+    /// is parked, so the requester's very next wait completes
+    /// immediately (and discovers `EngineGone`) instead of sleeping a
+    /// full `DFROST_CATCHUP_INTERVAL`.
+    #[tokio::test]
+    async fn catchup_hint_permit_survives_drop_before_wait_zeb1033() {
+        use crate::event_loop::EngineHookResult;
+
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0x34; 16]),
+            dfrost_log: log,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let hooks = DfrostLogEngine::catchup_hooks(&engine);
+
+        // Drop with NO waiter registered — the permit must be stored.
+        drop(engine);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), hooks.hint.notified())
+            .await
+            .expect("a pre-registration drop must leave a stored permit for the next wait");
+        assert!(matches!(
+            (hooks.build_request)().await,
             EngineHookResult::EngineGone
         ));
     }
