@@ -6654,7 +6654,15 @@ pub fn verify_snapshot_event(
 /// True iff `addr` is currently a Joined member in `state`. Pure
 /// helper — no logging, no allocation. Used by verify_event to gate
 /// moderation actions and counter-signing on active membership.
-fn is_joined_member(state: &MaterializedMembership, addr: &OwnerAddr) -> bool {
+///
+/// `pub(crate)` (ZEB-1031 review I1): `power_levels` entries are
+/// deliberately NOT cleaned up on Kick/Leave/Ban (documented above at
+/// the bootstrap-power-100 note and reiterated at every reset-side
+/// power gate — RS-P1/RS-C1/RS-R1 below all pair a power read with
+/// this check), so a kicked ex-admin or removed `nm` member would
+/// otherwise still read power-100 forever. `community_dfrost_log_engine.rs`'s
+/// `verify_reset_marker_admissible` (RS-M5) needs the same pairing.
+pub(crate) fn is_joined_member(state: &MaterializedMembership, addr: &OwnerAddr) -> bool {
     state
         .members
         .get(addr)

@@ -9,6 +9,7 @@ use crate::community_dfrost_catchup::{
     beacon_watermark_of, group_frames, select_catchup, CatchupBody, CatchupFrame, CatchupRequest,
     CatchupStatus, ResetChainLink, CATCHUP_VERSION, MAX_CATCHUP_BEACONS_PER_ROUND,
     MAX_CATCHUP_RESPONDER_GROUPS, MAX_DFROST_CATCHUP_FRAME_BYTES,
+    MAX_RESET_CHAIN_LINKS_PER_RESPONSE,
 };
 use crate::community_dfrost_log::{
     check_envelope, dfrost_event_id, verify_signed_committee_event, ApplyError, DfrostLog,
@@ -1378,6 +1379,31 @@ async fn process_inbound<R: tauri::Runtime>(
                 return;
             }
         };
+        // ZEB-1031 review C1: the marker's envelope HLC is peer-supplied
+        // and flows straight into `reset_membership_at`'s phase read —
+        // without a skew gate, a marker author stamps
+        // `t_q + vw + RESET_FINALITY_MS + 1` and RS-M3 reads Authorized
+        // while the real veto window is still open, skipping the ONE
+        // defense spec §10 names against a compromised admin quorum.
+        // Same house ceiling the `vb` gate uses (`adopt_beacons`,
+        // `select_catchup`); `now == 0` (clock unreadable) disables the
+        // gate per the plane-wide convention.
+        let now = trusted_now_wall_ms();
+        if now != 0
+            && crate::clock_trust::reject_future_logged(
+                event.hlc.wall_ms,
+                now,
+                crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                "dfrost.rs_marker.envelope_hlc",
+            )
+        {
+            tracing::warn!(
+                community_id = %hex::encode(community_id.0),
+                actor = ?event.actor,
+                "dfrost inbound: rs marker envelope HLC is forward-skewed — dropped",
+            );
+            return;
+        }
         let Some(resolver) = orchestrator.membership_resolver.as_ref() else {
             tracing::warn!(
                 community_id = %hex::encode(community_id.0),
@@ -2756,11 +2782,19 @@ pub fn verify_reset_marker_admissible(
         );
     }
 
+    // ZEB-1031 review I1: `power_levels` entries are deliberately NOT
+    // cleaned up on Kick/Leave/Ban (community_membership.rs docs this
+    // at `is_joined_member` and every sibling reset-side power gate —
+    // RS-P1/RS-C1/RS-R1 — pairs the power read with this same check).
+    // Without it, a kicked ex-admin or an `nm` member removed since
+    // RS-P2 verified the proposal could still author an admissible
+    // marker on a stale power-100/`nm` reading.
+    let actor_joined = crate::community_membership::is_joined_member(membership, actor);
     let actor_power = membership.power_levels.get(actor).copied().unwrap_or(0);
-    if actor_power < 100 && !proposal.new_members.contains(actor) {
+    if !actor_joined || (actor_power < 100 && !proposal.new_members.contains(actor)) {
         return Err(
-            "verify_reset_marker_admissible: marker author is neither power-100 nor a member \
-             of the pinned successor committee (ZEB-1031 RS-M5)"
+            "verify_reset_marker_admissible: marker author is not a Joined member who is \
+             either power-100 or a member of the pinned successor committee (ZEB-1031 RS-M5)"
                 .into(),
         );
     }
@@ -3397,7 +3431,23 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                             continue;
                         }
                     };
-                    for link in links {
+                    // ZEB-1031 review I3: independently cap what THIS
+                    // side will decode+verify, regardless of what the
+                    // responder claims to have capped — the same
+                    // defence-in-depth posture as `MAX_CATCHUP_
+                    // RESPONDER_GROUPS`/`MAX_CATCHUP_BEACONS_PER_ROUND`
+                    // (each non-status link sub-event pays an
+                    // `Ed25519::verify_strict`).
+                    let received = links.len();
+                    if received > MAX_RESET_CHAIN_LINKS_PER_RESPONSE {
+                        tracing::warn!(
+                            received,
+                            cap = MAX_RESET_CHAIN_LINKS_PER_RESPONSE,
+                            "dfrost catchup ingest: reset chain exceeds the per-frame link cap \
+                             — excess links dropped",
+                        );
+                    }
+                    for link in links.into_iter().take(MAX_RESET_CHAIN_LINKS_PER_RESPONSE) {
                         let Some(marker) = self
                             .verify_catchup_event(link.marker, DfrostEventKind::ResetMarker, "rs")
                             .await
@@ -3496,6 +3546,28 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             });
         }
 
+        // ZEB-1031 §6.2 (review C2a): reset-chain healing is tried
+        // BEFORE the active/inactive dispatch below, REGARDLESS of the
+        // local active flag. A node that already applied its own
+        // marker in a prior round (`!active`, `pending_reset` pinned)
+        // must still reach `apply_reset_chain` to continue the walk —
+        // routing it to `catchup_ingest_joiner` instead (which never
+        // reads `reset_chain`) would permanently wedge any straggler
+        // more than one reset behind, since the joiner path has no
+        // other way back onto a chain the responder is still serving.
+        // Harmless for a node with nothing to heal: every candidate
+        // group's `reset_chain` is empty (nothing to try), or the
+        // FIRST link fails RS-M2 against unrelated held state (`None`
+        // — falls through to the ordinary dispatch below).
+        for g in &verified_groups {
+            if g.reset_chain.is_empty() {
+                continue;
+            }
+            if let Some(outcome) = self.apply_reset_chain(&g.reset_chain).await {
+                return outcome;
+            }
+        }
+
         let (local_active, local_epoch) = {
             let log = self.dfrost_log.lock().await;
             (
@@ -3560,15 +3632,32 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// link's marker fails admissibility/apply — nothing in THIS
     /// chain was usable. A marker that DOES apply is durable progress
     /// even if a later step in the same chain stalls (e.g. this
-    /// responder hasn't itself completed the successor DKG yet): the
-    /// `pending_reset` pin carries forward, and this log is now
-    /// `!active`, so the NEXT catch-up round naturally routes through
-    /// the ordinary joiner path (`catchup_ingest_joiner`), which
-    /// enforces the same pin against any dk evidence it finds.
+    /// responder hasn't itself completed the successor DKG yet, or the
+    /// chain is capped mid-way — see `select_reset_chain`'s per-round
+    /// bound): the `pending_reset` pin carries forward, and this log is
+    /// now `!active`, so the NEXT catch-up round retries from wherever
+    /// this one stopped — `catchup_ingest` tries the chain-apply path
+    /// FIRST regardless of the local active flag (review C2a), so a
+    /// node stuck mid-chain is never routed to the joiner path (which
+    /// never reads `reset_chain`).
+    ///
+    /// ZEB-1031 review C2(b) / controller ruling: the §6.1
+    /// `rejected_vks` gate applies ONLY to the LAST link's quorum
+    /// adoption. Intermediate links are stepping stones: link N's
+    /// successor vk is, by construction, the very `target_vk` reset
+    /// N+1 names — so applying the fresh-joiner-scoped §6.1 gate there
+    /// would reject every genuine multi-reset chain (that vk is
+    /// Authorized-or-Consumed at HEAD precisely because the NEXT reset
+    /// targets it). Intermediate links are validated by their own
+    /// marker admissibility (RS-M3/M4/M5, just verified) plus the
+    /// `pending_reset` pin inside `adopt_initial_quorum`; the terminal
+    /// gate is what protects the chain's END state against adopting a
+    /// since-superseded vk.
     async fn apply_reset_chain(&self, links: &[ResetChainLink]) -> Option<CatchupOutcome> {
         let mut markers_applied = 0usize;
         let mut last_epoch: Option<u64> = None;
-        for link in links {
+        let last_index = links.len().saturating_sub(1);
+        for (idx, link) in links.iter().enumerate() {
             let payload: ResetMarkerPayload =
                 match ciborium::de::from_reader(&link.marker.payload[..]) {
                     Ok(p) => p,
@@ -3581,6 +3670,26 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                         break;
                     }
                 };
+            // ZEB-1031 review C1: same skew gate as `process_inbound`'s
+            // live `rs` path — see that call site's doc for why an
+            // ungated peer-supplied marker HLC lets a compromised admin
+            // quorum skip the veto window + 48h finality margin.
+            let now = trusted_now_wall_ms();
+            if now != 0
+                && crate::clock_trust::reject_future_logged(
+                    link.marker.hlc.wall_ms,
+                    now,
+                    crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                    "dfrost.rs_marker.envelope_hlc",
+                )
+            {
+                tracing::warn!(
+                    actor = ?link.marker.actor,
+                    "dfrost catchup ingest: reset chain link marker envelope HLC is \
+                     forward-skewed — chain application stopped",
+                );
+                break;
+            }
             let Some(resolver) = self.orchestrator.membership_resolver.as_ref() else {
                 tracing::warn!(
                     "dfrost catchup ingest: reset chain admissibility has no resolver wired \
@@ -3639,7 +3748,11 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             if link.dk_events.is_empty() {
                 continue;
             }
-            let rejected_vks = resolve_rejected_vks(&self.orchestrator, self.community_id).await;
+            let rejected_vks = if idx == last_index {
+                resolve_rejected_vks(&self.orchestrator, self.community_id).await
+            } else {
+                BTreeSet::new()
+            };
             let result = {
                 let mut log = self.dfrost_log.lock().await;
                 log.adopt_initial_quorum(&link.dk_events, &self.community_id, &rejected_vks)
@@ -3680,28 +3793,19 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// active committee at `local_epoch` and is looking for a newer
     /// epoch's evidence quorum, falling back to beacons-only adoption
     /// when no group's `dk` evidence clears `adopt_refresh_quorum`.
+    ///
+    /// ZEB-1031 §6.2: reset-chain healing is tried by the CALLER
+    /// (`catchup_ingest`, before the active/inactive dispatch — review
+    /// C2a) rather than here, so it also covers a node stuck `!active`
+    /// mid-chain. By the time this function runs, either no group had
+    /// a usable chain, or none was present at all — `adopt_refresh_
+    /// quorum`'s held-vk pin correctly refuses cross-reset adoption
+    /// regardless (that pin is exactly what forces the marker path).
     async fn catchup_ingest_straggler(
         &self,
         verified_groups: Vec<VerifiedCatchupGroup>,
         local_epoch: u64,
     ) -> CatchupOutcome {
-        // ZEB-1031 §6.2: reset-chain healing takes priority over an
-        // ordinary refresh-quorum search below — `adopt_refresh_quorum`'s
-        // held-vk pin correctly refuses cross-reset adoption (that is
-        // what forces this path in the first place), so a straggler
-        // stuck pre-reset can never clear it. Try every group's chain
-        // (not epoch-filtered — a responder's own `status.epoch` is
-        // unrelated to whether it can serve OUR reset healing data),
-        // applying the first one that makes any durable progress.
-        for g in &verified_groups {
-            if g.reset_chain.is_empty() {
-                continue;
-            }
-            if let Some(outcome) = self.apply_reset_chain(&g.reset_chain).await {
-                return outcome;
-            }
-        }
-
         let mut candidates: Vec<&VerifiedCatchupGroup> = verified_groups
             .iter()
             .filter(|g| g.status.epoch > local_epoch)
@@ -4248,15 +4352,39 @@ mod tests {
     /// A membership state with exactly one reset proposal, matching
     /// `RESET_PROPOSAL_ID`/`RESET_OLD_VK`/`RESET_OLD_EPOCH`, at the
     /// given `phase`. `new_members`/`new_threshold` are the successor
-    /// pin the marker's digest must bind to.
+    /// pin the marker's digest must bind to. `joined` lists the addrs
+    /// that materialize as Joined members (ZEB-1031 review I1: RS-M5
+    /// pairs the power/`nm` read with `is_joined_member`, so a test
+    /// actor absent from this list reads as not-Joined regardless of
+    /// its `power_levels` entry).
     fn test_membership(
         phase: ResetPhase,
         new_members: Vec<OwnerAddr>,
         new_threshold: u16,
         power_levels: Vec<(OwnerAddr, u8)>,
+        joined: Vec<OwnerAddr>,
     ) -> MaterializedMembership {
         let mut m = MaterializedMembership {
             power_levels: power_levels.into_iter().collect(),
+            members: joined
+                .into_iter()
+                .map(|addr| {
+                    (
+                        addr,
+                        crate::community_membership::MemberState {
+                            status: crate::community_membership::MemberStatus::Joined,
+                            joined_at: Hlc {
+                                wall_ms: 0,
+                                logical: 0,
+                                device_id: "t".into(),
+                            },
+                            left_at: None,
+                            enrolled_device_keys: Default::default(),
+                            revoked_device_keys: Default::default(),
+                        },
+                    )
+                })
+                .collect(),
             ..Default::default()
         };
         m.reset_proposals.push(ResetProposalView {
@@ -4313,6 +4441,7 @@ mod tests {
             successor.clone(),
             2,
             vec![(admin, 100)],
+            vec![admin],
         );
         let payload = good_marker_payload(&membership);
         let (nm, nt) = verify_reset_marker_admissible(&payload, &admin, &RESET_SPACE, &membership)
@@ -4327,7 +4456,13 @@ mod tests {
     fn verify_reset_marker_admissible_accepts_consumed_zeb1031() {
         let successor = vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])];
         let member = successor[0];
-        let membership = test_membership(ResetPhase::Consumed, successor.clone(), 2, Vec::new());
+        let membership = test_membership(
+            ResetPhase::Consumed,
+            successor.clone(),
+            2,
+            Vec::new(),
+            vec![member],
+        );
         let payload = good_marker_payload(&membership);
         // Actor is not power-100 but IS a member of `nm` — RS-M5's
         // other disjunct.
@@ -4347,6 +4482,7 @@ mod tests {
             vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])],
             2,
             vec![(admin, 100)],
+            vec![admin],
         );
         let payload = good_marker_payload(&membership);
         let err = verify_reset_marker_admissible(&payload, &admin, &RESET_SPACE, &membership)
@@ -4365,6 +4501,7 @@ mod tests {
             vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])],
             2,
             vec![(admin, 100)],
+            vec![admin],
         );
         let mut payload = good_marker_payload(&membership);
         payload.reset_digest = [0xEE; 32]; // forged
@@ -4382,11 +4519,34 @@ mod tests {
             vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])],
             2,
             Vec::new(), // nobody is power-100
+            Vec::new(),
         );
         let payload = good_marker_payload(&membership);
         let bystander = OwnerAddr([0x99; 16]);
         let err = verify_reset_marker_admissible(&payload, &bystander, &RESET_SPACE, &membership)
             .expect_err("bystander actor must not be admissible");
+        assert!(err.contains("RS-M5"), "unexpected error: {err}");
+    }
+
+    /// ZEB-1031 review I1: `power_levels` is not cleaned up on Kick —
+    /// an actor who reads power-100 but is no longer Joined must still
+    /// be rejected. Pinned to RS-M5, distinct from the plain-bystander
+    /// case above (that one has neither leg; this one has the power
+    /// leg but fails the paired Joined check).
+    #[test]
+    fn verify_reset_marker_admissible_rejects_kicked_power_100_actor_zeb1031() {
+        let kicked_admin = OwnerAddr([0xAD; 16]);
+        let membership = test_membership(
+            ResetPhase::Authorized,
+            vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])],
+            2,
+            vec![(kicked_admin, 100)], // power_levels survives Kick
+            Vec::new(),                // but no longer a Joined member
+        );
+        let payload = good_marker_payload(&membership);
+        let err =
+            verify_reset_marker_admissible(&payload, &kicked_admin, &RESET_SPACE, &membership)
+                .expect_err("kicked-but-still-power-100 actor must not be admissible");
         assert!(err.contains("RS-M5"), "unexpected error: {err}");
     }
 
@@ -4401,6 +4561,7 @@ mod tests {
             vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])],
             2,
             vec![(admin, 100)],
+            vec![admin],
         );
         let mut payload = good_marker_payload(&membership);
         payload.reset_proposal_id = [0xFF; 16]; // no such proposal
