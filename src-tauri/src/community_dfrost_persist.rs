@@ -304,7 +304,9 @@ pub fn share_snapshot_for_persist(
         return None;
     }
     let kp = log.local_key_package.as_ref()?;
-    let share_vec = kp.signing_share().serialize();
+    // CodeAnt (#777): `serialize()` allocates a second heap copy of the
+    // secret — zeroize it on drop rather than leaving it to the allocator.
+    let share_vec = zeroize::Zeroizing::new(kp.signing_share().serialize());
     let mut signing_share = [0u8; 32];
     if share_vec.len() != 32 {
         // Unreachable for Ristretto255; refuse to write a malformed file.

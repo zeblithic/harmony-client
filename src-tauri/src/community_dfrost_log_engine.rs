@@ -648,20 +648,28 @@ async fn persist_dfrost_snapshot(
             crate::community_dfrost_persist::share_snapshot_for_persist(&g, &community_id),
         )
     };
+    // CR-1 (#777): tag which file failed — a share-sidecar failure is the
+    // one that decides whether a full-committee restart recovers without
+    // RTS repair, so it must be distinguishable in the logs. Retry is the
+    // next dirty signal or the teardown flush; a share missed by both is
+    // re-judged as absent at next boot and repair covers it.
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::community_dfrost_persist::write_snapshot(&cipher, &path, &snapshot)?;
+        crate::community_dfrost_persist::write_snapshot(&cipher, &path, &snapshot)
+            .map_err(|e| (crate::community_dfrost_persist::DFROST_FILENAME, e))?;
         if let Some(share) = share_snapshot.as_ref() {
-            crate::community_dfrost_persist::write_share_snapshot(&cipher, &share_path, share)?;
+            crate::community_dfrost_persist::write_share_snapshot(&cipher, &share_path, share)
+                .map_err(|e| (crate::community_dfrost_persist::DFROST_SHARE_FILENAME, e))?;
         }
-        Ok::<(), crate::community_state_persist::PersistError>(())
+        Ok::<(), (&'static str, crate::community_state_persist::PersistError)>(())
     })
     .await;
     match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(
+        Ok(Err((file, e))) => tracing::warn!(
             ?community_id,
+            file,
             err = %e,
-            "dfrost persist: snapshot write failed; will retry on next dirty signal"
+            "dfrost persist: write failed; will retry on the next dirty signal or flush"
         ),
         Err(join_err) => tracing::warn!(
             ?community_id,
