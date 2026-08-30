@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::community_dfrost_log::DfrostLog;
-use crate::community_dfrost_types::{DfrostEventKind, DkgCompletePayload, SignedCommitteeEvent};
+use crate::community_dfrost_types::{
+    DfrostEventKind, DkgCompletePayload, ResetMarkerPayload, SignedCommitteeEvent,
+};
 use crate::owner_state_types::OwnerAddr;
 
 /// Wire version for the catch-up request/frame codec. Bumped on any
@@ -103,7 +105,8 @@ pub struct CatchupStatus {
     pub active: bool,
 }
 
-/// Externally-tagged enum — encodes as a 1-entry map {"st"|"dk"|"vb": ...}.
+/// Externally-tagged enum — encodes as a 1-entry map
+/// {"st"|"dk"|"vb"|"rc": ...}.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CatchupBody {
     #[serde(rename = "st")]
@@ -114,6 +117,30 @@ pub enum CatchupBody {
     /// Verbatim ciborium-encoded `SignedCommitteeEvent` (kind `vb`).
     #[serde(rename = "vb")]
     Beacon(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// ZEB-1031 §6.3: ciborium-encoded `Vec<ResetChainLink>` — the
+    /// responder's reset-chain healing payload for a straggler stuck
+    /// pre-reset (spec §6.2). A NEW variant, so a legacy (pre-ZEB-1031)
+    /// decoder that never sees this tag is unaffected — every existing
+    /// `Status`/`DkEvidence`/`Beacon` frame encodes byte-identically to
+    /// before; an old peer that DOES receive a `ResetChain` frame drops
+    /// just that one frame (the established per-frame decode-failure
+    /// tolerance — see `decode_frame`'s callers), never the whole round.
+    #[serde(rename = "rc")]
+    ResetChain(#[serde(with = "serde_bytes")] Vec<u8>),
+}
+
+/// ZEB-1031 §6.3: one link of a reset chain — the `rs` marker that
+/// retired a committee plus the successor epoch's retained `dk` quorum
+/// events (possibly empty, if the successor DKG hasn't completed on
+/// this responder yet). Interleaved `marker₁, quorum₁, marker₂,
+/// quorum₂, …` across links for a multi-reset chain (spec §6.2).
+/// 2-char keys per the module's same-length-keys invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetChainLink {
+    #[serde(rename = "mk")]
+    pub marker: SignedCommitteeEvent,
+    #[serde(rename = "dk")]
+    pub dk_events: Vec<SignedCommitteeEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +290,82 @@ pub struct CatchupSelection {
     /// (ZEB-1036) every member of a TIED beacon group regardless of
     /// watermark. OLDEST-first, capped at `max_beacons`.
     pub beacons: Vec<SignedCommitteeEvent>,
+    /// ZEB-1031 §6.3: reset-chain healing links, oldest reset first.
+    /// Empty unless this responder's `vk_history` holds a reset the
+    /// requester's implied epoch predates.
+    pub reset_chain: Vec<ResetChainLink>,
+}
+
+/// `dk` (DkgComplete) events at exactly `epoch`, one per distinct actor
+/// (newest per actor in synthesized-id/HLC order — `log.events()` is
+/// already HLC-ordered, so a later `insert` for the same actor key
+/// naturally overwrites the earlier one). Shared by `select_catchup`'s
+/// current-epoch retrieval and the reset-chain's per-link successor-
+/// epoch retrieval (ZEB-1031 §6.3 — "reuse that retrieval").
+fn dk_events_for_epoch(log: &DfrostLog, epoch: u64) -> Vec<SignedCommitteeEvent> {
+    let mut newest_per_actor: BTreeMap<OwnerAddr, SignedCommitteeEvent> = BTreeMap::new();
+    for ev in log.events() {
+        if ev.kind != DfrostEventKind::DkgComplete {
+            continue;
+        }
+        let payload: DkgCompletePayload = match ciborium::de::from_reader(&ev.payload[..]) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if payload.epoch != epoch {
+            continue;
+        }
+        newest_per_actor.insert(ev.actor, ev.clone());
+    }
+    newest_per_actor.into_values().collect()
+}
+
+/// ZEB-1031 §6.3: build the reset-chain healing links for a requester
+/// whose implied epoch (`req.epoch`; `0` for an inactive/fresh
+/// requester) predates one or more of this responder's recorded
+/// resets. For each `vk_history` entry with `req.epoch <= old_epoch`
+/// (monotonically increasing across resets, so this naturally selects
+/// "that entry forward"), attach the retained `rs` marker event for
+/// that reset plus the successor epoch's `dk` quorum (which may still
+/// be empty if this responder hasn't itself completed that successor
+/// DKG yet — the requester picks the chain back up on a later round).
+fn select_reset_chain(log: &DfrostLog, req: &CatchupRequest) -> Vec<ResetChainLink> {
+    if log.committee_state.vk_history.is_empty() {
+        return Vec::new();
+    }
+    let mut links = Vec::new();
+    for entry in &log.committee_state.vk_history {
+        if req.epoch > entry.old_epoch {
+            continue;
+        }
+        let marker = log.events().find(|ev| {
+            if ev.kind != DfrostEventKind::ResetMarker {
+                return false;
+            }
+            let payload: ResetMarkerPayload = match ciborium::de::from_reader(&ev.payload[..]) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            payload.reset_proposal_id == entry.reset_id
+        });
+        let Some(marker) = marker else {
+            // Defensive: a vk_history entry with no retained marker
+            // event would be an apply-layer bug (`apply_reset_marker`
+            // always inserts the event it just applied) — skip rather
+            // than serve a link with no marker to verify against.
+            tracing::warn!(
+                reset_id = ?entry.reset_id,
+                "dfrost catchup: vk_history entry has no retained rs marker event — skipped",
+            );
+            continue;
+        };
+        let successor_epoch = entry.old_epoch.saturating_add(1);
+        links.push(ResetChainLink {
+            marker: marker.clone(),
+            dk_events: dk_events_for_epoch(log, successor_epoch),
+        });
+    }
+    links
 }
 
 /// Pure responder selection. `None` ⇒ nothing to serve (inactive
@@ -403,34 +506,28 @@ pub fn select_catchup(
         .map(|&i| admitted[i].event.clone())
         .collect();
 
-    // Rule 2: requester fully current (active at the current epoch, and
-    // no beacon above its watermark — nor any tied group to heal) ⇒
-    // nothing to serve.
+    // ZEB-1031 §6.3: reset-chain healing links. Computed only in this
+    // (Rule 1-passed, responder active) branch — a responder that is
+    // ITSELF mid-reset (deactivated, not yet promoted) serves nothing
+    // at all here (Rule 1 above), which is a narrow, self-healing
+    // availability gap (another already-promoted responder, or this
+    // one once its own successor DKG completes, serves the chain) —
+    // not a correctness issue: every ACTIVE responder's vk_history is
+    // by construction the complete lineage that got it there.
+    let reset_chain = select_reset_chain(log, req);
+
+    // Rule 2: requester fully current (active at the current epoch, no
+    // beacon above its watermark — nor any tied group to heal — and no
+    // reset chain to serve) ⇒ nothing to serve.
     let requester_current = req.active && req.epoch == current_epoch;
-    if requester_current && beacons.is_empty() {
+    if requester_current && beacons.is_empty() && reset_chain.is_empty() {
         return None;
     }
 
     // dk_events: only when the requester is behind the current epoch
-    // (inactive, or active at an older epoch). Collapse to newest per
-    // actor — iterating in HLC order means a later `insert` for the same
-    // actor key naturally overwrites the earlier one.
+    // (inactive, or active at an older epoch).
     let dk_events = if !req.active || req.epoch < current_epoch {
-        let mut newest_per_actor: BTreeMap<OwnerAddr, SignedCommitteeEvent> = BTreeMap::new();
-        for ev in log.events() {
-            if ev.kind != DfrostEventKind::DkgComplete {
-                continue;
-            }
-            let payload: DkgCompletePayload = match ciborium::de::from_reader(&ev.payload[..]) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if payload.epoch != current_epoch {
-                continue;
-            }
-            newest_per_actor.insert(ev.actor, ev.clone());
-        }
-        newest_per_actor.into_values().collect()
+        dk_events_for_epoch(log, current_epoch)
     } else {
         Vec::new()
     };
@@ -442,6 +539,7 @@ pub fn select_catchup(
         },
         dk_events,
         beacons,
+        reset_chain,
     })
 }
 

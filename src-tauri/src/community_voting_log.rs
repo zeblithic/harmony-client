@@ -37,6 +37,47 @@ pub trait MembershipSnapshotResolver: Send + Sync {
         community_id: crate::owner_state_types::SpaceId,
         hlc: &crate::owner_state_types::Hlc,
     ) -> Result<crate::community_voting_core::MembershipSnapshot, SnapshotResolverError>;
+
+    /// ZEB-1031 §5.1/§6.1: resolve the FULL materialized membership
+    /// state — including `reset_proposals`, not just the narrow
+    /// `MembershipSnapshot` projection `snapshot_at` returns — strictly
+    /// BEFORE `hlc` (same at-event-HLC discipline as `snapshot_at`, via
+    /// `prior_state_at_hlc`). Consumed by the D-FROST engine's
+    /// `verify_reset_marker_admissible` (RS-M3/M4/M5), which must
+    /// evaluate reset-proposal phase/digest/actor-power at the marker
+    /// event's OWN envelope HLC so the verdict is deterministic across
+    /// replicas regardless of arrival order.
+    ///
+    /// Default: unsupported (`Err`) — only the production
+    /// `NodeStateMembershipResolver` overrides this; the voting/channel-
+    /// log resolvers this trait already serves have no use for it.
+    async fn reset_membership_at(
+        &self,
+        _community_id: crate::owner_state_types::SpaceId,
+        _hlc: &crate::owner_state_types::Hlc,
+    ) -> Result<crate::community_membership::MaterializedMembership, SnapshotResolverError> {
+        Err(SnapshotResolverError::BackendError(
+            "reset membership evidence not supported by this resolver (ZEB-1031)".into(),
+        ))
+    }
+
+    /// ZEB-1031 §6.1: resolve the CURRENT (at-HEAD) materialized
+    /// membership state. Used by `adopt_initial_quorum`/
+    /// `adopt_refresh_quorum` call sites to compute
+    /// `dfrost_reset_rejected_vks` against THIS replica's own live
+    /// view — deliberately never a peer-supplied HLC, since a stale
+    /// event's HLC could hide a reset authorized after it, defeating
+    /// the exact replay this gate exists to close.
+    ///
+    /// Default: unsupported (`Err`).
+    async fn reset_membership_now(
+        &self,
+        _community_id: crate::owner_state_types::SpaceId,
+    ) -> Result<crate::community_membership::MaterializedMembership, SnapshotResolverError> {
+        Err(SnapshotResolverError::BackendError(
+            "reset membership evidence not supported by this resolver (ZEB-1031)".into(),
+        ))
+    }
 }
 
 /// Why `MembershipSnapshotResolver::snapshot_at` failed.

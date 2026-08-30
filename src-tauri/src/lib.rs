@@ -59090,6 +59090,84 @@ impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMember
         .await
         .map_err(crate::community_voting_log::SnapshotResolverError::BackendError)
     }
+
+    /// ZEB-1031: full at-HLC materialized membership (`reset_proposals`
+    /// included), for `verify_reset_marker_admissible`.
+    async fn reset_membership_at(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        hlc: &crate::owner_state_types::Hlc,
+    ) -> Result<
+        crate::community_membership::MaterializedMembership,
+        crate::community_voting_log::SnapshotResolverError,
+    > {
+        dfrost_reset_membership_for_community_at_hlc(
+            self.crdt_state.clone(),
+            self.community_registry.clone(),
+            community_id,
+            hlc,
+        )
+        .await
+        .map_err(crate::community_voting_log::SnapshotResolverError::BackendError)
+    }
+
+    /// ZEB-1031: full at-HEAD materialized membership, for the
+    /// `dfrost_reset_rejected_vks` gate at the adoption call sites.
+    async fn reset_membership_now(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+    ) -> Result<
+        crate::community_membership::MaterializedMembership,
+        crate::community_voting_log::SnapshotResolverError,
+    > {
+        dfrost_reset_membership_for_community(
+            self.crdt_state.clone(),
+            self.community_registry.clone(),
+            community_id,
+        )
+        .await
+        .map_err(crate::community_voting_log::SnapshotResolverError::BackendError)
+    }
+}
+
+/// ZEB-1031: at-HLC counterpart of `voting_build_snapshot_for_community_at_hlc`
+/// that returns the FULL `MaterializedMembership` (including
+/// `reset_proposals`) instead of the narrow voting `MembershipSnapshot`
+/// projection — the D-FROST reset-marker admissibility check needs the
+/// reset-proposal lifecycle view, not just member/power data.
+async fn dfrost_reset_membership_for_community_at_hlc(
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    space_id: crate::owner_state_types::SpaceId,
+    at: &crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::MaterializedMembership, String> {
+    let (admin_addr, engine_state) =
+        voting_resolve_membership_source(&crdt_state, &community_registry, space_id).await?;
+    let events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let g = engine_state.lock().await;
+        g.events().cloned().collect()
+    };
+    Ok(crate::community_membership::prior_state_at_hlc(
+        &events, at, admin_addr,
+    ))
+}
+
+/// ZEB-1031: at-HEAD counterpart of `voting_build_snapshot_for_community`
+/// that returns the FULL `MaterializedMembership` — see
+/// `dfrost_reset_membership_for_community_at_hlc`'s doc for why the
+/// narrow `MembershipSnapshot` projection isn't enough here.
+async fn dfrost_reset_membership_for_community(
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    space_id: crate::owner_state_types::SpaceId,
+) -> Result<crate::community_membership::MaterializedMembership, String> {
+    let (admin_addr, engine_state) =
+        voting_resolve_membership_source(&crdt_state, &community_registry, space_id).await?;
+    let materialized = {
+        let g = engine_state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+    Ok(materialized)
 }
 
 /// ZEB-718: at boot, load a community's persisted voting log from disk and

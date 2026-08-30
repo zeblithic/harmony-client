@@ -1364,6 +1364,7 @@ impl DfrostLog {
         &mut self,
         events: &[SignedCommitteeEvent],
         expected_space: &crate::owner_state_types::SpaceId,
+        rejected_vks: &std::collections::BTreeSet<[u8; 32]>,
     ) -> Result<u64, String> {
         use crate::community_dfrost_types::DkgCompletePayload;
 
@@ -1417,6 +1418,38 @@ impl DfrostLog {
             {
                 return Err(
                     "adopt_initial_quorum: dk events disagree on the ceremony payload".into(),
+                );
+            }
+        }
+
+        // ZEB-1031 §6.1: reject any dk quorum whose claimed joint
+        // verifying key is a REJECTED tv (Authorized — live replacement
+        // in progress — or Consumed-and-not-superseded) — checked
+        // FIRST, before any shape validation below, so a stale
+        // pre-reset quorum never even reaches the shape/threshold
+        // gates. Closes the stale-committee replay a colluding
+        // ex-committee could otherwise replay against a fresh joiner
+        // once Lapse (if any) clears the freeze.
+        if rejected_vks.contains(&first.joint_verifying_key) {
+            return Err(
+                "adopt_initial_quorum: dk quorum's joint verifying key is a rejected target \
+                 of a committee reset (ZEB-1031 provenance)"
+                    .into(),
+            );
+        }
+        // ZEB-1031 §5.3/§6.2 (controller ruling on a Task 4 plan gap):
+        // while a reset is pending on THIS log — a straggler that just
+        // applied its own marker via `apply_reset_marker` — the
+        // successor quorum being adopted must claim EXACTLY the pinned
+        // shape. Without this, a post-marker straggler would adopt ANY
+        // structurally-valid quorum, defeating the covert-replacement
+        // protection the pin exists for.
+        if let Some(pin) = &self.committee_state.pending_reset {
+            if first.members != pin.new_members || first.threshold != pin.new_threshold {
+                return Err(
+                    "adopt_initial_quorum: dk quorum does not match the pinned successor \
+                     shape from the committee reset in progress (ZEB-1031)"
+                        .into(),
                 );
             }
         }
@@ -7660,7 +7693,14 @@ mod tests {
         let events = vec![ev_a.clone(), ev_b];
 
         let mut log = DfrostLog::new();
-        assert_eq!(log.adopt_initial_quorum(&events, &zeb1034_space()), Ok(1));
+        assert_eq!(
+            log.adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
         assert!(log.committee_state.active);
         assert_eq!(log.committee_state.joint_verifying_key, Some(joint_vk));
         let expected_shares: BTreeMap<OwnerAddr, [u8; 32]> = verifying_shares
@@ -7743,7 +7783,7 @@ mod tests {
         let community_y = crate::owner_state_types::SpaceId([0x0E; 16]);
         let mut log = DfrostLog::new();
         let err = log
-            .adopt_initial_quorum(&events, &community_y)
+            .adopt_initial_quorum(&events, &community_y, &std::collections::BTreeSet::new())
             .expect_err("cross-community dk quorum must be rejected");
         assert!(
             err.contains("bound to a different community"),
@@ -7761,7 +7801,11 @@ mod tests {
             signed_dk(bob, 1_001, "b", &legacy_payload),
         ];
         let err = log
-            .adopt_initial_quorum(&legacy_events, &zeb1034_space())
+            .adopt_initial_quorum(
+                &legacy_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new(),
+            )
             .expect_err("unbound legacy dk quorum must be rejected");
         assert!(
             err.contains("no community binding"),
@@ -7770,7 +7814,14 @@ mod tests {
         assert!(!log.committee_state.active);
 
         // Correctly-bound evidence at the right community still adopts.
-        assert_eq!(log.adopt_initial_quorum(&events, &zeb1034_space()), Ok(1));
+        assert_eq!(
+            log.adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
         assert!(log.committee_state.active);
     }
 
@@ -7814,7 +7865,11 @@ mod tests {
         ];
         let mut log = DfrostLog::new();
         assert_eq!(
-            log.adopt_initial_quorum(&initial_events, &zeb1034_space()),
+            log.adopt_initial_quorum(
+                &initial_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
             Ok(1)
         );
 
@@ -7981,7 +8036,11 @@ mod tests {
 
         for (name, events) in &cases {
             let mut log = DfrostLog::new();
-            let result = log.adopt_initial_quorum(events, &zeb1034_space());
+            let result = log.adopt_initial_quorum(
+                events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new(),
+            );
             assert!(result.is_err(), "case {name} should reject: {result:?}");
             // ZEB-1034 (PR#780 round-1): each case must fail on ITS OWN
             // defect — a binding-gate error here means the base fixture
@@ -8005,9 +8064,188 @@ mod tests {
             signed_dk(bob, 1_001, "b", &p),
         ];
         assert!(active_log
-            .adopt_initial_quorum(&events, &zeb1034_space())
+            .adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            )
             .is_err());
         assert_eq!(active_log.event_count(), 0);
+    }
+
+    /// ZEB-1031 §6.1: `adopt_initial_quorum`'s `rejected_vks` gate —
+    /// a quorum whose joint verifying key is in the rejected set is
+    /// rejected with the provenance error, BEFORE any shape validation
+    /// (a malformed-but-rejected quorum still gets the provenance
+    /// error, not a shape error); the empty-set case is prior
+    /// behaviour (adopts normally).
+    #[test]
+    fn adopt_initial_quorum_rejected_vks_gate_zeb1031() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let joint_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let verifying_shares: Vec<MemberVerifyingShare> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MemberVerifyingShare {
+                member: *m,
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pub_pkg.verifying_shares().get(&ids[i]).unwrap(),
+                ),
+            })
+            .collect();
+        let payload = DkgCompletePayload {
+            ceremony_id: [0x41; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares,
+            epoch: 1,
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 3,
+            space_id: Some(zeb1034_space()),
+        };
+        let events = vec![
+            signed_dk(alice, 1_000, "a", &payload),
+            signed_dk(bob, 1_001, "b", &payload),
+        ];
+
+        // In-set: rejected with the provenance error, nothing adopted.
+        let mut rejected = std::collections::BTreeSet::new();
+        rejected.insert(joint_vk);
+        let mut log = DfrostLog::new();
+        let err = log
+            .adopt_initial_quorum(&events, &zeb1034_space(), &rejected)
+            .expect_err("rejected vk must not be adopted");
+        assert!(
+            err.contains("rejected") && err.contains("ZEB-1031"),
+            "unexpected error: {err}"
+        );
+        assert!(!log.committee_state.active);
+        assert_eq!(log.event_count(), 0, "no partial insert");
+
+        // Empty set: prior behaviour — adopts normally.
+        let mut log2 = DfrostLog::new();
+        assert_eq!(
+            log2.adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
+        assert!(log2.committee_state.active);
+        assert_eq!(log2.committee_state.joint_verifying_key, Some(joint_vk));
+    }
+
+    /// ZEB-1031 §5.3/§6.2 (controller ruling): `adopt_initial_quorum`
+    /// enforces the `pending_reset` pin — when a reset is pending on
+    /// THIS log (a straggler that just applied its own marker), a dk
+    /// quorum whose shape doesn't match the pinned `new_members`/
+    /// `new_threshold` is rejected, even though it is otherwise
+    /// structurally valid; the pinned-shape quorum is adopted.
+    #[test]
+    fn adopt_initial_quorum_pending_reset_pin_zeb1031() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let carol = members[2];
+        let joint_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let verifying_shares: Vec<MemberVerifyingShare> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MemberVerifyingShare {
+                member: *m,
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pub_pkg.verifying_shares().get(&ids[i]).unwrap(),
+                ),
+            })
+            .collect();
+
+        // Pin the successor to exactly {alice, bob}, threshold 2 (a
+        // strict subset of the 2-of-3 material's 3-member committee —
+        // proves the pin, not merely the pre-existing shape gates,
+        // rejects the mismatched quorum below).
+        let mut log = DfrostLog::new();
+        log.committee_state.pending_reset = Some(PendingReset {
+            reset_id: [0x50; 16],
+            new_members: vec![alice, bob],
+            new_threshold: 2,
+        });
+
+        // Wrong shape: claims all 3 members (structurally valid on its
+        // own — passes every pre-existing adopt_initial_quorum check)
+        // but does not match the pin.
+        let wrong_shape_payload = DkgCompletePayload {
+            ceremony_id: [0x51; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares: verifying_shares.clone(),
+            epoch: 1,
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 3,
+            space_id: Some(zeb1034_space()),
+        };
+        let wrong_events = vec![
+            signed_dk(alice, 1_000, "a", &wrong_shape_payload),
+            signed_dk(bob, 1_001, "b", &wrong_shape_payload),
+            signed_dk(carol, 1_002, "c", &wrong_shape_payload),
+        ];
+        let err = log
+            .adopt_initial_quorum(
+                &wrong_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new(),
+            )
+            .expect_err("wrong-shape quorum must be rejected while a reset is pending");
+        assert!(
+            err.contains("pinned successor shape") && err.contains("ZEB-1031"),
+            "unexpected error: {err}"
+        );
+        assert!(!log.committee_state.active);
+        assert_eq!(log.event_count(), 0, "no partial insert");
+        assert!(
+            log.committee_state.pending_reset.is_some(),
+            "pin survives the rejected attempt"
+        );
+
+        // Pinned-shape quorum ({alice, bob}, threshold 2) is adopted.
+        let pinned_shares: Vec<MemberVerifyingShare> = verifying_shares
+            .into_iter()
+            .filter(|mvs| mvs.member == alice || mvs.member == bob)
+            .collect();
+        let pinned_vk = [0x60; 32];
+        let pinned_payload = DkgCompletePayload {
+            ceremony_id: [0x52; 32],
+            joint_verifying_key: pinned_vk,
+            verifying_shares: pinned_shares,
+            epoch: 1,
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+            space_id: Some(zeb1034_space()),
+        };
+        let pinned_events = vec![
+            signed_dk(alice, 2_000, "a", &pinned_payload),
+            signed_dk(bob, 2_001, "b", &pinned_payload),
+        ];
+        assert_eq!(
+            log.adopt_initial_quorum(
+                &pinned_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(pinned_vk));
+        assert_eq!(log.committee_state.members, vec![alice, bob]);
     }
 
     #[test]
