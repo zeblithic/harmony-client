@@ -6,8 +6,9 @@
 //! `ensure_dfrost_engine_for` requests when it registers an engine.
 
 use crate::community_dfrost_catchup::{
-    beacon_watermark_of, group_frames, select_catchup, CatchupBody, CatchupFrame, CatchupRequest,
-    CatchupStatus, CATCHUP_VERSION, MAX_CATCHUP_BEACONS_PER_ROUND, MAX_DFROST_CATCHUP_FRAME_BYTES,
+    beacon_watermark_of, cap_catchup_groups, group_frames, select_catchup, CatchupBody,
+    CatchupFrame, CatchupRequest, CatchupStatus, CATCHUP_VERSION, MAX_CATCHUP_BEACONS_PER_ROUND,
+    MAX_CATCHUP_RESPONDER_GROUPS, MAX_DFROST_CATCHUP_FRAME_BYTES,
 };
 use crate::community_dfrost_log::{
     check_envelope, dfrost_event_id, verify_signed_committee_event, ApplyError, DfrostLog,
@@ -1368,7 +1369,12 @@ async fn process_inbound<R: tauri::Runtime>(
         );
         // ZEB-1030: rate-limited hint so a catch-up requester loop wakes
         // early on evidence of epoch lag, instead of only on a timer.
-        maybe_fire_catchup_hint(orchestrator, event.kind, &apply_err);
+        maybe_fire_catchup_hint(
+            orchestrator,
+            event.kind,
+            &apply_err,
+            DFROST_CATCHUP_HINT_FLOOR,
+        );
         // ZEB-1022 straggler heal (CI stall on #771): a ceremony event
         // that fails to apply while OUR committee is already active is
         // the signature of a peer still stuck in a ceremony we
@@ -1566,6 +1572,16 @@ async fn process_inbound<R: tauri::Runtime>(
     }
 }
 
+/// ZEB-1030 final-review I1: the catch-up hint's own rate-limit floor —
+/// deliberately NOT `orchestrator.config.rebroadcast_interval` (5 s
+/// default), which is the re-broadcast cadence for a DIFFERENT concern
+/// (live-ceremony progress) and made the hint fire ~every 5 s for any
+/// node that cannot adopt (denied joiner, or straggler with no
+/// responder). 60 s keeps the hint meaningfully faster than the 300 s
+/// `DFROST_CATCHUP_INTERVAL` requester-loop timer it exists to
+/// pre-empt, without reintroducing the amplification.
+const DFROST_CATCHUP_HINT_FLOOR: Duration = Duration::from_secs(60);
+
 /// ZEB-1030: an apply failure that smells like "the committee moved
 /// without us" (or "a committee exists we never saw") pulls the next
 /// catch-up attempt forward. Rate-limited; never fires for di/dk
@@ -1573,10 +1589,22 @@ async fn process_inbound<R: tauri::Runtime>(
 ///
 /// Free function (not inlined in `process_inbound`) so tests can drive
 /// the rate-limit decision directly without spinning up a full engine.
+///
+/// `floor` is the hint's own rate-limit window — ZEB-1030 final-review
+/// I1: this used to borrow `orchestrator.config.rebroadcast_interval`
+/// (5 s default), so a permanently-lagging node (a denied joiner, or a
+/// straggler with no responder yet) issued a catch-up GET roughly every
+/// 5 s indefinitely, a ~60x amplification over the designed 300 s
+/// requester cadence. Production passes [`DFROST_CATCHUP_HINT_FLOOR`];
+/// taking it as a parameter (rather than reading a fixed constant
+/// directly) lets `catchup_hint_fires_rate_limited_zeb1030` keep
+/// exercising the rate-limit boundary on a short window without an
+/// actual 60 s sleep.
 pub(crate) fn maybe_fire_catchup_hint(
     orchestrator: &OrchestratorHandle,
     kind: DfrostEventKind,
     err: &ApplyError,
+    floor: Duration,
 ) {
     let hint_worthy = matches!(err, ApplyError::UnknownCeremony)
         || (matches!(err, ApplyError::InvariantViolation)
@@ -1589,9 +1617,7 @@ pub(crate) fn maybe_fire_catchup_hint(
             ));
     if hint_worthy {
         let mut last = orchestrator.catchup_hint_last.lock().expect("hint clock");
-        let due = last
-            .map(|t| t.elapsed() >= orchestrator.config.rebroadcast_interval)
-            .unwrap_or(true);
+        let due = last.map(|t| t.elapsed() >= floor).unwrap_or(true);
         if due {
             *last = Some(Instant::now());
             orchestrator.catchup_hint.notify_one();
@@ -2893,12 +2919,22 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// ZEB-1030: snapshot this node's committee epoch/active/watermark
     /// under one log lock, for use as a catch-up request.
     pub async fn catchup_build_request(&self) -> CatchupRequest {
+        // ZEB-1030 final-review C1: this node's own trusted wall clock,
+        // fed to `beacon_watermark_of`'s forward-skew gate — same
+        // `SystemTime::now()`-only, 0-on-unreadable convention as
+        // `community_voting_log_engine.rs`'s `receiver_now_ms` reads.
+        // Never a peer/HLC-adopt value: the bound only holds if measured
+        // against a clock the sender cannot move.
+        let now_wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let log = self.dfrost_log.lock().await;
         CatchupRequest {
             version: CATCHUP_VERSION,
             epoch: log.committee_state.current_epoch,
             active: log.committee_state.active,
-            beacon_watermark: beacon_watermark_of(&log),
+            beacon_watermark: beacon_watermark_of(&log, now_wall_ms),
         }
     }
 
@@ -3053,6 +3089,26 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             return CatchupOutcome::NothingUsable;
         }
 
+        // ZEB-1030 final-review I4: `group_frames` is pure and applies no
+        // cap — a responder legally fitting well under
+        // `MAX_DFROST_CATCHUP_ROUND_BYTES` can still pack ~10^5
+        // single-status-single-`dk` groups into one reply. Every group
+        // processed below pays an `Ed25519::verify_strict` per
+        // non-status frame (`catchup_decode_and_verify`), and on the
+        // joiner path a membership-resolver `snapshot_at` per `dk` event
+        // — so bound the groups actually processed here, not just the
+        // reply's byte size. Excess groups are simply dropped: a
+        // legitimate round never needs more than a handful.
+        let received_groups = groups.len();
+        let groups = cap_catchup_groups(groups, MAX_CATCHUP_RESPONDER_GROUPS);
+        if groups.len() < received_groups {
+            tracing::warn!(
+                received_groups,
+                processed_groups = groups.len(),
+                "dfrost catchup ingest: too many responder groups in one round — dropping excess",
+            );
+        }
+
         let mut verified_groups = Vec::with_capacity(groups.len());
         for (status, frames_in_group) in groups {
             let (dk_events, beacons) = self.catchup_decode_and_verify(frames_in_group).await;
@@ -3189,15 +3245,42 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// Membership gate (spec §5.3) for ONE candidate joiner group: every
     /// claimed member of every `dk` event's payload must resolve at
     /// that event's OWN envelope HLC (`dk` carries no payload mint
-    /// stamp — mirrors the `di` gate at lines 877-908). `None` resolver
-    /// ⇒ skip (test engines). Returns `false` (warn already logged) on
-    /// any failure — the caller tries the next-best group rather than
-    /// aborting the whole ingest (ZEB-1030 review round 1 M7: a single
-    /// group failing this gate must not deny catch-up when another
-    /// agreeing group would pass it).
+    /// stamp — mirrors the `di` gate at lines 877-908). Returns `false`
+    /// (warn already logged) on any failure — the caller tries the
+    /// next-best group rather than aborting the whole ingest (ZEB-1030
+    /// review round 1 M7: a single group failing this gate must not
+    /// deny catch-up when another agreeing group would pass it).
+    ///
+    /// ZEB-1030 final-review I3: this gate is the joiner's SOLE trust
+    /// anchor for spec invariant #4 (membership-at-HLC) — the
+    /// `verify_signed_committee_event` check upstream is
+    /// community-agnostic and enforces nothing about membership. A
+    /// `None` resolver must therefore fail CLOSED in production: no
+    /// resolver means no membership check at all, which is strictly
+    /// worse than rejecting. The single production caller
+    /// (`ensure_dfrost_engine_for`) always wires a resolver when it
+    /// wires driver support at all (`driver_wiring.is_some()`), so this
+    /// costs production nothing — it exists only so a future ensure
+    /// path that omits driver wiring can't silently ship joiner
+    /// adoption with the membership gate disabled and no signal. Test /
+    /// fixture builds keep the permissive skip (inherited from the `di`
+    /// gate, where a missing resolver is the normal shape for an
+    /// engine built without membership wiring) so existing unit tests
+    /// stay green.
     async fn catchup_joiner_membership_gate_ok(&self, group: &VerifiedCatchupGroup) -> bool {
         let Some(resolver) = self.orchestrator.membership_resolver.as_ref() else {
-            return true;
+            #[cfg(any(test, feature = "test-fixtures"))]
+            {
+                return true;
+            }
+            #[cfg(not(any(test, feature = "test-fixtures")))]
+            {
+                tracing::warn!(
+                    "dfrost catchup ingest: joiner membership gate has no resolver wired \
+                     — refusing initial adoption (fail-closed)",
+                );
+                return false;
+            }
         };
         for ev in &group.dk_events {
             let payload: DkgCompletePayload = match ciborium::de::from_reader(&ev.payload[..]) {
@@ -8169,7 +8252,11 @@ mod tests {
     /// `InvariantViolation` fires only for the "epoch lag" kinds
     /// (ThresholdSign/VrfBeacon/ProactiveRefresh/RepairShare), never for
     /// a live-ceremony race (e.g. CeremonyInit); and every fire is
-    /// rate-limited to `rebroadcast_interval`.
+    /// rate-limited to the caller-supplied floor — ZEB-1030 final-review
+    /// I1: production passes `DFROST_CATCHUP_HINT_FLOOR` (60 s), NOT
+    /// `orchestrator.config.rebroadcast_interval` (5 s default, a
+    /// different concern's cadence); this test exercises the same
+    /// rate-limit logic against a short floor so it stays fast.
     #[tokio::test]
     async fn catchup_hint_fires_rate_limited_zeb1030() {
         use crate::community_dfrost_log::ApplyError;
@@ -8178,13 +8265,11 @@ mod tests {
             OrchestratorState,
         };
 
+        let floor = Duration::from_millis(30);
         let orchestrator = OrchestratorHandle {
             driver: None,
             membership_resolver: None,
-            config: DfrostOrchestratorConfig {
-                rebroadcast_interval: Duration::from_millis(30),
-                ..Default::default()
-            },
+            config: DfrostOrchestratorConfig::default(),
             state: tokio::sync::Mutex::new(OrchestratorState::default()),
             catchup_hint: Arc::new(tokio::sync::Notify::new()),
             catchup_hint_last: std::sync::Mutex::new(None),
@@ -8196,6 +8281,7 @@ mod tests {
             &orchestrator,
             DfrostEventKind::ThresholdSign,
             &ApplyError::UnknownCeremony,
+            floor,
         );
         tokio::time::timeout(Duration::from_millis(200), hint.notified())
             .await
@@ -8203,11 +8289,12 @@ mod tests {
         let last_after_first = *orchestrator.catchup_hint_last.lock().unwrap();
         assert!(last_after_first.is_some());
 
-        // A second call within `rebroadcast_interval` does NOT re-arm.
+        // A second call within `floor` does NOT re-arm.
         maybe_fire_catchup_hint(
             &orchestrator,
             DfrostEventKind::ThresholdSign,
             &ApplyError::UnknownCeremony,
+            floor,
         );
         let last_after_second = *orchestrator.catchup_hint_last.lock().unwrap();
         assert_eq!(
@@ -8221,6 +8308,7 @@ mod tests {
             &orchestrator,
             DfrostEventKind::CeremonyInit,
             &ApplyError::InvariantViolation,
+            floor,
         );
         let last_after_ceremony_init = *orchestrator.catchup_hint_last.lock().unwrap();
         assert_eq!(
@@ -8228,17 +8316,35 @@ mod tests {
             "InvariantViolation on CeremonyInit must never fire"
         );
 
-        // InvariantViolation + ThresholdSign fires once the interval has
+        // InvariantViolation + ThresholdSign fires once the floor has
         // elapsed.
         tokio::time::sleep(Duration::from_millis(40)).await;
         maybe_fire_catchup_hint(
             &orchestrator,
             DfrostEventKind::ThresholdSign,
             &ApplyError::InvariantViolation,
+            floor,
         );
         tokio::time::timeout(Duration::from_millis(200), hint.notified())
             .await
-            .expect("InvariantViolation+ThresholdSign after the interval must fire");
+            .expect("InvariantViolation+ThresholdSign after the floor must fire");
+    }
+
+    /// ZEB-1030 final-review I1 regression: the hint floor is its own
+    /// dedicated 60 s constant, independent of (and far above)
+    /// `rebroadcast_interval`'s 5 s default — pins the fix against a
+    /// future accidental revert to borrowing that field.
+    #[test]
+    fn dfrost_catchup_hint_floor_is_decoupled_from_rebroadcast_interval_zeb1030() {
+        use crate::community_dfrost_log_engine::{
+            DfrostOrchestratorConfig, DFROST_CATCHUP_HINT_FLOOR,
+        };
+
+        assert_eq!(DFROST_CATCHUP_HINT_FLOOR, Duration::from_secs(60));
+        assert!(
+            DFROST_CATCHUP_HINT_FLOOR > DfrostOrchestratorConfig::default().rebroadcast_interval,
+            "the hint floor must not regress to the (much shorter) rebroadcast_interval default",
+        );
     }
 
     // ── ZEB-1030 Task 3 review round 1 fixes ────────────────────────────

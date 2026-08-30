@@ -45,6 +45,17 @@ pub const MAX_DFROST_CATCHUP_ROUND_BYTES: usize = 16 * 1024 * 1024;
 /// against a requester with a very stale (or absent) watermark.
 pub const MAX_CATCHUP_BEACONS_PER_ROUND: usize = 64;
 
+/// ZEB-1030 final-review I4: cap on the number of responder groups
+/// (`group_frames` output) a requester will process in one
+/// `catchup_ingest` round. A responder reply is otherwise bounded only
+/// by `MAX_DFROST_CATCHUP_ROUND_BYTES` (16 MiB), which admits on the
+/// order of 10^5 tiny single-status-single-`dk` groups — each of which
+/// pays an `Ed25519::verify_strict` per non-status frame, and on the
+/// joiner path a membership-resolver `snapshot_at` per `dk` event. 16
+/// is generous: a legitimate round only ever needs a handful of
+/// independent responders to make its case.
+pub const MAX_CATCHUP_RESPONDER_GROUPS: usize = 16;
+
 /// Envelope HLC of the newest `vb` event the requester holds. 2-char keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeaconWatermark {
@@ -172,12 +183,36 @@ pub fn decode_frame(bytes: &[u8]) -> Result<CatchupFrame, String> {
 /// Max envelope HLC among retained `vb` events (for the request).
 ///
 /// `log.events()` is already synthesized-id (HLC-major) ordered
-/// (ZEB-753), so the LAST `vb` event encountered while scanning in
-/// order carries the maximum `(wall_ms, logical, device_id)` among all
-/// `vb` events — no separate max-tracking needed.
-pub fn beacon_watermark_of(log: &DfrostLog) -> Option<BeaconWatermark> {
+/// (ZEB-753), so the LAST matching `vb` event encountered while
+/// scanning in order carries the maximum `(wall_ms, logical, device_id)`
+/// among the events considered — no separate max-tracking needed.
+///
+/// ZEB-1030 final-review C1: an event's envelope HLC is chosen by
+/// whichever peer re-wraps and re-signs it, and `adopt_beacons` verifies
+/// only the payload (Schnorr sig + VRF binding) — never the envelope HLC
+/// or the signing actor's membership. A `vb` retained at an implausibly
+/// future `wall_ms` (attacker-chosen, or an honest peer's badly-set
+/// clock) must never become the watermark: `select_catchup`'s
+/// `&hlc_key > watermark` test would then never be satisfied by any real
+/// future beacon again, permanently starving this node's beacon
+/// catch-up. Per house rule the skew gate lives at the VIEW, not the
+/// store — the event stays retained (`log.events()`/`log` are
+/// untouched); it is only skipped when computing this scalar high-water.
+/// `now_wall_ms == 0` (receiver clock unreadable) disables the gate —
+/// mirrors `community_voting_log_engine.rs`'s `receiver_now_ms`
+/// convention; a bad LOCAL clock must never suppress a real watermark.
+pub fn beacon_watermark_of(log: &DfrostLog, now_wall_ms: u64) -> Option<BeaconWatermark> {
     log.events()
         .filter(|e| e.kind == DfrostEventKind::VrfBeacon)
+        .filter(|e| {
+            now_wall_ms == 0
+                || !crate::clock_trust::reject_future_logged(
+                    e.hlc.wall_ms,
+                    now_wall_ms,
+                    crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                    "dfrost_catchup.beacon_watermark.envelope_hlc",
+                )
+        })
         .last()
         .map(|e| BeaconWatermark {
             wall_ms: e.hlc.wall_ms,
@@ -309,6 +344,21 @@ pub fn group_frames(frames: Vec<CatchupFrame>) -> Vec<(CatchupStatus, Vec<Catchu
             }
         })
         .collect()
+}
+
+/// ZEB-1030 final-review I4: cap the number of responder groups a
+/// requester will process in one `catchup_ingest` round, at
+/// [`MAX_CATCHUP_RESPONDER_GROUPS`]. Excess groups are dropped;
+/// `group_frames`'s first-seen order determines which groups survive.
+/// Kept separate from — and after — `group_frames` so `group_frames`
+/// itself stays a pure, uncapped grouping function; this is the seam
+/// that makes the cap independently testable without an engine.
+pub fn cap_catchup_groups(
+    mut groups: Vec<(CatchupStatus, Vec<CatchupFrame>)>,
+    cap: usize,
+) -> Vec<(CatchupStatus, Vec<CatchupFrame>)> {
+    groups.truncate(cap);
+    groups
 }
 
 #[cfg(test)]
@@ -664,6 +714,91 @@ mod tests {
         assert!(
             sel_zero.beacons.is_empty(),
             "max_beacons=0 yields zero beacons"
+        );
+    }
+
+    /// ZEB-1030 final-review C1 regression: a genuine-payload beacon
+    /// re-wrapped in an envelope at `wall_ms = u64::MAX` (the
+    /// permanent-watermark-pin vector) must be ignored when computing
+    /// the watermark — the event is still retained in the log (skew
+    /// gate is at the view, not the store), and a subsequent normal
+    /// beacon still advances the watermark past it.
+    #[test]
+    fn beacon_watermark_of_ignores_forward_skewed_envelope_zeb1030() {
+        let mut log = test_active_log(1);
+        let now = 1_700_000_000_000u64; // fixed plausible "now" for determinism
+
+        assert!(beacon_watermark_of(&log, now).is_none(), "no vb events yet");
+
+        let sane = test_vb_event(test_hlc(now - 1000, 0, "dev1"));
+        log.insert_event_for_test(sane);
+        let wm = beacon_watermark_of(&log, now).expect("watermark present");
+        assert_eq!(wm.wall_ms, now - 1000);
+
+        // Adversarial/misconfigured-clock vector: same kind of genuine
+        // payload, envelope re-wrapped at wall_ms = u64::MAX.
+        let skewed = test_vb_event(test_hlc(u64::MAX, 0, "dev1"));
+        log.insert_event_for_test(skewed.clone());
+        assert!(
+            log.events().any(|e| e.hlc.wall_ms == u64::MAX),
+            "skewed event is still retained in the log"
+        );
+        let wm_after_skewed = beacon_watermark_of(&log, now).expect("watermark still present");
+        assert_eq!(
+            wm_after_skewed.wall_ms,
+            now - 1000,
+            "skewed envelope must not advance (or clear) the watermark"
+        );
+
+        // A subsequent normal beacon still advances the watermark.
+        let newer_sane = test_vb_event(test_hlc(now - 500, 0, "dev1"));
+        log.insert_event_for_test(newer_sane);
+        let wm_final = beacon_watermark_of(&log, now).expect("watermark present");
+        assert_eq!(
+            wm_final.wall_ms,
+            now - 500,
+            "a subsequent normal beacon still advances the watermark"
+        );
+
+        // now_wall_ms == 0 (unreadable local clock) disables the gate —
+        // the skewed event becomes the max again.
+        let wm_no_clock = beacon_watermark_of(&log, 0).expect("watermark present");
+        assert_eq!(
+            wm_no_clock.wall_ms,
+            u64::MAX,
+            "now_wall_ms=0 disables the forward-skew gate (apply-all)"
+        );
+    }
+
+    /// ZEB-1030 final-review I4 regression: 17 legal single-status
+    /// groups in, at most `MAX_CATCHUP_RESPONDER_GROUPS` (16) survive.
+    #[test]
+    fn cap_catchup_groups_truncates_to_the_limit_zeb1030() {
+        let status = CatchupStatus {
+            epoch: 1,
+            active: true,
+        };
+        let groups: Vec<(CatchupStatus, Vec<CatchupFrame>)> = (0..17u16)
+            .map(|i| {
+                let mut rid = [0u8; 8];
+                rid[..2].copy_from_slice(&i.to_be_bytes());
+                (
+                    status,
+                    vec![CatchupFrame {
+                        version: CATCHUP_VERSION,
+                        responder_id: rid,
+                        body: CatchupBody::Status(status),
+                    }],
+                )
+            })
+            .collect();
+        assert_eq!(groups.len(), 17, "seeded 17 groups");
+
+        let capped = cap_catchup_groups(groups, MAX_CATCHUP_RESPONDER_GROUPS);
+        assert_eq!(
+            capped.len(),
+            MAX_CATCHUP_RESPONDER_GROUPS,
+            "at most MAX_CATCHUP_RESPONDER_GROUPS groups are processed"
         );
     }
 
