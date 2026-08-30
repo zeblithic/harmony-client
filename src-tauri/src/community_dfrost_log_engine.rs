@@ -243,9 +243,14 @@ pub trait DkgDriver: Send + Sync {
     /// `PendingSignSession.purpose` as `ResetResponse { proposal_id, verdict }`
     /// so the aggregation-side completion sink (in
     /// `dfrost_contribute_threshold_sign`) authors a `DfrostResetResponse`
-    /// membership event instead of minting `vb`. Default: refuse — test
-    /// driver impls that predate ZEB-1031 keep compiling without auto-
-    /// driving reset responses.
+    /// membership event instead of minting `vb`. `new_vk` (review round 1,
+    /// M4) is carried straight onto the session's `SignPurpose` — the
+    /// completion arm reads it from there instead of re-reading
+    /// `committee_state.joint_verifying_key`, which removes the race
+    /// where a `dk` promotion between initiation and completion could
+    /// otherwise change the held vk out from under the ceremony. Default:
+    /// refuse — test driver impls that predate ZEB-1031 keep compiling
+    /// without auto-driving reset responses.
     async fn initiate_reset_response(
         &self,
         community_id: SpaceId,
@@ -253,6 +258,7 @@ pub trait DkgDriver: Send + Sync {
         message_hash: [u8; 32],
         proposal_id: EventId,
         verdict: ResetVerdict,
+        new_vk: Option<[u8; 32]>,
     ) -> Result<(), String> {
         let _ = (
             community_id,
@@ -260,6 +266,7 @@ pub trait DkgDriver: Send + Sync {
             message_hash,
             proposal_id,
             verdict,
+            new_vk,
         );
         Err("initiate_reset_response not supported by this driver".to_string())
     }
@@ -3089,6 +3096,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                 message_hash,
                 proposal_id,
                 verdict,
+                new_vk,
             )
             .await
     }
@@ -5983,9 +5991,16 @@ mod tests {
         reset_responses: tokio::sync::Mutex<Vec<RecordedResetResponse>>,
     }
 
-    /// (community_id, ceremony_id, message_hash, proposal_id, verdict) —
-    /// factored into a named type per clippy::type_complexity.
-    type RecordedResetResponse = (SpaceId, [u8; 32], [u8; 32], EventId, ResetVerdict);
+    /// (community_id, ceremony_id, message_hash, proposal_id, verdict,
+    /// new_vk) — factored into a named type per clippy::type_complexity.
+    type RecordedResetResponse = (
+        SpaceId,
+        [u8; 32],
+        [u8; 32],
+        EventId,
+        ResetVerdict,
+        Option<[u8; 32]>,
+    );
 
     #[async_trait::async_trait]
     impl DkgDriver for RecordingDriver {
@@ -6073,6 +6088,7 @@ mod tests {
             message_hash: [u8; 32],
             proposal_id: EventId,
             verdict: ResetVerdict,
+            new_vk: Option<[u8; 32]>,
         ) -> Result<(), String> {
             self.reset_responses.lock().await.push((
                 community_id,
@@ -6080,6 +6096,7 @@ mod tests {
                 message_hash,
                 proposal_id,
                 verdict,
+                new_vk,
             ));
             Ok(())
         }
@@ -6323,10 +6340,14 @@ mod tests {
 
         let calls = driver.reset_responses.lock().await;
         assert_eq!(calls.len(), 1, "driver called exactly once");
-        let (cid, ceremony_id, message_hash, pid, verdict) = calls[0];
+        let (cid, ceremony_id, message_hash, pid, verdict, new_vk) = calls[0];
         assert_eq!(cid, community_id);
         assert_eq!(pid, proposal_id);
         assert_eq!(verdict, ResetVerdict::Endorse);
+        assert_eq!(
+            new_vk, None,
+            "endorse/veto never carry a new_vk — only Consumed does"
+        );
 
         let digest =
             dfrost_reset_digest(&community_id, &proposal_id, &target_vk, 1, &new_members, 2)

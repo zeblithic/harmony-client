@@ -63683,6 +63683,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
         message_hash: [u8; 32],
         proposal_id: crate::community_membership::EventId,
         verdict: crate::community_membership::ResetVerdict,
+        new_vk: Option<[u8; 32]>,
     ) -> Result<(), String> {
         dfrost_initiate_reset_response_core::<R>(
             &self.handles,
@@ -63691,6 +63692,7 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
             message_hash,
             proposal_id,
             verdict,
+            new_vk,
         )
         .await
     }
@@ -65384,6 +65386,7 @@ pub(crate) async fn dfrost_initiate_reset_response_core<R: tauri::Runtime>(
     message_hash: [u8; 32],
     proposal_id: crate::community_membership::EventId,
     verdict: crate::community_membership::ResetVerdict,
+    new_vk: Option<[u8; 32]>,
 ) -> Result<(), String> {
     use crate::community_dfrost_log::SignPurpose;
 
@@ -65493,6 +65496,7 @@ pub(crate) async fn dfrost_initiate_reset_response_core<R: tauri::Runtime>(
         pending.purpose = SignPurpose::ResetResponse {
             proposal_id,
             verdict,
+            new_vk,
         };
     }
 
@@ -66178,35 +66182,21 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         crate::community_dfrost_log::SignPurpose::ResetResponse {
             proposal_id,
             verdict,
+            new_vk,
         } => {
             let group_sig: [u8; 64] = sig_bytes.try_into().map_err(|_| {
                 "dfrost_contribute_threshold_sign: aggregate signature not 64 bytes".to_string()
             })?;
 
-            // §4.3: `nv` for a Consumed response is the CURRENT held vk
-            // (the successor committee attesting its own birth) — read
-            // from THIS node's own committee state, same source
-            // `initiate_reset_response_ceremony` used to derive the
-            // message hash this signature is over. Cleared in the same
-            // lock scope: there is no `vb` apply here to trigger
-            // `apply_vrf_beacon`'s pending_sign removal, so this arm
-            // clears the completed session explicitly.
-            let new_vk = {
-                let mut log = log_arc.lock().await;
-                let new_vk = match verdict {
-                    crate::community_membership::ResetVerdict::Consumed => {
-                        Some(log.committee_state.joint_verifying_key.ok_or(
-                            "dfrost_contribute_threshold_sign: consumed verdict but no active \
-                             committee vk held locally",
-                        )?)
-                    }
-                    crate::community_membership::ResetVerdict::Endorse
-                    | crate::community_membership::ResetVerdict::Veto => None,
-                };
-                log.committee_state.pending_sign.remove(&ceremony_bytes);
-                new_vk
-            };
-
+            // §4.3 / review round 1 M4: `nv` for a Consumed response is
+            // the CURRENT held vk the ceremony was INITIATED against
+            // (carried on `purpose` by `initiate_reset_response_ceremony`
+            // / `dfrost_initiate_reset_response_core`), not re-read here.
+            // Re-reading `committee_state.joint_verifying_key` at
+            // completion would race a `dk` promotion landing between
+            // initiation and completion; the carried value is exactly
+            // the vk `message_hash` was derived from, so it can never
+            // disagree with what the signature is actually over.
             let mut event_id_bytes = [0u8; 16];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut event_id_bytes);
 
@@ -66285,6 +66275,24 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                     &outcome,
                 ));
             }
+
+            // Review round 1 M5: clear the completed session only AFTER
+            // a successful author — mirrors `apply_vrf_beacon`'s
+            // success-only clear (`community_dfrost_log.rs`, removes on
+            // the `vb` apply path, never on an earlier failure). Every
+            // early `?`/`return Err` above this point (community_registry
+            // unavailable, no engine registered, sign/insert failure,
+            // Rejected) now leaves the session intact — this node's local
+            // state stays consistent with peers who already applied our
+            // (already-broadcast) `ts` share, instead of silently
+            // vanishing while the ceremony is still nonces-exhausted and
+            // unrecoverable either way.
+            log_arc
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .remove(&ceremony_bytes);
 
             Ok(())
         }

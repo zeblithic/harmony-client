@@ -486,6 +486,19 @@ pub enum SignPurpose {
     ResetResponse {
         proposal_id: crate::community_membership::EventId,
         verdict: crate::community_membership::ResetVerdict,
+        /// ZEB-1031 review round 1 (M4): carried at initiation rather
+        /// than re-read from `committee_state.joint_verifying_key` at
+        /// completion. `Some` iff `verdict == Consumed` (mirrors the
+        /// wire `DfrostResetResponse.new_vk` shape). The completion arm
+        /// builds the event's `nv` directly from this field — a `dk`
+        /// promotion landing between initiation and completion can no
+        /// longer make the authored `nv` disagree with the vk the
+        /// signature is actually over. RS-R3 recomputes the message
+        /// hash from the event's OWN `new_vk` regardless, so a stale
+        /// carried value was already fail-closed (verify would reject),
+        /// but carrying it removes the race entirely rather than
+        /// relying on that backstop.
+        new_vk: Option<[u8; 32]>,
     },
 }
 
@@ -5317,6 +5330,7 @@ mod tests {
             purpose: SignPurpose::ResetResponse {
                 proposal_id: [0x77; 16],
                 verdict: crate::community_membership::ResetVerdict::Veto,
+                new_vk: None,
             },
             ..Default::default()
         };
@@ -5325,7 +5339,27 @@ mod tests {
         let decoded: PendingSignSession = ciborium::from_reader(&buf[..]).expect("decode");
         assert_eq!(
             decoded.purpose, session.purpose,
-            "ResetResponse purpose must round-trip exactly (proposal_id + verdict)"
+            "ResetResponse purpose must round-trip exactly (proposal_id + verdict + new_vk)"
+        );
+    }
+
+    #[test]
+    fn pending_sign_session_reset_response_consumed_new_vk_round_trips() {
+        let session = PendingSignSession {
+            message_hash: [0xEE; 32],
+            purpose: SignPurpose::ResetResponse {
+                proposal_id: [0x78; 16],
+                verdict: crate::community_membership::ResetVerdict::Consumed,
+                new_vk: Some([0x99; 32]),
+            },
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&session, &mut buf).expect("encode");
+        let decoded: PendingSignSession = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(
+            decoded.purpose, session.purpose,
+            "Consumed's carried new_vk must round-trip exactly"
         );
     }
 
@@ -5379,17 +5413,31 @@ mod tests {
     }
 
     /// Full happy-path replay of what
-    /// `dfrost_contribute_threshold_sign`'s ResetResponse completion arm
-    /// does at aggregation: a REAL 2-of-3 FROST threshold signature over
-    /// the endorse-domain message hash (the SAME round1/round2/aggregate
-    /// mechanics the Beacon path shares), wrapped in a
-    /// `DfrostResetResponse` membership event that must (a) pass RS-R3
-    /// against the committee's own vk and (b) leave the dfrost log's
-    /// beacon state completely untouched — no `vb`, no beacon-index
-    /// entry, and (mirroring the completion arm's explicit cleanup) the
-    /// ceremony's `pending_sign` session gone.
+    /// The mint-site's `DfrostResetResponse` construction — a REAL 2-of-3
+    /// FROST threshold signature over the endorse-domain message hash
+    /// (the SAME round1/round2/aggregate mechanics the Beacon path
+    /// shares), wrapped exactly as `dfrost_contribute_threshold_sign`'s
+    /// ResetResponse arm builds the event — passes RS-R3 against the
+    /// committee's own vk.
+    ///
+    /// Scope note (review round 1, I3): this test previously also
+    /// asserted `beacon_index`/`beacon_watermark`/`pending_sign`
+    /// postconditions that its OWN body established rather than
+    /// exercised (it removed the `pending_sign` entry itself, then
+    /// asserted it was gone; nothing in the body could ever mint a `vb`
+    /// either) — deleted as vacuous, not as a coverage regression. The
+    /// executed coverage those assertions were gesturing at —
+    /// initiation-side purpose tagging and ceremony-id convergence
+    /// across two real engines — now lives in
+    /// `community_dfrost_transport_integration.rs`'s
+    /// `reset_response_ceremony_converges_and_tags_purpose_across_two_engines_zeb1031`.
+    /// Executing the completion-sink `match purpose` itself (this test's
+    /// original aspiration for the `no_vb` half) needs
+    /// `dfrost_contribute_threshold_sign` extracted into a `_core` the
+    /// way `dfrost_initiate_reset_response_core` was — filed as
+    /// ZEB-1040, a follow-up, not attempted this round.
     #[test]
-    fn reset_response_ceremony_aggregation_produces_verifiable_response_no_vb() {
+    fn reset_response_group_sig_passes_rsr3_against_committee_vk() {
         use crate::community_membership::{
             dfrost_reset_digest, dfrost_reset_message_hash, mint_test_owner, sign_event,
             test_enroll_member, verify_event, EventId, EventPayload, MaterializedMembership,
@@ -5399,10 +5447,9 @@ mod tests {
         use crate::owner_state_types::{Hlc, SpaceId};
 
         let community_id = SpaceId([0x51; 16]);
-        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let (_members, ids, key_packages, pub_pkg) = dkg_2of3_material();
         let target_vk =
             crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
-        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
 
         let proposal_id: EventId = [0x91; 16];
         let new_members = vec![OwnerAddr([0x71; 16]), OwnerAddr([0x72; 16])];
@@ -5410,26 +5457,6 @@ mod tests {
             dfrost_reset_digest(&community_id, &proposal_id, &target_vk, 1, &new_members, 2)
                 .expect("digest encode");
         let message_hash = dfrost_reset_message_hash(DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
-
-        let mut sign_tag = b"sign-v1:".to_vec();
-        sign_tag.extend_from_slice(&message_hash);
-        let ceremony_id =
-            crate::community_dfrost_types::derive_ceremony_id(&community_id, 1, &sign_tag);
-        // Seed the session the way `dfrost_initiate_reset_response_core`
-        // would have (purpose tagged, message_hash pinned) — the
-        // completion arm's cleanup removes exactly this entry.
-        log.committee_state.pending_sign.insert(
-            ceremony_id,
-            PendingSignSession {
-                message_hash,
-                contributions: BTreeMap::new(),
-                local_nonces: None,
-                purpose: SignPurpose::ResetResponse {
-                    proposal_id,
-                    verdict: ResetVerdict::Endorse,
-                },
-            },
-        );
 
         // Real 2-of-3 threshold sign of the endorse-domain message —
         // the SAME frost mechanics dfrost_contribute_threshold_sign's
@@ -5458,20 +5485,6 @@ mod tests {
             frost_ristretto255::aggregate(&signing_package, &shares, &pub_pkg).expect("aggregate");
         let sig_bytes = sig.serialize().expect("sig serialize");
         let group_sig: [u8; 64] = sig_bytes.try_into().expect("schnorr sig is 64 bytes");
-
-        // Snapshot beacon state BEFORE the (simulated) completion arm
-        // runs, so the after-assertions are a genuine before/after
-        // comparison, not a vacuous "started empty, still empty".
-        let watermark_before = crate::community_dfrost_catchup::beacon_watermark_of(&log, 1_000);
-        assert!(
-            log.beacon_index.is_empty(),
-            "precondition: no beacon minted yet"
-        );
-
-        // The completion arm's cleanup — no `vb` apply exists to trigger
-        // apply_vrf_beacon's pending_sign removal for a ResetResponse
-        // ceremony, so it clears the slot itself.
-        log.committee_state.pending_sign.remove(&ceremony_id);
 
         // Build the response event exactly as the lib.rs match arm
         // does: MembershipEventKind::DfrostResetResponse{target_event_id,
@@ -5542,23 +5555,6 @@ mod tests {
             verify_event(&response_event, &prior, &ctx),
             Ok(()),
             "the mint-site's DfrostResetResponse construction must pass RS-R3"
-        );
-
-        // NO vb, NO beacon-index change — nothing in this test (nor the
-        // real completion arm it replays) ever calls apply_vrf_beacon or
-        // touches beacon_index/beacon_watermark.
-        assert!(
-            log.beacon_index.is_empty(),
-            "a ResetResponse ceremony must never mint vb / touch the beacon index"
-        );
-        assert_eq!(
-            crate::community_dfrost_catchup::beacon_watermark_of(&log, 1_000),
-            watermark_before,
-            "beacon_watermark must be unchanged by a ResetResponse ceremony's completion"
-        );
-        assert!(
-            log.committee_state.pending_sign.is_empty(),
-            "the completion arm must clear its own pending_sign session"
         );
     }
 

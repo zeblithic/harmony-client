@@ -1157,6 +1157,333 @@ async fn dkg_two_engine_auto_orchestrated_from_initiate_no_manual_seeding() {
     drop(bob_engine);
 }
 
+// ─── ZEB-1031 Task 6 (review round 1, I2): reset-response ceremony ────────
+// convergence + purpose-tagging, executed for real across two orchestrated
+// engines. Reuses this section's `orchestrated_node`/`production_dkg_driver`
+// harness — the only addition is a membership-resolver-carrying start
+// variant, since `start_orchestrated` above hardcodes `membership_resolver:
+// None` (every other test here drives DKG/refresh, which don't need one).
+
+use harmony_app::community_dfrost_log::SignPurpose;
+use harmony_app::community_membership::{
+    EventId, MaterializedMembership, ResetPhase, ResetProposalView, ResetVerdict,
+};
+use harmony_app::community_voting_log::{MembershipSnapshotResolver, SnapshotResolverError};
+
+/// Membership resolver serving a FIXED `MaterializedMembership` (with one
+/// `reset_proposals` entry) for `reset_membership_now` — the only trait
+/// method `initiate_reset_response_ceremony` calls. `snapshot_at` is never
+/// invoked by that path; it returns an empty snapshot to satisfy the trait.
+struct FixedResetMembership(MaterializedMembership);
+
+#[async_trait::async_trait]
+impl MembershipSnapshotResolver for FixedResetMembership {
+    async fn snapshot_at(
+        &self,
+        _community_id: SpaceId,
+        _hlc: &Hlc,
+    ) -> Result<harmony_app::community_voting_core::MembershipSnapshot, SnapshotResolverError> {
+        Ok(harmony_app::community_voting_core::MembershipSnapshot {
+            members: HashMap::new(),
+        })
+    }
+
+    async fn reset_membership_now(
+        &self,
+        _community_id: SpaceId,
+    ) -> Result<MaterializedMembership, SnapshotResolverError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// `start_orchestrated` with a `membership_resolver` slot filled — every
+/// other field/step is identical (same driver, same orchestrator config,
+/// same registry).
+#[allow(clippy::too_many_arguments)]
+async fn start_orchestrated_with_membership_resolver(
+    node: &OrchestratedNode,
+    community_id: SpaceId,
+    self_addr: OwnerAddr,
+    self_x_priv: [u8; 32],
+    resolver_map: &HashMap<OwnerAddr, [u8; 64]>,
+    membership_resolver: Arc<dyn MembershipSnapshotResolver>,
+    publisher_tx: mpsc::Sender<Vec<u8>>,
+    subscriber_rx: mpsc::Receiver<Vec<u8>>,
+) -> Arc<DfrostLogEngine<MockRt>> {
+    let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+        Arc::new(StaticResolver(resolver_map.clone()));
+    let driver = production_dkg_driver::<MockRt>(node.handles.clone(), None);
+    DfrostLogRegistry::register(
+        &node.registry,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: node.log.clone(),
+            publisher_tx,
+            subscriber_rx,
+            app_handle: None,
+            self_addr,
+            self_x25519_priv: self_x_priv,
+            identity_resolver: resolver,
+            registry_weak: None,
+            driver: Some(driver),
+            membership_resolver: Some(membership_resolver),
+            orchestrator_config: test_orchestrator_config(),
+            persist: None,
+        },
+    )
+    .await
+}
+
+/// The round-1 core + purpose-tagging + ceremony-id convergence chain,
+/// executed for real (review I2 — this chain previously had zero executed
+/// coverage; `RecordingDriver`-backed unit tests never enter
+/// `dfrost_initiate_reset_response_core` or the completion-sink match).
+///
+/// Alice initiates a reset-response (Endorse) ceremony; her `ts` crosses
+/// the transport bridge to Bob, who — BEFORE calling initiate himself —
+/// has a session the wire alone created. That session MUST be tagged
+/// `Beacon` (mandate point 2: a remote contributor cannot steer another
+/// node's purpose — `apply_threshold_sign`'s `or_insert_with` always
+/// defaults to `Beacon`, and nothing else in the apply path touches
+/// `purpose`). Bob then independently calls `initiate_reset_response_ceremony`
+/// himself, as a real committee member responding rather than a passive
+/// relay; his own derivation must land on the SAME ceremony id (mandate
+/// point 4: convergence — both derive it purely from the same materialized
+/// proposal + verdict + their own committee epoch), upgrading the existing
+/// entry's purpose in place rather than creating a second session. A
+/// repeat call from Alice on the same id then hits the R5-2
+/// already-initiated guard rather than silently re-stashing fresh nonces
+/// over an already-broadcast commitment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_response_ceremony_converges_and_tags_purpose_across_two_engines_zeb1031() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xE1);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xE2);
+    let alice_x_priv = *dm_signing::ed25519_priv_to_x25519(&alice_sk);
+    let bob_x_priv = *dm_signing::ed25519_priv_to_x25519(&bob_sk);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub64);
+    resolver_map.insert(bob_addr, bob_pub64);
+
+    let community_id = SpaceId([0xE3; 16]);
+    let alice = orchestrated_node(
+        community_id,
+        "alice-dev",
+        alice_addr,
+        &alice_sk,
+        &resolver_map,
+    );
+    let bob = orchestrated_node(community_id, "bob-dev", bob_addr, &bob_sk, &resolver_map);
+
+    // Real 2-of-2 dealer-generated committee, seeded directly into both
+    // logs pre-start. This test exercises sign-ceremony orchestration, not
+    // DKG (already covered above); the dealer shortcut is the house
+    // pattern for that (`dealer_key_material_for_tests`/`dkg_2of3_material`
+    // in `community_dfrost_log.rs` use the same shortcut for the same
+    // reason). `build_identifier_map`'s sorted-member 1-indexed assignment
+    // matches `IdentifierList::Default`'s numbering (established
+    // equivalence: `dealer_key_package_for_tests`'s doc pins dealer share 1
+    // to `identifier_for_index(0)`, and existing tests substitute one for
+    // the other directly).
+    let mut sorted_members = vec![alice_addr, bob_addr];
+    sorted_members.sort();
+    let (shares, pub_pkg) = frost_ristretto255::keys::generate_with_dealer(
+        2,
+        2,
+        frost_ristretto255::keys::IdentifierList::Default,
+        frost_ristretto255::rand_core::OsRng,
+    )
+    .expect("dealer keygen");
+    let joint_vk = verifying_key_to_bytes(pub_pkg.verifying_key());
+    let identifier_map =
+        harmony_app::community_dfrost_log::CommitteeState::build_identifier_map(&sorted_members);
+    let mut verifying_shares = BTreeMap::new();
+    for addr in &sorted_members {
+        let id = identifier_map.get(addr).unwrap();
+        let share = pub_pkg.verifying_shares().get(id).unwrap();
+        verifying_shares.insert(*addr, verifying_share_to_bytes(share));
+    }
+    let seed_committee = |log: &mut DfrostLog, addr: OwnerAddr| {
+        let id = identifier_map.get(&addr).unwrap();
+        let kp = KeyPackage::try_from(shares.get(id).unwrap().clone()).expect("key package");
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = sorted_members.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = 2;
+        log.committee_state.joint_verifying_key = Some(joint_vk);
+        log.committee_state.verifying_shares = verifying_shares.clone();
+        log.committee_state.identifier_map = identifier_map.clone();
+        log.local_key_package = Some(kp);
+    };
+    {
+        let mut g = alice.log.lock().await;
+        seed_committee(&mut g, alice_addr);
+    }
+    {
+        let mut g = bob.log.lock().await;
+        seed_committee(&mut g, bob_addr);
+    }
+
+    // Fixed reset proposal both engines' membership resolver serves —
+    // target_vk is THIS committee's own vk (the endorse/veto verify_vk per
+    // RS-R3, spec §3.3).
+    let proposal_id: EventId = [0x9A; 16];
+    let new_members = vec![alice_addr, bob_addr];
+    let mut membership = MaterializedMembership::default();
+    membership.reset_proposals.push(ResetProposalView {
+        id: proposal_id,
+        proposer: alice_addr,
+        target_vk: joint_vk,
+        target_epoch: 1,
+        new_members: new_members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 24 * 3_600_000,
+        signers: std::collections::BTreeSet::from([alice_addr]),
+        proposed_at_wall_ms: 0,
+        deadline_ms: None,
+        authorized_at_ms: Some(0),
+        endorsed: true,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+    });
+
+    // Bridge: alice.pub → bob.sub, bob.pub → alice.sub.
+    let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_pub_tx, mut bob_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (bob_sub_tx, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let _a2b = tokio::spawn(async move {
+        while let Some(p) = alice_pub_rx.recv().await {
+            if bob_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let _b2a = tokio::spawn(async move {
+        while let Some(p) = bob_pub_rx.recv().await {
+            if alice_sub_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let alice_membership: Arc<dyn MembershipSnapshotResolver> =
+        Arc::new(FixedResetMembership(membership.clone()));
+    let bob_membership: Arc<dyn MembershipSnapshotResolver> =
+        Arc::new(FixedResetMembership(membership));
+
+    let alice_engine = start_orchestrated_with_membership_resolver(
+        &alice,
+        community_id,
+        alice_addr,
+        alice_x_priv,
+        &resolver_map,
+        alice_membership,
+        alice_pub_tx,
+        alice_sub_rx,
+    )
+    .await;
+    let bob_engine = start_orchestrated_with_membership_resolver(
+        &bob,
+        community_id,
+        bob_addr,
+        bob_x_priv,
+        &resolver_map,
+        bob_membership,
+        bob_pub_tx,
+        bob_sub_rx,
+    )
+    .await;
+
+    // Alice initiates — the ONLY manual step so far. Broadcasts her
+    // round-1 ts.
+    alice_engine
+        .initiate_reset_response_ceremony(proposal_id, ResetVerdict::Endorse)
+        .await
+        .expect("alice initiates");
+
+    // Bob's inbound apply creates HIS session from the wire alone.
+    expect_converged(
+        wait_converged("bob sees alice's ts", &bob.log, |l| {
+            !l.committee_state.pending_sign.is_empty()
+        })
+        .await,
+        &alice.log,
+        &bob.log,
+    )
+    .await;
+    let ceremony_id = {
+        let lb = bob.log.lock().await;
+        assert_eq!(
+            lb.committee_state.pending_sign.len(),
+            1,
+            "bob must have exactly one session, seeded from alice's ts"
+        );
+        let (id, session) = lb.committee_state.pending_sign.iter().next().unwrap();
+        assert_eq!(
+            session.purpose,
+            SignPurpose::Beacon,
+            "mandate point 2: a remote contributor's ts alone must never tag this node's purpose"
+        );
+        *id
+    };
+
+    // Bob independently initiates too. His own derivation must land on the
+    // SAME ceremony id, upgrading the existing entry rather than creating
+    // a second one.
+    bob_engine
+        .initiate_reset_response_ceremony(proposal_id, ResetVerdict::Endorse)
+        .await
+        .expect("bob initiates");
+    {
+        let lb = bob.log.lock().await;
+        assert_eq!(
+            lb.committee_state.pending_sign.len(),
+            1,
+            "bob's own initiate must upgrade the existing session, not add a second"
+        );
+        let (id, session) = lb.committee_state.pending_sign.iter().next().unwrap();
+        assert_eq!(
+            *id, ceremony_id,
+            "mandate point 4: bob converges on the SAME ceremony id alice derived"
+        );
+        assert_eq!(
+            session.purpose,
+            SignPurpose::ResetResponse {
+                proposal_id,
+                verdict: ResetVerdict::Endorse,
+                new_vk: None,
+            },
+            "bob's own initiate call must tag his session ResetResponse (endorse carries no new_vk)"
+        );
+    }
+    {
+        let la = alice.log.lock().await;
+        assert_eq!(la.committee_state.pending_sign.len(), 1);
+        assert!(
+            la.committee_state.pending_sign.contains_key(&ceremony_id),
+            "alice and bob converge on one ceremony id"
+        );
+    }
+
+    // R5-2 guard: a repeat initiate on the same id (alice already stashed
+    // local_nonces) must be refused, not silently overwrite an
+    // already-broadcast commitment.
+    let repeat = alice_engine
+        .initiate_reset_response_ceremony(proposal_id, ResetVerdict::Endorse)
+        .await;
+    let err = repeat.expect_err("repeat initiate on the same ceremony must be refused");
+    assert!(
+        err.contains("already initiated"),
+        "unexpected error message: {err}"
+    );
+
+    drop(alice_engine);
+    drop(bob_engine);
+}
+
 /// ZEB-1022 facet B: the initiator's first broadcasts (`di` + `dr` rn=1)
 /// are LOST on the wire (boot-window loss / late subscriber). The
 /// orchestrator's periodic re-broadcast re-mints them with fresh HLCs
