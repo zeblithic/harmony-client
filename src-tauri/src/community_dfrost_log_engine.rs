@@ -16,11 +16,16 @@ use crate::community_dfrost_log::{
     ResetMarkerApplied,
 };
 use crate::community_dfrost_types::{
-    derive_dkg_ceremony_id, derive_refresh_ceremony_id, derive_repair_ceremony_id,
-    CeremonyInitPayload, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, RefreshRoundPayload,
-    RepairRoundPayload, ResetMarkerPayload, SignedCommitteeEvent, VrfBeaconPayload,
+    derive_ceremony_id, derive_dkg_ceremony_id, derive_refresh_ceremony_id,
+    derive_repair_ceremony_id, CeremonyInitPayload, DfrostEventKind, DkgCompletePayload,
+    DkgRoundPayload, RefreshRoundPayload, RepairRoundPayload, ResetMarkerPayload,
+    SignedCommitteeEvent, VrfBeaconPayload,
 };
-use crate::community_membership::{dfrost_reset_digest, MaterializedMembership, ResetPhase};
+use crate::community_membership::{
+    dfrost_reset_digest, dfrost_reset_message_hash, EventId, MaterializedMembership, ResetPhase,
+    ResetVerdict, DFROST_RESET_CONSUMED_DOMAIN, DFROST_RESET_ENDORSE_DOMAIN,
+    DFROST_RESET_VETO_DOMAIN,
+};
 use crate::community_state_sync::IdentityResolver;
 use crate::community_voting_log::MembershipSnapshotResolver;
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -226,6 +231,37 @@ pub trait DkgDriver: Send + Sync {
     ) -> Result<String, String> {
         let _ = (community_id, attempt, expected_progress);
         Err("propose_refresh_retry not supported by this driver".to_string())
+    }
+
+    /// ZEB-1031 Task 6: this node's round-1 FROST commit for a reset-
+    /// response sign ceremony. `ceremony_id`/`message_hash` are already
+    /// fully derived by `DfrostLogEngine::initiate_reset_response_ceremony`
+    /// (the engine holds the membership resolver + local committee state
+    /// this needs); the driver's job is exactly `dfrost_request_vrf_beacon`'s
+    /// round-1 half — run `frost::round1::commit`, build + sign + apply +
+    /// broadcast the `ts` event — except it also tags the resulting
+    /// `PendingSignSession.purpose` as `ResetResponse { proposal_id, verdict }`
+    /// so the aggregation-side completion sink (in
+    /// `dfrost_contribute_threshold_sign`) authors a `DfrostResetResponse`
+    /// membership event instead of minting `vb`. Default: refuse — test
+    /// driver impls that predate ZEB-1031 keep compiling without auto-
+    /// driving reset responses.
+    async fn initiate_reset_response(
+        &self,
+        community_id: SpaceId,
+        ceremony_id: [u8; 32],
+        message_hash: [u8; 32],
+        proposal_id: EventId,
+        verdict: ResetVerdict,
+    ) -> Result<(), String> {
+        let _ = (
+            community_id,
+            ceremony_id,
+            message_hash,
+            proposal_id,
+            verdict,
+        );
+        Err("initiate_reset_response not supported by this driver".to_string())
     }
 }
 
@@ -2958,6 +2994,105 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         log.local_key_package.clone()
     }
 
+    /// ZEB-1031 Task 6: this node's entry point into a reset-response
+    /// sign ceremony (endorse / veto / consumed). Resolves the target
+    /// proposal's verbatim fields from the CURRENT materialized
+    /// membership (never a caller-supplied claim — mirrors the RS-R3
+    /// verify-side recompute discipline in
+    /// `community_membership::verify_event`), derives the verdict's
+    /// domain-tagged message hash and the deterministic ceremony id
+    /// (`derive_ceremony_id(&space_id, epoch, "sign-v1:" ‖ message_hash)`
+    /// — same tag as `dfrost_request_vrf_beacon`'s beacon ceremonies;
+    /// concurrent initiations by different committee members converge
+    /// on the same id because they're all pure functions of the same
+    /// materialized proposal + verdict), and delegates the actual FROST
+    /// round-1 commit to the driver — the engine deliberately holds no
+    /// signing key (see `DkgDriver`'s doc comment).
+    ///
+    /// `epoch` and (for `Consumed`) `new_vk` are read from THIS node's
+    /// own dfrost log: for endorse/veto that's the committee being
+    /// reset signing under its own `target_vk`; for consumed it's the
+    /// successor committee attesting its own birth under the vk it now
+    /// holds (spec §4.3) — in both cases "the committee this node is
+    /// currently part of," exactly what binds the ceremony id to the
+    /// acting committee generation the same way beacon ceremonies do.
+    pub async fn initiate_reset_response_ceremony(
+        &self,
+        proposal_id: EventId,
+        verdict: ResetVerdict,
+    ) -> Result<(), String> {
+        let resolver = self.orchestrator.membership_resolver.as_ref().ok_or(
+            "initiate_reset_response_ceremony: no membership resolver configured on this engine",
+        )?;
+        let membership = resolver
+            .reset_membership_now(self.community_id)
+            .await
+            .map_err(|e| format!("initiate_reset_response_ceremony: resolve membership: {e}"))?;
+        let view = membership
+            .reset_proposals
+            .iter()
+            .find(|p| p.id == proposal_id)
+            .ok_or_else(|| {
+                format!(
+                    "initiate_reset_response_ceremony: reset proposal {} not found in \
+                     materialized membership",
+                    hex::encode(proposal_id)
+                )
+            })?;
+
+        let digest = dfrost_reset_digest(
+            &self.community_id,
+            &view.id,
+            &view.target_vk,
+            view.target_epoch,
+            &view.new_members,
+            view.new_threshold,
+        )
+        .map_err(|e| format!("initiate_reset_response_ceremony: digest: {e}"))?;
+
+        // Read epoch (always) + the current held vk (Consumed only) from
+        // THIS node's own committee state, in one lock scope.
+        let (epoch, new_vk) = {
+            let log = self.dfrost_log.lock().await;
+            let epoch = log.committee_state.current_epoch;
+            let new_vk = match verdict {
+                ResetVerdict::Consumed => Some(log.committee_state.joint_verifying_key.ok_or(
+                    "initiate_reset_response_ceremony: consumed verdict but no active \
+                     committee vk held locally — was this node promoted into the successor \
+                     committee?",
+                )?),
+                ResetVerdict::Endorse | ResetVerdict::Veto => None,
+            };
+            (epoch, new_vk)
+        };
+
+        let domain = match verdict {
+            ResetVerdict::Endorse => DFROST_RESET_ENDORSE_DOMAIN,
+            ResetVerdict::Veto => DFROST_RESET_VETO_DOMAIN,
+            ResetVerdict::Consumed => DFROST_RESET_CONSUMED_DOMAIN,
+        };
+        let message_hash = dfrost_reset_message_hash(domain, &digest, new_vk.as_ref());
+
+        let mut sign_tag = Vec::with_capacity(b"sign-v1:".len() + message_hash.len());
+        sign_tag.extend_from_slice(b"sign-v1:");
+        sign_tag.extend_from_slice(&message_hash);
+        let ceremony_id = derive_ceremony_id(&self.community_id, epoch, &sign_tag);
+
+        let driver =
+            self.orchestrator.driver.as_ref().ok_or(
+                "initiate_reset_response_ceremony: no driver configured (ingest-only engine)",
+            )?;
+        driver
+            .initiate_reset_response(
+                self.community_id,
+                ceremony_id,
+                message_hash,
+                proposal_id,
+                verdict,
+            )
+            .await
+    }
+
     /// Look up the `vrf_output` for a completed beacon by its beacon seed and
     /// committee epoch. Derives `message_hash = derive_vrf_seed(seed, epoch)` and
     /// checks `dfrost_log.beacon_index`.
@@ -4320,7 +4455,8 @@ mod tests {
         DfrostEventKind, ResetMarkerPayload, SignedCommitteeEvent, ThresholdSignPayload,
     };
     use crate::community_membership::{
-        dfrost_reset_digest, EventId, MaterializedMembership, ResetPhase, ResetProposalView,
+        dfrost_reset_digest, dfrost_reset_message_hash, EventId, MaterializedMembership,
+        ResetPhase, ResetProposalView, ResetVerdict, DFROST_RESET_ENDORSE_DOMAIN,
     };
     use crate::community_state_sync::IdentityResolver;
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -5843,7 +5979,13 @@ mod tests {
         repair_contributions: tokio::sync::Mutex<Vec<(SpaceId, [u8; 32], u8)>>,
         repair_requests: tokio::sync::Mutex<Vec<(SpaceId, Option<Vec<OwnerAddr>>)>>,
         refresh_retries: tokio::sync::Mutex<Vec<(SpaceId, u32)>>,
+        // ZEB-1031 Task 6.
+        reset_responses: tokio::sync::Mutex<Vec<RecordedResetResponse>>,
     }
+
+    /// (community_id, ceremony_id, message_hash, proposal_id, verdict) —
+    /// factored into a named type per clippy::type_complexity.
+    type RecordedResetResponse = (SpaceId, [u8; 32], [u8; 32], EventId, ResetVerdict);
 
     #[async_trait::async_trait]
     impl DkgDriver for RecordingDriver {
@@ -5923,6 +6065,23 @@ mod tests {
                 .await
                 .push((community_id, attempt));
             Ok("refresh-retry".into())
+        }
+        async fn initiate_reset_response(
+            &self,
+            community_id: SpaceId,
+            ceremony_id: [u8; 32],
+            message_hash: [u8; 32],
+            proposal_id: EventId,
+            verdict: ResetVerdict,
+        ) -> Result<(), String> {
+            self.reset_responses.lock().await.push((
+                community_id,
+                ceremony_id,
+                message_hash,
+                proposal_id,
+                verdict,
+            ));
+            Ok(())
         }
     }
 
@@ -6062,6 +6221,131 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    // ── ZEB-1031 Task 6: initiate_reset_response_ceremony ────────────────
+
+    /// Membership resolver that returns a FIXED `MaterializedMembership`
+    /// (with `reset_proposals` pre-populated) for `reset_membership_now`.
+    /// `snapshot_at` is unused by this test — the default-unsupported
+    /// trait methods this struct doesn't override are never called by
+    /// `initiate_reset_response_ceremony`.
+    struct FixedResetMembership(MaterializedMembership);
+
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for FixedResetMembership {
+        async fn snapshot_at(
+            &self,
+            _community_id: SpaceId,
+            _hlc: &Hlc,
+        ) -> Result<
+            crate::community_voting_core::MembershipSnapshot,
+            crate::community_voting_log::SnapshotResolverError,
+        > {
+            Ok(crate::community_voting_core::MembershipSnapshot {
+                members: HashMap::new(),
+            })
+        }
+
+        async fn reset_membership_now(
+            &self,
+            _community_id: SpaceId,
+        ) -> Result<MaterializedMembership, crate::community_voting_log::SnapshotResolverError>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// `initiate_reset_response_ceremony` resolves the target proposal
+    /// from the membership resolver, derives the endorse-domain message
+    /// hash + the deterministic `sign-v1:` ceremony id from the
+    /// proposal's verbatim fields and this node's own committee epoch,
+    /// and delegates to the driver with exactly those values — proven
+    /// here by independently recomputing both from the same public
+    /// helpers (`dfrost_reset_digest`/`dfrost_reset_message_hash`/
+    /// `derive_ceremony_id`) and asserting equality, rather than
+    /// hard-coding expected bytes.
+    #[tokio::test]
+    async fn initiate_reset_response_ceremony_derives_and_delegates_zeb1031() {
+        let community_id = SpaceId([0x31; 16]);
+        let proposal_id: EventId = [0x91; 16];
+        let admin = OwnerAddr([0xA0; 16]);
+        let target_vk = [0x22u8; 32];
+        let new_members = vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])];
+
+        let mut membership = MaterializedMembership::default();
+        membership.reset_proposals.push(ResetProposalView {
+            id: proposal_id,
+            proposer: admin,
+            target_vk,
+            target_epoch: 1,
+            new_members: new_members.clone(),
+            new_threshold: 2,
+            veto_window_ms: 24 * 3_600_000,
+            signers: BTreeSet::from([admin]),
+            proposed_at_wall_ms: 1_000,
+            deadline_ms: None,
+            authorized_at_ms: Some(1_500),
+            endorsed: false,
+            phase: ResetPhase::Authorized,
+            consumed_new_vk: None,
+            consumption_superseded: false,
+        });
+        let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(FixedResetMembership(membership));
+
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let (engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            admin,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            Some(membership_resolver),
+            DfrostOrchestratorConfig::default(),
+        )
+        .await;
+        // The acting committee's own epoch — endorse/veto sign under
+        // the committee being reset, so this node's local dfrost log IS
+        // that committee.
+        {
+            let mut g = log.lock().await;
+            g.committee_state.active = true;
+            g.committee_state.current_epoch = 1;
+        }
+
+        engine
+            .initiate_reset_response_ceremony(proposal_id, ResetVerdict::Endorse)
+            .await
+            .expect("initiate_reset_response_ceremony succeeds");
+
+        let calls = driver.reset_responses.lock().await;
+        assert_eq!(calls.len(), 1, "driver called exactly once");
+        let (cid, ceremony_id, message_hash, pid, verdict) = calls[0];
+        assert_eq!(cid, community_id);
+        assert_eq!(pid, proposal_id);
+        assert_eq!(verdict, ResetVerdict::Endorse);
+
+        let digest =
+            dfrost_reset_digest(&community_id, &proposal_id, &target_vk, 1, &new_members, 2)
+                .expect("digest encode");
+        let expected_hash = dfrost_reset_message_hash(DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        assert_eq!(
+            message_hash, expected_hash,
+            "engine must derive the SAME message hash an honest verifier recomputes"
+        );
+
+        let mut sign_tag = b"sign-v1:".to_vec();
+        sign_tag.extend_from_slice(&expected_hash);
+        let expected_ceremony_id =
+            crate::community_dfrost_types::derive_ceremony_id(&community_id, 1, &sign_tag);
+        assert_eq!(
+            ceremony_id, expected_ceremony_id,
+            "ceremony id must be the deterministic sign-v1 derivation — concurrent \
+             initiations by different committee members must converge on this id"
+        );
     }
 
     #[tokio::test]

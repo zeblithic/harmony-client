@@ -63676,6 +63676,25 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
         .await
     }
 
+    async fn initiate_reset_response(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        ceremony_id: [u8; 32],
+        message_hash: [u8; 32],
+        proposal_id: crate::community_membership::EventId,
+        verdict: crate::community_membership::ResetVerdict,
+    ) -> Result<(), String> {
+        dfrost_initiate_reset_response_core::<R>(
+            &self.handles,
+            community_id,
+            ceremony_id,
+            message_hash,
+            proposal_id,
+            verdict,
+        )
+        .await
+    }
+
     async fn propose_refresh_retry(
         &self,
         community_id: crate::owner_state_types::SpaceId,
@@ -65336,6 +65355,177 @@ pub(crate) async fn dfrost_request_vrf_beacon_inner(
     Ok(hex::encode(ceremony_id))
 }
 
+/// ZEB-1031 Task 6: `DkgDriver::initiate_reset_response`'s production
+/// core. Mirrors `dfrost_request_vrf_beacon_inner`'s round-1 half
+/// (FROST `round1::commit`, build+sign+apply+broadcast the `ts` event)
+/// almost exactly — the caller
+/// (`DfrostLogEngine::initiate_reset_response_ceremony`) has already
+/// derived `ceremony_id`/`message_hash` from the materialized reset
+/// proposal (it holds the membership resolver this needs; the core
+/// stays sans-NodeState like every other `_core` fn), so this core's
+/// only extra job vs. the beacon round-1 is tagging the resulting
+/// `PendingSignSession.purpose` as `ResetResponse` — the signal
+/// `dfrost_contribute_threshold_sign`'s aggregation-side completion
+/// sink reads to author a `DfrostResetResponse` membership event
+/// instead of minting `vb`.
+///
+/// Whichever committee member's `dfrost_contribute_threshold_sign`
+/// call ends up completing this ceremony reads its OWN local
+/// session's `purpose` — and every node capable of completing
+/// aggregation must have called THIS function itself first (round-2
+/// needs `local_nonces`, which only a node's own round-1 call
+/// stashes), so the tag is guaranteed consistent with whoever actually
+/// aggregates, even though the wire-level `ts` payload itself carries
+/// no purpose signal.
+pub(crate) async fn dfrost_initiate_reset_response_core<R: tauri::Runtime>(
+    handles: &DfrostCoreHandles<R>,
+    space_id: crate::owner_state_types::SpaceId,
+    ceremony_id: [u8; 32],
+    message_hash: [u8; 32],
+    proposal_id: crate::community_membership::EventId,
+    verdict: crate::community_membership::ResetVerdict,
+) -> Result<(), String> {
+    use crate::community_dfrost_log::SignPurpose;
+
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
+
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    let key_package = {
+        let log = log_arc.lock().await;
+        if !log.committee_state.active {
+            return Err(
+                "dfrost_initiate_reset_response: no active committee — DKG must complete first"
+                    .to_string(),
+            );
+        }
+        log.local_key_package.clone().ok_or(
+            "dfrost_initiate_reset_response: local_key_package missing — \
+             was this node a DKG member?",
+        )?
+    };
+
+    // Mirrors dfrost_request_vrf_beacon_inner's R5-2 guard: refuse a
+    // repeat call for the same ceremony_id once local_nonces are
+    // already stashed — overwriting would orphan the already-broadcast
+    // round-1 commitment.
+    {
+        let log = log_arc.lock().await;
+        if let Some(existing) = log.committee_state.pending_sign.get(&ceremony_id) {
+            if existing.local_nonces.is_some() {
+                return Err(format!(
+                    "dfrost_initiate_reset_response: ceremony already initiated for this \
+                     ceremony_id ({}); call dfrost_contribute_threshold_sign to complete",
+                    hex::encode(ceremony_id)
+                ));
+            }
+        }
+    }
+
+    let signing_share = key_package.signing_share();
+    let mut rng = frost_ristretto255::rand_core::OsRng;
+    let (nonces, commitments) = frost_ristretto255::round1::commit(signing_share, &mut rng);
+
+    let mut nonces_cbor = Vec::new();
+    ciborium::into_writer(&nonces, &mut nonces_cbor)
+        .map_err(|e| format!("dfrost_initiate_reset_response: encode SigningNonces: {e}"))?;
+    let mut commitments_cbor = Vec::new();
+    ciborium::into_writer(&commitments, &mut commitments_cbor)
+        .map_err(|e| format!("dfrost_initiate_reset_response: encode SigningCommitments: {e}"))?;
+
+    let payload = crate::community_dfrost_types::ThresholdSignPayload {
+        ceremony_id,
+        message_hash,
+        commitment_bytes: commitments_cbor,
+        share_bytes: Vec::new(),
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    let signing_key = handles.signing_key.as_ref();
+    let ev = crate::community_dfrost_log::build_signed_dfrost_event(
+        signing_key,
+        self_owner,
+        crate::community_dfrost_types::DfrostEventKind::ThresholdSign,
+        &payload,
+        hlc,
+    )
+    .map_err(|e| format!("dfrost_initiate_reset_response: build_signed: {e}"))?;
+    let self_x25519_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+
+    {
+        let mut log = log_arc.lock().await;
+        log.apply_with_identity(ev.clone(), &self_owner, &self_x25519_priv)
+            .map_err(|e| format!("dfrost_initiate_reset_response: apply: {e:?}"))?;
+
+        let pending = log
+            .committee_state
+            .pending_sign
+            .get_mut(&ceremony_id)
+            .ok_or(
+                "dfrost_initiate_reset_response: apply succeeded but pending_sign entry missing",
+            )?;
+        pending.local_nonces = Some(nonces_cbor);
+        pending.purpose = SignPurpose::ResetResponse {
+            proposal_id,
+            verdict,
+        };
+    }
+
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(ev).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_initiate_reset_response: broadcast failed (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    space_id = ?space_id,
+                    "dfrost_initiate_reset_response: no engine registered for \
+                     community — broadcast skipped",
+                );
+            }
+        },
+        None => {
+            tracing::debug!(
+                "dfrost_initiate_reset_response: dfrost_log_registry is None — \
+                 broadcast skipped (test context?)",
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Tauri IPC: committee member contributes their partial threshold-sign
 /// share, and — if their share is the threshold-th to land — aggregates
 /// the joint Schnorr signature + emits the `vb` beacon event.
@@ -65398,6 +65588,13 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
 
     // 2. Snapshot NodeState handles. T8: also pull `dfrost_log_registry`
     //    (Option, None in test contexts that bypass `start_node`).
+    //    ZEB-1031 Task 6: also pull `community_registry` — needed only
+    //    by the ResetResponse completion arm below (to author the
+    //    `DfrostResetResponse` membership event via the SAME
+    //    `engine_arc(..).insert_local_event(..)` seam
+    //    `countersign_admin_proposal_impl` uses for AdminCountersign);
+    //    `None` in test contexts that bypass `start_node`, same as
+    //    `dfrost_log_registry`.
     let (
         hlc_tracker,
         adopt_floor,
@@ -65406,6 +65603,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         dm_outbox,
         dfrost_logs,
         dfrost_log_registry,
+        community_registry,
     ) = {
         let g = state_lock
             .lock()
@@ -65424,6 +65622,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
+            g.community_registry.clone(),
         )
     };
 
@@ -65776,7 +65975,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     //    DIFFERENT subset than each signer ran `round2::sign` against,
     //    silently breaking aggregation for every threshold < max_signers
     //    scheme. The 2-of-2 test couldn't expose it (full set == selection).
-    let shares_map = {
+    let (shares_map, purpose) = {
         let log = log_arc.lock().await;
         // R3 (round-3 bot-review MINOR): NOT an expect(). The
         // `aggregation_possible` check above released the log lock before
@@ -65825,7 +66024,13 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             shares_map.insert(id, share);
         }
 
-        shares_map
+        // ZEB-1031 Task 6: read the ceremony's purpose from THIS node's
+        // own local session — set by whichever core (beacon round-1 or
+        // `dfrost_initiate_reset_response_core`) this node itself ran to
+        // obtain the `local_nonces` round-2 just consumed. See that
+        // core's doc comment for why every possible aggregator is
+        // guaranteed to have a correctly-tagged local session.
+        (shares_map, pending.purpose)
     };
 
     let signature = frost_ristretto255::aggregate(&signing_package, &shares_map, &pub_key_package)
@@ -65838,127 +66043,252 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         64,
         "Schnorr signature must be R(32)||s(32)"
     );
-    let r_compressed: [u8; 32] = sig_bytes[..32]
-        .try_into()
-        .expect("sig_bytes asserted to be 64 bytes above");
-    let vrf_output = crate::community_dfrost_types::derive_vrf_output(&r_compressed);
 
-    let vb_payload = crate::community_dfrost_types::VrfBeaconPayload {
-        ceremony_id: ceremony_bytes,
-        message_hash,
-        signature: sig_bytes,
-        vrf_output,
-    };
+    // ZEB-1031 Task 6: the completion/mint site branches on the
+    // ceremony's purpose. `Beacon` keeps the pre-1031 behaviour
+    // (mint+apply+broadcast `vb`, advance the beacon index, dispatch
+    // beacon callbacks). `ResetResponse` NEVER mints `vb` — the
+    // aggregate signature instead authors a `DfrostResetResponse`
+    // membership event, so the beacon index must not see it.
+    match purpose {
+        crate::community_dfrost_log::SignPurpose::Beacon => {
+            let r_compressed: [u8; 32] = sig_bytes[..32]
+                .try_into()
+                .expect("sig_bytes asserted to be 64 bytes above");
+            let vrf_output = crate::community_dfrost_types::derive_vrf_output(&r_compressed);
 
-    let wall_now_ms_vb = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let hlc_vb = crate::dm_outbox::reserve_next_hlc_for_device(
-        &hlc_tracker,
-        &adopt_floor,
-        &device_id,
-        wall_now_ms_vb,
-    )
-    .await;
+            let vb_payload = crate::community_dfrost_types::VrfBeaconPayload {
+                ceremony_id: ceremony_bytes,
+                message_hash,
+                signature: sig_bytes,
+                vrf_output,
+            };
 
-    let vb_event = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        crate::community_dfrost_log::build_signed_dfrost_event(
-            signing_key,
-            self_owner,
-            crate::community_dfrost_types::DfrostEventKind::VrfBeacon,
-            &vb_payload,
-            hlc_vb,
-        )
-        .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed vb: {e}"))?
-    };
+            let wall_now_ms_vb = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let hlc_vb = crate::dm_outbox::reserve_next_hlc_for_device(
+                &hlc_tracker,
+                &adopt_floor,
+                &device_id,
+                wall_now_ms_vb,
+            )
+            .await;
 
-    // T8: clone the event for apply so the original remains available for
-    // the post-lock broadcast block below.
-    {
-        let mut log = log_arc.lock().await;
-        log.apply_with_identity(vb_event.clone(), &self_owner, &self_x25519_priv)
-            .map_err(|e| {
-                // R2-3: aggregate succeeded but the `vb` apply failed —
-                // the threshold signature was computed correctly but the
-                // beacon never landed. Restart from a fresh round-1
-                // since nonces are gone (FROST single-use).
-                format!(
-                    "dfrost_contribute_threshold_sign: aggregate succeeded but apply vb failed; \
-                     ceremony state inconsistent — restart via dfrost_request_vrf_beacon: {e:?}"
+            let vb_event = {
+                let outbox_g = dm_outbox.lock().await;
+                let signing_key = outbox_g.signing_key.as_ref();
+                crate::community_dfrost_log::build_signed_dfrost_event(
+                    signing_key,
+                    self_owner,
+                    crate::community_dfrost_types::DfrostEventKind::VrfBeacon,
+                    &vb_payload,
+                    hlc_vb,
                 )
-            })?;
-    }
+                .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed vb: {e}"))?
+            };
 
-    // T8: broadcast the vb aggregate event BEFORE dispatching local beacon
-    // callbacks (Cluster F fix, R2 bot review — vb→ss ordering race).
-    //
-    // Ordering rationale: `dispatch_beacon_callbacks` triggers VotingLogEngine
-    // to publish kd=ss referencing this vb beacon. Peers must receive kd=vb
-    // before kd=ss so they can verify the sortition; if we dispatch callbacks
-    // first the aggregating node publishes kd=ss before peers have the beacon.
-    //
-    // Broadcast is best-effort (local apply already succeeded). Lock ordering:
-    // this runs OUTSIDE the log lock scope above.
-    match dfrost_log_registry.as_ref() {
-        Some(registry) => match registry.get(space_id).await {
-            Some(engine) => {
-                if let Err(e) = engine.publish_event(vb_event).await {
-                    tracing::warn!(
-                        space_id = ?space_id,
-                        error = %e,
-                        "dfrost_contribute_threshold_sign (vb aggregate): broadcast failed \
-                         (local apply succeeded)",
+            // T8: clone the event for apply so the original remains available for
+            // the post-lock broadcast block below.
+            {
+                let mut log = log_arc.lock().await;
+                log.apply_with_identity(vb_event.clone(), &self_owner, &self_x25519_priv)
+                    .map_err(|e| {
+                        // R2-3: aggregate succeeded but the `vb` apply failed —
+                        // the threshold signature was computed correctly but the
+                        // beacon never landed. Restart from a fresh round-1
+                        // since nonces are gone (FROST single-use).
+                        format!(
+                            "dfrost_contribute_threshold_sign: aggregate succeeded but apply vb \
+                             failed; ceremony state inconsistent — restart via \
+                             dfrost_request_vrf_beacon: {e:?}"
+                        )
+                    })?;
+            }
+
+            // T8: broadcast the vb aggregate event BEFORE dispatching local beacon
+            // callbacks (Cluster F fix, R2 bot review — vb→ss ordering race).
+            //
+            // Ordering rationale: `dispatch_beacon_callbacks` triggers VotingLogEngine
+            // to publish kd=ss referencing this vb beacon. Peers must receive kd=vb
+            // before kd=ss so they can verify the sortition; if we dispatch callbacks
+            // first the aggregating node publishes kd=ss before peers have the beacon.
+            //
+            // Broadcast is best-effort (local apply already succeeded). Lock ordering:
+            // this runs OUTSIDE the log lock scope above.
+            match dfrost_log_registry.as_ref() {
+                Some(registry) => match registry.get(space_id).await {
+                    Some(engine) => {
+                        if let Err(e) = engine.publish_event(vb_event).await {
+                            tracing::warn!(
+                                space_id = ?space_id,
+                                error = %e,
+                                "dfrost_contribute_threshold_sign (vb aggregate): broadcast failed \
+                                 (local apply succeeded)",
+                            );
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            space_id = ?space_id,
+                            "dfrost_contribute_threshold_sign (vb aggregate): no engine \
+                             registered for community — broadcast skipped \
+                             (engine not registered — boot/join ensure has not run for this community?)",
+                        );
+                    }
+                },
+                None => {
+                    tracing::debug!(
+                        "dfrost_contribute_threshold_sign (vb aggregate): \
+                         dfrost_log_registry is None — broadcast skipped (test context?)",
                     );
                 }
             }
-            None => {
-                tracing::debug!(
-                    space_id = ?space_id,
-                    "dfrost_contribute_threshold_sign (vb aggregate): no engine \
-                     registered for community — broadcast skipped \
-                     (engine not registered — boot/join ensure has not run for this community?)",
-                );
+
+            // Cluster 5 fix (CodeAnt incomplete-implementation MAJOR, R1 bot review):
+            // dispatch beacon callbacks for the AGGREGATING node. The inbound path
+            // (`process_inbound`) dispatches callbacks after applying a peer's VrfBeacon
+            // event, but the aggregating node applied the beacon locally via
+            // `apply_with_identity` above, bypassing `process_inbound`. Without this
+            // dispatch, the VotingLogEngine on the aggregating node never receives the
+            // beacon notification → never publishes kd=ss → Tier 3 polls stall.
+            //
+            // Dispatch AFTER the T8 broadcast (above) so peers receive kd=vb before
+            // the aggregating node publishes kd=ss via beacon callbacks. Also dispatches
+            // AFTER the log lock is released so callbacks can safely re-acquire locks.
+            if let Some(registry) = dfrost_log_registry.as_ref() {
+                registry
+                    .dispatch_beacon_callbacks(&vb_payload, &space_id)
+                    .await;
             }
-        },
-        None => {
-            tracing::debug!(
-                "dfrost_contribute_threshold_sign (vb aggregate): \
-                 dfrost_log_registry is None — broadcast skipped (test context?)",
-            );
+
+            let evt = DfrostBeaconReadyPayload {
+                community_id: hex::encode(space_id.0),
+                ceremony_id: hex::encode(ceremony_bytes),
+                vrf_output: hex::encode(vrf_output),
+            };
+            if let Err(e) = app.emit("dfrost-beacon-ready", &evt) {
+                // Non-fatal: vb event is already applied; the emit is a UI hint.
+                tracing::warn!(error = %e, "dfrost-beacon-ready emit failed");
+            }
+
+            Ok(())
+        }
+        crate::community_dfrost_log::SignPurpose::ResetResponse {
+            proposal_id,
+            verdict,
+        } => {
+            let group_sig: [u8; 64] = sig_bytes.try_into().map_err(|_| {
+                "dfrost_contribute_threshold_sign: aggregate signature not 64 bytes".to_string()
+            })?;
+
+            // §4.3: `nv` for a Consumed response is the CURRENT held vk
+            // (the successor committee attesting its own birth) — read
+            // from THIS node's own committee state, same source
+            // `initiate_reset_response_ceremony` used to derive the
+            // message hash this signature is over. Cleared in the same
+            // lock scope: there is no `vb` apply here to trigger
+            // `apply_vrf_beacon`'s pending_sign removal, so this arm
+            // clears the completed session explicitly.
+            let new_vk = {
+                let mut log = log_arc.lock().await;
+                let new_vk = match verdict {
+                    crate::community_membership::ResetVerdict::Consumed => {
+                        Some(log.committee_state.joint_verifying_key.ok_or(
+                            "dfrost_contribute_threshold_sign: consumed verdict but no active \
+                             committee vk held locally",
+                        )?)
+                    }
+                    crate::community_membership::ResetVerdict::Endorse
+                    | crate::community_membership::ResetVerdict::Veto => None,
+                };
+                log.committee_state.pending_sign.remove(&ceremony_bytes);
+                new_vk
+            };
+
+            let mut event_id_bytes = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut event_id_bytes);
+
+            let wall_now_ms_resp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let hlc_resp = crate::dm_outbox::reserve_next_hlc_for_device(
+                &hlc_tracker,
+                &adopt_floor,
+                &device_id,
+                wall_now_ms_resp,
+            )
+            .await;
+
+            let response_event = {
+                let outbox_g = dm_outbox.lock().await;
+                // ZEB-339: membership-log event — signed with the
+                // enrolled device key (community_signing_key), NOT the
+                // owner-level `signing_key` the dfrost `ts` event above
+                // used (same distinction `mint_admin_countersign_event`
+                // callers draw).
+                let signing_key = outbox_g.community_signing_key.as_ref();
+                let payload = crate::community_membership::EventPayload {
+                    id: event_id_bytes,
+                    community_id: space_id,
+                    kind: crate::community_membership::MembershipEventKind::DfrostResetResponse {
+                        target_event_id: proposal_id,
+                        verdict,
+                        group_sig,
+                        new_vk,
+                    },
+                    actor: self_owner,
+                    at: hlc_resp,
+                };
+                crate::community_membership::sign_event(&payload, signing_key).map_err(|e| {
+                    format!("dfrost_contribute_threshold_sign: sign DfrostResetResponse: {e}")
+                })?
+            };
+
+            // Author into the membership log via the SAME
+            // `community_registry.engine_arc(..).insert_local_event(..)`
+            // seam `countersign_admin_proposal_impl` uses for
+            // AdminCountersign. This function is the tauri command
+            // itself (full NodeState access), so no new cross-log
+            // callback/hook plumbing is needed here — see the ZEB-1033
+            // beacon→voting-log Weak-hook pattern this deliberately does
+            // NOT reuse (Task 6 report documents why).
+            let registry = community_registry.ok_or_else(|| {
+                "dfrost_contribute_threshold_sign: community_registry unavailable — owner not \
+                 loaded"
+                    .to_string()
+            })?;
+            let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+                format!(
+                    "dfrost_contribute_threshold_sign: no membership engine for community {} — \
+                     not currently joined",
+                    hex::encode(space_id.0)
+                )
+            })?;
+            let outcome = engine_arc
+                .insert_local_event(response_event)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "dfrost_contribute_threshold_sign: insert_local_event \
+                         (DfrostResetResponse): {e}"
+                    )
+                })?;
+            if matches!(
+                outcome,
+                crate::community_state_crdt::InsertOutcome::Rejected(_)
+            ) {
+                return Err(membership_outcome_err(
+                    "dfrost_contribute_threshold_sign (reset-response)",
+                    &outcome,
+                ));
+            }
+
+            Ok(())
         }
     }
-
-    // Cluster 5 fix (CodeAnt incomplete-implementation MAJOR, R1 bot review):
-    // dispatch beacon callbacks for the AGGREGATING node. The inbound path
-    // (`process_inbound`) dispatches callbacks after applying a peer's VrfBeacon
-    // event, but the aggregating node applied the beacon locally via
-    // `apply_with_identity` above, bypassing `process_inbound`. Without this
-    // dispatch, the VotingLogEngine on the aggregating node never receives the
-    // beacon notification → never publishes kd=ss → Tier 3 polls stall.
-    //
-    // Dispatch AFTER the T8 broadcast (above) so peers receive kd=vb before
-    // the aggregating node publishes kd=ss via beacon callbacks. Also dispatches
-    // AFTER the log lock is released so callbacks can safely re-acquire locks.
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        registry
-            .dispatch_beacon_callbacks(&vb_payload, &space_id)
-            .await;
-    }
-
-    let evt = DfrostBeaconReadyPayload {
-        community_id: hex::encode(space_id.0),
-        ceremony_id: hex::encode(ceremony_bytes),
-        vrf_output: hex::encode(vrf_output),
-    };
-    if let Err(e) = app.emit("dfrost-beacon-ready", &evt) {
-        // Non-fatal: vb event is already applied; the emit is a UI hint.
-        tracing::warn!(error = %e, "dfrost-beacon-ready emit failed");
-    }
-
-    Ok(())
 }
 
 /// Tauri event payload for `"dfrost-refresh-progress"`. Mirrors

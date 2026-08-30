@@ -469,6 +469,26 @@ pub struct PendingCeremony {
     pub attempt: u32,
 }
 
+/// ZEB-1031 Task 6: what a `ts`/`vb` sign ceremony is FOR. `Beacon` (the
+/// pre-1031 default — VRF beacon draws for tier-3 sortition) completes
+/// by minting a `vb` event and advancing the beacon index, exactly as
+/// before this field existed. `ResetResponse` ceremonies never mint
+/// `vb` — the aggregate Schnorr signature is instead handed to
+/// `dfrost_contribute_threshold_sign`'s reset-response completion arm,
+/// which authors a `DfrostResetResponse` MEMBERSHIP event carrying it
+/// (spec §3.3). `#[serde(default)]` on the carrying field is load-
+/// bearing: every `PendingSignSession` persisted before this field
+/// existed decodes as `Beacon` — the only purpose that existed then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SignPurpose {
+    #[default]
+    Beacon,
+    ResetResponse {
+        proposal_id: crate::community_membership::EventId,
+        verdict: crate::community_membership::ResetVerdict,
+    },
+}
+
 /// Per-signing-ceremony pending state. One entry per in-flight
 /// threshold-sign + VRF-beacon ceremony, keyed by `ceremony_id`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -493,6 +513,16 @@ pub struct PendingSignSession {
     /// secret nonces onto the disk substrate.
     #[serde(skip, default)]
     pub local_nonces: Option<Vec<u8>>,
+    /// ZEB-1031 Task 6: what this ceremony's completion authors. Set by
+    /// the initiating core (`initiate_reset_response_ceremony`'s driver
+    /// impl mutates it right after `apply_with_identity` creates the
+    /// session — the same post-apply-mutate pattern `local_nonces` uses)
+    /// for reset-response ceremonies; left at the `Beacon` default for
+    /// VRF-beacon ceremonies started via `dfrost_request_vrf_beacon`.
+    /// `#[serde(default)]`: pre-1031 persisted sessions decode as
+    /// `Beacon`.
+    #[serde(default)]
+    pub purpose: SignPurpose,
 }
 
 /// ZEB-1027: in-flight RTS share-repair ceremony state (the `rp` event
@@ -2347,6 +2377,14 @@ impl DfrostLog {
                 message_hash: payload.message_hash,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                // ZEB-1031: the wire-level `ts` payload carries no
+                // purpose signal (it's opaque commitment/share bytes) —
+                // every replica creates the session at the Beacon
+                // default here; the LOCAL initiating core (whichever one
+                // this is) overwrites it to `ResetResponse` right after
+                // its own `apply_with_identity` call, mirroring how
+                // `local_nonces` is stashed post-apply below.
+                purpose: SignPurpose::default(),
             });
         // First-write-wins on message_hash — if a later `ts` claims a
         // different message for the same ceremony, that's an invariant
@@ -4188,6 +4226,7 @@ mod tests {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -4720,6 +4759,7 @@ mod tests {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -5128,6 +5168,7 @@ mod tests {
                 message_hash: agreed_msg,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -5236,6 +5277,289 @@ mod tests {
             "local_nonces must be skipped during serialization (security)"
         );
         assert_eq!(decoded.message_hash, [0xBB; 32], "public fields preserved");
+    }
+
+    // ── ZEB-1031 Task 6: SignPurpose ──────────────────────────────────
+
+    #[test]
+    fn pending_sign_session_purpose_defaults_beacon_on_legacy_blob() {
+        // Mirrors the pre-ZEB-1031 PendingSignSession shape (no
+        // `purpose` field at all) to prove #[serde(default)] loads
+        // old-persisted sessions as SignPurpose::Beacon — the only
+        // purpose that existed before this field. `local_nonces` is
+        // omitted here too since it was already #[serde(skip)] before
+        // this task and carries no wire representation either way.
+        #[derive(Serialize)]
+        struct LegacyPendingSignSession {
+            message_hash: [u8; 32],
+            contributions: BTreeMap<OwnerAddr, (Vec<u8>, Vec<u8>)>,
+        }
+        let legacy = LegacyPendingSignSession {
+            message_hash: [0xCC; 32],
+            contributions: BTreeMap::new(),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&legacy, &mut buf).expect("encode legacy shape");
+        let decoded: PendingSignSession =
+            ciborium::from_reader(&buf[..]).expect("decode into current shape");
+        assert_eq!(
+            decoded.purpose,
+            SignPurpose::Beacon,
+            "a legacy session blob (no purpose field) must decode as Beacon"
+        );
+        assert_eq!(decoded.message_hash, [0xCC; 32], "public fields preserved");
+    }
+
+    #[test]
+    fn pending_sign_session_reset_response_purpose_round_trips() {
+        let session = PendingSignSession {
+            message_hash: [0xDD; 32],
+            purpose: SignPurpose::ResetResponse {
+                proposal_id: [0x77; 16],
+                verdict: crate::community_membership::ResetVerdict::Veto,
+            },
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&session, &mut buf).expect("encode");
+        let decoded: PendingSignSession = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(
+            decoded.purpose, session.purpose,
+            "ResetResponse purpose must round-trip exactly (proposal_id + verdict)"
+        );
+    }
+
+    #[test]
+    fn apply_threshold_sign_creates_session_with_beacon_purpose_by_default() {
+        // The wire-level `ts` payload carries no purpose signal — every
+        // replica applying a `ts` event (whether or not this replica
+        // itself initiated a reset-response ceremony) creates the
+        // session at the Beacon default here. Regression guard for the
+        // pre-existing VRF-beacon ceremony flow: `apply_threshold_sign`
+        // must keep tagging fresh sessions Beacon so
+        // `dfrost_contribute_threshold_sign`'s aggregation-side match
+        // still takes the vb-mint arm for ordinary beacon ceremonies.
+        use crate::community_dfrost_types::ThresholdSignPayload;
+        use crate::owner_state_types::Hlc;
+
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let kp = key_packages.get(&ids[0]).unwrap().clone();
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, Some(kp));
+
+        let payload = ThresholdSignPayload {
+            ceremony_id: [0x11; 32],
+            message_hash: [0x22; 32],
+            commitment_bytes: vec![0xAB, 0xCD],
+            share_bytes: Vec::new(),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: members[0],
+            payload: pd,
+            sig: vec![0u8; 64],
+        })
+        .expect("ts applies");
+
+        let session = log
+            .committee_state
+            .pending_sign
+            .get(&[0x11; 32])
+            .expect("session created on first ts contribution");
+        assert_eq!(session.purpose, SignPurpose::Beacon);
+    }
+
+    /// Full happy-path replay of what
+    /// `dfrost_contribute_threshold_sign`'s ResetResponse completion arm
+    /// does at aggregation: a REAL 2-of-3 FROST threshold signature over
+    /// the endorse-domain message hash (the SAME round1/round2/aggregate
+    /// mechanics the Beacon path shares), wrapped in a
+    /// `DfrostResetResponse` membership event that must (a) pass RS-R3
+    /// against the committee's own vk and (b) leave the dfrost log's
+    /// beacon state completely untouched — no `vb`, no beacon-index
+    /// entry, and (mirroring the completion arm's explicit cleanup) the
+    /// ceremony's `pending_sign` session gone.
+    #[test]
+    fn reset_response_ceremony_aggregation_produces_verifiable_response_no_vb() {
+        use crate::community_membership::{
+            dfrost_reset_digest, dfrost_reset_message_hash, mint_test_owner, sign_event,
+            test_enroll_member, verify_event, EventId, EventPayload, MaterializedMembership,
+            MemberState, MemberStatus, MembershipEventKind, ResetPhase, ResetProposalView,
+            ResetVerdict, VerifyContext, DFROST_RESET_ENDORSE_DOMAIN,
+        };
+        use crate::owner_state_types::{Hlc, SpaceId};
+
+        let community_id = SpaceId([0x51; 16]);
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let target_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+
+        let proposal_id: EventId = [0x91; 16];
+        let new_members = vec![OwnerAddr([0x71; 16]), OwnerAddr([0x72; 16])];
+        let digest =
+            dfrost_reset_digest(&community_id, &proposal_id, &target_vk, 1, &new_members, 2)
+                .expect("digest encode");
+        let message_hash = dfrost_reset_message_hash(DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+
+        let mut sign_tag = b"sign-v1:".to_vec();
+        sign_tag.extend_from_slice(&message_hash);
+        let ceremony_id =
+            crate::community_dfrost_types::derive_ceremony_id(&community_id, 1, &sign_tag);
+        // Seed the session the way `dfrost_initiate_reset_response_core`
+        // would have (purpose tagged, message_hash pinned) — the
+        // completion arm's cleanup removes exactly this entry.
+        log.committee_state.pending_sign.insert(
+            ceremony_id,
+            PendingSignSession {
+                message_hash,
+                contributions: BTreeMap::new(),
+                local_nonces: None,
+                purpose: SignPurpose::ResetResponse {
+                    proposal_id,
+                    verdict: ResetVerdict::Endorse,
+                },
+            },
+        );
+
+        // Real 2-of-3 threshold sign of the endorse-domain message —
+        // the SAME frost mechanics dfrost_contribute_threshold_sign's
+        // shared round1/round2/aggregate path runs regardless of
+        // ceremony purpose.
+        let mut rng = frost_ristretto255::rand_core::OsRng;
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            let (n, c) = frost_ristretto255::round1::commit(kp.signing_share(), &mut rng);
+            nonces.insert(*id, n);
+            commitments.insert(*id, c);
+        }
+        let signing_package = frost_ristretto255::SigningPackage::new(commitments, &message_hash);
+        let mut shares = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            shares.insert(
+                *id,
+                frost_ristretto255::round2::sign(&signing_package, nonces.get(id).unwrap(), kp)
+                    .expect("round2 sign"),
+            );
+        }
+        let sig =
+            frost_ristretto255::aggregate(&signing_package, &shares, &pub_pkg).expect("aggregate");
+        let sig_bytes = sig.serialize().expect("sig serialize");
+        let group_sig: [u8; 64] = sig_bytes.try_into().expect("schnorr sig is 64 bytes");
+
+        // Snapshot beacon state BEFORE the (simulated) completion arm
+        // runs, so the after-assertions are a genuine before/after
+        // comparison, not a vacuous "started empty, still empty".
+        let watermark_before = crate::community_dfrost_catchup::beacon_watermark_of(&log, 1_000);
+        assert!(
+            log.beacon_index.is_empty(),
+            "precondition: no beacon minted yet"
+        );
+
+        // The completion arm's cleanup — no `vb` apply exists to trigger
+        // apply_vrf_beacon's pending_sign removal for a ResetResponse
+        // ceremony, so it clears the slot itself.
+        log.committee_state.pending_sign.remove(&ceremony_id);
+
+        // Build the response event exactly as the lib.rs match arm
+        // does: MembershipEventKind::DfrostResetResponse{target_event_id,
+        // verdict, group_sig, new_vk: None}, signed by a courier actor
+        // (RS-R1: any Joined member, not necessarily a committee
+        // member, for endorse/veto).
+        let courier = mint_test_owner(0x61);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            courier.owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "c".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: Default::default(),
+                revoked_device_keys: Default::default(),
+            },
+        );
+        test_enroll_member(&mut prior, &courier);
+        prior.reset_proposals.push(ResetProposalView {
+            id: proposal_id,
+            proposer: courier.owner,
+            target_vk,
+            target_epoch: 1,
+            new_members: new_members.clone(),
+            new_threshold: 2,
+            veto_window_ms: 24 * 3_600_000,
+            signers: std::collections::BTreeSet::from([courier.owner]),
+            proposed_at_wall_ms: 0,
+            deadline_ms: None,
+            authorized_at_ms: Some(100),
+            endorsed: true,
+            phase: ResetPhase::Authorized,
+            consumed_new_vk: None,
+            consumption_superseded: false,
+        });
+        let ctx = VerifyContext {
+            now_ms: None,
+            expected_community_id: community_id,
+            admin_addr: courier.owner,
+            is_invite_only: false,
+        };
+
+        let payload = EventPayload {
+            id: [0x99; 16],
+            community_id,
+            kind: MembershipEventKind::DfrostResetResponse {
+                target_event_id: proposal_id,
+                verdict: ResetVerdict::Endorse,
+                group_sig,
+                new_vk: None,
+            },
+            actor: courier.owner,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "c".into(),
+            },
+        };
+        let response_event =
+            sign_event(&payload, &courier.device_key).expect("sign_event succeeds");
+
+        assert_eq!(
+            verify_event(&response_event, &prior, &ctx),
+            Ok(()),
+            "the mint-site's DfrostResetResponse construction must pass RS-R3"
+        );
+
+        // NO vb, NO beacon-index change — nothing in this test (nor the
+        // real completion arm it replays) ever calls apply_vrf_beacon or
+        // touches beacon_index/beacon_watermark.
+        assert!(
+            log.beacon_index.is_empty(),
+            "a ResetResponse ceremony must never mint vb / touch the beacon index"
+        );
+        assert_eq!(
+            crate::community_dfrost_catchup::beacon_watermark_of(&log, 1_000),
+            watermark_before,
+            "beacon_watermark must be unchanged by a ResetResponse ceremony's completion"
+        );
+        assert!(
+            log.committee_state.pending_sign.is_empty(),
+            "the completion arm must clear its own pending_sign session"
+        );
     }
 
     #[test]
@@ -7307,6 +7631,7 @@ mod tests {
                 message_hash: [0x88; 32],
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -8263,6 +8588,7 @@ mod tests {
                 message_hash: [0xbb; 32],
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -8539,6 +8865,7 @@ mod tests {
                     message_hash,
                     contributions: BTreeMap::new(),
                     local_nonces: None,
+                    purpose: SignPurpose::default(),
                 },
             );
         };

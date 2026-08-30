@@ -17593,6 +17593,22 @@ mod reset_verify_tests {
         );
     }
 
+    // ZEB-1031 Task 6: direct pin (rather than relying only on the
+    // relabelled-sig rejections above) — endorse and veto derive
+    // DIFFERENT message hashes from the SAME digest, since Task 6's
+    // sign-ceremony domain selection depends on this holding for every
+    // digest, not just the fixture digests those tests happen to use.
+    #[test]
+    fn dfrost_reset_message_hash_domain_separated_endorse_veto() {
+        let digest = [0x5Au8; 32];
+        let endorse_hash = dfrost_reset_message_hash(DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        let veto_hash = dfrost_reset_message_hash(DFROST_RESET_VETO_DOMAIN, &digest, None);
+        assert_ne!(
+            endorse_hash, veto_hash,
+            "endorse and veto domains must never collide for the same digest"
+        );
+    }
+
     #[test]
     fn rsr3_veto_sig_rejected_when_relabelled_endorse() {
         let mut w = world();
