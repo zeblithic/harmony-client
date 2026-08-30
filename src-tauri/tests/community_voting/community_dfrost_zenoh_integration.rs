@@ -35,7 +35,7 @@ use harmony_app::community_dfrost_types::{
 };
 use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::dm_signing;
-use harmony_app::event_loop::{spawn_dfrost_log_zenoh_adapter, DfrostCatchupHooks};
+use harmony_app::event_loop::spawn_dfrost_log_zenoh_adapter;
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
 /// Build a `(SigningKey, OwnerAddr, [u8; 64])` triple from a single-byte
@@ -543,28 +543,9 @@ async fn dfrost_catchup_round_crosses_real_zenoh_session_zeb1030() {
     })
     .await;
 
-    // Mirrors `ensure_dfrost_engine_for`'s (lib.rs) hook construction:
-    // one closure per hook, each cloning the shared engine `Arc`.
-    let alice_hooks = {
-        let e_build = Arc::clone(&alice_engine);
-        let e_respond = Arc::clone(&alice_engine);
-        let e_ingest = Arc::clone(&alice_engine);
-        DfrostCatchupHooks {
-            build_request: Arc::new(move || {
-                let e = Arc::clone(&e_build);
-                Box::pin(async move { e.catchup_build_request().await })
-            }),
-            respond: Arc::new(move |request| {
-                let e = Arc::clone(&e_respond);
-                Box::pin(async move { e.catchup_respond(request).await })
-            }),
-            ingest: Arc::new(move |frames| {
-                let e = Arc::clone(&e_ingest);
-                Box::pin(async move { e.catchup_ingest(frames).await })
-            }),
-            hint: alice_engine.catchup_hint(),
-        }
-    };
+    // ZEB-1033: the production hook constructor (Weak engine capture) —
+    // the same closures `ensure_dfrost_engine_for` (lib.rs) wires.
+    let alice_hooks = DfrostLogEngine::catchup_hooks(&alice_engine);
     let _adapter_a = spawn_dfrost_log_zenoh_adapter(
         Arc::clone(&session_a),
         community_id_hex.clone(),
@@ -614,26 +595,7 @@ async fn dfrost_catchup_round_crosses_real_zenoh_session_zeb1030() {
     })
     .await;
 
-    let c_hooks = {
-        let e_build = Arc::clone(&c_engine);
-        let e_respond = Arc::clone(&c_engine);
-        let e_ingest = Arc::clone(&c_engine);
-        DfrostCatchupHooks {
-            build_request: Arc::new(move || {
-                let e = Arc::clone(&e_build);
-                Box::pin(async move { e.catchup_build_request().await })
-            }),
-            respond: Arc::new(move |request| {
-                let e = Arc::clone(&e_respond);
-                Box::pin(async move { e.catchup_respond(request).await })
-            }),
-            ingest: Arc::new(move |frames| {
-                let e = Arc::clone(&e_ingest);
-                Box::pin(async move { e.catchup_ingest(frames).await })
-            }),
-            hint: c_engine.catchup_hint(),
-        }
-    };
+    let c_hooks = DfrostLogEngine::catchup_hooks(&c_engine);
     // Kept separately from `c_hooks` (which is moved into the adapter
     // below) so `wait_for` can nudge the joiner's requester task directly
     // — same underlying `Arc<Notify>` as the hint the hooks/orchestrator

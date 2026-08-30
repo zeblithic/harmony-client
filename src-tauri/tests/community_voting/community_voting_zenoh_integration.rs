@@ -79,8 +79,10 @@ fn noop_backfill() -> (
     harmony_app::event_loop::VotingBackfillApplyFn,
 ) {
     (
-        Arc::new(|| Box::pin(async { Vec::new() })),
-        Arc::new(|_frame| Box::pin(async {})),
+        Arc::new(|| {
+            Box::pin(async { harmony_app::event_loop::EngineHookResult::Alive(Vec::new()) })
+        }),
+        Arc::new(|_frame| Box::pin(async { harmony_app::event_loop::EngineHookResult::Alive(()) })),
     )
 }
 

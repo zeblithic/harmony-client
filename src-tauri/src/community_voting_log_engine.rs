@@ -614,6 +614,83 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         (missing.len(), next)
     }
 
+    /// ZEB-1033: the type-erased closures the Zenoh adapter drives —
+    /// backfill read/apply (ZEB-718) + the RBSR protocol halves
+    /// (ZEB-932) — over a **`Weak`** engine reference. The engines map
+    /// owns the engine's lifetime; the adapter's long-lived transport
+    /// tasks only borrow it per call (upgrade-or-`EngineGone`), so an
+    /// engine dropped from the map mid-session actually dies instead of
+    /// living on inside these closures until global shutdown, its
+    /// backfill/RBSR queryables answering with progressively stale
+    /// state. Mirrors `DfrostLogEngine::catchup_hooks` — the two planes
+    /// move in lockstep.
+    #[allow(clippy::type_complexity)]
+    pub fn adapter_closures(
+        engine: &Arc<Self>,
+    ) -> (
+        crate::event_loop::VotingBackfillReadFn,
+        crate::event_loop::VotingBackfillApplyFn,
+        crate::event_loop::VotingRbsrHooks,
+    ) {
+        use crate::event_loop::EngineHookResult;
+        let w_read = Arc::downgrade(engine);
+        let read: crate::event_loop::VotingBackfillReadFn = Arc::new(move || {
+            let w = w_read.clone();
+            Box::pin(async move {
+                match w.upgrade() {
+                    Some(e) => EngineHookResult::Alive(e.read_backfill_frames().await),
+                    None => EngineHookResult::EngineGone,
+                }
+            })
+        });
+        let w_apply = Arc::downgrade(engine);
+        let apply: crate::event_loop::VotingBackfillApplyFn = Arc::new(move |frame: Vec<u8>| {
+            let w = w_apply.clone();
+            Box::pin(async move {
+                match w.upgrade() {
+                    Some(e) => {
+                        let _ = e.apply_backfilled_event(&frame).await;
+                        EngineHookResult::Alive(())
+                    }
+                    None => EngineHookResult::EngineGone,
+                }
+            })
+        });
+        let w_initial = Arc::downgrade(engine);
+        let w_respond = Arc::downgrade(engine);
+        let w_process = Arc::downgrade(engine);
+        let hooks = crate::event_loop::VotingRbsrHooks {
+            initial: Arc::new(move || {
+                let w = w_initial.clone();
+                Box::pin(async move {
+                    match w.upgrade() {
+                        Some(e) => EngineHookResult::Alive(e.rbsr_initial().await),
+                        None => EngineHookResult::EngineGone,
+                    }
+                })
+            }),
+            respond: Arc::new(move |request| {
+                let w = w_respond.clone();
+                Box::pin(async move {
+                    match w.upgrade() {
+                        Some(e) => EngineHookResult::Alive(e.rbsr_respond(&request).await),
+                        None => EngineHookResult::EngineGone,
+                    }
+                })
+            }),
+            process_reply: Arc::new(move |reply| {
+                let w = w_process.clone();
+                Box::pin(async move {
+                    match w.upgrade() {
+                        Some(e) => EngineHookResult::Alive(e.rbsr_process_reply(&reply).await),
+                        None => EngineHookResult::EngineGone,
+                    }
+                })
+            }),
+        };
+        (read, apply, hooks)
+    }
+
     /// Construct an engine, spawn its inbound receive loop, and return
     /// an `Arc<Self>` suitable for registry storage.
     pub async fn start(params: VotingLogEngineParams<R>) -> Arc<Self> {
@@ -3902,9 +3979,9 @@ async fn inbound_eligibility_check(
 
 /// Test seam (ZEB-718): build the backfill read + apply closures for
 /// `engine`, so integration tests — which see only the public API — can wire
-/// the real backfill path into `spawn_voting_log_zenoh_adapter`. Mirrors the
-/// closures `ensure_voting_engine_for` builds in production (the underlying
-/// `read_backfill_frames` / `apply_backfilled_event` are `pub(crate)`).
+/// the real backfill path into `spawn_voting_log_zenoh_adapter`. ZEB-1033:
+/// now delegates to `adapter_closures`, so tests exercise the same
+/// Weak-capture closures `ensure_voting_engine_for` wires in production.
 #[cfg(any(test, feature = "test-fixtures"))]
 #[doc(hidden)]
 pub fn backfill_closures_for_test<R: tauri::Runtime>(
@@ -3913,18 +3990,7 @@ pub fn backfill_closures_for_test<R: tauri::Runtime>(
     crate::event_loop::VotingBackfillReadFn,
     crate::event_loop::VotingBackfillApplyFn,
 ) {
-    let e_read = Arc::clone(engine);
-    let read: crate::event_loop::VotingBackfillReadFn = Arc::new(move || {
-        let e = Arc::clone(&e_read);
-        Box::pin(async move { e.read_backfill_frames().await })
-    });
-    let e_apply = Arc::clone(engine);
-    let apply: crate::event_loop::VotingBackfillApplyFn = Arc::new(move |frame: Vec<u8>| {
-        let e = Arc::clone(&e_apply);
-        Box::pin(async move {
-            let _ = e.apply_backfilled_event(&frame).await;
-        })
-    });
+    let (read, apply, _hooks) = VotingLogEngine::adapter_closures(engine);
     (read, apply)
 }
 
@@ -4205,6 +4271,72 @@ mod tests {
             membership_resolver: Some(mem_resolver),
         })
         .await
+    }
+
+    /// ZEB-1033: adapter closures capture the engine WEAKLY — once
+    /// every strong `Arc` is gone (engines-map clear/replacement, plus
+    /// the receive task's own clone exiting), each closure reports
+    /// `EngineGone` so the adapter's backfill/RBSR tasks exit instead
+    /// of serving a dead engine's progressively stale state until
+    /// global shutdown.
+    #[tokio::test]
+    async fn adapter_closures_report_engine_gone_after_drop_zeb1033() {
+        use crate::event_loop::EngineHookResult;
+
+        let community_id = SpaceId([0x7c; 16]);
+        let (_key, owner, pub64) = fixture_identity_engine(0x7c);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let engine = start_backfill_test_engine(
+            community_id,
+            owner,
+            pub64,
+            Arc::clone(&voting_log),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        )
+        .await;
+
+        let (read, apply, hooks) = VotingLogEngine::adapter_closures(&engine);
+
+        // Alive while a strong Arc stands; keep a real initial message
+        // to replay against the dead engine below.
+        let EngineHookResult::Alive(initial_msg) = (hooks.initial)().await else {
+            panic!("hooks report Alive while the engine Arc is held");
+        };
+        assert!(matches!(read().await, EngineHookResult::Alive(_)));
+
+        drop(engine);
+
+        // The engine's receive task holds its own Arc<Self> and exits
+        // when the adapter-side subscriber sender drops (the test
+        // helper's sender is already gone) — poll briefly until the
+        // last strong ref falls.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if matches!(read().await, EngineHookResult::EngineGone) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine still reachable through Weak hooks 5s after drop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            (apply)(Vec::new()).await,
+            EngineHookResult::EngineGone
+        ));
+        assert!(matches!(
+            (hooks.initial)().await,
+            EngineHookResult::EngineGone
+        ));
+        assert!(matches!(
+            (hooks.respond)(initial_msg.clone()).await,
+            EngineHookResult::EngineGone
+        ));
+        assert!(matches!(
+            (hooks.process_reply)(initial_msg).await,
+            EngineHookResult::EngineGone
+        ));
     }
 
     #[tokio::test]
