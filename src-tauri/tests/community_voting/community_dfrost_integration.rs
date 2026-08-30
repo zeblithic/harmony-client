@@ -15,25 +15,37 @@
 //! verify the outer Ed25519 sig (caller's responsibility — IPC layer in
 //! Tasks 5-6). Only the FROST inner crypto matters for convergence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use frost_ristretto255::{
     self as frost,
     keys::{KeyPackage, PublicKeyPackage},
     rand_core, Identifier,
 };
-use harmony_app::community_dfrost_crypto::{
-    dkg_part1_local, dkg_part2_local, dkg_part3_local, identifier_for_index,
-    verifying_key_to_bytes, verifying_share_to_bytes,
+use harmony_app::community_dfrost_catchup::{
+    decode_frame, encode_frame, CatchupBody, CatchupFrame, CatchupStatus, CATCHUP_VERSION,
 };
-use harmony_app::community_dfrost_log::{ApplyError, CommitteeState, DfrostLog, PendingCeremony};
+use harmony_app::community_dfrost_crypto::{
+    dkg_part1_local, dkg_part2_local, dkg_part3_local, verifying_key_to_bytes,
+    verifying_share_to_bytes,
+};
+use harmony_app::community_dfrost_log::{
+    build_signed_dfrost_event, ApplyError, CommitteeState, DfrostLog, PendingCeremony,
+};
+use harmony_app::community_dfrost_log_engine::{
+    CatchupOutcome, DfrostLogEngine, DfrostLogEngineParams,
+};
 use harmony_app::community_dfrost_types::{
     derive_vrf_output, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
-    RefreshRoundPayload, SignedCommitteeEvent, ThresholdSignPayload, VrfBeaconPayload,
+    RefreshRoundPayload, RepairRoundPayload, SignedCommitteeEvent, ThresholdSignPayload,
+    VrfBeaconPayload,
 };
 use harmony_app::community_membership::RecipientCiphertext;
+use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::dm_signing;
-use harmony_app::owner_state_types::{Hlc, OwnerAddr};
+use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use tokio::sync::{mpsc, Mutex};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -170,17 +182,47 @@ fn build_vb_event(
     }
 }
 
+/// ZEB-1030 Task 5: RTS repair-request (`rp`) event builder, same shape
+/// as the other `build_*_event` helpers — synthetic sig, since the
+/// repair-admissibility check below drives it through `apply()`
+/// directly (never wire-crossed, so no envelope-verify requirement).
+fn build_rp_event(
+    actor: OwnerAddr,
+    wall_ms: u64,
+    node_id: &str,
+    payload: RepairRoundPayload,
+) -> SignedCommitteeEvent {
+    let mut pd = Vec::new();
+    ciborium::into_writer(&payload, &mut pd).expect("encode rp payload");
+    SignedCommitteeEvent {
+        tag: 'd',
+        version: 1,
+        committee_tier: 0,
+        kind: DfrostEventKind::RepairShare,
+        hlc: hlc(wall_ms, node_id),
+        actor,
+        payload: pd,
+        sig: vec![0u8; 64],
+    }
+}
+
 /// Seed `pending_dkg` on a fresh log so the apply path has a ceremony to
 /// match against. In production this is populated by the
 /// `dfrost_initiate_dkg` IPC (Task 5); for the integration test we set it
-/// directly on both engines.
-fn fresh_log_with_pending() -> DfrostLog {
+/// directly on both engines. Parametrized over the member set and
+/// `max_signers` so [`dkg_2of2_setup_for`] can seed a ceremony over
+/// identity-derived addresses (ZEB-1030 Task 5 needs the wire-crossing
+/// `dk`/`vb` events it builds to carry REAL Ed25519 signatures — see
+/// that function's doc) with an optional bystander member widening the
+/// committee beyond 2 (see its `bystanders` param). Threshold stays
+/// fixed at 2 — nothing in this file needs a different threshold.
+fn fresh_log_with_pending_for(members: Vec<OwnerAddr>, max_signers: u16) -> DfrostLog {
     let mut log = DfrostLog::new();
     log.committee_state.pending_dkg = Some(PendingCeremony {
         ceremony_id: CEREMONY_ID,
-        members: members(),
+        members,
         threshold: 2,
-        max_signers: 2,
+        max_signers,
         proposed_epoch: 1,
         ..Default::default()
     });
@@ -209,21 +251,62 @@ struct ActivatedCommittee {
 /// test that calls this; Tasks 3 + 4 inherit the convergence as a
 /// precondition.
 fn dkg_2of2_setup() -> ActivatedCommittee {
-    let (alice_priv, alice_pub) = alice_x25519();
-    let (bob_priv, bob_pub) = bob_x25519();
+    dkg_2of2_setup_for(ALICE, BOB, alice_x25519(), bob_x25519(), Vec::new())
+}
 
-    let mut engine_a = fresh_log_with_pending();
-    let mut engine_b = fresh_log_with_pending();
+/// Parametrized DKG-setup body behind [`dkg_2of2_setup`]. ZEB-1030 Task 5's
+/// catch-up wire-crossing tests need this SAME ceremony shape, but over
+/// identity-derived member addresses: the later refresh `dk`/`vb` events
+/// those tests build have to carry REAL Ed25519 signatures that
+/// `verify_signed_committee_event` accepts, which requires
+/// `actor.0 == address_hash(signing key)` — a binding the fixed `ALICE`/
+/// `BOB` constants (arbitrary bytes, no real keypair behind them) can
+/// never satisfy. `identifier_for_index(0/1)` is replaced by an explicit
+/// `build_identifier_map` lookup so this stays correct regardless of how
+/// the caller's addresses happen to sort.
+///
+/// `bystanders`: extra committee-member addresses that are declared
+/// members (and get a fabricated, non-cryptographic `verifying_shares`
+/// entry) but never run the real FROST DKG rounds below — only
+/// `alice`/`bob` do. Empty for every existing caller (a real 2-of-2).
+/// ZEB-1030 Task 5's straggler test passes one: `check_repair_request_
+/// admissible` requires `helpers.len() >= threshold` with helpers drawn
+/// from `members ∖ {participant}`, which is structurally unreachable in
+/// a strict 2-of-2 (only 1 other member to draw from, below
+/// threshold=2 — the same reason the ZEB-1029 restart test above calls
+/// full-committee RTS repair "structurally unreachable" for a 2-of-2).
+/// A bystander gives that test a real THIRD member to name as a helper
+/// without needing a genuine 3-party DKG — `apply()`/`adopt_*` never
+/// cross-check a `dk` payload's declared shares against the actual FROST
+/// polynomial (see the epoch-1/refresh dk payloads below and
+/// `refresh_two_engine_preserves_joint_vk`'s doc comment), so a
+/// placeholder share for a member who never signs is a faithful exercise
+/// of the membership/repair bookkeeping without touching the real
+/// alice/bob crypto at all.
+fn dkg_2of2_setup_for(
+    alice: OwnerAddr,
+    bob: OwnerAddr,
+    (alice_priv, alice_pub): ([u8; 32], [u8; 32]),
+    (bob_priv, bob_pub): ([u8; 32], [u8; 32]),
+    bystanders: Vec<OwnerAddr>,
+) -> ActivatedCommittee {
+    let mut members = vec![alice, bob];
+    members.extend(bystanders.iter().copied());
+    let max_signers = members.len() as u16;
 
-    let id_alice = identifier_for_index(0); // alice sorts first
-    let id_bob = identifier_for_index(1);
+    let mut engine_a = fresh_log_with_pending_for(members.clone(), max_signers);
+    let mut engine_b = fresh_log_with_pending_for(members.clone(), max_signers);
+
+    let identifier_map = CommitteeState::build_identifier_map(&members);
+    let id_alice = identifier_map[&alice];
+    let id_bob = identifier_map[&bob];
 
     // Round 1
     let (r1_secret_alice, r1_pkg_alice_bytes) =
         dkg_part1_local(id_alice, 2, 2).expect("alice part1");
     let (r1_secret_bob, r1_pkg_bob_bytes) = dkg_part1_local(id_bob, 2, 2).expect("bob part1");
     let dr1_alice = build_dr_event(
-        ALICE,
+        alice,
         1_000,
         "alice",
         DkgRoundPayload {
@@ -234,7 +317,7 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
         },
     );
     let dr1_bob = build_dr_event(
-        BOB,
+        bob,
         1_100,
         "bob",
         DkgRoundPayload {
@@ -268,7 +351,7 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
     let sealed_alice_to_bob =
         dm_signing::seal_to_owner(&bob_pub, &r2_pkg_alice_to_bob).expect("seal a→b");
     let dr2_alice = build_dr_event(
-        ALICE,
+        alice,
         2_000,
         "alice",
         DkgRoundPayload {
@@ -276,16 +359,16 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
             round_num: 2,
             round1_package: None,
             recipient_ciphertexts: Some(vec![RecipientCiphertext {
-                recipient: BOB,
+                recipient: bob,
                 sealed: sealed_alice_to_bob,
             }]),
         },
     );
     engine_a
-        .apply_with_identity(dr2_alice.clone(), &ALICE, &alice_priv)
+        .apply_with_identity(dr2_alice.clone(), &alice, &alice_priv)
         .expect("a applies own dr2");
     engine_b
-        .apply_with_identity(dr2_alice, &BOB, &bob_priv)
+        .apply_with_identity(dr2_alice, &bob, &bob_priv)
         .expect("b decrypts dr2 from alice");
 
     let r2_pkg_bob_to_alice = r2_pkgs_from_bob
@@ -295,7 +378,7 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
     let sealed_bob_to_alice =
         dm_signing::seal_to_owner(&alice_pub, &r2_pkg_bob_to_alice).expect("seal b→a");
     let dr2_bob = build_dr_event(
-        BOB,
+        bob,
         2_100,
         "bob",
         DkgRoundPayload {
@@ -303,16 +386,16 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
             round_num: 2,
             round1_package: None,
             recipient_ciphertexts: Some(vec![RecipientCiphertext {
-                recipient: ALICE,
+                recipient: alice,
                 sealed: sealed_bob_to_alice,
             }]),
         },
     );
     engine_a
-        .apply_with_identity(dr2_bob.clone(), &ALICE, &alice_priv)
+        .apply_with_identity(dr2_bob.clone(), &alice, &alice_priv)
         .expect("a decrypts dr2 from bob");
     engine_b
-        .apply_with_identity(dr2_bob, &BOB, &bob_priv)
+        .apply_with_identity(dr2_bob, &bob, &bob_priv)
         .expect("b applies own dr2");
 
     // Qodo R3 (Bug): explicitly assert that `apply_with_identity` actually
@@ -338,24 +421,24 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
             .expect("b pending after r2");
         // Alice's engine should have decrypted Bob's r2 package for her.
         assert_eq!(
-            pending_a.round2_packages.get(&BOB),
+            pending_a.round2_packages.get(&bob),
             Some(&r2_pkg_bob_to_alice),
             "engine A must have decrypted Bob's sealed r2 package via apply_with_identity"
         );
         // Bob's engine should have decrypted Alice's r2 package for him.
         assert_eq!(
-            pending_b.round2_packages.get(&ALICE),
+            pending_b.round2_packages.get(&alice),
             Some(&r2_pkg_alice_to_bob),
             "engine B must have decrypted Alice's sealed r2 package via apply_with_identity"
         );
         // Each engine should NOT have stored a decrypt for its own
         // outgoing package (no ciphertext was targeted at self).
         assert!(
-            !pending_a.round2_packages.contains_key(&ALICE),
+            !pending_a.round2_packages.contains_key(&alice),
             "engine A must not have a self-addressed r2 decrypt"
         );
         assert!(
-            !pending_b.round2_packages.contains_key(&BOB),
+            !pending_b.round2_packages.contains_key(&bob),
             "engine B must not have a self-addressed r2 decrypt"
         );
     }
@@ -379,18 +462,28 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
 
     let joint_vk = verifying_key_to_bytes(pub_pkg.verifying_key());
 
-    // dk broadcast — BOTH members confirm (threshold=2 requires 2 confirmations)
-    let identifier_map = CommitteeState::build_identifier_map(&members());
-    let mut verifying_shares = Vec::with_capacity(2);
-    for member in members() {
-        let id = identifier_map[&member];
-        let vs = pub_pkg
-            .verifying_shares()
-            .get(&id)
-            .expect("verifying share");
+    // dk broadcast — BOTH real members confirm (threshold=2 requires 2
+    // confirmations; a bystander never confirms — `apply_dkg_complete`
+    // only requires `dk_confirmations.len() >= threshold`, so 2 of
+    // however many members suffices regardless of `bystanders.len()`).
+    let mut verifying_shares = Vec::with_capacity(members.len());
+    for member in members.clone() {
+        let vs_bytes = if member == alice || member == bob {
+            let id = identifier_map[&member];
+            let vs = pub_pkg
+                .verifying_shares()
+                .get(&id)
+                .expect("verifying share");
+            verifying_share_to_bytes(vs)
+        } else {
+            // Bystander (see `dkg_2of2_setup_for`'s doc): no real FROST
+            // key package exists for this identifier — a fixed
+            // placeholder is fine, nothing cross-checks it.
+            [0xB9; 32]
+        };
         verifying_shares.push(MemberVerifyingShare {
             member,
-            verifying_share: verifying_share_to_bytes(vs),
+            verifying_share: vs_bytes,
         });
     }
     let dk_payload = DkgCompletePayload {
@@ -398,12 +491,12 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
         joint_verifying_key: joint_vk,
         verifying_shares,
         epoch: 1,
-        members: members(),
+        members: members.clone(),
         threshold: 2,
-        max_signers: 2,
+        max_signers,
     };
-    let dk_alice = build_dk_event(ALICE, 3_000, "alice", dk_payload.clone());
-    let dk_bob = build_dk_event(BOB, 3_100, "bob", dk_payload);
+    let dk_alice = build_dk_event(alice, 3_000, "alice", dk_payload.clone());
+    let dk_bob = build_dk_event(bob, 3_100, "bob", dk_payload);
     engine_a.apply(dk_alice.clone()).expect("a dk_alice");
     engine_b.apply(dk_alice).expect("b dk_alice");
     engine_a.apply(dk_bob.clone()).expect("a dk_bob");
@@ -1115,5 +1208,746 @@ fn full_committee_restart_signs_after_sealed_share_restore_zeb1029() {
             Some(&vrf_output),
             "{label}: post-restart beacon indexed"
         );
+    }
+}
+
+// ─── ZEB-1030 Task 5: catch-up wire-crossing (straggler + joiner) ──────────
+//
+// Engine-level wire-crossing tests: every frame `catchup_respond` builds
+// is round-tripped through `encode_frame` → bytes → `decode_frame` before
+// `catchup_ingest` ever sees it — that byte boundary is the arbiter, not
+// a direct in-process handoff (matches the voting plane's test posture;
+// Zenoh-session-level coverage is explicitly out of scope here).
+//
+// Both tests need REAL Ed25519 identities (not this file's `ALICE`/`BOB`
+// constants) for the `dk`/`vb` events that cross the wire —
+// `verify_signed_committee_event` enforces `identity.address_hash ==
+// event.actor.0`, a binding the fixed constants can never satisfy (see
+// `dkg_2of2_setup_for`'s doc). `fixture_identity`/`StaticResolver` mirror
+// the identical helpers already used in `community_dfrost_transport_
+// integration.rs` and `community_dfrost_log_engine.rs`'s own test module.
+
+/// Build `(SigningKey, OwnerAddr, identity_pub_64)` from a seed where
+/// `address_hash` binds correctly. Mirrors `community_dfrost_log_engine::
+/// tests::fixture_identity`.
+fn fixture_identity(seed: u8) -> (ed25519_dalek::SigningKey, OwnerAddr, [u8; 64]) {
+    let priv_id = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+    let owner = OwnerAddr(priv_id.identity.address_hash);
+    let pub_64 = priv_id.identity.to_public_bytes();
+    let private_bytes = priv_id.to_private_bytes();
+    let mut ed_secret = [0u8; 32];
+    ed_secret.copy_from_slice(&private_bytes[32..64]);
+    let signing = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+    (signing, owner, pub_64)
+}
+
+/// Minimal `IdentityResolver` backed by a `HashMap`, same shape as the
+/// engine's own in-file `StaticResolver` test double.
+struct StaticResolver(HashMap<OwnerAddr, [u8; 64]>);
+
+#[async_trait::async_trait]
+impl IdentityResolver for StaticResolver {
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+        self.0.get(addr).copied()
+    }
+}
+
+fn resolver_with(entries: &[(OwnerAddr, [u8; 64])]) -> Arc<dyn IdentityResolver + Send + Sync> {
+    Arc::new(StaticResolver(entries.iter().copied().collect()))
+}
+
+/// Wire-cross every frame: `encode_frame` → bytes → `decode_frame`. The
+/// point of these tests is that THIS byte boundary — not a direct
+/// in-process handoff — separates `catchup_respond` from `catchup_ingest`.
+fn wire_cross(frames: Vec<CatchupFrame>) -> Vec<CatchupFrame> {
+    frames
+        .iter()
+        .map(|f| decode_frame(&encode_frame(f).expect("encode frame")).expect("decode frame"))
+        .collect()
+}
+
+/// Flip every bit of a verifying share. Used to make a "rotated" epoch-2
+/// share provably different from its epoch-1 value, so a stale
+/// `local_key_package` genuinely fails the adopted-consensus match
+/// (rather than trivially matching because nothing actually changed).
+fn perturbed(vs: [u8; 32]) -> [u8; 32] {
+    let mut out = vs;
+    for b in out.iter_mut() {
+        *b ^= 0xFF;
+    }
+    out
+}
+
+/// ZEB-1030 Task 5, Step 1: bob is a partitioned straggler at epoch 1
+/// while alice completes a full proactive refresh to epoch 2. Bob
+/// catches up via `catchup_build_request` → `catchup_respond` → (wire-
+/// cross) → `catchup_ingest`, must land on alice's epoch/shares, drop
+/// his now-stale epoch-1 signing share, and — now that adoption unlocked
+/// it — accept a repair request that was inadmissible before. Finally, a
+/// real epoch-2 beacon minted on alice reaches bob via a second round.
+#[tokio::test]
+async fn straggler_catches_up_after_missed_refresh_zeb1030() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x51);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0x52);
+    // Bystander member — see `dkg_2of2_setup_for`'s doc: repair
+    // admissibility needs a real THIRD member (helpers drawn from
+    // members ∖ {participant} must reach threshold=2), structurally
+    // unreachable in a strict 2-of-2. Never signs anything real.
+    let carol_addr = OwnerAddr([0x53; 16]);
+
+    let alice_x = alice_x25519();
+    let bob_x = bob_x25519();
+    let mut c = dkg_2of2_setup_for(alice_addr, bob_addr, alice_x, bob_x, vec![carol_addr]);
+
+    // Bob installs his real epoch-1 signing share, mirroring a real node
+    // (`dkg_2of2_setup`'s ceremony never does this by itself) — needed so
+    // the stale-share-drop assertion below genuinely exercises `adopt_
+    // refresh_quorum`'s consensus check instead of asserting a value
+    // that was already trivially `None`.
+    c.engine_b.local_key_package = Some(c.bob_key_pkg.clone());
+
+    // ── Drive the FULL refresh sequence on alice's log ONLY (bob is the
+    //    partitioned straggler, still at epoch 1) — same event shape as
+    //    `refresh_two_engine_preserves_joint_vk`, above.
+    let refresh_ceremony_id: [u8; 32] = [0xf1; 32];
+    let preserved_vk = c.joint_vk;
+    let (alice_x_priv, _alice_x_pub) = alice_x;
+    let (bob_x_priv, bob_x_pub) = bob_x;
+
+    let alice_r1_pkg = vec![0xaa; 32];
+    let bob_r1_pkg = vec![0xbb; 32];
+    for (actor, pkg, wall, node) in [
+        (alice_addr, alice_r1_pkg.clone(), 6_000u64, "alice"),
+        (bob_addr, bob_r1_pkg.clone(), 6_050, "bob"),
+    ] {
+        let rf1 = build_rf_event(
+            actor,
+            wall,
+            node,
+            RefreshRoundPayload {
+                ceremony_id: refresh_ceremony_id,
+                round_num: 1,
+                recipient_ciphertexts: None,
+                package: Some(pkg),
+                attempt: 0,
+            },
+        );
+        c.engine_a
+            .apply_with_identity(rf1, &alice_addr, &alice_x_priv)
+            .expect("alice applies rf1");
+    }
+
+    // rn=2 recipients must cover EVERY other committee member exactly
+    // once (`apply_proactive_refresh`'s Qodo #2 check) — with carol as a
+    // bystander member, that means bob AND carol, even though carol
+    // never actually decrypts anything real in this test.
+    let synthetic_share_for_bob = vec![0xb1; 64];
+    let synthetic_share_for_carol = vec![0xb2; 64];
+    let carol_x_pub = *PublicKey::from(&StaticSecret::from([0x54u8; 32])).as_bytes();
+    let rf2 = build_rf_event(
+        alice_addr,
+        6_100,
+        "alice",
+        RefreshRoundPayload {
+            ceremony_id: refresh_ceremony_id,
+            round_num: 2,
+            recipient_ciphertexts: Some(vec![
+                RecipientCiphertext {
+                    recipient: bob_addr,
+                    sealed: dm_signing::seal_to_owner(&bob_x_pub, &synthetic_share_for_bob)
+                        .expect("seal bob"),
+                },
+                RecipientCiphertext {
+                    recipient: carol_addr,
+                    sealed: dm_signing::seal_to_owner(&carol_x_pub, &synthetic_share_for_carol)
+                        .expect("seal carol"),
+                },
+            ]),
+            package: None,
+            attempt: 0,
+        },
+    );
+    c.engine_a
+        .apply_with_identity(rf2, &alice_addr, &alice_x_priv)
+        .expect("alice applies rf2");
+
+    // ── dk finalization: REAL Ed25519 signatures (these events cross the
+    //    catch-up wire). vk preserved; alice/bob's verifying_shares are
+    //    PERTURBED from epoch-1's (XOR 0xFF) — a real refresh rotates
+    //    shares, and bob's stale epoch-1 KeyPackage must provably no
+    //    longer match the adopted consensus. Carol (bystander) gets a
+    //    fixed placeholder — never checked against anything real; see
+    //    `dkg_2of2_setup_for`'s doc.
+    let members = vec![alice_addr, bob_addr, carol_addr];
+    let alice_vs_e1 = verifying_share_to_bytes(
+        c.pub_pkg
+            .verifying_shares()
+            .get(&c.id_alice)
+            .expect("alice vs e1"),
+    );
+    let bob_vs_e1 = verifying_share_to_bytes(
+        c.pub_pkg
+            .verifying_shares()
+            .get(&c.id_bob)
+            .expect("bob vs e1"),
+    );
+    let verifying_shares_e2 = vec![
+        MemberVerifyingShare {
+            member: alice_addr,
+            verifying_share: perturbed(alice_vs_e1),
+        },
+        MemberVerifyingShare {
+            member: bob_addr,
+            verifying_share: perturbed(bob_vs_e1),
+        },
+        MemberVerifyingShare {
+            member: carol_addr,
+            verifying_share: [0xC0; 32],
+        },
+    ];
+    let dk_payload_e2 = DkgCompletePayload {
+        ceremony_id: refresh_ceremony_id,
+        joint_verifying_key: preserved_vk,
+        verifying_shares: verifying_shares_e2,
+        epoch: 2,
+        members: members.clone(),
+        threshold: 2,
+        max_signers: 3,
+    };
+    let dk_alice_e2 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload_e2,
+        hlc(7_000, "alice"),
+    )
+    .expect("sign dk_alice e2");
+    let dk_bob_e2 = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload_e2,
+        hlc(7_100, "bob"),
+    )
+    .expect("sign dk_bob e2");
+    c.engine_a
+        .apply(dk_alice_e2)
+        .expect("alice applies dk_alice e2");
+    c.engine_a
+        .apply(dk_bob_e2)
+        .expect("alice applies dk_bob e2");
+    assert_eq!(
+        c.engine_a.committee_state.current_epoch, 2,
+        "alice reached epoch 2"
+    );
+
+    // ── Wrap both logs; bob stays untouched at epoch 1 ─────────────────
+    let alice_log = Arc::new(Mutex::new(c.engine_a));
+    let bob_log = Arc::new(Mutex::new(c.engine_b));
+
+    // ── Repair inadmissible BEFORE adoption: bob is still at epoch 1, so
+    //    the SAME epoch-2 repair request trips `apply_repair_round`'s
+    //    epoch-binding gate before `check_repair_request_admissible` even
+    //    runs — proving the failure below is about staleness, not a
+    //    malformed request (the identical bytes succeed later, once bob
+    //    has actually adopted epoch 2).
+    let mut repair_helpers = vec![alice_addr, carol_addr];
+    repair_helpers.sort();
+    let repair_payload = RepairRoundPayload {
+        ceremony_id: [0xd0; 32],
+        round_num: 1,
+        epoch: 2,
+        helpers: Some(repair_helpers),
+        minted_wall_ms: Some(9_000),
+        minted_logical: Some(0),
+        recipient_ciphertexts: None,
+    };
+    let rp_event = build_rp_event(bob_addr, 9_000, "bob", repair_payload);
+    {
+        let mut bg = bob_log.lock().await;
+        let err = bg
+            .apply(rp_event.clone())
+            .expect_err("stale-epoch repair request must be rejected");
+        assert!(
+            matches!(err, ApplyError::InvariantViolation),
+            "expected InvariantViolation, got {err:?}"
+        );
+    }
+
+    // ── Build engines over both logs ────────────────────────────────────
+    let community_id = SpaceId([0xF1; 16]);
+    let (a_pub_tx, _a_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_a_sub_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let alice_engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id,
+        dfrost_log: alice_log.clone(),
+        publisher_tx: a_pub_tx,
+        subscriber_rx: a_sub_rx,
+        app_handle: None,
+        self_addr: alice_addr,
+        self_x25519_priv: alice_x_priv,
+        identity_resolver: resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: None,
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+    let (b_pub_tx, _b_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let bob_engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id,
+        dfrost_log: bob_log.clone(),
+        publisher_tx: b_pub_tx,
+        subscriber_rx: b_sub_rx,
+        app_handle: None,
+        self_addr: bob_addr,
+        self_x25519_priv: bob_x_priv,
+        identity_resolver: resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: None,
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    // ── Wire-crossing catch-up: bob requests, alice responds, every
+    //    frame round-trips encode_frame → bytes → decode_frame before
+    //    bob's ingest ever sees it ────────────────────────────────────
+    let req = bob_engine.catchup_build_request().await;
+    assert_eq!(req.epoch, 1);
+    assert!(req.active);
+    let frames = alice_engine
+        .catchup_respond(req)
+        .await
+        .expect("alice has a newer epoch to serve");
+    let outcome = bob_engine.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedRefresh { epoch: 2, .. }),
+        "expected AdoptedRefresh at epoch 2, got {outcome:?}"
+    );
+
+    {
+        let ag = alice_log.lock().await;
+        let bg = bob_log.lock().await;
+        assert_eq!(bg.committee_state.current_epoch, 2);
+        assert_eq!(bg.committee_state.joint_verifying_key, Some(preserved_vk));
+        assert_eq!(
+            bg.committee_state.verifying_shares, ag.committee_state.verifying_shares,
+            "bob's adopted shares must equal alice's"
+        );
+        assert!(
+            bg.local_key_package.is_none(),
+            "bob's stale epoch-1 share must be dropped as provably stale"
+        );
+        assert!(bg.committee_state.pending_sign.is_empty());
+    }
+
+    // ── Repair admissible AFTER adoption: the identical rp bytes now
+    //    succeed — adoption is what unlocked it. ───────────────────────
+    {
+        let mut bg = bob_log.lock().await;
+        bg.apply(rp_event)
+            .expect("repair request must be admissible once bob is at epoch 2");
+        assert!(
+            bg.committee_state.pending_repair.is_some(),
+            "repair request seeded a pending slot"
+        );
+    }
+
+    // ── A real epoch-2 beacon minted on alice reaches bob via a second
+    //    catch-up round (BeaconsOnly) ───────────────────────────────────
+    let sign_ceremony_id: [u8; 32] = [0xf2; 32];
+    let message_hash: [u8; 32] = [0xf3; 32];
+    let (alice_nonces, alice_commitments) =
+        frost::round1::commit(c.alice_key_pkg.signing_share(), &mut rand_core::OsRng);
+    let (bob_nonces, bob_commitments) =
+        frost::round1::commit(c.bob_key_pkg.signing_share(), &mut rand_core::OsRng);
+    let mut alice_cm_bytes = Vec::new();
+    ciborium::into_writer(&alice_commitments, &mut alice_cm_bytes).expect("encode alice cm");
+    let mut bob_cm_bytes = Vec::new();
+    ciborium::into_writer(&bob_commitments, &mut bob_cm_bytes).expect("encode bob cm");
+    let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
+        BTreeMap::new();
+    commitments_map.insert(c.id_alice, alice_commitments);
+    commitments_map.insert(c.id_bob, bob_commitments);
+    let signing_package = frost::SigningPackage::new(commitments_map, &message_hash);
+    let alice_share = frost::round2::sign(&signing_package, &alice_nonces, &c.alice_key_pkg)
+        .expect("alice round2 sign");
+    let bob_share = frost::round2::sign(&signing_package, &bob_nonces, &c.bob_key_pkg)
+        .expect("bob round2 sign");
+    let mut alice_share_bytes = Vec::new();
+    ciborium::into_writer(&alice_share, &mut alice_share_bytes).expect("encode alice share");
+    let mut bob_share_bytes = Vec::new();
+    ciborium::into_writer(&bob_share, &mut bob_share_bytes).expect("encode bob share");
+    let mut shares_map: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
+    shares_map.insert(c.id_alice, alice_share);
+    shares_map.insert(c.id_bob, bob_share);
+    let group_signature = frost::aggregate(&signing_package, &shares_map, &c.pub_pkg)
+        .expect("aggregate threshold sig");
+    let sig_bytes = group_signature.serialize().expect("serialize sig");
+    let mut r_compressed = [0u8; 32];
+    r_compressed.copy_from_slice(&sig_bytes[..32]);
+    let vrf_output = derive_vrf_output(&r_compressed);
+
+    let ts_alice = build_ts_event(
+        alice_addr,
+        10_000,
+        "alice",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: alice_cm_bytes,
+            share_bytes: alice_share_bytes,
+        },
+    );
+    let ts_bob = build_ts_event(
+        bob_addr,
+        10_100,
+        "bob",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: bob_cm_bytes,
+            share_bytes: bob_share_bytes,
+        },
+    );
+    let vb = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::VrfBeacon,
+        &VrfBeaconPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            signature: sig_bytes,
+            vrf_output,
+        },
+        hlc(10_200, "alice"),
+    )
+    .expect("sign vb");
+    {
+        let mut ag = alice_log.lock().await;
+        ag.apply(ts_alice).expect("alice applies ts_alice");
+        ag.apply(ts_bob).expect("alice applies ts_bob");
+        ag.apply(vb).expect("alice applies vb");
+    }
+
+    let req2 = bob_engine.catchup_build_request().await;
+    let frames2 = alice_engine
+        .catchup_respond(req2)
+        .await
+        .expect("alice has a new beacon to serve");
+    let outcome2 = bob_engine.catchup_ingest(wire_cross(frames2)).await;
+    assert_eq!(outcome2, CatchupOutcome::BeaconsOnly(1));
+    {
+        let bg = bob_log.lock().await;
+        assert_eq!(
+            bg.beacon_index.get(&message_hash),
+            Some(&vrf_output),
+            "bob's beacon_index must contain alice's beacon"
+        );
+    }
+}
+
+/// ZEB-1030 Task 5, Step 2: a fresh, never-seen-the-DKG log/engine adopts
+/// alice's committee state wholesale via catch-up, can then self-
+/// certify-verify a beacon alice mints afterward, and a fresh SECOND
+/// joiner presented with two disagreeing responder groups (alice's real
+/// one + a hand-built hostile one claiming a different joint vk) adopts
+/// nothing and stays inactive.
+#[tokio::test]
+async fn fresh_joiner_adopts_committee_state_zeb1030() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x61);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0x62);
+    let (mallory_sk, mallory_addr, mallory_pub64) = fixture_identity(0x63);
+
+    let alice_x = alice_x25519();
+    let bob_x = bob_x25519();
+    let mut c = dkg_2of2_setup_for(alice_addr, bob_addr, alice_x, bob_x, Vec::new());
+
+    // Re-mint alice's epoch-1 dk confirmations with REAL Ed25519
+    // signatures and seed them as ADDITIONAL retained history —
+    // `dkg_2of2_setup_for`'s own dk events use synthetic sigs (`apply()`
+    // never verifies them), but `catchup_respond`'s served events DO go
+    // through `verify_signed_committee_event`. `insert_event_for_test`
+    // only touches retained history, never `committee_state` (already
+    // correctly materialized by the real ceremony above) — same pattern
+    // as Task 3's `build_dk_quorum_fixture`. A later HLC than the
+    // originals (3_000/3_100) makes `select_catchup`'s newest-per-actor
+    // collapse pick these instead.
+    let verifying_shares: Vec<MemberVerifyingShare> = c
+        .engine_a
+        .committee_state
+        .verifying_shares
+        .iter()
+        .map(|(member, vs)| MemberVerifyingShare {
+            member: *member,
+            verifying_share: *vs,
+        })
+        .collect();
+    let dk_payload_e1 = DkgCompletePayload {
+        ceremony_id: CEREMONY_ID,
+        joint_verifying_key: c.joint_vk,
+        verifying_shares,
+        epoch: 1,
+        members: c.engine_a.committee_state.members.clone(),
+        threshold: c.engine_a.committee_state.threshold,
+        max_signers: c.engine_a.committee_state.max_signers,
+    };
+    let dk_alice_signed = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload_e1,
+        hlc(3_500, "alice"),
+    )
+    .expect("sign dk_alice e1");
+    let dk_bob_signed = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload_e1,
+        hlc(3_600, "bob"),
+    )
+    .expect("sign dk_bob e1");
+    c.engine_a.insert_event_for_test(dk_alice_signed);
+    c.engine_a.insert_event_for_test(dk_bob_signed);
+
+    let alice_log = Arc::new(Mutex::new(c.engine_a));
+    let community_id = SpaceId([0x7A; 16]);
+    let (a_pub_tx, _a_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_a_sub_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let alice_engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id,
+        dfrost_log: alice_log.clone(),
+        publisher_tx: a_pub_tx,
+        subscriber_rx: a_sub_rx,
+        app_handle: None,
+        self_addr: alice_addr,
+        self_x25519_priv: alice_x.0,
+        identity_resolver: resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: None,
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    // ── Fresh joiner C: catch-up → AdoptedInitial ───────────────────────
+    let c_log = Arc::new(Mutex::new(DfrostLog::new()));
+    let (c_pub_tx, _c_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_c_sub_tx, c_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let c_engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id,
+        dfrost_log: c_log.clone(),
+        publisher_tx: c_pub_tx,
+        subscriber_rx: c_sub_rx,
+        app_handle: None,
+        self_addr: OwnerAddr([0xC0; 16]),
+        self_x25519_priv: [0u8; 32],
+        identity_resolver: resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: None,
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let req = c_engine.catchup_build_request().await;
+    assert_eq!(req.epoch, 0);
+    assert!(!req.active);
+    let frames = alice_engine
+        .catchup_respond(req)
+        .await
+        .expect("alice serves a fresh joiner");
+    let outcome = c_engine.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedInitial { epoch: 1, .. }),
+        "expected AdoptedInitial at epoch 1, got {outcome:?}"
+    );
+    {
+        let cg = c_log.lock().await;
+        assert!(cg.committee_state.active);
+        assert_eq!(cg.committee_state.joint_verifying_key, Some(c.joint_vk));
+        assert_eq!(
+            cg.committee_state.identifier_map.len(),
+            2,
+            "identifier_map built for both members"
+        );
+    }
+
+    // ── C can now VERIFY an alice-minted beacon (self-certifying
+    //    adopt_beacons — no in-flight sign session of C's own needed) ──
+    let sign_ceremony_id: [u8; 32] = [0x64; 32];
+    let message_hash: [u8; 32] = [0x65; 32];
+    let (alice_nonces, alice_commitments) =
+        frost::round1::commit(c.alice_key_pkg.signing_share(), &mut rand_core::OsRng);
+    let (bob_nonces, bob_commitments) =
+        frost::round1::commit(c.bob_key_pkg.signing_share(), &mut rand_core::OsRng);
+    let mut alice_cm_bytes = Vec::new();
+    ciborium::into_writer(&alice_commitments, &mut alice_cm_bytes).expect("encode alice cm");
+    let mut bob_cm_bytes = Vec::new();
+    ciborium::into_writer(&bob_commitments, &mut bob_cm_bytes).expect("encode bob cm");
+    let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
+        BTreeMap::new();
+    commitments_map.insert(c.id_alice, alice_commitments);
+    commitments_map.insert(c.id_bob, bob_commitments);
+    let signing_package = frost::SigningPackage::new(commitments_map, &message_hash);
+    let alice_share = frost::round2::sign(&signing_package, &alice_nonces, &c.alice_key_pkg)
+        .expect("alice round2 sign");
+    let bob_share = frost::round2::sign(&signing_package, &bob_nonces, &c.bob_key_pkg)
+        .expect("bob round2 sign");
+    let mut alice_share_bytes = Vec::new();
+    ciborium::into_writer(&alice_share, &mut alice_share_bytes).expect("encode alice share");
+    let mut bob_share_bytes = Vec::new();
+    ciborium::into_writer(&bob_share, &mut bob_share_bytes).expect("encode bob share");
+    let mut shares_map: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
+    shares_map.insert(c.id_alice, alice_share);
+    shares_map.insert(c.id_bob, bob_share);
+    let group_signature = frost::aggregate(&signing_package, &shares_map, &c.pub_pkg)
+        .expect("aggregate threshold sig");
+    let sig_bytes = group_signature.serialize().expect("serialize sig");
+    let mut r_compressed = [0u8; 32];
+    r_compressed.copy_from_slice(&sig_bytes[..32]);
+    let vrf_output = derive_vrf_output(&r_compressed);
+
+    let ts_alice = build_ts_event(
+        alice_addr,
+        4_000,
+        "alice",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: alice_cm_bytes,
+            share_bytes: alice_share_bytes,
+        },
+    );
+    let ts_bob = build_ts_event(
+        bob_addr,
+        4_100,
+        "bob",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: bob_cm_bytes,
+            share_bytes: bob_share_bytes,
+        },
+    );
+    let vb = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::VrfBeacon,
+        &VrfBeaconPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            signature: sig_bytes,
+            vrf_output,
+        },
+        hlc(4_200, "alice"),
+    )
+    .expect("sign vb");
+    {
+        let mut ag = alice_log.lock().await;
+        ag.apply(ts_alice).expect("alice applies ts_alice");
+        ag.apply(ts_bob).expect("alice applies ts_bob");
+        ag.apply(vb).expect("alice applies vb");
+    }
+
+    let req2 = c_engine.catchup_build_request().await;
+    let frames2 = alice_engine
+        .catchup_respond(req2)
+        .await
+        .expect("alice has a new beacon to serve");
+    let outcome2 = c_engine.catchup_ingest(wire_cross(frames2)).await;
+    assert_eq!(outcome2, CatchupOutcome::BeaconsOnly(1));
+    {
+        let cg = c_log.lock().await;
+        assert_eq!(
+            cg.beacon_index.get(&message_hash),
+            Some(&vrf_output),
+            "C verified and indexed alice's beacon"
+        );
+    }
+
+    // ── Hostile second responder group: a fresh joiner D presented with
+    //    alice's real group PLUS a hand-built group (valid signature,
+    //    different joint vk) must adopt nothing and stay inactive. ─────
+    let hostile_payload = DkgCompletePayload {
+        ceremony_id: [0xee; 32],
+        joint_verifying_key: [0xee; 32],
+        verifying_shares: vec![MemberVerifyingShare {
+            member: mallory_addr,
+            verifying_share: [0xee; 32],
+        }],
+        epoch: 1,
+        members: vec![mallory_addr],
+        threshold: 1,
+        max_signers: 1,
+    };
+    let hostile_dk = build_signed_dfrost_event(
+        &mallory_sk,
+        mallory_addr,
+        DfrostEventKind::DkgComplete,
+        &hostile_payload,
+        hlc(9_000, "mallory"),
+    )
+    .expect("sign hostile dk");
+    let mut hostile_buf = Vec::new();
+    ciborium::ser::into_writer(&hostile_dk, &mut hostile_buf).expect("encode hostile dk");
+    let hostile_frames = vec![
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x99; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 1,
+                active: true,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x99; 8],
+            body: CatchupBody::DkEvidence(hostile_buf),
+        },
+    ];
+
+    let d_log = Arc::new(Mutex::new(DfrostLog::new()));
+    let (d_pub_tx, _d_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_d_sub_tx, d_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let d_engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id,
+        dfrost_log: d_log.clone(),
+        publisher_tx: d_pub_tx,
+        subscriber_rx: d_sub_rx,
+        app_handle: None,
+        self_addr: OwnerAddr([0xD0; 16]),
+        self_x25519_priv: [0u8; 32],
+        identity_resolver: resolver_with(&[
+            (alice_addr, alice_pub64),
+            (bob_addr, bob_pub64),
+            (mallory_addr, mallory_pub64),
+        ]),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: None,
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let req_d = d_engine.catchup_build_request().await;
+    let mut all_frames = alice_engine
+        .catchup_respond(req_d)
+        .await
+        .expect("alice serves D too");
+    all_frames.extend(hostile_frames);
+    let outcome_d = d_engine.catchup_ingest(wire_cross(all_frames)).await;
+    assert_eq!(outcome_d, CatchupOutcome::Disagreement);
+    {
+        let dg = d_log.lock().await;
+        assert!(!dg.committee_state.active, "D must stay inactive");
     }
 }
