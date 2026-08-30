@@ -1582,6 +1582,18 @@ async fn process_inbound<R: tauri::Runtime>(
 /// pre-empt, without reintroducing the amplification.
 const DFROST_CATCHUP_HINT_FLOOR: Duration = Duration::from_secs(60);
 
+/// This node's trusted wall clock in epoch-ms, `0` on unreadable — the
+/// convention every forward-skew gate on this plane shares (mirrors
+/// `community_voting_log_engine.rs`'s `receiver_now_ms` reads). Always
+/// `SystemTime`-derived, never a peer/HLC-adopt value: a skew bound
+/// only holds when measured against a clock the sender cannot move.
+fn trusted_now_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// ZEB-1030: an apply failure that smells like "the committee moved
 /// without us" (or "a committee exists we never saw") pulls the next
 /// catch-up attempt forward. Rate-limited; never fires for di/dk
@@ -2916,19 +2928,63 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         self.orchestrator.catchup_hint.clone()
     }
 
+    /// ZEB-1033: the catch-up protocol hooks the Zenoh adapter drives,
+    /// over a **`Weak`** engine reference. The registry owns the
+    /// engine's lifetime; the adapter's responder/requester tasks only
+    /// borrow it per call (upgrade-or-`EngineGone`), so an engine
+    /// dropped from the registry mid-session actually dies instead of
+    /// living on inside these closures until global shutdown, its
+    /// catch-up queryable answering with progressively stale epoch
+    /// claims. The `hint` field holds the orchestrator's `Notify`
+    /// directly (engine-independent — it must outlive the engine so the
+    /// Drop-fired wake below reaches a parked requester). Mirrors
+    /// `VotingLogEngine::adapter_closures` — the two planes move in
+    /// lockstep.
+    pub fn catchup_hooks(engine: &Arc<Self>) -> crate::event_loop::DfrostCatchupHooks {
+        use crate::event_loop::EngineHookResult;
+        let w_build = Arc::downgrade(engine);
+        let w_respond = Arc::downgrade(engine);
+        let w_ingest = Arc::downgrade(engine);
+        crate::event_loop::DfrostCatchupHooks {
+            build_request: Arc::new(move || {
+                let w = w_build.clone();
+                Box::pin(async move {
+                    match w.upgrade() {
+                        Some(e) => EngineHookResult::Alive(e.catchup_build_request().await),
+                        None => EngineHookResult::EngineGone,
+                    }
+                })
+            }),
+            respond: Arc::new(move |request| {
+                let w = w_respond.clone();
+                Box::pin(async move {
+                    match w.upgrade() {
+                        Some(e) => EngineHookResult::Alive(e.catchup_respond(request).await),
+                        None => EngineHookResult::EngineGone,
+                    }
+                })
+            }),
+            ingest: Arc::new(move |frames| {
+                let w = w_ingest.clone();
+                Box::pin(async move {
+                    match w.upgrade() {
+                        Some(e) => EngineHookResult::Alive(e.catchup_ingest(frames).await),
+                        None => EngineHookResult::EngineGone,
+                    }
+                })
+            }),
+            hint: engine.catchup_hint(),
+        }
+    }
+
     /// ZEB-1030: snapshot this node's committee epoch/active/watermark
     /// under one log lock, for use as a catch-up request.
     pub async fn catchup_build_request(&self) -> CatchupRequest {
         // ZEB-1030 final-review C1: this node's own trusted wall clock,
-        // fed to `beacon_watermark_of`'s forward-skew gate — same
-        // `SystemTime::now()`-only, 0-on-unreadable convention as
-        // `community_voting_log_engine.rs`'s `receiver_now_ms` reads.
-        // Never a peer/HLC-adopt value: the bound only holds if measured
+        // fed to `beacon_watermark_of`'s forward-skew gate. Never a
+        // peer/HLC-adopt value: the bound only holds if measured
         // against a clock the sender cannot move.
-        let now_wall_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_wall_ms = trusted_now_wall_ms();
         let log = self.dfrost_log.lock().await;
         CatchupRequest {
             version: CATCHUP_VERSION,
@@ -2946,7 +3002,14 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         let responder_id: [u8; 8] = rand::random();
         let sel = {
             let log = self.dfrost_log.lock().await;
-            select_catchup(&log, &req, MAX_CATCHUP_BEACONS_PER_ROUND)?
+            // ZEB-1035: the responder's trusted clock gates serving of
+            // forward-skewed retained beacons.
+            select_catchup(
+                &log,
+                &req,
+                MAX_CATCHUP_BEACONS_PER_ROUND,
+                trusted_now_wall_ms(),
+            )?
         };
 
         let mut frames = Vec::with_capacity(1 + sel.dk_events.len() + sel.beacons.len());
@@ -3151,7 +3214,9 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         }
         let (adopted, landed) = {
             let mut log = self.dfrost_log.lock().await;
-            let adopted = log.adopt_beacons(beacons);
+            // ZEB-1035: reject (skip, don't retain) forward-skewed
+            // envelopes at ingest admission — see `adopt_beacons`.
+            let adopted = log.adopt_beacons(beacons, trusted_now_wall_ms());
             let landed: Vec<SignedCommitteeEvent> = beacons
                 .iter()
                 .filter(|ev| log.contains_event(&dfrost_event_id(ev)))
@@ -3458,6 +3523,19 @@ impl<R: tauri::Runtime> Drop for DfrostLogEngine<R> {
         if let Some(p) = self.persist_handle.as_ref() {
             p.abort();
         }
+        // ZEB-1033: wake the catch-up requester parked on the hint so
+        // it discovers `EngineGone` (Weak upgrade failure in its hooks
+        // — see `catchup_hooks`) now instead of on its next interval
+        // tick. `notify_one`, not `notify_waiters` (PR #779 round-1):
+        // it STORES a permit when no waiter is registered yet, so a
+        // drop that races ahead of the requester's `notified()`
+        // registration is still observed on its very next wait instead
+        // of after a full `DFROST_CATCHUP_INTERVAL`. One-consumer
+        // invariant: the requester task is this Notify's only awaiter
+        // (`catchup_wait` in event_loop.rs); the live producer
+        // (`maybe_fire_catchup_hint`) already uses `notify_one` for
+        // the same reason.
+        self.orchestrator.catchup_hint.notify_one();
     }
 }
 
@@ -8358,10 +8436,14 @@ mod tests {
 
         let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x61);
 
-        // A: active committee at epoch 1 holding one garbage-signature
-        // `vb` event from alice. `select_catchup` never crypto-verifies
-        // beacons (pure selection) — the garbage inner signature is only
-        // caught by `adopt_beacons` on the requester side.
+        // A garbage-signature `vb` event from alice, envelope-stamped at
+        // wall_ms = u64::MAX. Delivered below as HAND-CRAFTED frames
+        // modeling a malicious responder: an honest responder no longer
+        // ships it (ZEB-1035 — `select_catchup`'s forward-skew gate
+        // withholds it) and the requester's `adopt_beacons` rejects it
+        // at ingest admission for the same reason — but a hostile
+        // responder controls its own frame set, so the tracker
+        // non-recording invariant must hold independently of both gates.
         let garbage_payload = VrfBeaconPayload {
             ceremony_id: [0x01; 32],
             message_hash: [0x02; 32],
@@ -8380,35 +8462,6 @@ mod tests {
             },
         )
         .expect("build garbage vb");
-
-        let mut a_log = crate::community_dfrost_log::DfrostLog::new();
-        a_log.committee_state.active = true;
-        a_log.committee_state.current_epoch = 1;
-        a_log.insert_event_for_test(garbage_beacon.clone());
-        let a_log = Arc::new(tokio::sync::Mutex::new(a_log));
-
-        let mut a_resolver_map = HashMap::new();
-        a_resolver_map.insert(alice_addr, alice_pub64);
-        let a_resolver: Arc<dyn IdentityResolver + Send + Sync> =
-            Arc::new(StaticResolver(a_resolver_map));
-        let (a_pub_tx, _a_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let (_a_sub_tx, a_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let a = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
-            community_id: crate::owner_state_types::SpaceId([0x61; 16]),
-            dfrost_log: a_log,
-            publisher_tx: a_pub_tx,
-            subscriber_rx: a_sub_rx,
-            app_handle: None,
-            self_addr: alice_addr,
-            self_x25519_priv: [0u8; 32],
-            identity_resolver: a_resolver,
-            registry_weak: None,
-            driver: None,
-            membership_resolver: None,
-            orchestrator_config: Default::default(),
-            persist: None,
-        })
-        .await;
 
         // B: active at the SAME epoch — no dk candidates, so ingest goes
         // straight to the beacons-only fallthrough.
@@ -8441,8 +8494,26 @@ mod tests {
         })
         .await;
 
-        let req = b.catchup_build_request().await;
-        let frames = a.catchup_respond(req).await.expect("A serves its beacon");
+        let mut ev_bytes = Vec::new();
+        ciborium::ser::into_writer(&garbage_beacon, &mut ev_bytes).expect("encode garbage vb");
+        let rid = [0x5c; 8];
+        let frames = vec![
+            crate::community_dfrost_catchup::CatchupFrame {
+                version: crate::community_dfrost_catchup::CATCHUP_VERSION,
+                responder_id: rid,
+                body: crate::community_dfrost_catchup::CatchupBody::Status(
+                    crate::community_dfrost_catchup::CatchupStatus {
+                        epoch: 1,
+                        active: true,
+                    },
+                ),
+            },
+            crate::community_dfrost_catchup::CatchupFrame {
+                version: crate::community_dfrost_catchup::CATCHUP_VERSION,
+                responder_id: rid,
+                body: crate::community_dfrost_catchup::CatchupBody::Beacon(ev_bytes),
+            },
+        ];
         let outcome = b.catchup_ingest(frames).await;
         assert_eq!(
             outcome,
@@ -8455,6 +8526,132 @@ mod tests {
             "an unadopted beacon must not advance the replay tracker — recording it would \
              permanently wedge every future event from this actor+device behind hlc::MAX",
         );
+    }
+
+    /// ZEB-1033: catch-up hooks capture the engine WEAKLY — once the
+    /// last strong `Arc` drops (registry teardown/replacement), every
+    /// hook reports `EngineGone` so the adapter's responder/requester
+    /// tasks exit, and the engine's `Drop` fires the catch-up hint so a
+    /// requester parked in `catchup_wait` wakes and discovers it
+    /// promptly instead of on its next 300 s interval tick.
+    #[tokio::test]
+    async fn catchup_hooks_report_engine_gone_after_drop_zeb1033() {
+        use crate::event_loop::EngineHookResult;
+
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0x33; 16]),
+            dfrost_log: log,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let hooks = DfrostLogEngine::catchup_hooks(&engine);
+
+        assert!(matches!(
+            (hooks.build_request)().await,
+            EngineHookResult::Alive(_)
+        ));
+
+        // Park a waiter on the hint BEFORE the drop; the engine's Drop
+        // must wake it. (Default #[tokio::test] runtime is
+        // current_thread, so yield_now deterministically drives the
+        // spawned waiter to its await point first.)
+        let waiter = tokio::spawn({
+            let hint = hooks.hint.clone();
+            async move { hint.notified().await }
+        });
+        tokio::task::yield_now().await;
+
+        drop(engine);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("engine Drop must fire the catch-up hint")
+            .expect("hint waiter join");
+
+        assert!(matches!(
+            (hooks.build_request)().await,
+            EngineHookResult::EngineGone
+        ));
+        assert!(matches!(
+            (hooks.respond)(crate::community_dfrost_catchup::CatchupRequest {
+                version: crate::community_dfrost_catchup::CATCHUP_VERSION,
+                epoch: 0,
+                active: false,
+                beacon_watermark: None,
+            })
+            .await,
+            EngineHookResult::EngineGone
+        ));
+        assert!(matches!(
+            (hooks.ingest)(Vec::new()).await,
+            EngineHookResult::EngineGone
+        ));
+    }
+
+    /// ZEB-1033 / PR #779 round-1 (CodeRabbit): the Drop-fired hint
+    /// must survive a drop that lands BEFORE the requester registers
+    /// its `notified()` — `notify_one` stores a permit when no waiter
+    /// is parked, so the requester's very next wait completes
+    /// immediately (and discovers `EngineGone`) instead of sleeping a
+    /// full `DFROST_CATCHUP_INTERVAL`.
+    #[tokio::test]
+    async fn catchup_hint_permit_survives_drop_before_wait_zeb1033() {
+        use crate::event_loop::EngineHookResult;
+
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: crate::owner_state_types::SpaceId([0x34; 16]),
+            dfrost_log: log,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let hooks = DfrostLogEngine::catchup_hooks(&engine);
+
+        // Drop with NO waiter registered — the permit must be stored.
+        drop(engine);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), hooks.hint.notified())
+            .await
+            .expect("a pre-registration drop must leave a stored permit for the next wait");
+        assert!(matches!(
+            (hooks.build_request)().await,
+            EngineHookResult::EngineGone
+        ));
     }
 
     /// I2 positive: every claimed committee member (including one whose

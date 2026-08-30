@@ -61052,29 +61052,12 @@ async fn ensure_dfrost_engine_for(
         return Ok(());
     };
 
-    // ZEB-1030: catch-up protocol closures over the same engine Arc — the
-    // adapter's catchup responder drives `respond`, the periodic requester
-    // drives `build_request`/`ingest`. Mirrors the voting RBSR hook
-    // construction in `ensure_voting_engine_for` (clone-per-closure over
-    // one shared engine).
-    let engine_for_catchup_build = std::sync::Arc::clone(&engine);
-    let engine_for_catchup_respond = std::sync::Arc::clone(&engine);
-    let engine_for_catchup_ingest = std::sync::Arc::clone(&engine);
-    let catchup_hooks = crate::event_loop::DfrostCatchupHooks {
-        build_request: std::sync::Arc::new(move || {
-            let e = std::sync::Arc::clone(&engine_for_catchup_build);
-            Box::pin(async move { e.catchup_build_request().await })
-        }),
-        respond: std::sync::Arc::new(move |request| {
-            let e = std::sync::Arc::clone(&engine_for_catchup_respond);
-            Box::pin(async move { e.catchup_respond(request).await })
-        }),
-        ingest: std::sync::Arc::new(move |frames| {
-            let e = std::sync::Arc::clone(&engine_for_catchup_ingest);
-            Box::pin(async move { e.catchup_ingest(frames).await })
-        }),
-        hint: engine.catchup_hint(),
-    };
+    // ZEB-1030: catch-up protocol hooks — the adapter's catchup responder
+    // drives `respond`, the periodic requester drives
+    // `build_request`/`ingest`. ZEB-1033: constructed over a Weak engine
+    // reference (`catchup_hooks` on the engine), so the adapter's tasks
+    // never extend the engine's lifetime past its registry ownership.
+    let catchup_hooks = crate::community_dfrost_log_engine::DfrostLogEngine::catchup_hooks(&engine);
 
     // A send failure means the event loop's receiver is gone (shutdown /
     // restart teardown racing this ensure). Unlike the voting path's
@@ -61315,44 +61298,14 @@ async fn ensure_voting_engine_for(
         .await;
     }
 
-    // ZEB-718: backfill closures capture the engine so the adapter's
-    // responder can read live events and its requester can apply recovered
-    // frames through the engine's coordinate-dedup path.
-    let engine_for_backfill_read = std::sync::Arc::clone(&engine);
-    let read_for_backfill: crate::event_loop::VotingBackfillReadFn =
-        std::sync::Arc::new(move || {
-            let e = std::sync::Arc::clone(&engine_for_backfill_read);
-            Box::pin(async move { e.read_backfill_frames().await })
-        });
-    let engine_for_backfill_apply = std::sync::Arc::clone(&engine);
-    let apply_backfilled: crate::event_loop::VotingBackfillApplyFn =
-        std::sync::Arc::new(move |frame: Vec<u8>| {
-            let e = std::sync::Arc::clone(&engine_for_backfill_apply);
-            Box::pin(async move {
-                let _ = e.apply_backfilled_event(&frame).await;
-            })
-        });
-
-    // ZEB-932: RBSR protocol closures over the same engine — the adapter's
-    // rbsr responder drives `respond`, the RBSR-first requester drives
-    // `initial`/`process_reply`. Crypto (seal/open) is applied in the adapter.
-    let engine_for_rbsr_initial = std::sync::Arc::clone(&engine);
-    let engine_for_rbsr_respond = std::sync::Arc::clone(&engine);
-    let engine_for_rbsr_process = std::sync::Arc::clone(&engine);
-    let rbsr_hooks = crate::event_loop::VotingRbsrHooks {
-        initial: std::sync::Arc::new(move || {
-            let e = std::sync::Arc::clone(&engine_for_rbsr_initial);
-            Box::pin(async move { e.rbsr_initial().await })
-        }),
-        respond: std::sync::Arc::new(move |request| {
-            let e = std::sync::Arc::clone(&engine_for_rbsr_respond);
-            Box::pin(async move { e.rbsr_respond(&request).await })
-        }),
-        process_reply: std::sync::Arc::new(move |reply| {
-            let e = std::sync::Arc::clone(&engine_for_rbsr_process);
-            Box::pin(async move { e.rbsr_process_reply(&reply).await })
-        }),
-    };
+    // ZEB-718 backfill closures + ZEB-932 RBSR protocol closures — the
+    // adapter's responders drive `read`/`respond`, its requester drives
+    // `apply`/`initial`/`process_reply`; crypto (seal/open) stays in the
+    // adapter. ZEB-1033: constructed over Weak engine references
+    // (`adapter_closures` on the engine), so the adapter's tasks never
+    // extend the engine's lifetime past its map ownership.
+    let (read_for_backfill, apply_backfilled, rbsr_hooks) =
+        crate::community_voting_log_engine::VotingLogEngine::adapter_closures(&engine);
 
     // Build the adapter request now but do NOT send yet — we only send if
     // we win the engine map insertion below. This closes the TOCTOU window

@@ -164,13 +164,33 @@ pub struct CommunityRootFetchRequest {
     pub report: tokio::sync::oneshot::Sender<usize>,
 }
 
+/// ZEB-1033: the result of one engine-hook invocation.
+///
+/// Hook closures capture a `Weak` of their engine — see
+/// `VotingLogEngine::adapter_closures` and
+/// `DfrostLogEngine::catchup_hooks`, the only production constructors —
+/// never a strong `Arc`: an engine's lifetime is owned by its registry,
+/// and the transport tasks only borrow it per call. `EngineGone` means
+/// the upgrade failed because the registry dropped the engine; the
+/// calling task must EXIT, not retry — hooks are bound to one engine
+/// for life, and a replacement engine's ensure path sends a brand-new
+/// adapter request carrying fresh hooks. (Pre-1033, these closures held
+/// strong `Arc`s, so a dropped-from-registry engine — and its queryable,
+/// answering with progressively stale state — survived until the event
+/// loop's global `closing`.)
+pub enum EngineHookResult<T> {
+    Alive(T),
+    EngineGone,
+}
+
 /// ZEB-718: closure the backfill responder calls to read the engine's
 /// live voting events as plaintext `SignedVotingEvent` CBOR frames. The
 /// adapter re-encrypts each frame under the **current** epoch before
 /// replying, so it passes the requester's current-epoch cut.
 pub type VotingBackfillReadFn = std::sync::Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
-        + Send
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = EngineHookResult<Vec<Vec<u8>>>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -181,7 +201,10 @@ pub type VotingBackfillReadFn = std::sync::Arc<
 /// it uses `process_reply`'s post-apply `missing` count, which also catches
 /// bodies that never reached here.)
 pub type VotingBackfillApplyFn = std::sync::Arc<
-    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    dyn Fn(
+            Vec<u8>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = EngineHookResult<()>> + Send>>
         + Send
         + Sync,
 >;
@@ -196,9 +219,14 @@ pub type VotingBackfillApplyFn = std::sync::Arc<
 /// already been applied via the backfill apply path).
 #[derive(Clone)]
 pub struct VotingRbsrHooks {
+    #[allow(clippy::type_complexity)]
     pub initial: std::sync::Arc<
         dyn Fn() -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::channel_rbsr::RbsrMessage> + Send>,
+                Box<
+                    dyn std::future::Future<
+                            Output = EngineHookResult<crate::channel_rbsr::RbsrMessage>,
+                        > + Send,
+                >,
             > + Send
             + Sync,
     >,
@@ -209,7 +237,9 @@ pub struct VotingRbsrHooks {
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                            Output = Option<(crate::channel_rbsr::RbsrMessage, Vec<Vec<u8>>)>,
+                            Output = EngineHookResult<
+                                Option<(crate::channel_rbsr::RbsrMessage, Vec<Vec<u8>>)>,
+                            >,
                         > + Send,
                 >,
             > + Send
@@ -222,7 +252,10 @@ pub struct VotingRbsrHooks {
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                            Output = (usize, Option<crate::channel_rbsr::RbsrMessage>),
+                            Output = EngineHookResult<(
+                                usize,
+                                Option<crate::channel_rbsr::RbsrMessage>,
+                            )>,
                         > + Send,
                 >,
             > + Send
@@ -283,7 +316,9 @@ pub struct DfrostCatchupHooks {
         dyn Fn() -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                            Output = crate::community_dfrost_catchup::CatchupRequest,
+                            Output = EngineHookResult<
+                                crate::community_dfrost_catchup::CatchupRequest,
+                            >,
                         > + Send,
                 >,
             > + Send
@@ -296,7 +331,9 @@ pub struct DfrostCatchupHooks {
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                            Output = Option<Vec<crate::community_dfrost_catchup::CatchupFrame>>,
+                            Output = EngineHookResult<
+                                Option<Vec<crate::community_dfrost_catchup::CatchupFrame>>,
+                            >,
                         > + Send,
                 >,
             > + Send
@@ -309,7 +346,9 @@ pub struct DfrostCatchupHooks {
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
-                            Output = crate::community_dfrost_log_engine::CatchupOutcome,
+                            Output = EngineHookResult<
+                                crate::community_dfrost_log_engine::CatchupOutcome,
+                            >,
                         > + Send,
                 >,
             > + Send
@@ -11191,6 +11230,9 @@ enum VotingReconcileOutcome {
     /// A responder answered but the exchange failed (extra reply, round cap,
     /// seal/get failure) — fall back to the full dump.
     Failed,
+    /// ZEB-1033: a hook reported its engine dropped from the registry —
+    /// the requester task must exit (no fallback, no next tick).
+    EngineGone,
 }
 
 /// ZEB-932: decide whether to run the full-dump backstop this tick. RBSR is
@@ -11235,7 +11277,10 @@ async fn drive_voting_rbsr(
     apply_backfilled: &VotingBackfillApplyFn,
     closing: &AtomicBool,
 ) -> VotingReconcileOutcome {
-    let mut request = (hooks.initial)().await;
+    let mut request = match (hooks.initial)().await {
+        EngineHookResult::Alive(r) => r,
+        EngineHookResult::EngineGone => return VotingReconcileOutcome::EngineGone,
+    };
     let mut round: u32 = 0;
     // ZEB-932: if any advertised Have key is still absent from our set AFTER
     // applying this reconcile's bodies, do NOT report convergence.
@@ -11301,7 +11346,9 @@ async fn drive_voting_rbsr(
                         // Applied-or-not is confirmed after the round via
                         // process_reply's post-apply `missing` count, which also
                         // catches bodies that never reached here.
-                        (apply_backfilled)(plaintext).await;
+                        if let EngineHookResult::EngineGone = (apply_backfilled)(plaintext).await {
+                            return VotingReconcileOutcome::EngineGone;
+                        }
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
@@ -11324,7 +11371,10 @@ async fn drive_voting_rbsr(
                 VotingReconcileOutcome::Failed
             };
         };
-        let (missing, next) = (hooks.process_reply)(reply_msg).await;
+        let (missing, next) = match (hooks.process_reply)(reply_msg).await {
+            EngineHookResult::Alive(v) => v,
+            EngineHookResult::EngineGone => return VotingReconcileOutcome::EngineGone,
+        };
         if missing > 0 {
             // The responder advertised Have keys we still don't have after
             // applying — some body never landed. Don't trust convergence.
@@ -11522,7 +11572,19 @@ pub fn spawn_voting_log_zenoh_adapter(
                     biased;
                     res = qbl.recv_async() => {
                         let Ok(query) = res else { break; };
-                        let frames = (read_for_backfill)().await;
+                        let frames = match (read_for_backfill)().await {
+                            EngineHookResult::Alive(f) => f,
+                            EngineHookResult::EngineGone => {
+                                // ZEB-1033: registry dropped the engine —
+                                // stop serving; a replacement engine gets
+                                // its own adapter + hooks.
+                                tracing::debug!(
+                                    topic = %backfill_topic_qbl,
+                                    "voting backfill responder exiting: engine gone"
+                                );
+                                return;
+                            }
+                        };
                         let mut served_frames = 0usize;
                         let mut served_bytes = 0usize;
                         for frame in frames {
@@ -11617,8 +11679,18 @@ pub fn spawn_voting_log_zenoh_adapter(
                             else {
                                 continue;
                             };
-                            let Some((reply_msg, bodies)) = (respond)(request).await else {
-                                continue;
+                            let (reply_msg, bodies) = match (respond)(request).await {
+                                EngineHookResult::Alive(Some(v)) => v,
+                                EngineHookResult::Alive(None) => continue,
+                                EngineHookResult::EngineGone => {
+                                    // ZEB-1033: engine dropped from the
+                                    // registry — stop answering.
+                                    tracing::debug!(
+                                        topic = %rbsr_topic_resp,
+                                        "voting rbsr responder exiting: engine gone"
+                                    );
+                                    return;
+                                }
                             };
                             let Some(frames) = voting_rbsr_seal_reply_and_bodies(
                                 &crdt_state_rbsr, community_id, &reply_msg, &bodies,
@@ -11677,6 +11749,15 @@ pub fn spawn_voting_log_zenoh_adapter(
                 if closing_req.load(Ordering::SeqCst) {
                     return;
                 }
+                if matches!(outcome, VotingReconcileOutcome::EngineGone) {
+                    // ZEB-1033: engine dropped from the registry — exit
+                    // instead of falling back to the full dump.
+                    tracing::debug!(
+                        topic = %backfill_topic_req,
+                        "voting backfill requester exiting: engine gone"
+                    );
+                    return;
+                }
 
                 // 2) Full-dump backstop / fallback.
                 if need_full_dump(outcome, since_full, VOTING_FULL_DUMP_BACKSTOP_TICKS) {
@@ -11723,7 +11804,12 @@ pub fn spawn_voting_log_zenoh_adapter(
                                             if let Some(plaintext) = voting_decrypt_current_epoch_cut(
                                                 &crdt_state_req, community_id, &raw,
                                             ).await {
-                                                (apply_backfilled)(plaintext).await;
+                                                if let EngineHookResult::EngineGone =
+                                                    (apply_backfilled)(plaintext).await
+                                                {
+                                                    // ZEB-1033: engine gone — exit the task.
+                                                    return;
+                                                }
                                             }
                                         }
                                     }
@@ -12496,8 +12582,20 @@ pub fn spawn_dfrost_log_zenoh_adapter(
                                 ).await else {
                                     continue;
                                 };
-                                let Some(frames) = (respond)(request).await else {
-                                    continue;
+                                let frames = match (respond)(request).await {
+                                    EngineHookResult::Alive(Some(f)) => f,
+                                    EngineHookResult::Alive(None) => continue,
+                                    EngineHookResult::EngineGone => {
+                                        // ZEB-1033: engine dropped from the
+                                        // registry — stop answering; a
+                                        // replacement engine gets its own
+                                        // adapter + hooks.
+                                        tracing::debug!(
+                                            topic = %catchup_topic_resp,
+                                            "dfrost catchup responder exiting: engine gone"
+                                        );
+                                        return;
+                                    }
                                 };
                                 let Some(wires) = dfrost_catchup_seal_reply(
                                     &crdt_state_catchup, community_id, &frames,
@@ -12550,7 +12648,20 @@ pub fn spawn_dfrost_log_zenoh_adapter(
                     if closing_req_c.load(Ordering::SeqCst) {
                         return;
                     }
-                    let request = (hooks.build_request)().await;
+                    let request = match (hooks.build_request)().await {
+                        EngineHookResult::Alive(r) => r,
+                        EngineHookResult::EngineGone => {
+                            // ZEB-1033: engine dropped from the registry —
+                            // exit (the engine's Drop fires the hint, so a
+                            // requester parked in catchup_wait wakes and
+                            // lands here promptly).
+                            tracing::debug!(
+                                topic = %catchup_topic_req,
+                                "dfrost catchup requester exiting: engine gone"
+                            );
+                            return;
+                        }
+                    };
                     if let Some(sealed) =
                         dfrost_catchup_seal_request(&crdt_state_req_c, community_id, &request)
                             .await
@@ -12577,7 +12688,13 @@ pub fn spawn_dfrost_log_zenoh_adapter(
                                 }
                             }
                             if !frames.is_empty() {
-                                let outcome = (hooks.ingest)(frames).await;
+                                let outcome = match (hooks.ingest)(frames).await {
+                                    EngineHookResult::Alive(o) => o,
+                                    EngineHookResult::EngineGone => {
+                                        // ZEB-1033: engine gone — exit the task.
+                                        return;
+                                    }
+                                };
                                 match outcome {
                                     crate::community_dfrost_log_engine::CatchupOutcome::AdoptedRefresh { .. }
                                     | crate::community_dfrost_log_engine::CatchupOutcome::AdoptedInitial { .. } => {

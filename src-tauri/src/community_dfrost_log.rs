@@ -750,6 +750,41 @@ impl DfrostLog {
         self.beacon_index.get(&message_hash).copied()
     }
 
+    /// ZEB-1032: deterministic, commutative beacon-index tie-break — the
+    /// bytewise-minimum `vrf_output` wins, on EVERY indexing path (live
+    /// `apply_vrf_beacon` and catch-up `adopt_beacons`).
+    ///
+    /// Two concurrent threshold-sign ceremonies over the same seed
+    /// produce two independently-valid beacons for one `message_hash`
+    /// (distinct ceremony ids, fresh nonces → distinct `R` → distinct
+    /// `vrf_output`, both Schnorr-valid under the joint vk). The old
+    /// postures — last-wins on the live path, first-wins on the adopt
+    /// path — both indexed whichever beacon a replica happened to see
+    /// first/last, so replicas diverged on the value driving sortition
+    /// (`find_vrf_beacon_output_by_seed`). Min is order-independent, so
+    /// every replica converges on the same value regardless of arrival
+    /// order — and downgrade-capable, so a replica that indexed the
+    /// larger output self-heals the moment the smaller one is re-applied
+    /// or re-served through catch-up.
+    ///
+    /// Returns `true` when the index changed (fresh insert or downgrade).
+    fn index_beacon_min_wins(&mut self, message_hash: [u8; 32], vrf_output: [u8; 32]) -> bool {
+        match self.beacon_index.entry(message_hash) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(vrf_output);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if vrf_output < *slot.get() {
+                    slot.insert(vrf_output);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     /// Apply a single committee event. Caller has already verified the
     /// Ed25519 envelope signature and any kind-specific membership /
     /// authorization rules. This function only handles the
@@ -1302,7 +1337,8 @@ impl DfrostLog {
     }
 
     /// ZEB-1030: adopt self-certifying beacons. Per-event failures skip
-    /// that event (each is independent). Returns newly-indexed count.
+    /// that event (each is independent). Returns the count of index
+    /// changes (fresh inserts + min-wins downgrades).
     ///
     /// Unlike `apply_vrf_beacon`, this deliberately does NOT require a
     /// matching `pending_sign` session — that is the whole point of a
@@ -1311,18 +1347,24 @@ impl DfrostLog {
     /// straggler catching up cold (no in-flight sign session of its own)
     /// can still adopt it. `pending_sign` is never touched.
     ///
-    /// Tie posture: indexing is first-wins (`beacon_index` is never
-    /// overwritten once a `message_hash` is populated), deliberately
-    /// conservative given this path has no session to arbitrate between
-    /// two independently-valid beacons over the same message. Note that
-    /// the LIVE `apply_vrf_beacon` path is last-wins and is already
-    /// arrival-order-dependent across replicas when two concurrent
-    /// signing ceremonies complete over the same seed — so this is not
-    /// a new divergence class, just a differently-shaped instance of a
-    /// pre-existing one. A deterministic tie-break for BOTH paths (e.g.
-    /// min `vrf_output`) is tracked as ZEB-1032; `apply_vrf_beacon` is
-    /// intentionally left unchanged here.
-    pub fn adopt_beacons(&mut self, events: &[SignedCommitteeEvent]) -> usize {
+    /// Tie posture (ZEB-1032): min-wins on BOTH indexing paths — see
+    /// `index_beacon_min_wins`. The pre-1032 postures (first-wins here,
+    /// last-wins on the live path) were each arrival-order-dependent,
+    /// so a caught-up replica and an always-online replica could
+    /// converge on different sortition values for the same event set.
+    ///
+    /// ZEB-1035: `now_wall_ms` (this node's trusted wall clock; `0` =
+    /// clock unreadable ⇒ gate disabled, the voting plane's
+    /// `receiver_now_ms` convention) drives an ingest-admission
+    /// forward-skew gate: an event whose envelope HLC is implausibly
+    /// future is REJECTED outright — neither indexed nor retained.
+    /// Retaining it would make this node re-serve it forever, since it
+    /// sorts above every requester's (correctly skew-capped, see
+    /// `beacon_watermark_of`) watermark. This is the voting plane's
+    /// ingest-admission reject, not a store purge — the house
+    /// VIEW-not-store rule governs events already retained, and REJECT
+    /// (never clamp) per the grow-only-register rule.
+    pub fn adopt_beacons(&mut self, events: &[SignedCommitteeEvent], now_wall_ms: u64) -> usize {
         use crate::community_dfrost_types::{derive_vrf_output, VrfBeaconPayload};
 
         if !self.committee_state.active {
@@ -1335,6 +1377,19 @@ impl DfrostLog {
         let mut newly_indexed = 0usize;
         for event in events {
             if event.kind != DfrostEventKind::VrfBeacon {
+                continue;
+            }
+            // ZEB-1035: forward-skew ingest-admission gate — see the
+            // doc comment above. Cheapest check first, before any
+            // decode/crypto work on a peer-controlled stamp.
+            if now_wall_ms != 0
+                && crate::clock_trust::reject_future_logged(
+                    event.hlc.wall_ms,
+                    now_wall_ms,
+                    crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                    "dfrost_catchup.adopt_beacons.envelope_hlc",
+                )
+            {
                 continue;
             }
             let payload: VrfBeaconPayload = match ciborium::de::from_reader(&event.payload[..]) {
@@ -1374,10 +1429,7 @@ impl DfrostLog {
                 continue;
             }
 
-            if let std::collections::hash_map::Entry::Vacant(slot) =
-                self.beacon_index.entry(payload.message_hash)
-            {
-                slot.insert(payload.vrf_output);
+            if self.index_beacon_min_wins(payload.message_hash, payload.vrf_output) {
                 newly_indexed += 1;
             }
             if !self.log.contains(&dfrost_event_id(event)) {
@@ -2087,9 +2139,9 @@ impl DfrostLog {
         // Index the completed beacon so `find_vrf_beacon_output_by_seed` can
         // answer oracle lookups without re-scanning `events`. Key is
         // `message_hash` (= `derive_vrf_seed(seed_bytes, epoch)`); value is
-        // the verified `vrf_output`. Inserted before clearing pending_sign.
-        self.beacon_index
-            .insert(payload.message_hash, payload.vrf_output);
+        // the verified `vrf_output` — min-wins across every indexing path
+        // (ZEB-1032). Indexed before clearing pending_sign.
+        self.index_beacon_min_wins(payload.message_hash, payload.vrf_output);
 
         // Clear the pending sign session — the ceremony is now finalised
         // on this replica.
@@ -7506,7 +7558,7 @@ mod tests {
             sig: vec![0u8; 64],
         };
         let mut inactive_log = DfrostLog::new();
-        assert_eq!(inactive_log.adopt_beacons(&[inactive_ev]), 0);
+        assert_eq!(inactive_log.adopt_beacons(&[inactive_ev], 0), 0);
 
         let message_hash = [0x33u8; 32];
         let mut rng = frost_ristretto255::rand_core::OsRng;
@@ -7561,12 +7613,12 @@ mod tests {
         };
         let ev = build_event(5_000, &good_payload);
 
-        assert_eq!(log.adopt_beacons(std::slice::from_ref(&ev)), 1);
+        assert_eq!(log.adopt_beacons(std::slice::from_ref(&ev), 0), 1);
         assert_eq!(log.beacon_index.get(&message_hash), Some(&vrf_output));
         assert_eq!(log.event_count(), 1);
 
         // Idempotent re-adopt.
-        assert_eq!(log.adopt_beacons(std::slice::from_ref(&ev)), 0);
+        assert_eq!(log.adopt_beacons(std::slice::from_ref(&ev), 0), 0);
         assert_eq!(log.event_count(), 1);
 
         // Tampered signature (flip a byte in the `s` half) — the
@@ -7581,7 +7633,7 @@ mod tests {
             vrf_output,
         };
         let tampered_ev = build_event(5_001, &tampered_payload);
-        assert_eq!(log.adopt_beacons(&[tampered_ev]), 0);
+        assert_eq!(log.adopt_beacons(&[tampered_ev], 0), 0);
 
         // Wrong vrf_output (R-binding check fails).
         let wrong_payload = VrfBeaconPayload {
@@ -7591,7 +7643,7 @@ mod tests {
             vrf_output: [0x00; 32],
         };
         let wrong_ev = build_event(5_002, &wrong_payload);
-        assert_eq!(log.adopt_beacons(&[wrong_ev]), 0);
+        assert_eq!(log.adopt_beacons(&[wrong_ev], 0), 0);
 
         // Wrong-length signature (63 bytes) — rejected before any crypto.
         let mut short_sig = sig_bytes.clone();
@@ -7604,11 +7656,12 @@ mod tests {
             vrf_output,
         };
         let short_ev = build_event(5_004, &short_payload);
-        assert_eq!(log.adopt_beacons(&[short_ev]), 0);
+        assert_eq!(log.adopt_beacons(&[short_ev], 0), 0);
 
         // A second VALID signature over the SAME message_hash (fresh
-        // FROST nonces → a different R, hence a different vrf_output)
-        // must NOT overwrite the first-wins index entry.
+        // FROST nonces → a different R, hence a different vrf_output):
+        // min-wins (ZEB-1032) — the index converges on the bytewise
+        // smaller output, changing iff the newcomer is smaller.
         let mut rng2 = frost_ristretto255::rand_core::OsRng;
         let mut nonces2 = BTreeMap::new();
         let mut commitments2 = BTreeMap::new();
@@ -7644,15 +7697,16 @@ mod tests {
             vrf_output: vrf_output2,
         };
         let second_ev = build_event(5_005, &second_payload);
+        let expect_downgrade = vrf_output2 < vrf_output;
         assert_eq!(
-            log.adopt_beacons(&[second_ev]),
-            0,
-            "already-indexed message_hash is first-wins"
+            log.adopt_beacons(&[second_ev], 0),
+            usize::from(expect_downgrade),
+            "min-wins: a second valid beacon changes the index iff its output is smaller (ZEB-1032)"
         );
         assert_eq!(
             log.beacon_index.get(&message_hash),
-            Some(&vrf_output),
-            "index value unchanged by the second, later-arriving valid signature"
+            Some(&std::cmp::min(vrf_output, vrf_output2)),
+            "index converges on the bytewise-minimum output (ZEB-1032)"
         );
 
         // pending_sign was never touched by any of the above.
@@ -7667,9 +7721,247 @@ mod tests {
             vrf_output: [0x00; 32],
         };
         let bad_ev = build_event(5_003, &bogus_payload);
-        assert_eq!(fresh_log.adopt_beacons(&[ev.clone(), bad_ev]), 1);
+        assert_eq!(fresh_log.adopt_beacons(&[ev.clone(), bad_ev], 0), 1);
         assert_eq!(fresh_log.beacon_index.get(&message_hash), Some(&vrf_output));
         assert_eq!(fresh_log.event_count(), 1);
+    }
+
+    /// ZEB-1032: the beacon index must converge on the bytewise-minimum
+    /// `vrf_output` regardless of arrival order and regardless of which
+    /// path (live `apply_vrf_beacon` / catch-up `adopt_beacons`)
+    /// delivered each beacon — the reviewer probe on ZEB-1030 showed a
+    /// caught-up replica (first-wins adopt) and an always-online replica
+    /// (last-wins live apply) indexing different sortition values for
+    /// the same two-beacon event set.
+    #[test]
+    fn beacon_index_min_wins_across_paths_and_orders_zeb1032() {
+        use crate::community_dfrost_types::{derive_vrf_output, VrfBeaconPayload};
+        use crate::owner_state_types::Hlc;
+
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let message_hash = [0x5a; 32];
+
+        // Two independently-valid FROST threshold signatures over the
+        // SAME message (two concurrent ceremonies: fresh nonces each →
+        // distinct R → distinct vrf_output, both Schnorr-valid).
+        let sign_once = || {
+            let mut rng = frost_ristretto255::rand_core::OsRng;
+            let mut nonces = BTreeMap::new();
+            let mut commitments = BTreeMap::new();
+            for id in &ids[..2] {
+                let kp = key_packages.get(id).unwrap();
+                let (n, c) = frost_ristretto255::round1::commit(kp.signing_share(), &mut rng);
+                nonces.insert(*id, n);
+                commitments.insert(*id, c);
+            }
+            let signing_package =
+                frost_ristretto255::SigningPackage::new(commitments, &message_hash);
+            let mut shares = BTreeMap::new();
+            for id in &ids[..2] {
+                let kp = key_packages.get(id).unwrap();
+                shares.insert(
+                    *id,
+                    frost_ristretto255::round2::sign(&signing_package, nonces.get(id).unwrap(), kp)
+                        .expect("round2 sign"),
+                );
+            }
+            let sig = frost_ristretto255::aggregate(&signing_package, &shares, &pub_pkg)
+                .expect("aggregate");
+            let sig_bytes = sig.serialize().expect("sig serialize");
+            let r: [u8; 32] = sig_bytes[..32].try_into().unwrap();
+            (sig_bytes, derive_vrf_output(&r))
+        };
+        let (sig_a, out_a) = sign_once();
+        let (sig_b, out_b) = sign_once();
+        assert_ne!(out_a, out_b, "fresh nonces must yield distinct outputs");
+        let min_out = std::cmp::min(out_a, out_b);
+
+        let vb_event = |ceremony_id: [u8; 32], wall: u64, sig: &[u8], out: [u8; 32]| {
+            let payload = VrfBeaconPayload {
+                ceremony_id,
+                message_hash,
+                signature: sig.to_vec(),
+                vrf_output: out,
+            };
+            let mut pd = Vec::new();
+            ciborium::into_writer(&payload, &mut pd).unwrap();
+            SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: DfrostEventKind::VrfBeacon,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                actor: members[0],
+                payload: pd,
+                sig: vec![0u8; 64],
+            }
+        };
+        let seed_session = |log: &mut DfrostLog, cid: [u8; 32]| {
+            log.committee_state.pending_sign.insert(
+                cid,
+                PendingSignSession {
+                    message_hash,
+                    contributions: BTreeMap::new(),
+                    local_nonces: None,
+                },
+            );
+        };
+        let both_orders = [
+            ((sig_a.clone(), out_a), (sig_b.clone(), out_b)),
+            ((sig_b.clone(), out_b), (sig_a.clone(), out_a)),
+        ];
+
+        // Adopt path: both orders converge on the min; the change count
+        // reflects whether the newcomer actually changed the index.
+        for (first, second) in &both_orders {
+            let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+            assert_eq!(
+                log.adopt_beacons(&[vb_event([0xc1; 32], 1_000, &first.0, first.1)], 0),
+                1
+            );
+            assert_eq!(
+                log.adopt_beacons(&[vb_event([0xc2; 32], 1_001, &second.0, second.1)], 0),
+                usize::from(second.1 < first.1)
+            );
+            assert_eq!(log.beacon_index.get(&message_hash), Some(&min_out));
+        }
+
+        // Live path: both orders converge on the min. Each apply consumes
+        // its own pending_sign session (distinct ceremony ids pinning the
+        // SAME message_hash — exactly the concurrent-ceremony race).
+        for (first, second) in &both_orders {
+            let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+            seed_session(&mut log, [0xd1; 32]);
+            seed_session(&mut log, [0xd2; 32]);
+            log.apply(vb_event([0xd1; 32], 2_000, &first.0, first.1))
+                .unwrap();
+            log.apply(vb_event([0xd2; 32], 2_001, &second.0, second.1))
+                .unwrap();
+            assert_eq!(log.beacon_index.get(&message_hash), Some(&min_out));
+        }
+
+        // Cross-path, both directions.
+        let (hi, lo) = if out_a < out_b {
+            ((sig_b, out_b), (sig_a, out_a))
+        } else {
+            ((sig_a, out_a), (sig_b, out_b))
+        };
+        // (1) Live-applied larger output, then catch-up serves the
+        //     smaller → adopt downgrades (self-heal for replicas that
+        //     indexed the larger arrival first).
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        seed_session(&mut log, [0xe1; 32]);
+        log.apply(vb_event([0xe1; 32], 3_000, &hi.0, hi.1)).unwrap();
+        assert_eq!(log.beacon_index.get(&message_hash), Some(&hi.1));
+        assert_eq!(
+            log.adopt_beacons(&[vb_event([0xe2; 32], 3_001, &lo.0, lo.1)], 0),
+            1,
+            "adopt downgrades a larger live-indexed output (ZEB-1032 self-heal)"
+        );
+        assert_eq!(log.beacon_index.get(&message_hash), Some(&min_out));
+        // (2) Adopted the smaller first; a later live apply of the larger
+        //     must not regress the index.
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        assert_eq!(
+            log.adopt_beacons(&[vb_event([0xf1; 32], 4_000, &lo.0, lo.1)], 0),
+            1
+        );
+        seed_session(&mut log, [0xf2; 32]);
+        log.apply(vb_event([0xf2; 32], 4_001, &hi.0, hi.1)).unwrap();
+        assert_eq!(
+            log.beacon_index.get(&message_hash),
+            Some(&min_out),
+            "live apply must not overwrite a smaller indexed output (ZEB-1032)"
+        );
+    }
+
+    /// ZEB-1035: `adopt_beacons` REJECTS (skips — neither indexes nor
+    /// retains) an event whose envelope HLC is beyond the forward-skew
+    /// tolerance. Retaining it would mean re-serving it forever: it
+    /// sorts above every requester's (skew-capped, per ZEB-1030
+    /// final-review C1) watermark, so `select_catchup` would ship it
+    /// every round and the fully-current short-circuit would never fire.
+    #[test]
+    fn adopt_beacons_rejects_forward_skewed_envelope_zeb1035() {
+        use crate::community_dfrost_types::{derive_vrf_output, VrfBeaconPayload};
+        use crate::owner_state_types::Hlc;
+
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let message_hash = [0x6b; 32];
+
+        // One real threshold signature, re-wrapped at different envelope
+        // HLCs below (adopt_beacons verifies the payload; the envelope
+        // stamp is whatever the re-broadcaster chose).
+        let mut rng = frost_ristretto255::rand_core::OsRng;
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            let (n, c) = frost_ristretto255::round1::commit(kp.signing_share(), &mut rng);
+            nonces.insert(*id, n);
+            commitments.insert(*id, c);
+        }
+        let signing_package = frost_ristretto255::SigningPackage::new(commitments, &message_hash);
+        let mut shares = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            shares.insert(
+                *id,
+                frost_ristretto255::round2::sign(&signing_package, nonces.get(id).unwrap(), kp)
+                    .expect("round2 sign"),
+            );
+        }
+        let sig =
+            frost_ristretto255::aggregate(&signing_package, &shares, &pub_pkg).expect("aggregate");
+        let sig_bytes = sig.serialize().expect("sig serialize");
+        let r: [u8; 32] = sig_bytes[..32].try_into().unwrap();
+        let payload = VrfBeaconPayload {
+            ceremony_id: [0xcc; 32],
+            message_hash,
+            signature: sig_bytes,
+            vrf_output: derive_vrf_output(&r),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        let wrap_at = |wall: u64| SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::VrfBeacon,
+            hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor: members[0],
+            payload: pd.clone(),
+            sig: vec![0u8; 64],
+        };
+
+        let now: u64 = 1_000_000_000;
+        let max = crate::clock_trust::MAX_FORWARD_SKEW_MS;
+
+        // Beyond tolerance → rejected outright: not indexed AND not
+        // retained (the gate precedes decode/crypto).
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        let skewed = wrap_at(now + max + 1);
+        assert_eq!(log.adopt_beacons(std::slice::from_ref(&skewed), now), 0);
+        assert!(log.beacon_index.is_empty(), "skewed beacon never indexed");
+        assert_eq!(log.event_count(), 0, "skewed beacon never retained");
+
+        // Exactly at the tolerance bound → still plausible: adopted.
+        assert_eq!(log.adopt_beacons(&[wrap_at(now + max)], now), 1);
+        assert_eq!(log.event_count(), 1);
+
+        // now == 0 (clock unreadable) disables the gate — a bad LOCAL
+        // clock must not suppress adoption.
+        let mut log2 = committee_log_from_material(&members, &ids, &pub_pkg, None);
+        assert_eq!(log2.adopt_beacons(&[skewed], 0), 1);
+        assert_eq!(log2.event_count(), 1);
     }
 
     /// ZEB-1030 round-2: a genuine, committee-signed beacon PAYLOAD
@@ -7745,7 +8037,7 @@ mod tests {
             sig: vec![0u8; 64],
         };
 
-        assert_eq!(log.adopt_beacons(&[ev]), 0);
+        assert_eq!(log.adopt_beacons(&[ev], 0), 0);
         assert_eq!(log.beacon_index.get(&message_hash), None);
         assert_eq!(log.event_count(), 0);
     }
