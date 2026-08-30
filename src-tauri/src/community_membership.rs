@@ -3259,39 +3259,56 @@ fn evaluate_reset_phases(
         // corrupted-looking window fails closed on both paths.
         let t_q: Option<u64> = if collect_expired { None } else { t_q_raw };
 
+        // ZEB-1031 review fix-round-2 (M1 regression): the response
+        // validity window's upper bound must be a FIXED fact about the
+        // event log — never a function of the evaluation-time `t` —
+        // or a terminal Vetoed/Authorized-via-endorse verdict could
+        // flip away on a later re-evaluation of the identical log
+        // (exactly the bug: `!collect_expired`, which depends on `t`,
+        // silently erased a genuine in-window committee veto once `t`
+        // advanced far enough). While Collecting (no valid quorum —
+        // `deadline` is `None`, whether because quorum hasn't landed
+        // yet or landed too late), the window is the collecting window
+        // itself, `[t0, t0 + ADMIN_PROPOSAL_EXPIRY_MS]`; once quorum
+        // validly lands it is `[t0, deadline]` as before. `saturating_add`
+        // (not `checked_add`): a `None` here would need `t0` within
+        // ~30 days of `u64::MAX`, an unreachable wall-clock value that
+        // upstream forward-skew gates already exclude, so there is no
+        // meaningful "fail closed" direction to pick — the saturated
+        // value serves as a de facto unreachable bound.
+        let response_window_end =
+            deadline.unwrap_or_else(|| t0.saturating_add(ADMIN_PROPOSAL_EXPIRY_MS));
+
         // First-response-wins among valid e/v responses with wall in
-        // [t0, deadline] — open-ended while Collecting (spec §4.2: a
-        // veto is effective even before quorum lands). `c` responses
-        // are excluded from this contest entirely (spec §4.3).
-        // ZEB-1031 review M1: `!collect_expired` excludes ALL
-        // candidates once the proposal genuinely died of neglect (no
-        // quorum within ADMIN_PROPOSAL_EXPIRY_MS) — a response
-        // authored well after that point (e.g. a veto 31 days later)
-        // must not retroactively earn the committee credit for an
-        // intervention it didn't make; Expired wins, symmetrically with
-        // how the endorse path already treated this case.
+        // [t0, response_window_end] — open-ended (within the fixed
+        // collecting window) while Collecting (spec §4.2: a veto is
+        // effective even before quorum lands). `c` responses are
+        // excluded from this contest entirely (spec §4.3).
         let winner = work
             .responses
             .iter()
             .filter(|(wall, _, verdict, _)| {
-                !collect_expired
-                    && matches!(verdict, ResetVerdict::Endorse | ResetVerdict::Veto)
+                matches!(verdict, ResetVerdict::Endorse | ResetVerdict::Veto)
                     && *wall >= t0
-                    && deadline.map(|d| *wall <= d).unwrap_or(true)
+                    && *wall <= response_window_end
             })
             .min_by_key(|(wall, rid, _, _)| (*wall, *rid));
 
         let (mut phase, authorized_at_ms, endorsed) = match winner {
+            // A veto inside the fixed window is TERMINAL — unconditional,
+            // never re-litigated against `collect_expired` (which is a
+            // function of `t` and therefore not eligible to un-decide an
+            // already-decided verdict; see the fix-round-2 note above).
             Some((_, _, ResetVerdict::Veto, _)) => (ResetPhase::Vetoed, None, false),
             // Cooperative path: an effective endorse authorizes
             // immediately at max(w_endorse, t_q) once quorum lands; no
             // window ever opens (spec §4.1). Observed during Collecting
-            // (t_q still None), it simply waits for quorum. `winner`
-            // being `Some` already implies `!collect_expired` (the
-            // filter above), so there is no separate Expired sub-arm
-            // here — that's handled by the `_ if collect_expired` arm.
+            // with quorum never validly reached, it ages out to Expired
+            // exactly like the no-response case does (an unconsummated
+            // endorse alone authorizes nothing without quorum).
             Some((w_wall, _, ResetVerdict::Endorse, _)) => match t_q {
                 Some(tq) => (ResetPhase::Authorized, Some((*w_wall).max(tq)), true),
+                None if collect_expired => (ResetPhase::Expired, None, false),
                 None => (ResetPhase::Collecting, None, false),
             },
             _ if collect_expired => (ResetPhase::Expired, None, false),
@@ -18837,6 +18854,48 @@ mod reset_lifecycle_tests {
 
         let m = materialize_with_now(&events, admin1(), Some(late_veto_wall + 10));
         assert_eq!(view(&m, P1).phase, ResetPhase::Expired);
+    }
+
+    // ── Fix round 2 (review M1 regression): Vetoed is TERMINAL — an
+    // in-window veto must not flip to Expired on a later re-evaluation of
+    // the identical event log ──
+
+    #[test]
+    fn early_veto_stays_vetoed_at_any_later_evaluation_time() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        // No cosigns at all — quorum (2) never reached, so this is the
+        // exact same event log as `late_veto_after_expiry_does_not_
+        // override_expired`, EXCEPT the veto's own wall is well inside
+        // the collecting window this time.
+        let digest = digest_for(P1, target_vk);
+        let early_veto_wall = T0 + 100;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            early_veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        // Evaluated shortly after the veto: Vetoed.
+        let soon = materialize_with_now(&events, admin1(), Some(early_veto_wall + 10));
+        assert_eq!(view(&soon, P1).phase, ResetPhase::Vetoed);
+
+        // Evaluated long past ADMIN_PROPOSAL_EXPIRY_MS — the SAME log,
+        // only `now_ms` differs. Must still be Vetoed: the veto already
+        // decided this proposal's fate inside the collecting window: a
+        // later evaluation time cannot un-decide it.
+        let much_later = materialize_with_now(
+            &events,
+            admin1(),
+            Some(T0 + ADMIN_PROPOSAL_EXPIRY_MS + 10_000_000),
+        );
+        assert_eq!(view(&much_later, P1).phase, ResetPhase::Vetoed);
     }
 
     // ── Fix round 1 (review M2/M3): one-directional test strengthenings ──
