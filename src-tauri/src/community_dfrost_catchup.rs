@@ -1141,6 +1141,43 @@ mod tests {
         );
     }
 
+    /// ZEB-1045 (PR #786 round 1): when the largest agreeing group is
+    /// SMALLER than its payload threshold, the whole group is served
+    /// unchanged — the documented sub-threshold "serve what you have,
+    /// the requester retries next round" fallback, pinned explicitly
+    /// (never padded, never dropped, never an error).
+    #[test]
+    fn reset_chain_sub_threshold_group_served_whole_zeb1045() {
+        let mut log = test_active_log(2);
+        seed_reset(&mut log, [0x01; 16], [0xAA; 32], 1);
+        let members: Vec<OwnerAddr> = (1..=6).map(test_owner).collect();
+        // Only two confirmers retained; the payload demands threshold 5.
+        for (i, actor) in members.iter().take(2).enumerate() {
+            log.insert_event_for_test(zeb1045_dk_event(
+                2,
+                *actor,
+                &members,
+                5,
+                [0xAB; 32],
+                test_hlc(1100 + i as u64, 0, "dev"),
+            ));
+        }
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: None,
+        };
+        let links = select_reset_chain(&log, &req);
+        assert_eq!(links.len(), 1);
+        let served: Vec<OwnerAddr> = links[0].dk_events.iter().map(|ev| ev.actor).collect();
+        assert_eq!(
+            served,
+            vec![test_owner(1), test_owner(2)],
+            "sub-threshold group is served whole"
+        );
+    }
+
     /// ZEB-1045 headline: a committee whose untrimmed link exceeds the
     /// 64KiB frame cap (the documented ZEB-1038 residual) serves a
     /// fitting link after the quorum trim. 120 payload members × 8 dk
