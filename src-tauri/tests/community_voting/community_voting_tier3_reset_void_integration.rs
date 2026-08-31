@@ -298,6 +298,77 @@ async fn relaunch_produces_new_poll_with_predecessor_old_stays_voided() {
     );
 }
 
+/// CR review round 1 (narrowed): a second relaunch of the SAME voided
+/// predecessor is rejected once the first relaunch's successor is live
+/// (non-terminal) — the late re-check immediately before `publish_event`
+/// catches this even though the read-scope lock was already dropped and
+/// re-acquired between the two calls. This is the shrink-the-window
+/// mitigation, not a full close (a true concurrent race can still slip
+/// both through — deliberately not closed at apply, see the doc comment
+/// on the check in `relaunch_voided_poll`).
+#[tokio::test]
+async fn relaunch_of_a_poll_with_existing_live_successor_rejected() {
+    let community_id = SpaceId([0x55; 16]);
+    let creator = OwnerAddr([0xA0; 16]);
+    let old_poll_id = PollId([0x65; 32]);
+    let reset_id: EventId = [0x75; 16];
+
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    {
+        let mut log = voting_log.lock().await;
+        seed_poll(
+            &mut log,
+            old_poll_id,
+            creator,
+            community_id,
+            1,
+            Some(VoidedInfo {
+                reset_id,
+                old_epoch: 1,
+            }),
+        );
+    }
+    let engine = engine_with_active_committee(community_id, voting_log.clone(), 2).await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x45; 32]);
+
+    let first_new_poll_id = engine
+        .relaunch_voided_poll(
+            old_poll_id,
+            creator,
+            /* caller_is_power_100 */ false,
+            &signing_key,
+            hlc(10_000, "relauncher"),
+            None,
+        )
+        .await
+        .expect("first relaunch must succeed");
+
+    // The first relaunch's successor is fresh (Sortition stage) — a live,
+    // non-terminal successor for `old_poll_id` now exists.
+    let second_result = engine
+        .relaunch_voided_poll(
+            old_poll_id,
+            creator,
+            /* caller_is_power_100 */ false,
+            &signing_key,
+            hlc(11_000, "relauncher"),
+            None,
+        )
+        .await;
+    assert!(
+        second_result.is_err(),
+        "a second relaunch must be rejected while the first successor is still live"
+    );
+
+    let log = voting_log.lock().await;
+    assert_eq!(
+        log.polls.len(),
+        2,
+        "the rejected second relaunch must not have authored a poll"
+    );
+    assert!(log.polls.contains_key(&first_new_poll_id));
+}
+
 /// ZEB-1031 Task 7: relaunch by someone who is neither the original
 /// creator nor power-100 is rejected — no new poll is authored.
 #[tokio::test]

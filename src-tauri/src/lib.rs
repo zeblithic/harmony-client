@@ -55656,6 +55656,11 @@ pub struct ResetProposalDto {
     pub consumption_superseded: bool,
     /// Analogue of `RecoveryProposalDto::self_has_cosigned`.
     pub self_has_cosigned: bool,
+    /// Review round 1 (CR): the admin-quorum value in effect at the
+    /// event that authorized this proposal (`ResetProposalView::effective_quorum`),
+    /// not the community's live quorum. `None` while `phase == "collecting"`
+    /// — callers render the live admin quorum in that case.
+    pub effective_quorum: Option<u8>,
 }
 
 /// ZEB-1031 §9 review round 1 I4: pure projection of the materialized
@@ -55688,6 +55693,7 @@ pub fn compute_dfrost_reset_state(
             consumed_new_vk: p.consumed_new_vk.map(hex::encode),
             consumption_superseded: p.consumption_superseded,
             self_has_cosigned: p.signers.contains(&self_owner),
+            effective_quorum: p.effective_quorum,
         })
         .collect()
 }
@@ -57743,6 +57749,66 @@ mod community_member_dto_tests {
         let statuses: Vec<_> = dto.iter().map(|d| d.status).collect();
         assert!(statuses.contains(&MemberStatusDto::Left));
         assert!(statuses.contains(&MemberStatusDto::Banned));
+    }
+}
+
+#[cfg(test)]
+mod dfrost_reset_dto_tests {
+    use super::{compute_dfrost_reset_state, ResetProposalDto};
+    use crate::community_membership::{MaterializedMembership, ResetPhase, ResetProposalView};
+    use crate::owner_state_types::OwnerAddr;
+
+    fn base_view(phase: ResetPhase, effective_quorum: Option<u8>) -> ResetProposalView {
+        let proposer = OwnerAddr([0x01; 16]);
+        ResetProposalView {
+            id: [0x02; 16],
+            proposer,
+            target_vk: [0x03; 32],
+            target_epoch: 1,
+            new_members: vec![proposer],
+            new_threshold: 1,
+            veto_window_ms: 86_400_000,
+            signers: std::collections::BTreeSet::from([proposer]),
+            proposed_at_wall_ms: 1_000,
+            deadline_ms: Some(2_000),
+            authorized_at_ms: Some(2_000),
+            endorsed: true,
+            phase,
+            consumed_new_vk: None,
+            consumption_superseded: false,
+            effective_quorum,
+        }
+    }
+
+    /// Review round 1 (CR): `ResetProposalView::effective_quorum` must
+    /// project verbatim onto `ResetProposalDto::effective_quorum` (wire
+    /// name `effectiveQuorum`) — not the live `admin_quorum`, and not
+    /// silently dropped by the DTO projection.
+    #[test]
+    fn effective_quorum_projects_onto_dto() {
+        let proposer = OwnerAddr([0x01; 16]);
+        let mut materialized = MaterializedMembership::default();
+        materialized
+            .reset_proposals
+            .push(base_view(ResetPhase::Authorized, Some(2)));
+
+        let dtos: Vec<ResetProposalDto> = compute_dfrost_reset_state(&materialized, proposer);
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].effective_quorum, Some(2));
+    }
+
+    /// While Collecting, no tip has happened yet — the DTO must carry
+    /// `None` so the panel falls back to rendering the live adminQuorum.
+    #[test]
+    fn effective_quorum_none_while_collecting() {
+        let proposer = OwnerAddr([0x01; 16]);
+        let mut materialized = MaterializedMembership::default();
+        materialized
+            .reset_proposals
+            .push(base_view(ResetPhase::Collecting, None));
+
+        let dtos = compute_dfrost_reset_state(&materialized, proposer);
+        assert_eq!(dtos[0].effective_quorum, None);
     }
 }
 

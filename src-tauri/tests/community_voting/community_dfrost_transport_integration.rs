@@ -1376,6 +1376,7 @@ async fn reset_response_ceremony_converges_and_tags_purpose_across_two_engines_z
         phase: ResetPhase::Window,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
 
     // Bridge: alice.pub → bob.sub, bob.pub → alice.sub.
@@ -1625,7 +1626,10 @@ async fn reset_marker_and_consumed_response_auto_drive_across_two_engines_zeb103
     // RS-M5 REJECTION rather than the auto-drive success this test
     // proves.
     let proposal_id: EventId = [0x9B; 16];
-    let new_members = vec![alice_addr, bob_addr];
+    // CR review round 1: use `sorted_members` (not a literal-order list) so
+    // this can't drift from `check_ceremony_init_admissible`'s sorted+exact
+    // `Vec` comparison against `pending_reset.new_members`.
+    let new_members = sorted_members.clone();
     let mut membership = MaterializedMembership::default();
     for addr in [alice_addr, bob_addr] {
         membership.power_levels.insert(addr, 100);
@@ -1656,6 +1660,7 @@ async fn reset_marker_and_consumed_response_auto_drive_across_two_engines_zeb103
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
 
     let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);

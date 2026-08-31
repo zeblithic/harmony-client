@@ -598,6 +598,41 @@ describe('Tier3ProposalPanel', () => {
     expect(await findByText('not authorized')).toBeTruthy();
   });
 
+  it('clears a stale relaunchError banner when the selection moves to a different poll', async () => {
+    // CodeAnt nitpick 3 (review round 1): a failed relaunch's error must
+    // not linger into an unrelated poll's banner once the user selects
+    // away from the poll that failed.
+    const OTHER_POLL_ID = 'bb'.repeat(32);
+    const otherSummary: Tier3PollSummary = {
+      ...makeSummaryFixture(),
+      pollId: OTHER_POLL_ID,
+      proposalText: 'Other proposal',
+    };
+    const adapter = createAdapterMock([makeSummaryFixture(), otherSummary]);
+    vi.spyOn(adapter, 'getTier3Poll').mockImplementation(async (pollId: string) => {
+      if (pollId === OTHER_POLL_ID) {
+        return { ...makeExportFixture(), pollId: OTHER_POLL_ID, proposalText: 'Other proposal' };
+      }
+      return {
+        ...makeExportFixture(),
+        proposer: TEST_MY_ADDR,
+        voided: { resetId: 'ab'.repeat(16), oldEpoch: 3 },
+      };
+    });
+    vi.spyOn(adapter, 'relaunchVoidedPoll').mockRejectedValue(new Error('not authorized'));
+
+    const { findByText, queryByText, getByTestId } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => getByTestId('voided-banner'));
+    await fireEvent.click(await findByText('Relaunch'));
+    expect(await findByText('not authorized')).toBeTruthy();
+
+    await fireEvent.click(await findByText('Other proposal'));
+    await waitFor(() => expect(queryByText('not authorized')).toBeNull());
+  });
+
   it('refetches list + detail on voting-tier3-voided matching selected community + poll', async () => {
     let voidedHandler:
       | ((p: { pollId: string; communityId: string; resetId: string; oldEpoch: number }) => void)

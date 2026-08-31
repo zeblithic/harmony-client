@@ -44,6 +44,11 @@ export interface ResetProposalDto {
    *  committee is still alive — spec §6.1 supersession. */
   consumptionSuperseded: boolean;
   selfHasCosigned: boolean;
+  /** Admin-quorum value in effect when this proposal was authorized —
+   *  NOT the community's live quorum (a later `ChangeQuorum` must not
+   *  relabel an already-authorized proposal's signature count). `null`
+   *  while `phase === 'collecting'`; render the live quorum then. */
+  effectiveQuorum: number | null;
 }
 
 export interface ProposeDfrostResetResult {

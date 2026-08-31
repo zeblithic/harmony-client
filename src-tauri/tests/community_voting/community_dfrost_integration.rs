@@ -2105,6 +2105,7 @@ async fn committee_reset_marker_successor_dkg_and_straggler_healing_zeb1031() {
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     let resolver = Arc::new(TestResetResolver::new(new_members.clone(), membership));
 
@@ -2467,6 +2468,7 @@ fn build_skew_fixture(marker_wall_ms: u64) -> SkewFixture {
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     let resolver = Arc::new(TestResetResolver::new(new_members, membership));
 
@@ -2943,6 +2945,7 @@ fn build_two_reset_fixture() -> TwoResetFixture {
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     membership.reset_proposals.push(ResetProposalView {
         id: reset2_id,
@@ -2960,6 +2963,7 @@ fn build_two_reset_fixture() -> TwoResetFixture {
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     let resolver = Arc::new(TestResetResolver::new(members, membership));
 
@@ -3271,6 +3275,7 @@ async fn apply_reset_chain_no_progress_falls_through_to_other_groups_dk_evidence
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     let resolver = Arc::new(TestResetResolver::new(new_members.clone(), membership));
 
@@ -3646,6 +3651,7 @@ async fn live_ingest_reset_marker_voids_open_tier3_polls_zeb1031() {
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     let resolver = Arc::new(TestResetResolver::new(members.clone(), membership));
     let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
@@ -4127,6 +4133,7 @@ async fn peer_materialized_poll_voids_via_wire_carried_epoch_zeb1031() {
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
 
@@ -4472,6 +4479,7 @@ async fn late_syncing_pre_reset_poll_arrives_already_voided_via_watermark_zeb103
         phase: ResetPhase::Authorized,
         consumed_new_vk: None,
         consumption_superseded: false,
+        effective_quorum: None,
     });
     let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
     let resolver = Arc::new(TestResetResolver::new(members.clone(), membership));

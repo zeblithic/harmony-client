@@ -146,6 +146,9 @@
     // null out the detail.)
     selectedDetail = null;
     detailError = null;
+    // CodeAnt nitpick 3 (review round 1): a failed relaunch's error
+    // must not linger into a different poll's voided banner.
+    relaunchError = null;
     loadDetail(pollId);
   }
 
@@ -215,19 +218,32 @@
   // to the retired committee), so this is a fresh poll, not a resume.
   let relaunching = $state(false);
   let relaunchError = $state<string | null>(null);
+  let relaunchRequestSeq = 0;
 
   async function relaunchVoided(pollId: string) {
+    // CR review round 1: guard against a community switch (or a second
+    // relaunch click) racing this call, mirroring loadSummaries'/
+    // loadDetail's `req`/`cid` pattern — an older relaunch's success
+    // must not `select()` a new poll into the WRONG (now-current)
+    // community's panel, and its error must not land in the wrong
+    // community either.
     if (relaunching) return;
+    const request = ++relaunchRequestSeq;
+    const cid = communityId;
     relaunching = true;
     relaunchError = null;
     try {
       const newPollId = await adapter.relaunchVoidedPoll(pollId);
+      if (request !== relaunchRequestSeq || cid !== communityId) return;
       await loadSummaries();
+      if (request !== relaunchRequestSeq || cid !== communityId) return;
       select(newPollId);
     } catch (e) {
-      relaunchError = e instanceof Error ? e.message : String(e);
+      if (request === relaunchRequestSeq && cid === communityId) {
+        relaunchError = e instanceof Error ? e.message : String(e);
+      }
     } finally {
-      relaunching = false;
+      if (request === relaunchRequestSeq) relaunching = false;
     }
   }
 
@@ -263,6 +279,7 @@
     detailError = null;
     listError = null;
     ceremonyStatus = null;
+    relaunchError = null;
 
     loadSummaries();
     unsubscribers.push(adapter.subscribeTier3PollCreated(() => loadSummaries()));

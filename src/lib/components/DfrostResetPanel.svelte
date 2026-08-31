@@ -90,7 +90,7 @@
   let targetVkHex = $state('');
   let targetEpoch = $state('');
   let selectedMembers = $state<Set<string>>(new Set());
-  let newThreshold = $state(1);
+  let newThreshold = $state(2);
   let vetoWindowHours = $state(RESET_VETO_WINDOW_DEFAULT_MS / HOUR_MS);
   let confirmingPropose = $state(false);
   let proposing = $state(false);
@@ -191,7 +191,7 @@
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
     } finally {
-      cosignBusy = null;
+      if (cosignBusy === p.proposalEventId) cosignBusy = null;
     }
   }
 
@@ -231,12 +231,16 @@
       : `${(vetoWindowHours / 24).toFixed(1)}d`,
   );
 
+  // CodeAnt majors 1+2 (review round 1): the backend requires at least
+  // two successor members and a threshold of at least two — a 1-member
+  // or threshold-1 submission always fails server-side. Match the
+  // bounds here so the form never advertises a config it will reject.
   let canSubmitPropose = $derived(
     !proposing &&
       targetVkHex.trim().length > 0 &&
       targetEpoch.trim().length > 0 &&
-      selectedMembers.size > 0 &&
-      newThreshold >= 1 &&
+      selectedMembers.size >= 2 &&
+      newThreshold >= 2 &&
       newThreshold <= selectedMembers.size,
   );
 
@@ -264,7 +268,7 @@
       targetVkHex = '';
       targetEpoch = '';
       selectedMembers = new Set();
-      newThreshold = 1;
+      newThreshold = 2;
       vetoWindowHours = RESET_VETO_WINDOW_DEFAULT_MS / HOUR_MS;
       showProposeForm = false;
       confirmingPropose = false;
@@ -315,7 +319,9 @@
             </dd>
             {#if p.phase === 'collecting' || p.phase === 'window'}
               <dt>Admin signatures</dt>
-              <dd>{p.signerAddrs.length} of {adminQuorum} required</dd>
+              <dd>
+                {p.signerAddrs.length} of {p.effectiveQuorum ?? adminQuorum} required
+              </dd>
             {/if}
             {#if p.phase === 'authorized'}
               <dt>Since authorization</dt>
@@ -427,7 +433,7 @@
         <div class="field-label">Successor committee members</div>
         <ul class="pick-list" role="listbox" aria-label="Successor committee members" aria-multiselectable="true">
           {#each joinedMembers as m (m.address)}
-            <li>
+            <li role="presentation">
               <button
                 type="button"
                 class="pick-row"
@@ -442,7 +448,7 @@
             </li>
           {/each}
           {#if joinedMembers.length === 0}
-            <li class="empty">No joined members found.</li>
+            <li class="empty" role="presentation">No joined members found.</li>
           {/if}
         </ul>
 
@@ -451,8 +457,8 @@
           <input
             type="number"
             class="threshold-input"
-            min="1"
-            max={Math.max(1, selectedMembers.size)}
+            min="2"
+            max={Math.max(2, selectedMembers.size)}
             bind:value={newThreshold}
           />
         </label>

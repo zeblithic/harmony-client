@@ -5526,6 +5526,7 @@ mod tests {
             phase: ResetPhase::Authorized,
             consumed_new_vk: None,
             consumption_superseded: false,
+            effective_quorum: None,
         });
         let ctx = VerifyContext {
             now_ms: None,

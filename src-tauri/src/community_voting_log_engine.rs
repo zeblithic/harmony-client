@@ -1259,6 +1259,36 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let new_poll_id =
             crate::community_voting_core::derive_poll_id(&self.community_id, &signing_bytes);
 
+        // CR review round 1 (narrowed): re-check for a live non-terminal
+        // successor of `old_poll_id` as late as possible, immediately
+        // before publish, to shrink (not close) the race window opened
+        // by dropping `voting_log` above this function's first read.
+        // Deliberately NOT enforced at apply/materialization: rejecting a
+        // signed PollCreate based on the LOCAL ARRIVAL ORDER
+        // of a concurrent create would make acceptance depend on gossip
+        // order rather than event content, which diverges replicas that
+        // see the two creates in a different order (the ZEB-1032
+        // arrival-order lesson). A lost race here still yields two valid
+        // successor polls for the same predecessor — benign provenance
+        // noise, disclosed, not the replica-divergence hazard the
+        // apply-side gate would introduce.
+        {
+            use crate::community_voting_tier3::Stage;
+            let log = self.voting_log.lock().await;
+            let already_has_live_successor = log.polls.values().any(|state| {
+                state.tier_state.as_tier3().is_some_and(|t3| {
+                    t3.meta.config.predecessor == Some(old_poll_id)
+                        && !matches!(t3.stage, Stage::Finalized | Stage::Failed)
+                })
+            });
+            if already_has_live_successor {
+                return Err(format!(
+                    "relaunch_voided_poll: poll {} already has a live successor",
+                    hex::encode(old_poll_id.0)
+                ));
+            }
+        }
+
         self.publish_event(event, snapshot)
             .await
             .map_err(|e| format!("relaunch_voided_poll: publish: {e}"))?;

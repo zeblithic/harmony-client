@@ -5017,6 +5017,7 @@ mod tests {
             phase,
             consumed_new_vk: None,
             consumption_superseded: false,
+            effective_quorum: None,
         });
         m
     }
@@ -6790,6 +6791,7 @@ mod tests {
             phase: ResetPhase::Authorized,
             consumed_new_vk: None,
             consumption_superseded: false,
+            effective_quorum: None,
         });
         let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
             Arc::new(FixedResetMembership(membership));
@@ -6881,6 +6883,7 @@ mod tests {
             phase: ResetPhase::Authorized,
             consumed_new_vk: None,
             consumption_superseded: false,
+            effective_quorum: None,
         }
     }
 

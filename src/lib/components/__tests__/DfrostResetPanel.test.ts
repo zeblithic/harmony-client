@@ -40,6 +40,7 @@ function makeProposal(overrides: Partial<ResetProposalDto> = {}): ResetProposalD
     consumedNewVk: null,
     consumptionSuperseded: false,
     selfHasCosigned: false,
+    effectiveQuorum: null,
     ...overrides,
   };
 }
@@ -147,6 +148,36 @@ describe('DfrostResetPanel', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('renders the effective (tipping-time) quorum, falling back to the live adminQuorum while collecting', async () => {
+    // CR review round 1: the denominator must come from the proposal's
+    // own effectiveQuorum once tipped, not the live adminQuorum, so a
+    // later ChangeQuorum can't relabel an already-authorized proposal.
+    mockResetState([
+      makeProposal({ phase: 'collecting', effectiveQuorum: null, signerAddrs: [PROPOSER] }),
+    ]);
+    const { getByText } = renderPanel({ adminQuorum: 3 });
+    await waitFor(() => {
+      expect(getByText('1 of 3 required')).toBeTruthy();
+    });
+  });
+
+  it('keeps the tipping-time effectiveQuorum denominator even after the live adminQuorum changes', async () => {
+    mockResetState([
+      makeProposal({
+        phase: 'window',
+        deadlineMs: Date.now() + 60_000,
+        effectiveQuorum: 2,
+        signerAddrs: [PROPOSER, MEMBER_A],
+      }),
+    ]);
+    // Live adminQuorum has since been raised to 3 — the panel must still
+    // report the pinned effectiveQuorum (2), not the live value.
+    const { getByText } = renderPanel({ adminQuorum: 3 });
+    await waitFor(() => {
+      expect(getByText('2 of 2 required')).toBeTruthy();
+    });
   });
 
   it('disables Co-sign once selfHasCosigned is true, and invokes it otherwise', async () => {
@@ -278,6 +309,38 @@ describe('DfrostResetPanel', () => {
         vetoWindowMs: 48 * 3_600_000,
       });
     });
+  });
+
+  it('keeps the submit button disabled with only one successor member (backend requires >=2)', async () => {
+    // CodeAnt majors 1+2 (review round 1): the backend rejects a 1-member
+    // or threshold-1 successor config — the form must not advertise those
+    // as submittable.
+    mockResetState([]);
+    const { getByText, container } = renderPanel();
+    await fireEvent.click(getByText('Propose a committee reset…'));
+
+    const vkInput = container.querySelector(
+      'input[placeholder*="64-char hex"]',
+    ) as HTMLInputElement;
+    await fireEvent.input(vkInput, { target: { value: 'ab'.repeat(32) } });
+    const epochInput = container.querySelector('input[type="number"][min="0"]') as HTMLInputElement;
+    await fireEvent.input(epochInput, { target: { value: '4' } });
+
+    const bobRow = getByText('@bob').closest('button')!;
+    await fireEvent.click(bobRow);
+
+    const submitButton = getByText('Review proposal…') as HTMLButtonElement;
+    expect(submitButton.disabled).toBe(true);
+
+    const thresholdInput = container.querySelector('.threshold-input') as HTMLInputElement;
+    expect(thresholdInput.min).toBe('2');
+
+    // Selecting a second member alone isn't enough while threshold
+    // still starts below 2 — but the panel now defaults newThreshold
+    // to 2, so a second selection should make the form submittable.
+    const cynRow = getByText('@cyn').closest('button')!;
+    await fireEvent.click(cynRow);
+    expect(submitButton.disabled).toBe(false);
   });
 
   it('hides the propose form entirely when canAdmin is false', async () => {

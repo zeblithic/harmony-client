@@ -2469,6 +2469,15 @@ pub struct ResetProposalView {
     /// proposal).
     #[serde(rename = "cs")]
     pub consumption_superseded: bool,
+    /// Review round 1 (CR): the admin-quorum value in effect at the
+    /// event that tipped `signers` to quorum — `ResetWork::t_q_reached`'s
+    /// companion, NOT the live `adminQuorum`. A later `ChangeQuorum`
+    /// must not relabel an already-authorized proposal's signature
+    /// count. `None` while Collecting (no tip yet); callers render the
+    /// live admin quorum in that phase. Default-elided so pre-existing
+    /// encodings stay byte-identical (the `"aq"`/`"vb"` pattern).
+    #[serde(rename = "eq", skip_serializing_if = "Option::is_none", default)]
+    pub effective_quorum: Option<u8>,
 }
 
 impl CanonicalPayloadSealed for ResetProposalView {}
@@ -3082,6 +3091,10 @@ struct ResetWork {
     /// window to before t0, making the committee veto structurally
     /// unreachable (the I2 hazard).
     t_q_reached: Option<u64>,
+    /// Review round 1 (CR): `admin_quorum_now` at the SAME tipping event
+    /// that set `t_q_reached` — set together, in `maybe_tip_reset_quorum`,
+    /// never independently. Projected onto `ResetProposalView::effective_quorum`.
+    effective_quorum: Option<u8>,
     /// VALID responses only — the RS-R1 consumed-half and RS-R3 group
     /// signature have already been re-checked at fold time (review I5,
     /// `fold_reset_response`): (wall_ms, response event id, verdict,
@@ -3108,6 +3121,7 @@ fn maybe_tip_reset_quorum(work: &mut ResetWork, admin_quorum_now: u8, at_wall_ms
         && work.signers.len() >= admin_quorum_now as usize
     {
         work.t_q_reached = Some(at_wall_ms);
+        work.effective_quorum = Some(admin_quorum_now);
     }
 }
 
@@ -4656,6 +4670,7 @@ pub fn materialize_with_now(
                     t0_wall_ms: event.at.wall_ms,
                     signers: BTreeSet::from([event.actor]),
                     t_q_reached: None,
+                    effective_quorum: None,
                     responses: Vec::new(),
                 };
                 if let Some(queued) = pending_reset_cosigns.remove(&event.id) {
@@ -4861,6 +4876,7 @@ pub fn materialize_with_now(
                 phase: outcome.phase,
                 consumed_new_vk: outcome.consumed_new_vk,
                 consumption_superseded: false,
+                effective_quorum: work.effective_quorum,
             }
         })
         .collect();
@@ -17034,6 +17050,7 @@ mod reset_verify_tests {
             phase,
             consumed_new_vk: None,
             consumption_superseded: false,
+            effective_quorum: None,
         });
     }
 
@@ -18021,6 +18038,85 @@ mod reset_lifecycle_tests {
         assert_eq!(view(&live, P1).phase, ResetPhase::Authorized);
     }
 
+    // ── Case 2b: CR review round 1 — effective_quorum stays pinned ──
+
+    /// A `ChangeQuorum` proposal landing after this reset proposal has
+    /// already tipped to quorum — and even after it reaches Authorized —
+    /// must not retroactively relabel `effective_quorum`. It stays
+    /// pinned to the admin_quorum value live at the tipping event,
+    /// exactly like `t_q_reached` (ZEB-1031 review I1's ruling).
+    #[test]
+    fn effective_quorum_pinned_when_quorum_raised_after_authorization() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events(); // admin_quorum = 2 after this
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 1_000;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1)); // tips at quorum=2
+        let deadline = t_q + VW;
+        let authorized_at = deadline + RESET_FINALITY_MS;
+
+        // Raise the LIVE admin_quorum to 3 well after the tip (and after
+        // authorization) via a real 2-of-2-at-quorum-2 promote + ChangeQuorum
+        // — mirrors `materialize_proposal_effective_when_two_countersigns_reach_quorum_3`'s
+        // recipe, just under the already-raised quorum=2 baseline.
+        let admin3_join = authorized_at + 900;
+        events.push(ev(
+            [0xCF; 16],
+            admin3(),
+            admin3_join,
+            MembershipEventKind::Join,
+        ));
+        let promote_id: EventId = [0xD0; 16];
+        events.push(ev(
+            promote_id,
+            admin1(),
+            authorized_at + 1_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower {
+                    target: admin3(),
+                    level: 100,
+                },
+            },
+        ));
+        events.push(ev(
+            [0xD1; 16],
+            admin2(),
+            authorized_at + 1_100,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: promote_id,
+            },
+        ));
+        let quorum_id: EventId = [0xD2; 16];
+        events.push(ev(
+            quorum_id,
+            admin1(),
+            authorized_at + 1_200,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+            },
+        ));
+        events.push(ev(
+            [0xD3; 16],
+            admin2(),
+            authorized_at + 1_300,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: quorum_id,
+            },
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(authorized_at + 2_000));
+        assert_eq!(m.admin_quorum, 3, "live admin_quorum did raise to 3");
+
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert_eq!(
+            pv.effective_quorum,
+            Some(2),
+            "effective_quorum must stay pinned to the quorum live at the \
+             tip, not the later-raised live admin_quorum"
+        );
+    }
+
     // ── Case 3: veto during Collecting wins over a later endorse ──
 
     #[test]
@@ -18507,6 +18603,7 @@ mod reset_lifecycle_tests {
                 phase,
                 consumed_new_vk: None,
                 consumption_superseded,
+                effective_quorum: None,
             }
         }
         let views = vec![

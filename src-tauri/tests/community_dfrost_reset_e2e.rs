@@ -781,12 +781,17 @@ async fn drive_reset_response(
     // may already be in flight — `initiate_reset_response_ceremony` is
     // idempotent-safe to call again only via a fresh id, so callers that
     // know round-1 already fired should skip straight to convergence-wait).
-    let _ = engine_a
+    engine_a
         .initiate_reset_response_ceremony(proposal_id, verdict)
-        .await;
-    let _ = engine_b
+        .await
+        .expect("alice initiates the reset-response ceremony");
+    if let Err(e) = engine_b
         .initiate_reset_response_ceremony(proposal_id, verdict)
-        .await;
+        .await
+    {
+        // Benign when bob's inbound apply already seeded the session.
+        eprintln!("bob's initiate returned: {e}");
+    }
 
     poll_until(
         "both sides see 2 round-1 contributions",
