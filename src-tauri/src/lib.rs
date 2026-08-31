@@ -55627,20 +55627,82 @@ fn reset_phase_dto(phase: crate::community_membership::ResetPhase) -> &'static s
     }
 }
 
+/// ZEB-1031 §9 review round 1 I4: one D-FROST committee-reset proposal
+/// projected for the admin panel — mirrors `RecoveryProposalDto`'s shape
+/// exactly (camelCase, addresses/keys hex-encoded, phase as a readable
+/// string, a `self_*` derived field) rather than the CBOR-wire
+/// `ResetProposalView` verbatim (2-char keys, `serialize_bytes_as_bstr`
+/// number arrays for byte fields).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetProposalDto {
+    pub proposal_event_id: String,
+    pub proposer_addr: String,
+    pub target_vk: String,
+    pub target_epoch: u64,
+    pub new_member_addrs: Vec<String>,
+    pub new_threshold: u16,
+    pub veto_window_ms: u64,
+    pub signer_addrs: Vec<String>,
+    pub proposed_at_wall_ms: u64,
+    pub deadline_ms: Option<u64>,
+    pub authorized_at_ms: Option<u64>,
+    pub endorsed: bool,
+    /// "collecting" | "window" | "authorized" | "consumed" | "vetoed" |
+    /// "expired" | "lapsed"
+    pub phase: String,
+    /// Some iff phase == "consumed".
+    pub consumed_new_vk: Option<String>,
+    pub consumption_superseded: bool,
+    /// Analogue of `RecoveryProposalDto::self_has_cosigned`.
+    pub self_has_cosigned: bool,
+}
+
+/// ZEB-1031 §9 review round 1 I4: pure projection of the materialized
+/// `reset_proposals` view into `ResetProposalDto`s — mirrors
+/// `compute_recovery_state`'s shape (a plain `Vec`, not wrapped in a
+/// config-carrying envelope struct, since — unlike recovery designates —
+/// a reset proposal carries its own successor shape; there is no
+/// separate community-level "reset config" to project alongside it).
+pub fn compute_dfrost_reset_state(
+    materialized: &crate::community_membership::MaterializedMembership,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> Vec<ResetProposalDto> {
+    materialized
+        .reset_proposals
+        .iter()
+        .map(|p| ResetProposalDto {
+            proposal_event_id: hex::encode(p.id),
+            proposer_addr: hex::encode(p.proposer.0),
+            target_vk: hex::encode(p.target_vk),
+            target_epoch: p.target_epoch,
+            new_member_addrs: p.new_members.iter().map(|a| hex::encode(a.0)).collect(),
+            new_threshold: p.new_threshold,
+            veto_window_ms: p.veto_window_ms,
+            signer_addrs: p.signers.iter().map(|s| hex::encode(s.0)).collect(),
+            proposed_at_wall_ms: p.proposed_at_wall_ms,
+            deadline_ms: p.deadline_ms,
+            authorized_at_ms: p.authorized_at_ms,
+            endorsed: p.endorsed,
+            phase: reset_phase_dto(p.phase).to_string(),
+            consumed_new_vk: p.consumed_new_vk.map(hex::encode),
+            consumption_superseded: p.consumption_superseded,
+            self_has_cosigned: p.signers.contains(&self_owner),
+        })
+        .collect()
+}
+
 /// ZEB-1031 §9: read the community's D-FROST committee-reset proposal
 /// lifecycle (spec §4) on the TIME-AWARE now-floor view — same as-of
 /// pattern as `get_recovery_state_impl` (`now_ms` overrides the real wall
 /// clock for READS only; every mutating reset verb below stays on the
 /// real wall clock). Readable by any Joined member — the proposal list,
-/// like the recovery banner, is public CRDT state. Returns the
-/// materialized `ResetProposalView`s directly (spec §9's literal
-/// interface — the CBOR-wire field names ride along on the JSON
-/// boundary too, exactly as the type derives).
+/// like the recovery banner, is public CRDT state.
 pub(crate) async fn get_dfrost_reset_state_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
     now_ms: Option<u64>,
-) -> Result<Vec<crate::community_membership::ResetProposalView>, String> {
+) -> Result<Vec<ResetProposalDto>, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -55689,7 +55751,7 @@ pub(crate) async fn get_dfrost_reset_state_impl(
         return Err("get_dfrost_reset_state: caller is not a Joined member".to_string());
     }
 
-    Ok(materialized.reset_proposals)
+    Ok(compute_dfrost_reset_state(&materialized, self_owner))
 }
 
 #[tauri::command]
@@ -55697,7 +55759,7 @@ async fn get_dfrost_reset_state(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
     now_ms: Option<u64>,
-) -> Result<Vec<crate::community_membership::ResetProposalView>, String> {
+) -> Result<Vec<ResetProposalDto>, String> {
     get_dfrost_reset_state_impl(state_lock.inner(), community_id, now_ms).await
 }
 
@@ -56155,21 +56217,18 @@ async fn cosign_dfrost_reset(
 /// never user-invocable — a manually forged `c` is (per spec §10) no
 /// worse than refusing DKG, but there is no reason to expose the footgun
 /// through this IPC.
+///
+/// Review round 1 I4: `verdict` is a plain string (`"endorse"`/`"veto"`),
+/// not the internal 1-char wire enum — callers (Task 9's UI) never see
+/// `ResetVerdict`'s CBOR-wire encoding, mirroring every other DTO
+/// boundary in this file.
 pub(crate) async fn respond_dfrost_reset_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
     target_event_id: String,
-    verdict: crate::community_membership::ResetVerdict,
+    verdict: String,
 ) -> Result<(), String> {
-    use crate::community_membership::ResetVerdict;
-
-    if verdict == ResetVerdict::Consumed {
-        return Err(
-            "respond_dfrost_reset: verdict 'consumed' is auto-driven by the engine once the \
-             successor committee is promoted — it cannot be invoked manually"
-                .to_string(),
-        );
-    }
+    let verdict = parse_dfrost_reset_verdict(&verdict)?;
 
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
@@ -56212,9 +56271,33 @@ async fn respond_dfrost_reset(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
     target_event_id: String,
-    verdict: crate::community_membership::ResetVerdict,
+    verdict: String,
 ) -> Result<(), String> {
     respond_dfrost_reset_impl(state_lock.inner(), community_id, target_event_id, verdict).await
+}
+
+/// ZEB-1031 §9 review round 1 I4: parse `respond_dfrost_reset`'s plain
+/// verdict string into the internal wire enum. `"consumed"` gets its own
+/// pinned rejection (auto-driven, never user-invocable — the exact text
+/// `respond_dfrost_reset_rejects_consumed_verdict` asserts against);
+/// anything else unrecognized is a generic bad-input error.
+fn parse_dfrost_reset_verdict(
+    verdict: &str,
+) -> Result<crate::community_membership::ResetVerdict, String> {
+    use crate::community_membership::ResetVerdict;
+
+    match verdict {
+        "endorse" => Ok(ResetVerdict::Endorse),
+        "veto" => Ok(ResetVerdict::Veto),
+        "consumed" => Err(
+            "respond_dfrost_reset: verdict 'consumed' is auto-driven by the engine once the \
+             successor committee is promoted — it cannot be invoked manually"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "respond_dfrost_reset: unknown verdict '{other}' (expected 'endorse' or 'veto')"
+        )),
+    }
 }
 
 /// ZEB-1031 §5/§9: manual fallback that authors + applies + broadcasts

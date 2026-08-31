@@ -295,15 +295,16 @@ struct DfrostResetTargetArgs {
     target_event_id: String,
 }
 
-/// ZEB-1031 Task 8: `respond_dfrost_reset` (spec §3.3) — `verdict` is the
-/// same short-code (`"e"`/`"v"`/`"c"`) `ResetVerdict` uses on the wire;
-/// `"c"` is rejected at the impl layer (auto-driven, not user-invocable).
+/// ZEB-1031 Task 8/review round 1 I4: `respond_dfrost_reset` (spec
+/// §3.3) — `verdict` is a plain string (`"endorse"`/`"veto"`), parsed at
+/// the impl layer via `parse_dfrost_reset_verdict`; `"consumed"` is
+/// rejected there (auto-driven, not user-invocable).
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RespondDfrostResetArgs {
     community_id: String,
     target_event_id: String,
-    verdict: crate::community_membership::ResetVerdict,
+    verdict: String,
 }
 
 /// ZEB-1031 Task 8: `relaunch_voided_poll` (spec §7/§9).
@@ -2789,7 +2790,7 @@ mod tests {
                 serde_json::json!({
                     "communityId": community_id,
                     "targetEventId": target_event_id,
-                    "verdict": "e",
+                    "verdict": "endorse",
                 }),
             ),
             ("author_dfrost_reset_marker", reset_target),
@@ -2815,9 +2816,9 @@ mod tests {
         }
     }
 
-    /// ZEB-1031 Task 8: `respond_dfrost_reset` rejects verdict `c`
-    /// (Consumed) BEFORE touching `NodeState` — it is auto-driven by the
-    /// engine's orchestrator tick once the successor committee is
+    /// ZEB-1031 Task 8: `respond_dfrost_reset` rejects verdict
+    /// `"consumed"` BEFORE touching `NodeState` — it is auto-driven by
+    /// the engine's orchestrator tick once the successor committee is
     /// promoted (`maybe_auto_drive_reset`), never user-invocable. Pinned
     /// to the exact error text so a future refactor can't silently widen
     /// or narrow the rejection.
@@ -2829,7 +2830,7 @@ mod tests {
         let args = serde_json::json!({
             "communityId": community_id,
             "targetEventId": target_event_id,
-            "verdict": "c",
+            "verdict": "consumed",
         });
         match reg
             .dispatch(
