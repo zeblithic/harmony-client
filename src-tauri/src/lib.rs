@@ -67495,38 +67495,12 @@ pub(crate) async fn dfrost_author_reset_marker_core<R: tauri::Runtime>(
 }
 
 /// Tauri IPC: committee member contributes their partial threshold-sign
-/// share, and — if their share is the threshold-th to land — aggregates
-/// the joint Schnorr signature + emits the `vb` beacon event.
-///
-/// Precondition: this member has already called
-/// `dfrost_request_vrf_beacon(community_id, seed_hex, epoch)` for the
-/// same ceremony, which stashed their secret nonces into
-/// `committee_state.pending_sign[ceremony_id].local_nonces` and applied
-/// a `ts` event with empty `share_bytes` carrying their commitments.
-/// Other members must independently have applied their own `ts(empty
-/// share)` events so the local `pending_sign[ceremony_id].contributions`
-/// map carries at least `threshold` commitment entries — otherwise the
-/// `SigningPackage` won't include their identifier and `frost::aggregate`
-/// will reject the result.
-///
-/// Pipeline:
-///   1. Decode stashed `local_nonces` back into `frost::round1::SigningNonces`.
-///   2. Decode every member's `commitment_bytes` from `pending_sign.contributions`
-///      into a `BTreeMap<Identifier, SigningCommitments>`.
-///   3. Build the `SigningPackage` from the commitment map + the
-///      `message_hash` recorded on the pending session.
-///   4. Run `frost::round2::sign` to produce this node's `SignatureShare`.
-///   5. Build + apply a `ts` event re-using the existing commitment bytes
-///      and populating `share_bytes` with the CBOR-encoded share.
-///   6. Post-apply, count contributions with non-empty `share_bytes`. If
-///      `>= threshold`, build the shares map, call `frost::aggregate`,
-///      derive `vrf_output = derive_vrf_output(R)` (first 32 bytes of the
-///      64-byte Schnorr sig), build + apply a `vb` event, and emit
-///      `dfrost-beacon-ready { ceremony_id, vrf_output }`.
-///
-/// Out of scope (Phase 4a-foundation): Zenoh broadcast of the share-bearing
-/// `ts` and the `vb` event to peer committee members (Phase 4a-main wires
-/// the `dfrost` topic). For now they land only on the local log.
+/// share — a thin handle-extraction shim over
+/// [`dfrost_complete_threshold_sign_core`] (ZEB-1040), which carries the
+/// full pipeline documentation. Decodes the hex args, snapshots
+/// [`DfrostCoreHandles`] + the enrolled community signing key + the
+/// registry-backed [`ResetResponseAuthor`] from `NodeState`, and calls
+/// the core.
 #[tauri::command]
 async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
@@ -67534,7 +67508,6 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     community_id: String,
     ceremony_id: String,
 ) -> Result<(), String> {
-    // 1. Decode hex args.
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("dfrost_contribute_threshold_sign: invalid community_id hex: {e}"))?
         .as_slice()
@@ -67554,47 +67527,160 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 .to_string()
         })?;
 
-    // 2. Snapshot NodeState handles. T8: also pull `dfrost_log_registry`
-    //    (Option, None in test contexts that bypass `start_node`).
-    //    ZEB-1031 Task 6: also pull `community_registry` — needed only
-    //    by the ResetResponse completion arm below (to author the
-    //    `DfrostResetResponse` membership event via the SAME
-    //    `engine_arc(..).insert_local_event(..)` seam
-    //    `countersign_admin_proposal_impl` uses for AdminCountersign);
-    //    `None` in test contexts that bypass `start_node`, same as
-    //    `dfrost_log_registry`.
-    let (
-        hlc_tracker,
-        adopt_floor,
-        device_id,
-        self_owner,
-        dm_outbox,
-        dfrost_logs,
-        dfrost_log_registry,
-        community_registry,
-    ) = {
+    let handles = dfrost_core_handles_from_state(&state_lock).await?;
+
+    // ZEB-1031 Task 6 → ZEB-1040: the ResetResponse completion arm needs
+    // the enrolled community signing key (ZEB-339 membership events are
+    // NOT signed with the owner-level key the handles carry) and the
+    // membership registry; both stay outside `DfrostCoreHandles` because
+    // no other dfrost core touches the membership layer.
+    let (dm_outbox, community_registry) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_contribute_threshold_sign: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.hlc_adopt_floor.clone(),
-            g.dm_device_id
-                .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
             g.dm_outbox
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
-            std::sync::Arc::clone(&g.dfrost_logs),
-            g.dfrost_log_registry.clone(),
             g.community_registry.clone(),
         )
     };
+    let community_signing_key = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.community_signing_key)
+    };
+    let author = RegistryResetResponseAuthor {
+        registry: community_registry,
+    };
 
-    // 3. Get the per-community DfrostLog Arc.
+    dfrost_complete_threshold_sign_core::<R, tauri::Wry>(
+        &handles,
+        Some(&app),
+        space_id,
+        ceremony_bytes,
+        community_signing_key.as_ref(),
+        &author,
+    )
+    .await
+}
+
+/// ZEB-1040: the completion core's seam for authoring the
+/// `DfrostResetResponse` MEMBERSHIP event — the one step of
+/// [`dfrost_complete_threshold_sign_core`] that crosses out of the
+/// dfrost layer. Production adapts it onto
+/// `CommunitySyncEngine::insert_local_event` (see
+/// [`RegistryResetResponseAuthor`]); integration tests adapt it onto
+/// their membership fixtures, because a DFROST-committee identity cannot
+/// pass the membership layer's `EnrollmentCert` bootstrap (the
+/// `OwnerAddr` dual-derivation documented in
+/// `community_dfrost_reset_e2e.rs`'s module doc — proving the real-wire
+/// membership path is ZEB-1043's).
+///
+/// The seam returns `insert_local_event`'s shape (outcome-or-error) so
+/// the CORE keeps the outcome adjudication and the review-round-1 M5
+/// clear-session-only-after-success ordering — exactly the completion
+/// glue this extraction exists to make executable.
+#[async_trait::async_trait]
+pub trait ResetResponseAuthor: Send + Sync {
+    /// Author `event` into the membership log of `event.community_id`.
+    async fn author(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, String>;
+}
+
+/// Production [`ResetResponseAuthor`]: routes through
+/// `community_registry.engine_arc(..).insert_local_event(..)` — the SAME
+/// verify-then-insert seam `countersign_admin_proposal_impl` uses for
+/// AdminCountersign. Built per-call by the IPC wrapper; a `None`
+/// registry (owner not loaded) surfaces as an error only if the
+/// ResetResponse arm actually runs.
+struct RegistryResetResponseAuthor {
+    registry: Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
+}
+
+#[async_trait::async_trait]
+impl ResetResponseAuthor for RegistryResetResponseAuthor {
+    async fn author(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, String> {
+        let space_id = event.community_id;
+        let registry = self.registry.as_ref().ok_or_else(|| {
+            "dfrost_contribute_threshold_sign: community_registry unavailable — owner not \
+             loaded"
+                .to_string()
+        })?;
+        let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+            format!(
+                "dfrost_contribute_threshold_sign: no membership engine for community {} — \
+                 not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+        engine_arc.insert_local_event(event).await.map_err(|e| {
+            format!(
+                "dfrost_contribute_threshold_sign: insert_local_event \
+                 (DfrostResetResponse): {e}"
+            )
+        })
+    }
+}
+
+/// ZEB-1040: FROST round-2 + aggregate + completion sink for a pending
+/// threshold-sign session — the body `dfrost_contribute_threshold_sign`
+/// carried inline until this extraction. Sans-`NodeState`, driven from
+/// [`DfrostCoreHandles`] like every sibling ceremony core, which is what
+/// makes the completion sink's `match purpose` (mint `vb` for
+/// `SignPurpose::Beacon`, author a `DfrostResetResponse` for
+/// `SignPurpose::ResetResponse`) executable by integration tests.
+///
+/// Precondition: this member has already run round-1 for the same
+/// ceremony (`dfrost_request_vrf_beacon` for beacons,
+/// `dfrost_initiate_reset_response_core` for reset responses), which
+/// stashed their secret nonces into
+/// `committee_state.pending_sign[ceremony_id].local_nonces` and applied
+/// a `ts` event with empty `share_bytes` carrying their commitments.
+/// Other members must independently have applied their own `ts(empty
+/// share)` events so the local `pending_sign[ceremony_id].contributions`
+/// map carries at least `threshold` commitment entries — otherwise the
+/// `SigningPackage` won't include their identifier and `frost::aggregate`
+/// will reject the result.
+///
+/// Pipeline:
+///   1. Decode stashed `local_nonces` back into `frost::round1::SigningNonces`.
+///   2. Decode every member's `commitment_bytes` from `pending_sign.contributions`
+///      into a `BTreeMap<Identifier, SigningCommitments>`.
+///   3. Build the `SigningPackage` from the commitment map + the
+///      `message_hash` recorded on the pending session.
+///   4. Run `frost::round2::sign` to produce this node's `SignatureShare`.
+///   5. Build + apply a `ts` event re-using the existing commitment bytes
+///      and populating `share_bytes` with the CBOR-encoded share.
+///   6. Post-apply, if every member of the canonical signing set has a
+///      filled share, build the shares map, call `frost::aggregate`, and
+///      run the purpose-matched completion sink: `Beacon` derives
+///      `vrf_output = derive_vrf_output(R)` (first 32 bytes of the
+///      64-byte Schnorr sig), builds + applies + broadcasts a `vb` event,
+///      dispatches beacon callbacks, and emits `dfrost-beacon-ready`
+///      (when `app` is `Some`); `ResetResponse` signs a
+///      `DfrostResetResponse` membership event with
+///      `community_signing_key` and hands it to `reset_response_author`.
+pub async fn dfrost_complete_threshold_sign_core<R: tauri::Runtime, H: tauri::Runtime>(
+    handles: &DfrostCoreHandles<H>,
+    app: Option<&tauri::AppHandle<R>>,
+    space_id: crate::owner_state_types::SpaceId,
+    ceremony_bytes: [u8; 32],
+    community_signing_key: &ed25519_dalek::SigningKey,
+    reset_response_author: &dyn ResetResponseAuthor,
+) -> Result<(), String> {
+    let hlc_tracker = &handles.hlc_tracker;
+    let adopt_floor = &handles.adopt_floor;
+    let device_id = &handles.device_id;
+    let self_owner = handles.self_owner;
+    let dfrost_logs = &handles.dfrost_logs;
+    let dfrost_log_registry = &handles.dfrost_log_registry;
+
+    // 1. Get the per-community DfrostLog Arc.
     let log_arc = {
         let mut map = dfrost_logs.lock().await;
         map.entry(space_id)
@@ -67606,7 +67692,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             .clone()
     };
 
-    // 4. Read state, decode nonces + commitments, build the canonical
+    // 2. Read state, decode nonces + commitments, build the canonical
     //    SigningPackage. Snapshot the KeyPackage + PublicKeyPackage now so
     //    we don't hold the log lock across the FROST signing call.
     //
@@ -67616,8 +67702,8 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     //    `c = H(R || M || X)` where R is the AGGREGATE commitment over
     //    the signing set — recomputing the challenge from a different
     //    commitment set means `s_aggregate != R + c · X` and aggregation
-    //    fails verification. Before this fix, step 4 built the package
-    //    from EVERY contribution, but step 8 rebuilt a smaller selection
+    //    fails verification. Before this fix, step 2 built the package
+    //    from EVERY contribution, but step 6 rebuilt a smaller selection
     //    package for aggregate; invisible at 2-of-2 (selection == full
     //    set) but broken for every real-world threshold < max_signers.
     //
@@ -67786,7 +67872,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         )
     };
 
-    // 5. Run FROST round-2. `frost::round2::sign` CONSUMES the nonces by
+    // 3. Run FROST round-2. `frost::round2::sign` CONSUMES the nonces by
     //    value — single-use enforcement by the type system. The stashed
     //    CBOR was already cleared via `take()` under the same lock as
     //    the quorum check above (R2 CRITICAL: no race window where two
@@ -67798,7 +67884,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     ciborium::into_writer(&sig_share, &mut share_bytes)
         .map_err(|e| format!("dfrost_contribute_threshold_sign: encode SignatureShare: {e}"))?;
 
-    // 6. Build + sign the share-bearing `ts` event. `commitment_bytes`
+    // 4. Build + sign the share-bearing `ts` event. `commitment_bytes`
     //    matches the round-1 contribution exactly — apply_threshold_sign
     //    requires it (it never mutates the commitment slot of an existing
     //    contribution; the same `(actor, ceremony_id)` pair can only post
@@ -67815,34 +67901,29 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         .unwrap_or_default()
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
-        &hlc_tracker,
-        &adopt_floor,
-        &device_id,
+        hlc_tracker,
+        adopt_floor,
+        device_id,
         wall_now_ms,
     )
     .await;
 
-    // R4-2 (Greptile P2): consolidate the outbox lock — previously this
-    // acquired the lock twice (once to sign the event, once to derive
-    // self's X25519 priv). Both reads access the same `Arc<SigningKey>`
-    // and neither mutates the outbox; one acquisition produces both
-    // values. Self's X25519 priv is required by `apply_with_identity`
-    // (the `ts` apply path never decrypts since there's no per-recipient
-    // seal, but the signature requires the parameter).
-    let (event, self_x25519_priv) = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
-            signing_key,
-            self_owner,
-            crate::community_dfrost_types::DfrostEventKind::ThresholdSign,
-            &payload,
-            hlc,
-        )
-        .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed: {e}"))?;
-        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
-        (ev, x_priv)
-    };
+    // ZEB-1040: `handles.signing_key` IS the outbox's owner-level
+    // `Arc<SigningKey>` (see `dfrost_core_handles_from_state`), so the
+    // pre-extraction outbox lock (R4-2) is gone entirely. Self's X25519
+    // priv is required by `apply_with_identity` (the `ts` apply path
+    // never decrypts since there's no per-recipient seal, but the
+    // signature requires the parameter).
+    let signing_key = handles.signing_key.as_ref();
+    let event = crate::community_dfrost_log::build_signed_dfrost_event(
+        signing_key,
+        self_owner,
+        crate::community_dfrost_types::DfrostEventKind::ThresholdSign,
+        &payload,
+        hlc,
+    )
+    .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed: {e}"))?;
+    let self_x25519_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
 
     // T8: clone the event for apply so the original remains available for
     // the post-lock broadcast block below.
@@ -67897,7 +67978,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         }
     }
 
-    // 7. Post-apply: do ALL members of the canonical signing set have
+    // 5. Post-apply: do ALL members of the canonical signing set have
     //    filled shares? Aggregation can only proceed when every member of
     //    the deterministically-selected set has posted their share-bearing
     //    `ts`. Earlier code only counted TOTAL filled shares across ALL
@@ -67925,9 +68006,9 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         return Ok(());
     }
 
-    // 8. Aggregate. R4 CRITICAL: build the SignatureShare map from the
-    //    SAME canonical `signing_set` we selected in step 4, and REUSE
-    //    the `signing_package` from step 4 (NOT a freshly-built one). By
+    // 6. Aggregate. R4 CRITICAL: build the SignatureShare map from the
+    //    SAME canonical `signing_set` we selected in step 2, and REUSE
+    //    the `signing_package` from step 2 (NOT a freshly-built one). By
     //    construction:
     //
     //      * Every signer's `round2::sign` ran against this same
@@ -68037,25 +68118,21 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 .unwrap_or_default()
                 .as_millis() as u64;
             let hlc_vb = crate::dm_outbox::reserve_next_hlc_for_device(
-                &hlc_tracker,
-                &adopt_floor,
-                &device_id,
+                hlc_tracker,
+                adopt_floor,
+                device_id,
                 wall_now_ms_vb,
             )
             .await;
 
-            let vb_event = {
-                let outbox_g = dm_outbox.lock().await;
-                let signing_key = outbox_g.signing_key.as_ref();
-                crate::community_dfrost_log::build_signed_dfrost_event(
-                    signing_key,
-                    self_owner,
-                    crate::community_dfrost_types::DfrostEventKind::VrfBeacon,
-                    &vb_payload,
-                    hlc_vb,
-                )
-                .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed vb: {e}"))?
-            };
+            let vb_event = crate::community_dfrost_log::build_signed_dfrost_event(
+                signing_key,
+                self_owner,
+                crate::community_dfrost_types::DfrostEventKind::VrfBeacon,
+                &vb_payload,
+                hlc_vb,
+            )
+            .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed vb: {e}"))?;
 
             // T8: clone the event for apply so the original remains available for
             // the post-lock broadcast block below.
@@ -68131,14 +68208,16 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                     .await;
             }
 
-            let evt = DfrostBeaconReadyPayload {
-                community_id: hex::encode(space_id.0),
-                ceremony_id: hex::encode(ceremony_bytes),
-                vrf_output: hex::encode(vrf_output),
-            };
-            if let Err(e) = app.emit("dfrost-beacon-ready", &evt) {
-                // Non-fatal: vb event is already applied; the emit is a UI hint.
-                tracing::warn!(error = %e, "dfrost-beacon-ready emit failed");
+            if let Some(app) = app {
+                let evt = DfrostBeaconReadyPayload {
+                    community_id: hex::encode(space_id.0),
+                    ceremony_id: hex::encode(ceremony_bytes),
+                    vrf_output: hex::encode(vrf_output),
+                };
+                if let Err(e) = app.emit("dfrost-beacon-ready", &evt) {
+                    // Non-fatal: vb event is already applied; the emit is a UI hint.
+                    tracing::warn!(error = %e, "dfrost-beacon-ready emit failed");
+                }
             }
 
             Ok(())
@@ -68169,21 +68248,20 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 .unwrap_or_default()
                 .as_millis() as u64;
             let hlc_resp = crate::dm_outbox::reserve_next_hlc_for_device(
-                &hlc_tracker,
-                &adopt_floor,
-                &device_id,
+                hlc_tracker,
+                adopt_floor,
+                device_id,
                 wall_now_ms_resp,
             )
             .await;
 
+            // ZEB-339: membership-log event — signed with the enrolled
+            // device key (`community_signing_key`, snapshotted off the
+            // outbox by the IPC wrapper), NOT the owner-level
+            // `handles.signing_key` the dfrost `ts` event above used
+            // (same distinction `mint_admin_countersign_event` callers
+            // draw).
             let response_event = {
-                let outbox_g = dm_outbox.lock().await;
-                // ZEB-339: membership-log event — signed with the
-                // enrolled device key (community_signing_key), NOT the
-                // owner-level `signing_key` the dfrost `ts` event above
-                // used (same distinction `mint_admin_countersign_event`
-                // callers draw).
-                let signing_key = outbox_g.community_signing_key.as_ref();
                 let payload = crate::community_membership::EventPayload {
                     id: event_id_bytes,
                     community_id: space_id,
@@ -68196,40 +68274,20 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                     actor: self_owner,
                     at: hlc_resp,
                 };
-                crate::community_membership::sign_event(&payload, signing_key).map_err(|e| {
-                    format!("dfrost_contribute_threshold_sign: sign DfrostResetResponse: {e}")
-                })?
+                crate::community_membership::sign_event(&payload, community_signing_key).map_err(
+                    |e| format!("dfrost_contribute_threshold_sign: sign DfrostResetResponse: {e}"),
+                )?
             };
 
-            // Author into the membership log via the SAME
+            // Author into the membership log through the
+            // `ResetResponseAuthor` seam — in production the SAME
             // `community_registry.engine_arc(..).insert_local_event(..)`
-            // seam `countersign_admin_proposal_impl` uses for
-            // AdminCountersign. This function is the tauri command
-            // itself (full NodeState access), so no new cross-log
-            // callback/hook plumbing is needed here — see the ZEB-1033
-            // beacon→voting-log Weak-hook pattern this deliberately does
-            // NOT reuse (Task 6 report documents why).
-            let registry = community_registry.ok_or_else(|| {
-                "dfrost_contribute_threshold_sign: community_registry unavailable — owner not \
-                 loaded"
-                    .to_string()
-            })?;
-            let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
-                format!(
-                    "dfrost_contribute_threshold_sign: no membership engine for community {} — \
-                     not currently joined",
-                    hex::encode(space_id.0)
-                )
-            })?;
-            let outcome = engine_arc
-                .insert_local_event(response_event)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "dfrost_contribute_threshold_sign: insert_local_event \
-                         (DfrostResetResponse): {e}"
-                    )
-                })?;
+            // path `countersign_admin_proposal_impl` uses for
+            // AdminCountersign (see `RegistryResetResponseAuthor`), so
+            // no new cross-log callback/hook plumbing exists here — see
+            // the ZEB-1033 beacon→voting-log Weak-hook pattern this
+            // deliberately does NOT reuse (Task 6 report documents why).
+            let outcome = reset_response_author.author(response_event).await?;
             if matches!(
                 outcome,
                 crate::community_state_crdt::InsertOutcome::Rejected(_)

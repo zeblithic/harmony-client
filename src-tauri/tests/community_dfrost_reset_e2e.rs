@@ -77,7 +77,7 @@ use tokio::sync::{mpsc, Mutex};
 use harmony_app::community_dfrost_crypto::{
     identifier_for_index, verifying_key_to_bytes, verifying_share_to_bytes,
 };
-use harmony_app::community_dfrost_log::{CommitteeState, DfrostLog};
+use harmony_app::community_dfrost_log::{CommitteeState, DfrostLog, SignPurpose};
 use harmony_app::community_dfrost_log_engine::{
     CatchupOutcome, DfrostLogEngine, DfrostLogEngineParams, DfrostLogRegistry,
     DfrostOrchestratorConfig,
@@ -87,14 +87,15 @@ use harmony_app::community_membership::{
     EventId, EventPayload, MaterializedMembership, MembershipEventKind, ProposalKind, ResetPhase,
     ResetVerdict, SignedMembershipEvent, RESET_FINALITY_MS, RESET_VETO_WINDOW_FLOOR_MS,
 };
-use harmony_app::community_state_crdt::CommunityState;
+use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::community_voting_core::{MemberAttrs, MembershipSnapshot};
 use harmony_app::community_voting_log::{MembershipSnapshotResolver, SnapshotResolverError};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use harmony_app::{
-    dfrost_initiate_dkg_core, dfrost_reset_membership_from_state, dm_signing,
-    production_dkg_driver, DfrostCoreHandles,
+    dfrost_complete_threshold_sign_core, dfrost_initiate_dkg_core,
+    dfrost_reset_membership_from_state, dm_signing, production_dkg_driver, DfrostCoreHandles,
+    ResetResponseAuthor,
 };
 
 type MockRt = tauri::test::MockRuntime;
@@ -2314,4 +2315,791 @@ async fn flow4_joiner_bootstrap_post_reset() {
 
     drop(engine_b);
     drop(dave_engine);
+}
+
+// ─── ZEB-1040: the production completion core, executed for real ────────────
+//
+// `dfrost_contribute_threshold_sign` was the one dfrost ceremony round
+// with no `_core` seam — its round-2 + aggregate + completion-sink half
+// (the `match purpose` between minting `vb` and authoring a
+// `DfrostResetResponse`) had never been EXECUTED by a test, only mirrored
+// by hand (`contribute_round2` / `maybe_complete_reset_response` above).
+// These tests drive the extracted `dfrost_complete_threshold_sign_core`
+// itself. The membership author step crosses the layer boundary through
+// the `ResetResponseAuthor` seam: production adapts it onto
+// `CommunitySyncEngine::insert_local_event`; here it adapts onto the
+// trusted-write seam, for exactly the dual-derivation reason the module
+// doc explains (a DFROST-committee identity cannot pass the membership
+// cert bootstrap — the real-wire membership path is ZEB-1043's).
+
+/// What production's registry-backed author does via
+/// `insert_local_event`, this does via `insert_verified_for_test` on both
+/// nodes' states — the event the CORE built and signed lands verbatim.
+struct InsertBothAuthor {
+    state_a: Arc<Mutex<CommunityState>>,
+    state_b: Arc<Mutex<CommunityState>>,
+    calls: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl ResetResponseAuthor for InsertBothAuthor {
+    async fn author(&self, event: SignedMembershipEvent) -> Result<InsertOutcome, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.state_a
+            .lock()
+            .await
+            .insert_verified_for_test(event.clone());
+        self.state_b.lock().await.insert_verified_for_test(event);
+        Ok(InsertOutcome::Inserted)
+    }
+}
+
+/// Always-failing author — pins the review-round-1 M5 ordering: the
+/// pending session is cleared only AFTER a successful author.
+struct FailingAuthor {
+    calls: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl ResetResponseAuthor for FailingAuthor {
+    async fn author(&self, _event: SignedMembershipEvent) -> Result<InsertOutcome, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err("injected author failure".to_string())
+    }
+}
+
+/// The Beacon arm must never reach the membership author.
+struct UnreachableAuthor;
+
+#[async_trait::async_trait]
+impl ResetResponseAuthor for UnreachableAuthor {
+    async fn author(&self, _event: SignedMembershipEvent) -> Result<InsertOutcome, String> {
+        panic!("Beacon completion must never author a membership event");
+    }
+}
+
+/// The production completion core reads `log.local_pub_key_package` (a
+/// real DKG stores it; `seed_old_committee`'s dealer shortcut does not) —
+/// rebuild it from the seeded committee state, exactly as the
+/// hand-mirrored aggregates above rebuild theirs.
+async fn install_pub_key_package(log: &Arc<Mutex<DfrostLog>>, joint_vk: &[u8; 32]) {
+    let mut g = log.lock().await;
+    let pkp = PublicKeyPackage::new(
+        {
+            let mut m = BTreeMap::new();
+            for (addr, bytes) in &g.committee_state.verifying_shares {
+                let id = g.committee_state.identifier_map.get(addr).unwrap();
+                m.insert(
+                    *id,
+                    frost::keys::VerifyingShare::deserialize(bytes).expect("verifying share"),
+                );
+            }
+            m
+        },
+        frost::VerifyingKey::deserialize(joint_vk).expect("verifying key"),
+        None,
+    );
+    g.local_pub_key_package = Some(pkp);
+}
+
+/// Mirror `dfrost_request_vrf_beacon`'s round-1 half for one node
+/// (`community_dfrost_ipc_integration.rs::request_vrf_beacon_local` is the
+/// proven precedent): FROST round-1 commit, ts(empty share) build + apply
+/// (the apply materialises the pending session), then stash the secret
+/// nonces on the new entry. Purpose is left at its `Beacon` default.
+/// Returns the event for cross-application / broadcast.
+fn round1_commit_local(
+    log: &mut DfrostLog,
+    who: &Person,
+    key_pkg: &KeyPackage,
+    ceremony_id: [u8; 32],
+    message_hash: [u8; 32],
+    at: Hlc,
+) -> harmony_app::community_dfrost_types::SignedCommitteeEvent {
+    let mut rng = OsRng;
+    let (nonces, commitments) = frost::round1::commit(key_pkg.signing_share(), &mut rng);
+    let mut nonces_cbor = Vec::new();
+    ciborium::into_writer(&nonces, &mut nonces_cbor).expect("encode nonces");
+    let mut commitments_cbor = Vec::new();
+    ciborium::into_writer(&commitments, &mut commitments_cbor).expect("encode commitments");
+    let payload = ThresholdSignPayload {
+        ceremony_id,
+        message_hash,
+        commitment_bytes: commitments_cbor,
+        share_bytes: Vec::new(),
+    };
+    let event = harmony_app::community_dfrost_log::build_signed_dfrost_event(
+        &who.signing_key,
+        who.owner,
+        DfrostEventKind::ThresholdSign,
+        &payload,
+        at,
+    )
+    .expect("build ts(empty share)");
+    log.apply_with_identity(event.clone(), &who.owner, &who.x25519_priv)
+        .expect("apply own ts(empty share)");
+    log.committee_state
+        .pending_sign
+        .get_mut(&ceremony_id)
+        .expect("session materialised by apply_threshold_sign")
+        .local_nonces = Some(nonces_cbor);
+    event
+}
+
+/// ZEB-1040: drive a veto reset-response ceremony to completion through
+/// the PRODUCTION `dfrost_complete_threshold_sign_core` on both nodes —
+/// round-2 signing, canonical-set aggregation, and the
+/// `SignPurpose::ResetResponse` completion arm all run the extracted IPC
+/// code, not the hand-mirror. The phase flip is the end-to-end
+/// observable: `evaluate_reset_phases` only turns the proposal `Vetoed`
+/// if a `DfrostResetResponse` with an RS-R3-valid group signature
+/// materialized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_response_completion_via_production_core_zeb1040() {
+    let alice = person(0xA1);
+    let bob = person(0xB2);
+    let carol = person(0xC3);
+
+    let state_a = Arc::new(Mutex::new(CommunityState::new(SPACE_ID)));
+    let state_b = Arc::new(Mutex::new(CommunityState::new(SPACE_ID)));
+    seed_genesis(&state_a, &state_b, &alice, &bob, &carol).await;
+
+    let node_a = orchestrated_node(
+        "node-a",
+        alice.owner,
+        &alice.signing_key,
+        &[&alice, &bob, &carol],
+    );
+    let node_b = orchestrated_node(
+        "node-b",
+        bob.owner,
+        &bob.signing_key,
+        &[&alice, &bob, &carol],
+    );
+    let old = seed_old_committee(
+        &mut node_a.log.try_lock().unwrap(),
+        &mut node_b.log.try_lock().unwrap(),
+        &alice,
+        &bob,
+        &carol,
+    );
+    install_pub_key_package(&node_a.log, &old.joint_vk).await;
+    install_pub_key_package(&node_b.log, &old.joint_vk).await;
+
+    // The PRODUCTION core stamps the authored response with a real
+    // wall-clock HLC (`reserve_next_hlc_for_device` over
+    // `SystemTime::now()`), and `evaluate_reset_phases` only counts a
+    // veto whose wall time falls inside `[t0, t_q + veto_window]` — so
+    // this test's membership timeline must run on real wall-clock, not
+    // the synthetic ~10_000ms base the hand-mirrored flows use.
+    let base_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after epoch")
+        .as_millis() as u64;
+    let now_ms = Arc::new(AtomicU64::new(base_ms));
+    let members_all = {
+        let mut m = vec![alice.owner, bob.owner, carol.owner];
+        m.sort();
+        m
+    };
+    let resolver_a: Arc<dyn MembershipSnapshotResolver> = Arc::new(LiveMembershipResolver {
+        state: state_a.clone(),
+        admin: alice.owner,
+        now_ms: now_ms.clone(),
+        members_for_snapshot: members_all.clone(),
+    });
+    let resolver_b: Arc<dyn MembershipSnapshotResolver> = Arc::new(LiveMembershipResolver {
+        state: state_b.clone(),
+        admin: alice.owner,
+        now_ms: now_ms.clone(),
+        members_for_snapshot: members_all.clone(),
+    });
+
+    let (a_pub, a_sub, b_pub, b_sub) = make_bridge();
+    let engine_a = start_orchestrated(
+        &node_a,
+        alice.owner,
+        alice.x25519_priv,
+        &[&alice, &bob, &carol],
+        resolver_a,
+        a_pub,
+        a_sub,
+    )
+    .await;
+    let engine_b = start_orchestrated(
+        &node_b,
+        bob.owner,
+        bob.x25519_priv,
+        &[&alice, &bob, &carol],
+        resolver_b,
+        b_pub,
+        b_sub,
+    )
+    .await;
+
+    // ── Propose (alice) + cosign (bob) → Window ──
+    let proposal = mint(
+        MembershipEventKind::DfrostResetProposal {
+            target_vk: old.joint_vk,
+            target_epoch: 1,
+            new_members: sorted_pair(alice.owner, bob.owner),
+            new_threshold: 2,
+            veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
+        },
+        alice.owner,
+        hlc(base_ms, "alice"),
+        &alice.signing_key,
+    );
+    let proposal_id = proposal.id;
+    insert_both(&state_a, &state_b, proposal).await;
+    let cosign = mint(
+        MembershipEventKind::DfrostResetCosign {
+            target_event_id: proposal_id,
+        },
+        bob.owner,
+        hlc(base_ms + 100, "bob"),
+        &bob.signing_key,
+    );
+    insert_both(&state_a, &state_b, cosign).await;
+
+    // ── Round-1 auto-fires from the production initiate on both engines ──
+    engine_a
+        .initiate_reset_response_ceremony(proposal_id, ResetVerdict::Veto)
+        .await
+        .expect("alice initiates the veto ceremony");
+    if let Err(e) = engine_b
+        .initiate_reset_response_ceremony(proposal_id, ResetVerdict::Veto)
+        .await
+    {
+        // Benign when bob's inbound apply already seeded the session.
+        eprintln!("bob's initiate returned: {e}");
+    }
+
+    poll_until(
+        "both sides see 2 round-1 contributions",
+        Duration::from_secs(10),
+        || async {
+            let a2 = node_a
+                .log
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .values()
+                .any(|p| p.contributions.len() >= 2);
+            let b2 = node_b
+                .log
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .values()
+                .any(|p| p.contributions.len() >= 2);
+            a2 && b2
+        },
+    )
+    .await
+    .expect("round-1 convergence");
+
+    let ceremony_id = {
+        let g = node_a.log.lock().await;
+        *g.committee_state
+            .pending_sign
+            .iter()
+            .find(|(_, p)| p.contributions.len() >= 2)
+            .map(|(id, _)| id)
+            .expect("ceremony present")
+    };
+
+    let author_calls = Arc::new(AtomicU64::new(0));
+    let author = InsertBothAuthor {
+        state_a: state_a.clone(),
+        state_b: state_b.clone(),
+        calls: author_calls.clone(),
+    };
+
+    // ── Alice's core call: posts her round-2 share; her canonical set is
+    // not yet share-complete, so no aggregation and no author ──
+    dfrost_complete_threshold_sign_core::<MockRt, MockRt>(
+        &node_a.handles,
+        None,
+        SPACE_ID,
+        ceremony_id,
+        &alice.signing_key,
+        &author,
+    )
+    .await
+    .expect("alice's contribute succeeds without aggregating");
+    assert_eq!(
+        author_calls.load(Ordering::SeqCst),
+        0,
+        "no aggregation yet — the author must not fire on a share-only call"
+    );
+
+    poll_until(
+        "bob sees alice's round-2 share",
+        Duration::from_secs(10),
+        || async {
+            node_b
+                .log
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .get(&ceremony_id)
+                .map(|p| {
+                    !p.contributions
+                        .get(&alice.owner)
+                        .map(|(_, s)| s.is_empty())
+                        .unwrap_or(true)
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("alice's round-2 share converges to bob");
+
+    // ── Bob's core call crosses threshold: round-2 + aggregate + the
+    // ResetResponse completion arm ──
+    dfrost_complete_threshold_sign_core::<MockRt, MockRt>(
+        &node_b.handles,
+        None,
+        SPACE_ID,
+        ceremony_id,
+        &bob.signing_key,
+        &author,
+    )
+    .await
+    .expect("bob's contribute aggregates and authors the response");
+    assert_eq!(
+        author_calls.load(Ordering::SeqCst),
+        1,
+        "exactly one DfrostResetResponse authored"
+    );
+
+    // ── End-to-end observable: the RS-R3-verified veto flips the phase ──
+    let view_a = reset_view(
+        &state_a,
+        alice.owner,
+        now_ms.load(Ordering::SeqCst),
+        proposal_id,
+    )
+    .await
+    .expect("proposal present on a");
+    let view_b = reset_view(
+        &state_b,
+        alice.owner,
+        now_ms.load(Ordering::SeqCst),
+        proposal_id,
+    )
+    .await
+    .expect("proposal present on b");
+    assert_eq!(
+        view_a.phase,
+        ResetPhase::Vetoed,
+        "core-authored veto response materialized with a valid group sig on a"
+    );
+    assert_eq!(
+        view_b.phase,
+        ResetPhase::Vetoed,
+        "core-authored veto response materialized with a valid group sig on b"
+    );
+
+    {
+        let la = node_a.log.lock().await;
+        let lb = node_b.log.lock().await;
+        assert!(
+            la.events().all(|e| e.kind != DfrostEventKind::VrfBeacon),
+            "ResetResponse completion must not mint vb on alice's log"
+        );
+        assert!(
+            lb.events().all(|e| e.kind != DfrostEventKind::VrfBeacon),
+            "ResetResponse completion must not mint vb on bob's log"
+        );
+        assert!(
+            !lb.committee_state.pending_sign.contains_key(&ceremony_id),
+            "the aggregating node clears its session after a successful author (M5)"
+        );
+        assert!(
+            la.committee_state.pending_sign.contains_key(&ceremony_id),
+            "the non-aggregating node's session lingers — production's clear is per-node"
+        );
+        assert!(
+            la.committee_state.active && lb.committee_state.active,
+            "committee stays active on veto"
+        );
+    }
+
+    drop(engine_a);
+    drop(engine_b);
+}
+
+/// ZEB-1040 / review-round-1 M5: a failed membership author must leave
+/// the pending session in place (with nonces consumed — FROST single-use)
+/// so the node's local state stays consistent with peers who already
+/// applied its broadcast share. Pins the clear-only-after-success
+/// ordering the extraction carried into the core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_response_completion_failed_author_leaves_session_zeb1040() {
+    let alice = person(0xA1);
+    let bob = person(0xB2);
+    let carol = person(0xC3);
+
+    let node_a = orchestrated_node(
+        "node-a",
+        alice.owner,
+        &alice.signing_key,
+        &[&alice, &bob, &carol],
+    );
+    let node_b = orchestrated_node(
+        "node-b",
+        bob.owner,
+        &bob.signing_key,
+        &[&alice, &bob, &carol],
+    );
+    let old = seed_old_committee(
+        &mut node_a.log.try_lock().unwrap(),
+        &mut node_b.log.try_lock().unwrap(),
+        &alice,
+        &bob,
+        &carol,
+    );
+    install_pub_key_package(&node_b.log, &old.joint_vk).await;
+
+    let members_all = {
+        let mut m = vec![alice.owner, bob.owner, carol.owner];
+        m.sort();
+        m
+    };
+    let ceremony_id = [0x40; 32];
+    let message_hash = [0x53; 32];
+    let proposal_id: EventId = [0x1D; 16];
+
+    // ── Round-1 both sides + cross-apply (no engines: the core's
+    // broadcast paths take the "no engine registered" skip) ──
+    let ts_a = round1_commit_local(
+        &mut node_a.log.try_lock().unwrap(),
+        &alice,
+        &old.key_pkg_alice,
+        ceremony_id,
+        message_hash,
+        hlc(1_000, "alice"),
+    );
+    let ts_b = round1_commit_local(
+        &mut node_b.log.try_lock().unwrap(),
+        &bob,
+        &old.key_pkg_bob,
+        ceremony_id,
+        message_hash,
+        hlc(1_100, "bob"),
+    );
+    node_a
+        .log
+        .lock()
+        .await
+        .apply_with_identity(ts_b, &alice.owner, &alice.x25519_priv)
+        .expect("alice applies bob's ts");
+    node_b
+        .log
+        .lock()
+        .await
+        .apply_with_identity(ts_a, &bob.owner, &bob.x25519_priv)
+        .expect("bob applies alice's ts");
+
+    // ── Tag both sessions ResetResponse (what the production initiate
+    // does; the tagging chain itself is pinned by the transport tests) ──
+    for log in [&node_a.log, &node_b.log] {
+        log.lock()
+            .await
+            .committee_state
+            .pending_sign
+            .get_mut(&ceremony_id)
+            .expect("session present")
+            .purpose = SignPurpose::ResetResponse {
+            proposal_id,
+            verdict: ResetVerdict::Veto,
+            new_vk: None,
+        };
+    }
+
+    // ── Alice's round-2 share via the hand-helper, cross-applied to bob
+    // so bob's core call is the one that crosses threshold ──
+    let (share_a, _sp) = contribute_round2(
+        &mut node_a.log.try_lock().unwrap(),
+        alice.owner,
+        ceremony_id,
+        &members_all,
+        &old.key_pkg_alice,
+        hlc(1_200, "alice"),
+        &alice.signing_key,
+    );
+    node_b
+        .log
+        .lock()
+        .await
+        .apply_with_identity(share_a, &bob.owner, &bob.x25519_priv)
+        .expect("bob applies alice's share");
+
+    // ── Bob's core call: aggregate succeeds, author fails ──
+    let calls = Arc::new(AtomicU64::new(0));
+    let failing = FailingAuthor {
+        calls: calls.clone(),
+    };
+    let err = dfrost_complete_threshold_sign_core::<MockRt, MockRt>(
+        &node_b.handles,
+        None,
+        SPACE_ID,
+        ceremony_id,
+        &bob.signing_key,
+        &failing,
+    )
+    .await
+    .expect_err("author failure must surface as the core's error");
+    assert!(
+        err.contains("injected author failure"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "author attempted once");
+
+    let gb = node_b.log.lock().await;
+    let pending = gb
+        .committee_state
+        .pending_sign
+        .get(&ceremony_id)
+        .expect("M5: a failed author leaves the pending session in place");
+    assert!(
+        pending.local_nonces.is_none(),
+        "nonces stay consumed even on failure — FROST single-use"
+    );
+    assert!(
+        gb.events().all(|e| e.kind != DfrostEventKind::VrfBeacon),
+        "no vb minted on the failed ResetResponse path"
+    );
+}
+
+/// ZEB-1040: Beacon-arm regression through the SAME extracted core — a
+/// beacon-purpose ceremony driven through
+/// `dfrost_complete_threshold_sign_core` still mints, applies, and
+/// broadcasts `vb` (and never touches the membership author), replacing
+/// the Task 6 "verified as a textual move" evidence with execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn beacon_completion_via_production_core_still_mints_vb_zeb1040() {
+    let alice = person(0xA1);
+    let bob = person(0xB2);
+    let carol = person(0xC3);
+
+    let state_a = Arc::new(Mutex::new(CommunityState::new(SPACE_ID)));
+    let state_b = Arc::new(Mutex::new(CommunityState::new(SPACE_ID)));
+    seed_genesis(&state_a, &state_b, &alice, &bob, &carol).await;
+
+    let node_a = orchestrated_node(
+        "node-a",
+        alice.owner,
+        &alice.signing_key,
+        &[&alice, &bob, &carol],
+    );
+    let node_b = orchestrated_node(
+        "node-b",
+        bob.owner,
+        &bob.signing_key,
+        &[&alice, &bob, &carol],
+    );
+    let old = seed_old_committee(
+        &mut node_a.log.try_lock().unwrap(),
+        &mut node_b.log.try_lock().unwrap(),
+        &alice,
+        &bob,
+        &carol,
+    );
+    install_pub_key_package(&node_a.log, &old.joint_vk).await;
+    install_pub_key_package(&node_b.log, &old.joint_vk).await;
+
+    let now_ms = Arc::new(AtomicU64::new(10_000));
+    let members_all = {
+        let mut m = vec![alice.owner, bob.owner, carol.owner];
+        m.sort();
+        m
+    };
+    let resolver_a: Arc<dyn MembershipSnapshotResolver> = Arc::new(LiveMembershipResolver {
+        state: state_a.clone(),
+        admin: alice.owner,
+        now_ms: now_ms.clone(),
+        members_for_snapshot: members_all.clone(),
+    });
+    let resolver_b: Arc<dyn MembershipSnapshotResolver> = Arc::new(LiveMembershipResolver {
+        state: state_b.clone(),
+        admin: alice.owner,
+        now_ms: now_ms.clone(),
+        members_for_snapshot: members_all.clone(),
+    });
+
+    let (a_pub, a_sub, b_pub, b_sub) = make_bridge();
+    let engine_a = start_orchestrated(
+        &node_a,
+        alice.owner,
+        alice.x25519_priv,
+        &[&alice, &bob, &carol],
+        resolver_a,
+        a_pub,
+        a_sub,
+    )
+    .await;
+    let engine_b = start_orchestrated(
+        &node_b,
+        bob.owner,
+        bob.x25519_priv,
+        &[&alice, &bob, &carol],
+        resolver_b,
+        b_pub,
+        b_sub,
+    )
+    .await;
+
+    let ceremony_id = [0x77; 32];
+    let message_hash = [0x33; 32];
+
+    // ── Round-1 on each node (purpose stays the Beacon default),
+    // broadcast over the real bridge ──
+    let ts_a = round1_commit_local(
+        &mut node_a.log.try_lock().unwrap(),
+        &alice,
+        &old.key_pkg_alice,
+        ceremony_id,
+        message_hash,
+        hlc(2_000, "alice"),
+    );
+    engine_a
+        .publish_event(ts_a)
+        .await
+        .expect("alice broadcasts round-1 ts");
+    let ts_b = round1_commit_local(
+        &mut node_b.log.try_lock().unwrap(),
+        &bob,
+        &old.key_pkg_bob,
+        ceremony_id,
+        message_hash,
+        hlc(2_100, "bob"),
+    );
+    engine_b
+        .publish_event(ts_b)
+        .await
+        .expect("bob broadcasts round-1 ts");
+
+    poll_until(
+        "both logs hold 2 round-1 contributions",
+        Duration::from_secs(10),
+        || async {
+            let a = node_a
+                .log
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .get(&ceremony_id)
+                .map(|p| p.contributions.len() >= 2)
+                .unwrap_or(false);
+            let b = node_b
+                .log
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .get(&ceremony_id)
+                .map(|p| p.contributions.len() >= 2)
+                .unwrap_or(false);
+            a && b
+        },
+    )
+    .await
+    .expect("round-1 convergence");
+
+    for log in [&node_a.log, &node_b.log] {
+        assert_eq!(
+            log.lock()
+                .await
+                .committee_state
+                .pending_sign
+                .get(&ceremony_id)
+                .expect("session present")
+                .purpose,
+            SignPurpose::Beacon,
+            "both sessions carry the default Beacon purpose"
+        );
+    }
+
+    // ── Alice's core call: share only, no aggregation ──
+    dfrost_complete_threshold_sign_core::<MockRt, MockRt>(
+        &node_a.handles,
+        None,
+        SPACE_ID,
+        ceremony_id,
+        &alice.signing_key,
+        &UnreachableAuthor,
+    )
+    .await
+    .expect("alice's contribute succeeds without aggregating");
+
+    poll_until(
+        "bob sees alice's round-2 share",
+        Duration::from_secs(10),
+        || async {
+            node_b
+                .log
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .get(&ceremony_id)
+                .map(|p| {
+                    !p.contributions
+                        .get(&alice.owner)
+                        .map(|(_, s)| s.is_empty())
+                        .unwrap_or(true)
+                })
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("alice's round-2 share converges to bob");
+
+    // ── Bob's core call crosses threshold: aggregate + mint vb ──
+    dfrost_complete_threshold_sign_core::<MockRt, MockRt>(
+        &node_b.handles,
+        None,
+        SPACE_ID,
+        ceremony_id,
+        &bob.signing_key,
+        &UnreachableAuthor,
+    )
+    .await
+    .expect("bob's contribute aggregates and mints vb");
+
+    {
+        let gb = node_b.log.lock().await;
+        assert!(
+            gb.events().any(|e| e.kind == DfrostEventKind::VrfBeacon),
+            "vb minted + applied on the aggregating node"
+        );
+        assert!(
+            !gb.committee_state.pending_sign.contains_key(&ceremony_id),
+            "vb apply clears the aggregator's session"
+        );
+    }
+
+    // ── The vb broadcast crosses the wire; alice's ingest applies it and
+    // clears her session too ──
+    poll_until(
+        "alice ingests the broadcast vb",
+        Duration::from_secs(10),
+        || async {
+            let ga = node_a.log.lock().await;
+            ga.events().any(|e| e.kind == DfrostEventKind::VrfBeacon)
+                && !ga.committee_state.pending_sign.contains_key(&ceremony_id)
+        },
+    )
+    .await
+    .expect("vb crosses the wire and clears alice's session");
+
+    drop(engine_a);
+    drop(engine_b);
 }
