@@ -270,6 +270,41 @@ pub trait DkgDriver: Send + Sync {
         );
         Err("initiate_reset_response not supported by this driver".to_string())
     }
+
+    /// ZEB-1031 Task 8: author + apply + broadcast this node's `rs`
+    /// (ResetMarker) event for an Authorized reset proposal this node's
+    /// own committee state can still satisfy. The caller (the
+    /// orchestrator's `maybe_auto_drive_reset`, or the
+    /// `author_dfrost_reset_marker` manual-fallback IPC) has ALREADY
+    /// resolved `reset_digest`/`new_members`/`new_threshold` from the
+    /// current materialized membership — this method's job is exactly
+    /// `initiate_reset_response`'s division of labor: signing + local
+    /// apply + broadcast, never membership resolution (the engine holds
+    /// no signing key — see this trait's doc comment). Default: refuse —
+    /// pre-ZEB-1031 driver impls (tests) keep compiling without
+    /// auto-authoring markers.
+    #[allow(clippy::too_many_arguments)]
+    async fn author_reset_marker(
+        &self,
+        community_id: SpaceId,
+        proposal_id: EventId,
+        reset_digest: [u8; 32],
+        old_vk: [u8; 32],
+        old_epoch: u64,
+        new_members: Vec<OwnerAddr>,
+        new_threshold: u16,
+    ) -> Result<(), String> {
+        let _ = (
+            community_id,
+            proposal_id,
+            reset_digest,
+            old_vk,
+            old_epoch,
+            new_members,
+            new_threshold,
+        );
+        Err("author_reset_marker not supported by this driver".to_string())
+    }
 }
 
 /// Timer + retry policy for the ceremony orchestration layer. All
@@ -2506,6 +2541,271 @@ async fn recovery_liveness_tick(
 
 /// ZEB-1022: one orchestrator tick — auto-drive catch-up, re-broadcast
 /// scheduling, and the initiator's quiet-deadline abort/re-initiate.
+/// ZEB-1031 Task 6/8: shared core of
+/// `DfrostLogEngine::initiate_reset_response_ceremony` — extracted so the
+/// orchestrator tick's auto-drive (Task 8, `maybe_auto_drive_reset`) can
+/// fire the `Consumed` response ceremony directly, without needing an
+/// `Arc<DfrostLogEngine<R>>` handle (the tick only has the raw
+/// `community_id`/`dfrost_log`/`orchestrator` triple — see
+/// `orchestrator_tick`'s own parameters). See the (now-thin) method's
+/// original doc comment for the full derivation rationale.
+async fn initiate_reset_response_ceremony_core(
+    community_id: SpaceId,
+    dfrost_log: &Arc<Mutex<DfrostLog>>,
+    orchestrator: &Arc<OrchestratorHandle>,
+    proposal_id: EventId,
+    verdict: ResetVerdict,
+) -> Result<(), String> {
+    let resolver = orchestrator.membership_resolver.as_ref().ok_or(
+        "initiate_reset_response_ceremony: no membership resolver configured on this engine",
+    )?;
+    let membership = resolver
+        .reset_membership_now(community_id)
+        .await
+        .map_err(|e| format!("initiate_reset_response_ceremony: resolve membership: {e}"))?;
+    let view = membership
+        .reset_proposals
+        .iter()
+        .find(|p| p.id == proposal_id)
+        .ok_or_else(|| {
+            format!(
+                "initiate_reset_response_ceremony: reset proposal {} not found in \
+                 materialized membership",
+                hex::encode(proposal_id)
+            )
+        })?;
+
+    let digest = dfrost_reset_digest(
+        &community_id,
+        &view.id,
+        &view.target_vk,
+        view.target_epoch,
+        &view.new_members,
+        view.new_threshold,
+    )
+    .map_err(|e| format!("initiate_reset_response_ceremony: digest: {e}"))?;
+
+    // Read epoch (always) + the current held vk (Consumed only) from
+    // THIS node's own committee state, in one lock scope.
+    let (epoch, new_vk) = {
+        let log = dfrost_log.lock().await;
+        let epoch = log.committee_state.current_epoch;
+        let new_vk = match verdict {
+            ResetVerdict::Consumed => Some(log.committee_state.joint_verifying_key.ok_or(
+                "initiate_reset_response_ceremony: consumed verdict but no active \
+                 committee vk held locally — was this node promoted into the successor \
+                 committee?",
+            )?),
+            ResetVerdict::Endorse | ResetVerdict::Veto => None,
+        };
+        (epoch, new_vk)
+    };
+
+    let domain = match verdict {
+        ResetVerdict::Endorse => DFROST_RESET_ENDORSE_DOMAIN,
+        ResetVerdict::Veto => DFROST_RESET_VETO_DOMAIN,
+        ResetVerdict::Consumed => DFROST_RESET_CONSUMED_DOMAIN,
+    };
+    let message_hash = dfrost_reset_message_hash(domain, &digest, new_vk.as_ref());
+
+    let mut sign_tag = Vec::with_capacity(b"sign-v1:".len() + message_hash.len());
+    sign_tag.extend_from_slice(b"sign-v1:");
+    sign_tag.extend_from_slice(&message_hash);
+    let ceremony_id = derive_ceremony_id(&community_id, epoch, &sign_tag);
+
+    let driver = orchestrator
+        .driver
+        .as_ref()
+        .ok_or("initiate_reset_response_ceremony: no driver configured (ingest-only engine)")?;
+    driver
+        .initiate_reset_response(
+            community_id,
+            ceremony_id,
+            message_hash,
+            proposal_id,
+            verdict,
+            new_vk,
+        )
+        .await
+}
+
+/// ZEB-1031 Task 8: auto-drive both reset-marker authoring and
+/// Consumed-response initiation. Runs every tick, independent of the
+/// DKG slot — exactly like `maybe_auto_drive_recovery`/
+/// `recovery_liveness_tick` above, which this mirrors in spirit (a
+/// membership-driven condition this node checks every tick and fires
+/// a best-effort, idempotent-under-retry driver call for).
+///
+/// (a) Marker authoring: for every `Authorized` reset proposal whose
+/// claimed `(target_vk, target_epoch)` still matches this node's OWN
+/// held committee state, author + apply + broadcast the `rs` marker.
+/// Skipped (idempotent) once `vk_history` already carries the
+/// `reset_id` — the state-match check itself also naturally goes false
+/// the instant a marker (from any source — this node OR a peer) has
+/// applied, since `apply_reset_marker` deactivates the committee.
+///
+/// (b) Consumed-response initiation: once THIS node is promoted into
+/// the successor committee (`active` and a held vk), and `vk_history`'s
+/// LATEST entry names a reset proposal still `Authorized` (not yet
+/// `Consumed` — a valid `c` response flips the phase, so re-checking the
+/// phase each tick is the idempotency guard; no separate "already
+/// pending" bookkeeping needed since the ceremony's own deterministic
+/// id + `pending_sign` guard, `initiate_reset_response_ceremony_core`
+/// → `DkgDriver::initiate_reset_response`, refuses a concurrent
+/// duplicate) whose pinned `new_members` names this node, initiate the
+/// `Consumed` ceremony. GATED strictly on promotion completion
+/// (`active == true` and a held vk) — never fired speculatively before
+/// the successor DKG has actually finished (review carry-forward from
+/// Task 6).
+async fn maybe_auto_drive_reset(
+    community_id: SpaceId,
+    self_addr: &OwnerAddr,
+    dfrost_log: &Arc<Mutex<DfrostLog>>,
+    orchestrator: &Arc<OrchestratorHandle>,
+) {
+    let Some(driver) = orchestrator.driver.as_ref() else {
+        return;
+    };
+    let Some(resolver) = orchestrator.membership_resolver.as_ref() else {
+        return;
+    };
+
+    // (a) Marker authoring.
+    {
+        let membership = match resolver.reset_membership_now(community_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(
+                    community_id = %hex::encode(community_id.0),
+                    error = ?e,
+                    "dfrost orchestrator: auto-drive reset marker — membership resolve failed \
+                     this tick (will retry)",
+                );
+                return;
+            }
+        };
+        for proposal in membership
+            .reset_proposals
+            .iter()
+            .filter(|p| p.phase == ResetPhase::Authorized)
+        {
+            let should_author = {
+                let log = dfrost_log.lock().await;
+                let already_recorded = log
+                    .committee_state
+                    .vk_history
+                    .iter()
+                    .any(|e| e.reset_id == proposal.id);
+                let state_matches = log.committee_state.active
+                    && log.committee_state.joint_verifying_key == Some(proposal.target_vk)
+                    && log.committee_state.current_epoch == proposal.target_epoch;
+                state_matches && !already_recorded
+            };
+            if !should_author {
+                continue;
+            }
+            let digest = match dfrost_reset_digest(
+                &community_id,
+                &proposal.id,
+                &proposal.target_vk,
+                proposal.target_epoch,
+                &proposal.new_members,
+                proposal.new_threshold,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        proposal = %hex::encode(proposal.id),
+                        error = ?e,
+                        "dfrost orchestrator: auto-drive reset marker — digest recompute \
+                         failed",
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = driver
+                .author_reset_marker(
+                    community_id,
+                    proposal.id,
+                    digest,
+                    proposal.target_vk,
+                    proposal.target_epoch,
+                    proposal.new_members.clone(),
+                    proposal.new_threshold,
+                )
+                .await
+            {
+                tracing::debug!(
+                    community_id = %hex::encode(community_id.0),
+                    proposal = %hex::encode(proposal.id),
+                    error = %e,
+                    "dfrost orchestrator: auto-author reset marker not applied this tick \
+                     (will retry)",
+                );
+            }
+        }
+    }
+
+    // (b) Consumed-response initiation.
+    let (active, held_vk, latest_reset_id) = {
+        let log = dfrost_log.lock().await;
+        (
+            log.committee_state.active,
+            log.committee_state.joint_verifying_key,
+            log.committee_state.vk_history.last().map(|e| e.reset_id),
+        )
+    };
+    if !active || held_vk.is_none() {
+        return;
+    }
+    let Some(reset_id) = latest_reset_id else {
+        return;
+    };
+    let membership = match resolver.reset_membership_now(community_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(
+                community_id = %hex::encode(community_id.0),
+                error = ?e,
+                "dfrost orchestrator: auto-drive consumed response — membership resolve \
+                 failed this tick (will retry)",
+            );
+            return;
+        }
+    };
+    let Some(proposal) = membership.reset_proposals.iter().find(|p| p.id == reset_id) else {
+        return;
+    };
+    if proposal.phase != ResetPhase::Authorized {
+        // Consumed already landed (or some other terminal phase) —
+        // idempotent no-op.
+        return;
+    }
+    if !proposal.new_members.contains(self_addr) {
+        // Not a pinned successor member — only they may attest the
+        // birth of the successor committee (spec §4.3).
+        return;
+    }
+    if let Err(e) = initiate_reset_response_ceremony_core(
+        community_id,
+        dfrost_log,
+        orchestrator,
+        reset_id,
+        ResetVerdict::Consumed,
+    )
+    .await
+    {
+        tracing::debug!(
+            community_id = %hex::encode(community_id.0),
+            proposal = %hex::encode(reset_id),
+            error = %e,
+            "dfrost orchestrator: auto-drive consumed response not fired this tick (expected \
+             once a prior attempt is already in flight)",
+        );
+    }
+}
+
 async fn orchestrator_tick<R: tauri::Runtime>(
     community_id: SpaceId,
     dfrost_log: &Arc<Mutex<DfrostLog>>,
@@ -2534,6 +2834,11 @@ async fn orchestrator_tick<R: tauri::Runtime>(
     // ZEB-1028: recovery-ceremony liveness (re-broadcast cadence +
     // quiet-deadline retries) — also independent of the DKG slot.
     recovery_liveness_tick(community_id, dfrost_log, orchestrator, &snapshot).await;
+
+    // ZEB-1031 Task 8: reset-marker auto-authoring + Consumed-response
+    // auto-initiation — also independent of the DKG slot (a marker can
+    // become authorable, or a promotion complete, at any time).
+    maybe_auto_drive_reset(community_id, self_addr, dfrost_log, orchestrator).await;
 
     let Some(v) = snapshot.pending.as_ref() else {
         // No pending ceremony. If our own deadline abort's re-initiate
@@ -3075,77 +3380,14 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         proposal_id: EventId,
         verdict: ResetVerdict,
     ) -> Result<(), String> {
-        let resolver = self.orchestrator.membership_resolver.as_ref().ok_or(
-            "initiate_reset_response_ceremony: no membership resolver configured on this engine",
-        )?;
-        let membership = resolver
-            .reset_membership_now(self.community_id)
-            .await
-            .map_err(|e| format!("initiate_reset_response_ceremony: resolve membership: {e}"))?;
-        let view = membership
-            .reset_proposals
-            .iter()
-            .find(|p| p.id == proposal_id)
-            .ok_or_else(|| {
-                format!(
-                    "initiate_reset_response_ceremony: reset proposal {} not found in \
-                     materialized membership",
-                    hex::encode(proposal_id)
-                )
-            })?;
-
-        let digest = dfrost_reset_digest(
-            &self.community_id,
-            &view.id,
-            &view.target_vk,
-            view.target_epoch,
-            &view.new_members,
-            view.new_threshold,
+        initiate_reset_response_ceremony_core(
+            self.community_id,
+            &self.dfrost_log,
+            &self.orchestrator,
+            proposal_id,
+            verdict,
         )
-        .map_err(|e| format!("initiate_reset_response_ceremony: digest: {e}"))?;
-
-        // Read epoch (always) + the current held vk (Consumed only) from
-        // THIS node's own committee state, in one lock scope.
-        let (epoch, new_vk) = {
-            let log = self.dfrost_log.lock().await;
-            let epoch = log.committee_state.current_epoch;
-            let new_vk = match verdict {
-                ResetVerdict::Consumed => Some(log.committee_state.joint_verifying_key.ok_or(
-                    "initiate_reset_response_ceremony: consumed verdict but no active \
-                     committee vk held locally — was this node promoted into the successor \
-                     committee?",
-                )?),
-                ResetVerdict::Endorse | ResetVerdict::Veto => None,
-            };
-            (epoch, new_vk)
-        };
-
-        let domain = match verdict {
-            ResetVerdict::Endorse => DFROST_RESET_ENDORSE_DOMAIN,
-            ResetVerdict::Veto => DFROST_RESET_VETO_DOMAIN,
-            ResetVerdict::Consumed => DFROST_RESET_CONSUMED_DOMAIN,
-        };
-        let message_hash = dfrost_reset_message_hash(domain, &digest, new_vk.as_ref());
-
-        let mut sign_tag = Vec::with_capacity(b"sign-v1:".len() + message_hash.len());
-        sign_tag.extend_from_slice(b"sign-v1:");
-        sign_tag.extend_from_slice(&message_hash);
-        let ceremony_id = derive_ceremony_id(&self.community_id, epoch, &sign_tag);
-
-        let driver =
-            self.orchestrator.driver.as_ref().ok_or(
-                "initiate_reset_response_ceremony: no driver configured (ingest-only engine)",
-            )?;
-        driver
-            .initiate_reset_response(
-                self.community_id,
-                ceremony_id,
-                message_hash,
-                proposal_id,
-                verdict,
-                new_vk,
-            )
-            .await
+        .await
     }
 
     /// Look up the `vrf_output` for a completed beacon by its beacon seed and
@@ -6121,6 +6363,8 @@ mod tests {
         refresh_retries: tokio::sync::Mutex<Vec<(SpaceId, u32)>>,
         // ZEB-1031 Task 6.
         reset_responses: tokio::sync::Mutex<Vec<RecordedResetResponse>>,
+        // ZEB-1031 Task 8.
+        reset_markers: tokio::sync::Mutex<Vec<RecordedResetMarker>>,
     }
 
     /// (community_id, ceremony_id, message_hash, proposal_id, verdict,
@@ -6132,6 +6376,19 @@ mod tests {
         EventId,
         ResetVerdict,
         Option<[u8; 32]>,
+    );
+
+    /// (community_id, proposal_id, reset_digest, old_vk, old_epoch,
+    /// new_members, new_threshold) — factored into a named type per
+    /// clippy::type_complexity.
+    type RecordedResetMarker = (
+        SpaceId,
+        EventId,
+        [u8; 32],
+        [u8; 32],
+        u64,
+        Vec<OwnerAddr>,
+        u16,
     );
 
     #[async_trait::async_trait]
@@ -6229,6 +6486,27 @@ mod tests {
                 proposal_id,
                 verdict,
                 new_vk,
+            ));
+            Ok(())
+        }
+        async fn author_reset_marker(
+            &self,
+            community_id: SpaceId,
+            proposal_id: EventId,
+            reset_digest: [u8; 32],
+            old_vk: [u8; 32],
+            old_epoch: u64,
+            new_members: Vec<OwnerAddr>,
+            new_threshold: u16,
+        ) -> Result<(), String> {
+            self.reset_markers.lock().await.push((
+                community_id,
+                proposal_id,
+                reset_digest,
+                old_vk,
+                old_epoch,
+                new_members,
+                new_threshold,
             ));
             Ok(())
         }
@@ -6498,6 +6776,326 @@ mod tests {
             ceremony_id, expected_ceremony_id,
             "ceremony id must be the deterministic sign-v1 derivation — concurrent \
              initiations by different committee members must converge on this id"
+        );
+    }
+
+    // ── ZEB-1031 Task 8: maybe_auto_drive_reset ───────────────────────────
+
+    /// A single `Authorized` reset proposal fixture, reused by the
+    /// marker-authoring auto-drive tests below.
+    #[allow(clippy::too_many_arguments)]
+    fn authorized_reset_view(
+        proposal_id: EventId,
+        proposer: OwnerAddr,
+        target_vk: [u8; 32],
+        target_epoch: u64,
+        new_members: Vec<OwnerAddr>,
+        new_threshold: u16,
+    ) -> ResetProposalView {
+        ResetProposalView {
+            id: proposal_id,
+            proposer,
+            target_vk,
+            target_epoch,
+            new_members,
+            new_threshold,
+            veto_window_ms: 24 * 3_600_000,
+            signers: BTreeSet::from([proposer]),
+            proposed_at_wall_ms: 1_000,
+            deadline_ms: Some(1_500),
+            authorized_at_ms: Some(1_500),
+            endorsed: true,
+            phase: ResetPhase::Authorized,
+            consumed_new_vk: None,
+            consumption_superseded: false,
+        }
+    }
+
+    /// The orchestrator tick auto-authors the `rs` marker (via
+    /// `DkgDriver::author_reset_marker`) for an `Authorized` proposal
+    /// whose claimed `(target_vk, target_epoch)` matches this node's own
+    /// held committee state — no manual `author_dfrost_reset_marker` IPC
+    /// call.
+    #[tokio::test]
+    async fn orchestrator_auto_authors_reset_marker_zeb1031() {
+        let community_id = SpaceId([0x41; 16]);
+        let proposal_id: EventId = [0x51; 16];
+        let admin = OwnerAddr([0xA1; 16]);
+        let target_vk = [0x33u8; 32];
+        let new_members = vec![OwnerAddr([0x03; 16]), OwnerAddr([0x04; 16])];
+
+        let mut membership = MaterializedMembership::default();
+        membership.reset_proposals.push(authorized_reset_view(
+            proposal_id,
+            admin,
+            target_vk,
+            1,
+            new_members.clone(),
+            2,
+        ));
+        let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(FixedResetMembership(membership));
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            admin,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            Some(membership_resolver),
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+        {
+            let mut g = log.lock().await;
+            g.committee_state.active = true;
+            g.committee_state.joint_verifying_key = Some(target_vk);
+            g.committee_state.current_epoch = 1;
+        }
+
+        wait_until("auto-drive authors the reset marker", || async {
+            driver
+                .reset_markers
+                .lock()
+                .await
+                .iter()
+                .any(|(cid, pid, _dg, vk, epoch, nm, nt)| {
+                    *cid == community_id
+                        && *pid == proposal_id
+                        && *vk == target_vk
+                        && *epoch == 1
+                        && *nm == new_members
+                        && *nt == 2
+                })
+        })
+        .await;
+    }
+
+    /// Idempotency: once `vk_history` already records the `reset_id`
+    /// (this node — or a peer via catch-up — already authored/applied
+    /// the marker), the tick must NOT fire another `author_reset_marker`
+    /// call, even though the membership resolver still reports the
+    /// proposal `Authorized` (the phase only advances to `Consumed` on a
+    /// valid `c`, which this test never supplies).
+    #[tokio::test]
+    async fn orchestrator_skips_reset_marker_already_recorded_zeb1031() {
+        let community_id = SpaceId([0x42; 16]);
+        let proposal_id: EventId = [0x52; 16];
+        let admin = OwnerAddr([0xA2; 16]);
+        let target_vk = [0x34u8; 32];
+        let new_members = vec![OwnerAddr([0x05; 16]), OwnerAddr([0x06; 16])];
+
+        let mut membership = MaterializedMembership::default();
+        membership.reset_proposals.push(authorized_reset_view(
+            proposal_id,
+            admin,
+            target_vk,
+            1,
+            new_members,
+            2,
+        ));
+        let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(FixedResetMembership(membership));
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            admin,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            Some(membership_resolver),
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+        {
+            let mut g = log.lock().await;
+            // Committee already moved past this reset (inactive, marker
+            // recorded) — the natural post-apply state, NOT the
+            // pre-apply active-and-matching state the previous test
+            // seeds.
+            g.committee_state.active = false;
+            g.committee_state.joint_verifying_key = None;
+            g.committee_state
+                .vk_history
+                .push(crate::community_dfrost_log::VkLineageEntry {
+                    old_vk: target_vk,
+                    old_epoch: 1,
+                    reset_id: proposal_id,
+                    digest: [0u8; 32],
+                    at: Hlc {
+                        wall_ms: 1_500,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                });
+        }
+
+        // No positive predicate to poll for a negative — sleep past
+        // several ticks (10ms interval) and assert nothing fired.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            driver.reset_markers.lock().await.is_empty(),
+            "an already-recorded reset must never re-fire author_reset_marker"
+        );
+    }
+
+    /// Consumed-response auto-drive: once this node is promoted into the
+    /// successor committee (`active` + a held vk) and `vk_history`'s
+    /// latest entry names a still-`Authorized` reset whose pinned
+    /// `new_members` includes this node, the tick initiates the
+    /// `Consumed` ceremony — no manual `respond_dfrost_reset` IPC call.
+    #[tokio::test]
+    async fn orchestrator_auto_initiates_consumed_response_zeb1031() {
+        let community_id = SpaceId([0x43; 16]);
+        let proposal_id: EventId = [0x53; 16];
+        let admin = OwnerAddr([0xA3; 16]);
+        let self_addr = OwnerAddr([0x07; 16]);
+        let old_vk = [0x35u8; 32];
+        let new_vk = [0x36u8; 32];
+        let new_members = vec![self_addr, OwnerAddr([0x08; 16])];
+
+        let mut membership = MaterializedMembership::default();
+        membership.reset_proposals.push(authorized_reset_view(
+            proposal_id,
+            admin,
+            old_vk,
+            1,
+            new_members.clone(),
+            2,
+        ));
+        let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(FixedResetMembership(membership));
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            self_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            Some(membership_resolver),
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+        {
+            let mut g = log.lock().await;
+            // Promotion complete: active, holding the NEW vk, chain
+            // records this reset as the most recent link.
+            g.committee_state.active = true;
+            g.committee_state.joint_verifying_key = Some(new_vk);
+            g.committee_state.current_epoch = 2;
+            g.committee_state
+                .vk_history
+                .push(crate::community_dfrost_log::VkLineageEntry {
+                    old_vk,
+                    old_epoch: 1,
+                    reset_id: proposal_id,
+                    digest: [0u8; 32],
+                    at: Hlc {
+                        wall_ms: 1_500,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                });
+        }
+
+        wait_until("auto-drive initiates the Consumed response", || async {
+            driver
+                .reset_responses
+                .lock()
+                .await
+                .iter()
+                .any(|(cid, _cer, _mh, pid, verdict, nv)| {
+                    *cid == community_id
+                        && *pid == proposal_id
+                        && *verdict == ResetVerdict::Consumed
+                        && *nv == Some(new_vk)
+                })
+        })
+        .await;
+    }
+
+    /// Gate: NOT promoted yet (`active == false`, e.g. the marker
+    /// applied but the successor DKG hasn't completed) — the tick must
+    /// never speculatively initiate the Consumed ceremony (review
+    /// carry-forward from Task 6: gate on promotion completion, never
+    /// retry-on-error blindly).
+    #[tokio::test]
+    async fn orchestrator_does_not_initiate_consumed_before_promotion_zeb1031() {
+        let community_id = SpaceId([0x44; 16]);
+        let proposal_id: EventId = [0x54; 16];
+        let admin = OwnerAddr([0xA4; 16]);
+        let self_addr = OwnerAddr([0x09; 16]);
+        let old_vk = [0x37u8; 32];
+        let new_members = vec![self_addr, OwnerAddr([0x0A; 16])];
+
+        let mut membership = MaterializedMembership::default();
+        membership.reset_proposals.push(authorized_reset_view(
+            proposal_id,
+            admin,
+            old_vk,
+            1,
+            new_members,
+            2,
+        ));
+        let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(FixedResetMembership(membership));
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            self_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            Some(membership_resolver),
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+        {
+            let mut g = log.lock().await;
+            // Marker applied (pending_reset pinned, vk_history chain
+            // recorded, deactivated) but DKG has NOT yet completed:
+            // active stays false, no held vk.
+            g.committee_state.active = false;
+            g.committee_state.joint_verifying_key = None;
+            g.committee_state
+                .vk_history
+                .push(crate::community_dfrost_log::VkLineageEntry {
+                    old_vk,
+                    old_epoch: 1,
+                    reset_id: proposal_id,
+                    digest: [0u8; 32],
+                    at: Hlc {
+                        wall_ms: 1_500,
+                        logical: 0,
+                        device_id: "t".into(),
+                    },
+                });
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            driver.reset_responses.lock().await.is_empty(),
+            "Consumed must never fire before this node's own committee_state.active flips true"
         );
     }
 

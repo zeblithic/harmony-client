@@ -51978,6 +51978,71 @@ pub fn mint_recovery_veto_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign recovery_veto: {e}"))
 }
 
+/// ZEB-1031 §3.1: mint a signed `DfrostResetProposal` event. `new_members`
+/// is sorted + deduped by the caller BEFORE this is called (RS-P2 requires
+/// the wire shape already sorted — mirrors `dfrost_initiate_dkg_core`'s
+/// member handling).
+#[allow(clippy::too_many_arguments)]
+pub fn mint_dfrost_reset_proposal_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target_vk: [u8; 32],
+    target_epoch: u64,
+    new_members: Vec<crate::owner_state_types::OwnerAddr>,
+    new_threshold: u16,
+    veto_window_ms: u64,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::DfrostResetProposal {
+            target_vk,
+            target_epoch,
+            new_members,
+            new_threshold,
+            veto_window_ms,
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign dfrost_reset_proposal: {e}"))
+}
+
+/// ZEB-1031 §3.2: mint a signed `DfrostResetCosign` event referencing an
+/// existing `DfrostResetProposal` (RS-C1/RS-C2).
+pub fn mint_dfrost_reset_cosign_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target_event_id: [u8; 16],
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::DfrostResetCosign { target_event_id },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign dfrost_reset_cosign: {e}"))
+}
+
 /// ZEB-250 §6.3: mint a signed AdminCountersign event referencing an
 /// existing AdminProposal. Same signing/HLC contract as the
 /// `mint_admin_proposal_*` family.
@@ -55545,6 +55610,783 @@ async fn veto_admin_recovery(
     veto_admin_recovery_impl(state_lock.inner(), community_id, proposal_event_id).await
 }
 
+// ─── ZEB-1031 Task 8: D-FROST committee-reset ceremony IPCs (spec §9) ─────
+
+/// ZEB-1031: camelCase-friendly rendering of `ResetPhase`, mirroring
+/// `recovery_phase_dto`.
+fn reset_phase_dto(phase: crate::community_membership::ResetPhase) -> &'static str {
+    use crate::community_membership::ResetPhase;
+    match phase {
+        ResetPhase::Collecting => "collecting",
+        ResetPhase::Window => "window",
+        ResetPhase::Authorized => "authorized",
+        ResetPhase::Consumed => "consumed",
+        ResetPhase::Vetoed => "vetoed",
+        ResetPhase::Expired => "expired",
+        ResetPhase::Lapsed => "lapsed",
+    }
+}
+
+/// ZEB-1031 §9: read the community's D-FROST committee-reset proposal
+/// lifecycle (spec §4) on the TIME-AWARE now-floor view — same as-of
+/// pattern as `get_recovery_state_impl` (`now_ms` overrides the real wall
+/// clock for READS only; every mutating reset verb below stays on the
+/// real wall clock). Readable by any Joined member — the proposal list,
+/// like the recovery banner, is public CRDT state. Returns the
+/// materialized `ResetProposalView`s directly (spec §9's literal
+/// interface — the CBOR-wire field names ride along on the JSON
+/// boundary too, exactly as the type derives).
+pub(crate) async fn get_dfrost_reset_state_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    now_ms: Option<u64>,
+) -> Result<Vec<crate::community_membership::ResetProposalView>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (registry, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+        )
+    };
+
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let wall_now_ms = now_ms.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    });
+
+    let admin_addr = engine_arc.admin_addr();
+    let materialized = {
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        g.materialized_with_now(admin_addr, wall_now_ms)
+    };
+
+    let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+    if !matches!(
+        caller_status,
+        Some(crate::community_membership::MemberStatus::Joined)
+    ) {
+        return Err("get_dfrost_reset_state: caller is not a Joined member".to_string());
+    }
+
+    Ok(materialized.reset_proposals)
+}
+
+#[tauri::command]
+async fn get_dfrost_reset_state(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    now_ms: Option<u64>,
+) -> Result<Vec<crate::community_membership::ResetProposalView>, String> {
+    get_dfrost_reset_state_impl(state_lock.inner(), community_id, now_ms).await
+}
+
+/// Result of `propose_dfrost_reset` — the new proposal's event id.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposeDfrostResetResult {
+    pub proposal_event_id: String,
+}
+
+/// ZEB-1031 §3.1/§9: admin IPC that proposes a D-FROST committee reset.
+/// Friendly pre-checks mirror `verify_event`'s RS-P1-RS-P5 gates
+/// (`community_membership.rs`) so the UI gets readable errors instead of
+/// insert rejections — same discipline as `initiate_admin_recovery_impl`'s
+/// RP1-RP6 mirror. `new_members` is sorted + deduped here (mirrors
+/// `dfrost_initiate_dkg_core`) rather than rejecting caller order — RS-P2
+/// requires the wire shape already sorted.
+///
+/// Authorization: caller must be Joined with power 100.
+pub(crate) async fn propose_dfrost_reset_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    target_vk_hex: String,
+    target_epoch: u64,
+    new_members: Vec<String>,
+    new_threshold: u16,
+    veto_window_ms: u64,
+) -> Result<ProposeDfrostResetResult, String> {
+    use crate::community_membership::{MemberStatus, ResetPhase};
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let target_vk: [u8; 32] = hex::decode(&target_vk_hex)
+        .map_err(|e| format!("propose_dfrost_reset: invalid target_vk hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "propose_dfrost_reset: target_vk must be 32 bytes (64 hex chars)".to_string()
+        })?;
+
+    let mut member_addrs: Vec<crate::owner_state_types::OwnerAddr> = new_members
+        .iter()
+        .map(|hex_str| {
+            let bytes: [u8; 16] = hex::decode(hex_str)
+                .map_err(|e| format!("propose_dfrost_reset: invalid member hex: {e}"))?
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
+                    "propose_dfrost_reset: member must be 16 bytes (32 hex chars)".to_string()
+                })?;
+            Ok(crate::owner_state_types::OwnerAddr(bytes))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    member_addrs.sort();
+    member_addrs.dedup();
+
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    // Generation + registry fence.
+    {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during propose_dfrost_reset (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during propose_dfrost_reset (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Friendly pre-checks mirroring RS-P1-RS-P5.
+    {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialized_with_now(admin_addr, wall_now_ms);
+
+        // RS-P1: caller is a currently-Joined power-100 admin.
+        let caller_power = m.power_levels.get(&self_owner).copied().unwrap_or(0);
+        let caller_status = m.members.get(&self_owner).map(|ms| ms.status);
+        if caller_power != 100 || !matches!(caller_status, Some(MemberStatus::Joined)) {
+            return Err(
+                "propose_dfrost_reset: caller is not a Joined power-100 admin (RS-P1)".to_string(),
+            );
+        }
+        // RS-P2: new_members len >= 2, every member currently Joined
+        // (already sorted/deduped above).
+        if member_addrs.len() < 2 {
+            return Err(
+                "propose_dfrost_reset: new_members needs at least 2 distinct members (RS-P2)"
+                    .to_string(),
+            );
+        }
+        if !member_addrs.iter().all(|a| {
+            matches!(
+                m.members.get(a).map(|ms| ms.status),
+                Some(MemberStatus::Joined)
+            )
+        }) {
+            return Err(
+                "propose_dfrost_reset: every new_members entry must be a currently-Joined \
+                 member (RS-P2)"
+                    .to_string(),
+            );
+        }
+        // RS-P3: 2 <= new_threshold <= new_members.len().
+        let member_count = u16::try_from(member_addrs.len())
+            .map_err(|_| "propose_dfrost_reset: new_members too large (RS-P3)".to_string())?;
+        if new_threshold < 2 || new_threshold > member_count {
+            return Err(format!(
+                "propose_dfrost_reset: new_threshold must be in [2, {member_count}] (RS-P3)"
+            ));
+        }
+        // RS-P4: veto_window_ms within the clamp.
+        if !(crate::community_membership::RESET_VETO_WINDOW_FLOOR_MS
+            ..=crate::community_membership::RESET_VETO_WINDOW_CEILING_MS)
+            .contains(&veto_window_ms)
+        {
+            return Err(format!(
+                "propose_dfrost_reset: veto_window_ms must be in [{}, {}] (RS-P4)",
+                crate::community_membership::RESET_VETO_WINDOW_FLOOR_MS,
+                crate::community_membership::RESET_VETO_WINDOW_CEILING_MS,
+            ));
+        }
+        // RS-P5: caller has no other open (Collecting/Window/Authorized)
+        // reset proposal.
+        let has_open = m.reset_proposals.iter().any(|p| {
+            p.proposer == self_owner
+                && matches!(
+                    p.phase,
+                    ResetPhase::Collecting | ResetPhase::Window | ResetPhase::Authorized
+                )
+        });
+        if has_open {
+            return Err(
+                "propose_dfrost_reset: caller already has an open reset proposal (RS-P5)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let proposal = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.community_signing_key.as_ref();
+        mint_dfrost_reset_proposal_event(
+            space_id,
+            self_owner,
+            target_vk,
+            target_epoch,
+            member_addrs,
+            new_threshold,
+            veto_window_ms,
+            signing_key,
+            event_hlc,
+        )?
+    };
+    let proposal_id_hex = hex::encode(proposal.id);
+    let outcome = engine_arc
+        .insert_local_event(proposal)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (DfrostResetProposal): {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err("propose_dfrost_reset", &outcome));
+    }
+
+    Ok(ProposeDfrostResetResult {
+        proposal_event_id: proposal_id_hex,
+    })
+}
+
+#[tauri::command]
+async fn propose_dfrost_reset(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_vk_hex: String,
+    target_epoch: u64,
+    new_members: Vec<String>,
+    new_threshold: u16,
+    veto_window_ms: u64,
+) -> Result<ProposeDfrostResetResult, String> {
+    propose_dfrost_reset_impl(
+        state_lock.inner(),
+        community_id,
+        target_vk_hex,
+        target_epoch,
+        new_members,
+        new_threshold,
+        veto_window_ms,
+    )
+    .await
+}
+
+/// Result of `cosign_dfrost_reset`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CosignDfrostResetResult {
+    pub signers_after: u8,
+    pub phase: String,
+    pub reached_threshold: bool,
+}
+
+/// ZEB-1031 §3.2/§9: admin-quorum IPC that co-signs an open reset
+/// proposal (RS-C1/RS-C2). Idempotent: if the caller already signed (as
+/// proposer or via a prior cosign), returns the current state without
+/// minting — mirrors `cosign_admin_recovery_impl`.
+pub(crate) async fn cosign_dfrost_reset_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    target_event_id: String,
+) -> Result<CosignDfrostResetResult, String> {
+    use crate::community_membership::{MemberStatus, ResetPhase};
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let proposal_id_bytes: [u8; 16] = hex::decode(&target_event_id)
+        .map_err(|e| format!("cosign_dfrost_reset: invalid target_event_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "cosign_dfrost_reset: target_event_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during cosign_dfrost_reset (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during cosign_dfrost_reset (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    let already_signed = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialized_with_now(admin_addr, wall_now_ms);
+
+        // RS-C1: caller is a currently-Joined power-100 admin.
+        let caller_power = m.power_levels.get(&self_owner).copied().unwrap_or(0);
+        let caller_status = m.members.get(&self_owner).map(|ms| ms.status);
+        if caller_power != 100 || !matches!(caller_status, Some(MemberStatus::Joined)) {
+            return Err(
+                "cosign_dfrost_reset: caller is not a Joined power-100 admin (RS-C1)".to_string(),
+            );
+        }
+        let Some(view) = m.reset_proposals.iter().find(|p| p.id == proposal_id_bytes) else {
+            return Err(format!(
+                "cosign_dfrost_reset: proposal {target_event_id} not found"
+            ));
+        };
+        match view.phase {
+            ResetPhase::Collecting | ResetPhase::Window => {}
+            other => {
+                return Err(format!(
+                    "cosign_dfrost_reset: proposal is no longer open (phase: {})",
+                    reset_phase_dto(other)
+                ));
+            }
+        }
+        view.signers.contains(&self_owner)
+    };
+
+    if !already_signed {
+        let cosign = {
+            let outbox_g = dm_outbox.lock().await;
+            let signing_key = outbox_g.community_signing_key.as_ref();
+            mint_dfrost_reset_cosign_event(
+                space_id,
+                self_owner,
+                proposal_id_bytes,
+                signing_key,
+                event_hlc,
+            )?
+        };
+        let outcome = engine_arc
+            .insert_local_event(cosign)
+            .await
+            .map_err(|e| format!("engine.insert_local_event (DfrostResetCosign): {e}"))?;
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::Rejected(_)
+        ) {
+            return Err(membership_outcome_err("cosign_dfrost_reset", &outcome));
+        }
+    }
+
+    // Recompute from the post-insert view.
+    let (signers_after, phase) = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialized_with_now(admin_addr, wall_now_ms);
+        m.reset_proposals
+            .iter()
+            .find(|p| p.id == proposal_id_bytes)
+            .map(|p| (p.signers.len().min(u8::MAX as usize) as u8, p.phase))
+            .unwrap_or((0, ResetPhase::Collecting))
+    };
+    Ok(CosignDfrostResetResult {
+        signers_after,
+        phase: reset_phase_dto(phase).to_string(),
+        reached_threshold: !matches!(phase, ResetPhase::Collecting),
+    })
+}
+
+#[tauri::command]
+async fn cosign_dfrost_reset(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_event_id: String,
+) -> Result<CosignDfrostResetResult, String> {
+    cosign_dfrost_reset_impl(state_lock.inner(), community_id, target_event_id).await
+}
+
+/// ZEB-1031 §3.3/§9: drive the endorse/veto sign ceremony for a reset
+/// proposal, then (on completion) author the `DfrostResetResponse`
+/// event. Delegates to Task 6's
+/// `DfrostLogEngine::initiate_reset_response_ceremony` — the completion
+/// sink that turns a finished threshold signature into the membership
+/// event is already wired there (`dfrost_contribute_threshold_sign`'s
+/// `SignPurpose::ResetResponse` arm).
+///
+/// Verdict `Consumed` (`c`) is REJECTED here: it is auto-driven by the
+/// orchestrator once this node is promoted into the successor committee
+/// (`maybe_auto_drive_reset` in `community_dfrost_log_engine.rs`) and is
+/// never user-invocable — a manually forged `c` is (per spec §10) no
+/// worse than refusing DKG, but there is no reason to expose the footgun
+/// through this IPC.
+pub(crate) async fn respond_dfrost_reset_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    target_event_id: String,
+    verdict: crate::community_membership::ResetVerdict,
+) -> Result<(), String> {
+    use crate::community_membership::ResetVerdict;
+
+    if verdict == ResetVerdict::Consumed {
+        return Err(
+            "respond_dfrost_reset: verdict 'consumed' is auto-driven by the engine once the \
+             successor committee is promoted — it cannot be invoked manually"
+                .to_string(),
+        );
+    }
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let proposal_id_bytes: [u8; 16] = hex::decode(&target_event_id)
+        .map_err(|e| format!("respond_dfrost_reset: invalid target_event_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "respond_dfrost_reset: target_event_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+
+    let dfrost_log_registry = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.dfrost_log_registry.clone()
+    };
+    let registry = dfrost_log_registry.ok_or_else(|| {
+        "respond_dfrost_reset: dfrost engine not started (node not running)".to_string()
+    })?;
+    let engine = registry.get(space_id).await.ok_or_else(|| {
+        format!(
+            "respond_dfrost_reset: no dfrost engine for community {} — not currently joined",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    engine
+        .initiate_reset_response_ceremony(proposal_id_bytes, verdict)
+        .await
+}
+
+#[tauri::command]
+async fn respond_dfrost_reset(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_event_id: String,
+    verdict: crate::community_membership::ResetVerdict,
+) -> Result<(), String> {
+    respond_dfrost_reset_impl(state_lock.inner(), community_id, target_event_id, verdict).await
+}
+
+/// ZEB-1031 §5/§9: manual fallback that authors + applies + broadcasts
+/// the `rs` (ResetMarker) event for an Authorized reset proposal. Normally
+/// auto-driven (`maybe_auto_drive_reset`'s marker-authoring half) — this
+/// IPC exists for the case where auto-drive hasn't fired yet (or the
+/// caller wants it to happen now rather than on the next tick).
+///
+/// Composes exactly like the auto-drive path: resolve the proposal from
+/// the current materialized membership, recompute its binding digest,
+/// run it through `verify_reset_marker_admissible` (RS-M3/M4/M5 — the
+/// SAME verifier the ingest path uses, so a self-authored marker can
+/// never diverge from what a peer would accept), then hand the verified
+/// `(new_members, new_threshold)` pin to `dfrost_author_reset_marker_core`
+/// for signing + local apply + broadcast.
+pub(crate) async fn author_dfrost_reset_marker_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+    target_event_id: String,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let proposal_id_bytes: [u8; 16] = hex::decode(&target_event_id)
+        .map_err(|e| format!("author_dfrost_reset_marker: invalid target_event_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "author_dfrost_reset_marker: target_event_id must be 16 bytes (32 hex chars)"
+                .to_string()
+        })?;
+
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        dfrost_logs,
+        dfrost_log_registry,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            std::sync::Arc::clone(&g.dfrost_logs),
+            g.dfrost_log_registry.clone(),
+        )
+    };
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+    let admin_addr = engine_arc.admin_addr();
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let (reset_digest, old_vk, old_epoch, new_members, new_threshold) = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let materialized = state_g.materialized_with_now(admin_addr, wall_now_ms);
+
+        let proposal = materialized
+            .reset_proposals
+            .iter()
+            .find(|p| p.id == proposal_id_bytes)
+            .ok_or_else(|| {
+                format!("author_dfrost_reset_marker: proposal {target_event_id} not found")
+            })?;
+
+        let reset_digest = crate::community_membership::dfrost_reset_digest(
+            &space_id,
+            &proposal.id,
+            &proposal.target_vk,
+            proposal.target_epoch,
+            &proposal.new_members,
+            proposal.new_threshold,
+        )
+        .map_err(|e| format!("author_dfrost_reset_marker: digest: {e}"))?;
+
+        let payload = crate::community_dfrost_types::ResetMarkerPayload {
+            reset_proposal_id: proposal_id_bytes,
+            reset_digest,
+            old_vk: proposal.target_vk,
+            old_epoch: proposal.target_epoch,
+            space_id,
+        };
+        // RS-M3/M4/M5 — the same verifier the ingest path uses.
+        let (new_members, new_threshold) =
+            crate::community_dfrost_log_engine::verify_reset_marker_admissible(
+                &payload,
+                &self_owner,
+                &space_id,
+                &materialized,
+            )
+            .map_err(|e| format!("author_dfrost_reset_marker: {e}"))?;
+
+        (
+            reset_digest,
+            proposal.target_vk,
+            proposal.target_epoch,
+            new_members,
+            new_threshold,
+        )
+    };
+
+    let signing_key = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    // Direct struct literal (not `DfrostCoreHandles::for_tests`, which is
+    // gated behind `test-fixtures`): this function is production code —
+    // the fields are `pub(crate)` and constructible in-crate, exactly
+    // like `dfrost_core_handles_from_state` does for the other dfrost
+    // IPCs.
+    let handles = DfrostCoreHandles::<tauri::Wry> {
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        signing_key,
+        dfrost_logs,
+        identity_resolver: Some(community_registry.identity_resolver()),
+        dfrost_log_registry,
+    };
+
+    dfrost_author_reset_marker_core::<tauri::Wry>(
+        &handles,
+        space_id,
+        proposal_id_bytes,
+        reset_digest,
+        old_vk,
+        old_epoch,
+        new_members,
+        new_threshold,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn author_dfrost_reset_marker(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_event_id: String,
+) -> Result<(), String> {
+    author_dfrost_reset_marker_impl(state_lock.inner(), community_id, target_event_id).await
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -58077,8 +58919,13 @@ async fn voting_resolve_community_for_poll(
 /// Authorization: caller must be the voided poll's original creator, or
 /// hold power-100 (admin) in the community. Returns an error if the poll
 /// is not found, not Tier 3, or not voided.
+///
+/// ZEB-1031 Task 8: named `relaunch_voided_poll` (not
+/// `voting_relaunch_voided_poll`) to match spec §9's IPC surface exactly
+/// — renamed here rather than aliased since nothing else referenced the
+/// old name (Task 9's UI is the first consumer).
 #[tauri::command]
-async fn voting_relaunch_voided_poll(
+async fn relaunch_voided_poll(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     poll_id: String,
 ) -> Result<String, String> {
@@ -58097,7 +58944,10 @@ pub async fn relaunch_voided_poll_impl(
     relaunch_voided_poll_raw(state_lock, poll_id).await
 }
 
-async fn relaunch_voided_poll_raw(
+// ZEB-1031 Task 8: `pub(crate)` (not private) so the rpc.rs registry can
+// call it directly — the always-compiled production seam, unlike the
+// test-fixtures-gated `relaunch_voided_poll_impl` sibling above.
+pub(crate) async fn relaunch_voided_poll_raw(
     state_lock: &Mutex<NodeState>,
     poll_id: String,
 ) -> Result<String, String> {
@@ -64032,6 +64882,29 @@ impl<R: tauri::Runtime> crate::community_dfrost_log_engine::DkgDriver for Produc
         .await
     }
 
+    async fn author_reset_marker(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        proposal_id: crate::community_membership::EventId,
+        reset_digest: [u8; 32],
+        old_vk: [u8; 32],
+        old_epoch: u64,
+        new_members: Vec<crate::owner_state_types::OwnerAddr>,
+        new_threshold: u16,
+    ) -> Result<(), String> {
+        dfrost_author_reset_marker_core::<R>(
+            &self.handles,
+            community_id,
+            proposal_id,
+            reset_digest,
+            old_vk,
+            old_epoch,
+            new_members,
+            new_threshold,
+        )
+        .await
+    }
+
     async fn propose_refresh_retry(
         &self,
         community_id: crate::owner_state_types::SpaceId,
@@ -65863,6 +66736,116 @@ pub(crate) async fn dfrost_initiate_reset_response_core<R: tauri::Runtime>(
     }
 
     Ok(())
+}
+
+/// ZEB-1031 Task 8: author + apply + broadcast this node's `rs`
+/// (ResetMarker) event. `reset_digest`/`new_members`/`new_threshold` are
+/// the caller's ALREADY-VERIFIED values (computed against the current
+/// materialized membership — via `verify_reset_marker_admissible` on the
+/// manual-fallback IPC path, or the equivalent state-match check on the
+/// orchestrator's auto-drive path). This function is exactly
+/// `apply_reset_marker`'s signing + local-apply + broadcast half,
+/// mirroring `dfrost_initiate_reset_response_core`'s division of labor.
+///
+/// Idempotent: `DfrostLog::apply_reset_marker`'s own RS-M6 replay check
+/// makes a second call for an already-applied reset a benign `Ok(())`
+/// no-op (no re-publish — the orchestrator's rebroadcast cadence heals a
+/// missed original), never a duplicate marker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dfrost_author_reset_marker_core<R: tauri::Runtime>(
+    handles: &DfrostCoreHandles<R>,
+    space_id: crate::owner_state_types::SpaceId,
+    proposal_id: crate::community_membership::EventId,
+    reset_digest: [u8; 32],
+    old_vk: [u8; 32],
+    old_epoch: u64,
+    new_members: Vec<crate::owner_state_types::OwnerAddr>,
+    new_threshold: u16,
+) -> Result<(), String> {
+    use crate::community_dfrost_log::ResetMarkerApplied;
+    use crate::community_dfrost_types::{DfrostEventKind, ResetMarkerPayload};
+
+    let payload = ResetMarkerPayload {
+        reset_proposal_id: proposal_id,
+        reset_digest,
+        old_vk,
+        old_epoch,
+        space_id,
+    };
+
+    let log_arc = {
+        let mut map = handles.dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.adopt_floor,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    let event = crate::community_dfrost_log::build_signed_dfrost_event(
+        handles.signing_key.as_ref(),
+        handles.self_owner,
+        DfrostEventKind::ResetMarker,
+        &payload,
+        hlc,
+    )
+    .map_err(|e| format!("dfrost_author_reset_marker: build_signed: {e}"))?;
+
+    let apply_result = {
+        let mut log = log_arc.lock().await;
+        log.apply_reset_marker(&event, &space_id, new_members, new_threshold)
+    };
+
+    match apply_result {
+        Ok(ResetMarkerApplied::Applied { .. }) => {
+            match handles.dfrost_log_registry.as_ref() {
+                Some(registry) => match registry.get(space_id).await {
+                    Some(engine) => {
+                        if let Err(e) = engine.publish_event(event).await {
+                            tracing::warn!(
+                                space_id = ?space_id,
+                                error = %e,
+                                "dfrost_author_reset_marker: broadcast failed (local apply \
+                                 succeeded)",
+                            );
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            space_id = ?space_id,
+                            "dfrost_author_reset_marker: no engine registered for community — \
+                             broadcast skipped",
+                        );
+                    }
+                },
+                None => {
+                    tracing::debug!(
+                        "dfrost_author_reset_marker: dfrost_log_registry is None — broadcast \
+                         skipped (test context?)",
+                    );
+                }
+            }
+            Ok(())
+        }
+        Ok(ResetMarkerApplied::AlreadyMoved) => Ok(()),
+        Err(e) => Err(format!(
+            "dfrost_author_reset_marker: apply_reset_marker: {e:?}"
+        )),
+    }
 }
 
 /// Tauri IPC: committee member contributes their partial threshold-sign
@@ -80192,8 +81175,14 @@ pub fn run() {
             voting_approve_draft_candidate,
             voting_decline_sortition,
             voting_cast_ratification_ballot,
-            // ZEB-1031 Task 7: relaunch a poll voided by a committee reset.
-            voting_relaunch_voided_poll,
+            // ZEB-1031 Task 7/8: relaunch a poll voided by a committee reset.
+            relaunch_voided_poll,
+            // ZEB-1031 Task 8: D-FROST committee-reset ceremony IPCs (spec §9).
+            get_dfrost_reset_state,
+            propose_dfrost_reset,
+            cosign_dfrost_reset,
+            respond_dfrost_reset,
+            author_dfrost_reset_marker,
             // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
             voting_create_tier2_proposal,
             voting_signal_tier2,
@@ -80428,8 +81417,14 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_approve_draft_candidate,
         voting_decline_sortition,
         voting_cast_ratification_ballot,
-        // ZEB-1031 Task 7: relaunch a poll voided by a committee reset.
-        voting_relaunch_voided_poll,
+        // ZEB-1031 Task 7/8: relaunch a poll voided by a committee reset.
+        relaunch_voided_poll,
+        // ZEB-1031 Task 8: D-FROST committee-reset ceremony IPCs (spec §9).
+        get_dfrost_reset_state,
+        propose_dfrost_reset,
+        cosign_dfrost_reset,
+        respond_dfrost_reset,
+        author_dfrost_reset_marker,
         // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
         voting_create_tier2_proposal,
         voting_signal_tier2,
