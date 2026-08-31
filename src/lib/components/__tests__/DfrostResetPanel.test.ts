@@ -108,16 +108,29 @@ describe('DfrostResetPanel', () => {
   });
 
   it('renders a live countdown for the window phase from deadlineMs', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Deliberately WITHOUT `shouldAdvanceTime: true` (ZEB-1031 Task 9
+    // review round 1 C1): that option ties the fake clock's progression to
+    // REAL elapsed wall-clock time via a background real interval — which
+    // reliably passed in the full parallel suite (enough other work
+    // running alongside masked the drift) but failed deterministically
+    // under `npx vitest run` on this file in isolation (less contention →
+    // the drift consistently landed on a different hour than expected:
+    // "2d 1h remaining" instead of "2d 2h remaining"). Every clock move
+    // below is now driven explicitly via `vi.advanceTimersByTimeAsync` —
+    // no real time ever leaks into the fake clock, so the test is
+    // deterministic under both isolation and full-suite runs.
+    vi.useFakeTimers();
     try {
       const now = Date.UTC(2026, 7, 1, 12, 0, 0);
       vi.setSystemTime(now);
       const deadline = now + 2 * 86_400_000 + 3 * 3_600_000; // 2d 3h out
       mockResetState([makeProposal({ phase: 'window', deadlineMs: deadline })]);
       const { getByText } = renderPanel();
-      // Initial render depends on the async invoke() resolving — this one
-      // wait genuinely needs waitFor (no fake-clock value is being
-      // asserted, just that the row has appeared).
+      // Initial render depends on the async invoke() resolving —
+      // testing-library's `waitFor` resolves via a MutationObserver
+      // watching the DOM (a microtask, not a timer), so it needs no fake-
+      // timer advance at all here; no fake-clock value is being asserted,
+      // just that the row has appeared.
       await waitFor(() => {
         expect(getByText('2d 3h remaining')).toBeTruthy();
       });
