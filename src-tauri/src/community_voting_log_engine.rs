@@ -1067,6 +1067,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
         let mut voided_count = 0usize;
         let mut watermark_advanced = false;
+        // ZEB-1031 Task 9: voided polls, collected for the post-lock event
+        // emit below — voiding is out-of-band engine mutation (no `kd=*`
+        // event drives it), so it is otherwise invisible to every existing
+        // `voting-tier3-*` event (all fired from `apply_event`'s dispatch).
+        let mut newly_voided: Vec<PollId> = Vec::new();
         {
             let mut log = self.voting_log.lock().await;
             for state in log.polls.values_mut() {
@@ -1087,6 +1092,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     old_epoch,
                 });
                 voided_count += 1;
+                newly_voided.push(state.meta.poll_id);
             }
             // ZEB-1031 Task 7 review M1: advance the community-wide
             // retired-epoch watermark whenever this call names a NEW
@@ -1112,6 +1118,30 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         }
         if voided_count > 0 || watermark_advanced {
             self.persist_now().await;
+        }
+        // ZEB-1031 Task 9: notify the UI per newly-voided poll, mirroring
+        // `maybe_emit_tier3_lifecycle_events`'s guard/failure-handling shape
+        // (missing AppHandle = test-only mode, no-op; emit failure is
+        // logged and non-fatal — the state mutation + persist already
+        // succeeded above).
+        if let Some(app_handle) = self.app_handle.as_ref() {
+            let community_id_hex = hex::encode(self.community_id.0);
+            let reset_id_hex = hex::encode(reset_id);
+            for pid in &newly_voided {
+                let payload = crate::VotingTier3VoidedPayload {
+                    poll_id: hex::encode(pid.0),
+                    community_id: community_id_hex.clone(),
+                    reset_id: reset_id_hex.clone(),
+                    old_epoch,
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-voided", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %hex::encode(pid.0),
+                        "voting-tier3-voided emit failed (non-fatal)"
+                    );
+                }
+            }
         }
         voided_count
     }

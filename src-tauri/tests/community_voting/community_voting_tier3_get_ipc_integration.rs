@@ -147,6 +147,49 @@ impl Tier3TestHarness {
         }
     }
 
+    /// NodeState with a Tier 3 poll in Sortition stage, then voided
+    /// directly on the tier3 state — mirrors what
+    /// `void_tier3_polls_for_reset` does (ZEB-1031 Task 7), without
+    /// driving a full reset-marker apply. Used to pin the `voided` DTO
+    /// projection (ZEB-1031 Task 9).
+    async fn with_voided_poll_in_sortition_stage() -> Self {
+        let community_id = SpaceId([0xA5; 16]);
+        let proposer = fixture_identity(5);
+        let self_id = fixture_identity(98);
+
+        let config = tier3_config();
+        let hlc = hlc_at(1_000_000);
+        let event =
+            build_signed_poll_create_tier3(&proposer.signing_key, proposer.owner, &config, hlc)
+                .expect("build_signed_poll_create_tier3");
+        let signing_bytes = event.signing_bytes().expect("signing_bytes");
+        let poll_id = derive_poll_id(&community_id, &signing_bytes);
+
+        let snapshot = single_member_snapshot(proposer.owner);
+        let mut log = VotingLog::new();
+        log.apply_with_snapshot(event, &community_id, Some(snapshot))
+            .expect("apply tier3 poll create");
+
+        {
+            let state = log.polls.get_mut(&poll_id).expect("poll just created");
+            let t3 = state
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 poll just created");
+            t3.voided = Some(harmony_app::community_voting_tier3::VoidedInfo {
+                reset_id: [0x9a; 16],
+                old_epoch: 3,
+            });
+        }
+
+        let state = build_node_state_with_log(community_id, log, Some(self_id.owner)).await;
+        Tier3TestHarness {
+            state,
+            poll_id_hex: hex::encode(poll_id.0),
+            community_id_hex: hex::encode(community_id.0),
+        }
+    }
+
     /// NodeState with a Tier 3 poll where kd=ss has been applied including self_id in primary.
     async fn with_poll_in_drafting_stage_and_self_in_mini_public() -> Self {
         let community_id = SpaceId([0xA3; 16]);
@@ -748,6 +791,59 @@ async fn list_tier3_polls_projects_deliberation_stage_after_kd_ss_within_dw_wind
         summary.stage,
         Tier3StageTag::Deliberation,
         "list summary stage should mirror get_tier3_poll stage (both via current_stage_at)"
+    );
+}
+
+// ─── ZEB-1031 Task 9: voided-field DTO projection ─────────────────────────────
+
+#[tokio::test]
+async fn get_tier3_poll_projects_voided_field_with_correct_hex_reset_id_and_epoch() {
+    let h = Tier3TestHarness::with_voided_poll_in_sortition_stage().await;
+    let export = h.get_tier3_poll(&h.poll_id_hex).await.expect("ok");
+    let voided = export
+        .voided
+        .expect("voided poll must project Some(voided)");
+    assert_eq!(voided.reset_id, "9a".repeat(16));
+    assert_eq!(voided.old_epoch, 3);
+}
+
+#[tokio::test]
+async fn get_tier3_poll_projects_none_for_voided_when_poll_untouched_by_a_reset() {
+    let h = Tier3TestHarness::with_poll_in_sortition_stage().await;
+    let export = h.get_tier3_poll(&h.poll_id_hex).await.expect("ok");
+    assert!(
+        export.voided.is_none(),
+        "a poll no reset has touched must project voided = None"
+    );
+}
+
+#[tokio::test]
+async fn list_tier3_polls_projects_voided_field_with_correct_hex_reset_id_and_epoch() {
+    let h = Tier3TestHarness::with_voided_poll_in_sortition_stage().await;
+    let summaries = h.list_tier3_polls(&h.community_id_hex).await.expect("ok");
+    let summary = summaries
+        .iter()
+        .find(|s| s.poll_id == h.poll_id_hex)
+        .expect("poll should appear in list");
+    let voided = summary
+        .voided
+        .clone()
+        .expect("voided poll must project Some(voided) in the summary too");
+    assert_eq!(voided.reset_id, "9a".repeat(16));
+    assert_eq!(voided.old_epoch, 3);
+}
+
+#[tokio::test]
+async fn list_tier3_polls_projects_none_for_voided_when_poll_untouched_by_a_reset() {
+    let h = Tier3TestHarness::with_poll_in_sortition_stage().await;
+    let summaries = h.list_tier3_polls(&h.community_id_hex).await.expect("ok");
+    let summary = summaries
+        .iter()
+        .find(|s| s.poll_id == h.poll_id_hex)
+        .expect("poll should appear in list");
+    assert!(
+        summary.voided.is_none(),
+        "a poll no reset has touched must project voided = None in the summary too"
     );
 }
 

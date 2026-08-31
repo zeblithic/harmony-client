@@ -58024,6 +58024,22 @@ pub struct CandidateScoreDto {
     pub runoff_votes: u32,
 }
 
+/// Tauri event payload for `"voting-tier3-voided"`. ZEB-1031 Task 7/9:
+/// voiding is out-of-band engine mutation (`void_tier3_polls_for_reset`,
+/// driven by a D-FROST reset-marker apply, not any `kd=*` poll event), so
+/// unlike every other `voting-tier3-*` event above it is not fired from
+/// `maybe_emit_tier3_lifecycle_events`'s `apply_event`-driven dispatch —
+/// it is invisible to all of those. Emitted once per poll newly voided by
+/// a single reset sweep.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier3VoidedPayload {
+    pub poll_id: String,
+    pub community_id: String,
+    pub reset_id: String,
+    pub old_epoch: u64,
+}
+
 /// Tauri event payload for `"voting-tier3-finalized"`. Carries enough for
 /// the UI to render the winner without re-querying the poll.
 #[derive(Debug, Clone, Serialize)]
@@ -58118,6 +58134,21 @@ mod tier3_payload_struct_tests {
         assert!(json.contains("\"winnerEventHash\""));
         assert!(json.contains("\"runnerUpEventHash\""));
         assert!(json.contains("\"totalScore\":12"));
+    }
+
+    #[test]
+    fn tier3_voided_payload_serializes_camel_case() {
+        let p = VotingTier3VoidedPayload {
+            poll_id: "09".repeat(32),
+            community_id: "0a".repeat(16),
+            reset_id: "0b".repeat(16),
+            old_epoch: 3,
+        };
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(json.contains("\"pollId\""));
+        assert!(json.contains("\"communityId\""));
+        assert!(json.contains("\"resetId\""));
+        assert!(json.contains("\"oldEpoch\":3"));
     }
 }
 
@@ -59897,6 +59928,26 @@ pub struct MyDeliberationVoteExport {
     pub vote: String, // "agree" | "disagree" | "pass"
 }
 
+/// ZEB-1031 Task 7/9: frontend projection of
+/// `community_voting_tier3::VoidedInfo` — the committee reset that retired
+/// a Tier 3 poll. `reset_id` hex-encoded like every other `EventId` field
+/// in this DTO family (32-char hex; `EventId` is 16 bytes).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoidedInfoDto {
+    pub reset_id: String, // 32-char hex
+    pub old_epoch: u64,
+}
+
+impl From<crate::community_voting_tier3::VoidedInfo> for VoidedInfoDto {
+    fn from(v: crate::community_voting_tier3::VoidedInfo) -> Self {
+        Self {
+            reset_id: hex::encode(v.reset_id),
+            old_epoch: v.old_epoch,
+        }
+    }
+}
+
 /// ZEB-311: full state for a single Tier 3 poll, projected from
 /// `Tier3PollState` plus caller-derived `my_*` fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -59963,6 +60014,9 @@ pub struct Tier3PollExport {
     /// latest committee epoch. Always 0 in pu-mode polls or when no
     /// committee is yet active.
     pub encrypted_tally_committee_size: u16,
+    /// ZEB-1031 Task 7/9: set when a committee reset voided this poll
+    /// (spec §7). `None` for a poll no reset has touched.
+    pub voided: Option<VoidedInfoDto>,
 }
 
 /// ZEB-311: lightweight per-row shape returned by
@@ -59990,6 +60044,9 @@ pub struct Tier3PollSummary {
     /// config ("pu" | "se" | "rf"). Lets the list view render the 🔒
     /// privacy chip without doing a full `voting_get_tier3_poll` fetch.
     pub privacy_mode: String,
+    /// ZEB-1031 Task 7/9: set when a committee reset voided this poll
+    /// (spec §7). `None` for a poll no reset has touched.
+    pub voided: Option<VoidedInfoDto>,
 }
 
 /// ZEB-294: camelCase wire DTO for a bridging-statement score row.
@@ -64199,6 +64256,7 @@ fn build_tier3_export(
         encrypted_tally_share_count,
         encrypted_tally_threshold,
         encrypted_tally_committee_size,
+        voided: t3.voided.map(VoidedInfoDto::from),
     })
 }
 
@@ -64304,6 +64362,7 @@ async fn voting_list_tier3_polls_raw(
                 sortition_size: t3.meta.config.sortition_size,
                 winner_text,
                 privacy_mode: t3.meta.config.privacy_mode.clone(),
+                voided: t3.voided.map(VoidedInfoDto::from),
             })
         })
         .collect();
