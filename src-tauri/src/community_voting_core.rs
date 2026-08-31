@@ -427,10 +427,29 @@ pub struct Tier3PollConfigPayload {
     /// regardless of when it was actually created.
     ///
     /// `None` means a pre-Task-7 poll, from before this field existed.
-    /// Every materialization path treats an absent `ce` as epoch `0` —
-    /// correct by construction: a legacy poll necessarily predates every
-    /// reset this scheme can represent, so "voidable by any reset" is the
-    /// right disposition, not a fallback to paper over.
+    /// Every materialization path treats an absent `ce` as epoch `0`.
+    ///
+    /// For a uniform fleet (every node ZEB-1031-aware), this is correct by
+    /// construction: a genuinely `ce`-less event necessarily predates the
+    /// existence of the reset feature itself, hence predates every reset
+    /// the community could represent — "voidable by any reset" is the
+    /// right disposition, not a fallback to paper over. (A node's OWN
+    /// pre-upgrade poll, whose true epoch survives separately via the
+    /// legacy `set_tier3_poll_epoch` overlay, is a different case — see
+    /// `reconcile_voting_from_state`'s replay-overlay ordering, ZEB-1031
+    /// Task 7 review round 3.)
+    ///
+    /// For a mixed-version fleet — an un-upgraded peer still broadcasting
+    /// `ce`-less creates into a community that has since run a reset — the
+    /// same epoch-0 disposition is *still* correct, for a structural reason
+    /// rather than a coincidence: a reset's `o`/`w`/`z` membership events
+    /// hard-fork the community state root (ZEB-1031 §6), so an un-upgraded
+    /// client cannot decode post-reset membership state at all — it cannot
+    /// be a live participant in that community. Any Tier-3 `PollCreate` it
+    /// could still somehow emit would bind the *retired* committee's `vk`
+    /// regardless of what epoch value gets attributed to it, so voiding a
+    /// live-ingested `ce`-less create in a post-reset community disposes of
+    /// genuinely stale state, not collateral damage from an absent field.
     ///
     /// Trust model: this payload is creator-signed, but `ce` is NOT
     /// independently verified against real D-FROST state (unlike a reset

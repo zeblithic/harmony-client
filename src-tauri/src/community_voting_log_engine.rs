@@ -1120,9 +1120,17 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// (spec §7). Authors a fresh `kd=cr` PollCreate copying the voided
     /// poll's parameters, carrying `predecessor: Some(old_poll_id)`, and
     /// publishes it through the SAME local-mint dispatch every other
-    /// Tier-3 PollCreate uses (`publish_event`) — so it inherits the
-    /// CURRENT-epoch pre-read, the D-FROST-readiness gate, persistence,
-    /// and the beacon-request trigger for free, unmodified.
+    /// Tier-3 PollCreate uses (`publish_event`).
+    ///
+    /// Epoch handling (review round 2, C1): the current-committee-epoch
+    /// pre-read and D-FROST-readiness gate now happen HERE, before
+    /// signing, via `read_current_committee_epoch_for_tier3_create` —
+    /// the read has to precede signing so the epoch is part of what's
+    /// signed. `publish_event`'s own pre-read/gate is skipped for this
+    /// event, since `cfg.ce` already carries a value by the time it gets
+    /// there (see `publish_event`'s Tier3-create block: it only runs its
+    /// own gate+read when `cfg.ce.is_none()`). `publish_event` still
+    /// supplies persistence and the beacon-request trigger, unmodified.
     ///
     /// Authorization: `caller` must be the voided poll's original creator,
     /// or `caller_is_power_100` must be `true` — resolved by the caller

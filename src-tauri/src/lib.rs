@@ -59447,12 +59447,30 @@ async fn reconcile_voting_from_state(
         // ZEB-1031 Task 7: restore `voided` (set by the engine's
         // `void_tier3_polls_for_reset`, not by any event — replay alone
         // would resurrect a reset-voided poll as live-and-mutable).
-        // Mirrors the Tier-2 timing overlay's inline-match style above.
-        if let Some(voided) = restore.voided {
-            if let Some(state) = log.polls.get_mut(&pid) {
-                if let crate::community_voting_log::TierState::Tier3(t3) = &mut state.tier_state {
-                    t3.voided = Some(voided);
-                }
+        //
+        // Round-2-review-round-3 fix: this MUST be an unconditional
+        // assignment, not "only when `Some`". The replay loop above
+        // materializes each PollCreate using ONLY the wire-carried `ce`
+        // (0 for a pre-ZEB-1031 event, which never had that key) — it has
+        // no visibility into `tier3_community_epoch` restored just above,
+        // which happens only after materialization. So a legacy poll whose
+        // TRUE epoch sits above the watermark gets wrongly voided by the
+        // replay-time materialization check (0 <= watermark.old_epoch is
+        // true whenever a watermark exists), purely as an artifact of the
+        // legacy-decode default — nothing before this point corrects it.
+        // `restore.voided` is captured in the SAME persist snapshot as
+        // `tier3_community_epoch` and the watermark (one lock scope in
+        // `snapshot_for_persist`), so it is always the mutually-consistent,
+        // authoritative last-known answer for this poll: applying it
+        // unconditionally — including `None`, to clear a replay-time
+        // false-positive void — is what keeps a pre-upgrade poll whose real
+        // epoch outlived a reset from staying wrongly voided forever after
+        // a restart, while a poll genuinely voided under the old epoch
+        // (`restore.voided` is truly `Some`) still restores voided exactly
+        // as before.
+        if let Some(state) = log.polls.get_mut(&pid) {
+            if let crate::community_voting_log::TierState::Tier3(t3) = &mut state.tier_state {
+                t3.voided = restore.voided;
             }
         }
     }
@@ -60548,6 +60566,165 @@ mod zeb718_voting_reconcile_tests {
             Some(42),
             "Tier-3 community_epoch must survive restart, not reset to 0"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_wrongly_void_pre_upgrade_poll_above_watermark() {
+        // ZEB-1031 Task 7 review round 3, finding 1: a pre-ZEB-1031 poll
+        // (created before the wire `ce` key existed, so its stored event
+        // has no `ce`) whose TRUE epoch — tracked only via the legacy
+        // `set_tier3_poll_epoch` overlay, restored AFTER the replay loop —
+        // sits ABOVE a since-persisted retired-epoch watermark must NOT
+        // come back voided after a save -> load -> replay cycle. Replay's
+        // own materialization pass decodes `ce` as absent (0) for this
+        // event and, seeing a watermark already loaded, would wrongly void
+        // it; the overlay pass must correct that using the poll's true
+        // persisted epoch and voided state, not just layer a `Some` on top.
+        use crate::community_voting_tier3::VoidedInfo;
+        let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
+        let cid = SpaceId([0x7a; 16]);
+        let actor = OwnerAddr([0xdd; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+        let mut log = VotingLog::new();
+        // No watermark yet at create time — materializes not-voided at the
+        // legacy default epoch 0 (this poll's event carries no `ce`).
+        let pid = log
+            .apply_with_snapshot(
+                tier3_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier3 create");
+        // The legacy live-patch mechanism records this poll's TRUE epoch —
+        // well above the reset that is about to be recorded below.
+        assert!(log.set_tier3_poll_epoch(&pid, 42));
+        // A reset at epoch 10 is later recorded as a watermark. Because the
+        // live sweep that set this watermark ran against the poll's true
+        // epoch (42), it correctly did NOT void this poll — `voided` stays
+        // `None`, exactly as it would on the node that actually ran that
+        // sweep.
+        log.retired_epoch_watermark = Some(VoidedInfo {
+            reset_id: [0xAA; 16],
+            old_epoch: 10,
+        });
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        let t3 = g
+            .polls
+            .get(&pid)
+            .and_then(|s| s.tier_state.as_tier3())
+            .expect("poll reloaded as tier3");
+        assert_eq!(
+            t3.meta.community_epoch, 42,
+            "true epoch must survive restart"
+        );
+        assert!(
+            t3.voided.is_none(),
+            "a poll whose true epoch (42) sits above the watermark (10) must not \
+             come back voided just because replay's own materialization pass saw \
+             the legacy ce-absent default of 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_preserves_void_for_pre_upgrade_poll_at_or_below_watermark() {
+        // ZEB-1031 Task 7 review round 3, finding 1 (regression guard on the
+        // same fix): a pre-ZEB-1031 poll that WAS genuinely voided (its true
+        // epoch sits at or below the retired watermark, and the live sweep
+        // recorded that) must still come back voided after a restart — the
+        // round-3 fix to stop wrongly voiding must not also start wrongly
+        // un-voiding a poll that really was voided.
+        use crate::community_voting_tier3::VoidedInfo;
+        let dir = tempfile::tempdir().unwrap();
+        crate::device_dataset_file::install_test_cipher(dir.path());
+        let cid = SpaceId([0x7b; 16]);
+        let actor = OwnerAddr([0xee; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier3_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier3 create");
+        // True epoch (5) sits AT the reset's old_epoch (5) — the live sweep
+        // that recorded this watermark would have voided this poll.
+        assert!(log.set_tier3_poll_epoch(&pid, 5));
+        let voided_info = VoidedInfo {
+            reset_id: [0xBB; 16],
+            old_epoch: 5,
+        };
+        {
+            let state = log.polls.get_mut(&pid).expect("poll materialized");
+            if let crate::community_voting_log::TierState::Tier3(t3) = &mut state.tier_state {
+                t3.voided = Some(voided_info);
+            }
+        }
+        log.retired_epoch_watermark = Some(voided_info);
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(
+            &crate::device_dataset_file::test_cipher(),
+            &path,
+            &log,
+            &cid,
+        )
+        .unwrap();
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        let t3 = g
+            .polls
+            .get(&pid)
+            .and_then(|s| s.tier_state.as_tier3())
+            .expect("poll reloaded as tier3");
+        let voided = t3
+            .voided
+            .expect("a poll genuinely voided at or below the watermark must stay voided");
+        assert_eq!(voided.reset_id, [0xBB; 16]);
+        assert_eq!(voided.old_epoch, 5);
     }
 
     #[tokio::test]
