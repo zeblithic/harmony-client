@@ -27,6 +27,7 @@
   import PipMeter from './governance/PipMeter.svelte';
   import RecoveryConfigDialog from './RecoveryConfigDialog.svelte';
   import InitiateRecoveryDialog from './InitiateRecoveryDialog.svelte';
+  import DfrostResetPanel from './DfrostResetPanel.svelte';
   import type { RecoveryStateDto } from '../recovery-types';
   import {
     RECOVERY_FLAGS_CHANGED_EVENT,
@@ -709,6 +710,23 @@
         {/if}
       </div>
     {/if}
+
+    <!-- ZEB-1031 §9: D-FROST committee-reset section. Unlike "Admin
+         recovery" above, this is NOT admin-gated at the section level —
+         `get_dfrost_reset_state` is readable by any Joined member (the
+         committee whose liveness is at stake may not overlap with the
+         admin set at all), so the section always mounts; the panel
+         itself gates the propose form + Cosign button on `canAdmin`
+         internally. -->
+    <div class="section dfrost-reset-section" aria-label="D-FROST committee reset">
+      <div class="section-label">D-FROST committee reset</div>
+      <DfrostResetPanel
+        {communityId}
+        {joinedMembers}
+        {canAdmin}
+        adminQuorum={currentAdminQuorum}
+      />
+    </div>
 
     {#if showChangeQuorumDialog && canAdmin}
       <ChangeQuorumDialog
