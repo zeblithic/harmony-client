@@ -2812,16 +2812,28 @@ struct RecoveryWork {
     veto_window_ms: u64,
     designates: Vec<OwnerAddr>,
     config_digest: [u8; 32],
-    /// wall_ms of each distinct valid signature (proposer's included).
-    /// Unsorted — forward-ref cosigns can carry walls ≤ t0; sorted at
-    /// evaluation time to find the Rth-smallest (t_R).
-    sig_walls: Vec<u64>,
     signers: BTreeSet<OwnerAddr>,
+    /// ZEB-1037 (mirrors `ResetWork::t_q_reached`): wall_ms of the event
+    /// whose fold tipped `signers` to R, credited AT THE FOLD POSITION.
+    /// Live cosigns credit their own wall — they cannot sort before the
+    /// proposal (the replay's total order is primarily wall_ms), so it
+    /// is always ≥ t₀. Forward-ref-queued cosigns drain at the
+    /// PROPOSAL's fold and credit t₀ itself: a queued cosign CAN be
+    /// backdated (clock skew, or collusion), and the previous
+    /// derivation — Rth-smallest of the per-cosign walls — let R
+    /// backdated cosigns place t_R (and so `deadline = t_R + W`) before
+    /// t₀, emptying the RV1 `[t₀, deadline]` veto window and executing
+    /// the recovery at materialize with the time-lock bypassed. Set at
+    /// most once (`maybe_tip_recovery_threshold`'s `is_none()` guard).
+    ///
+    /// Always `>= t0_wall_ms` by construction, so the veto window is
+    /// never shorter than the full W the config promised.
+    t_r_reached: Option<u64>,
     /// PR #497 R2 (Greptile P1): deadline as computed AT REPLAY TIME
     /// (when the Rth signature folded) — the cutoff for the
-    /// `new_admin_joined` snapshot below. May differ from evaluate's
-    /// authoritative deadline in exotic late-delivery orderings; both
-    /// are pure functions of the sorted log, so replicas still converge.
+    /// `new_admin_joined` snapshot below. Since ZEB-1037 both this and
+    /// evaluate's authoritative deadline derive from the set-once
+    /// `t_r_reached`, so they agree by construction.
     deadline_at_replay: Option<u64>,
     /// PR #497 R2 (Greptile P1): running snapshot of "new_admin is
     /// currently Joined", refreshed after every replayed event whose
@@ -2835,19 +2847,23 @@ struct RecoveryWork {
     new_admin_joined: bool,
 }
 
-/// ZEB-713 (PR #497 R2): once a proposal's distinct-signer count
-/// reaches R, freeze the replay-time deadline used as the
-/// `new_admin_joined` snapshot cutoff. `checked_add` mirrors the
+/// ZEB-1037: set-once threshold tip — the FIRST fold that pushes
+/// `signers.len()` to (or past) R records `at_wall_ms` as `t_r_reached`
+/// and freezes the replay-time deadline (PR #497 R2) from it.
+/// `at_wall_ms` is the tipping event's own FOLD-POSITION wall — the
+/// cosign's wall on the live arm, the PROPOSAL's wall (t₀) on the
+/// forward-ref drain and the self-satisfy path; see
+/// `RecoveryWork::t_r_reached` for why callers must never pass a queued
+/// cosign's (possibly backdated) wall here. `checked_add` mirrors the
 /// evaluate-side fail-closed arithmetic (an overflowing window leaves
-/// the proposal Expired there, so a None here is inert).
-fn maybe_set_replay_deadline(work: &mut RecoveryWork) {
-    if work.deadline_at_replay.is_some() || work.signers.len() < work.threshold as usize {
-        return;
-    }
-    let mut walls = work.sig_walls.clone();
-    walls.sort_unstable();
-    if let Some(tr) = walls.get(work.threshold as usize - 1) {
-        work.deadline_at_replay = tr.checked_add(work.veto_window_ms);
+/// the proposal Expired there, so a None deadline here is inert).
+fn maybe_tip_recovery_threshold(work: &mut RecoveryWork, at_wall_ms: u64) {
+    if work.t_r_reached.is_none()
+        && work.threshold > 0
+        && work.signers.len() >= work.threshold as usize
+    {
+        work.t_r_reached = Some(at_wall_ms);
+        work.deadline_at_replay = at_wall_ms.checked_add(work.veto_window_ms);
     }
 }
 
@@ -2859,9 +2875,12 @@ fn maybe_set_replay_deadline(work: &mut RecoveryWork) {
 /// prior signers (BTreeSet dedup).
 /// ZEB-713: facts recorded for a cosign at its replay position —
 /// everything the fold needs to judge validity once the target proposal
-/// is known (forward-ref cosigns are queued as these).
+/// is known (forward-ref cosigns are queued as these). No wall_ms
+/// (ZEB-1037, mirrors `QueuedResetCosign`): the forward-ref drain
+/// deliberately never consults a queued cosign's own — possibly
+/// backdated — wall; the tip credits the proposal's fold position
+/// instead (see `RecoveryWork::t_r_reached`).
 struct QueuedRecoveryCosign {
-    wall_ms: u64,
     actor: OwnerAddr,
     /// Running config digest at the cosign's position (RC2).
     running_digest: Option<[u8; 32]>,
@@ -2869,7 +2888,10 @@ struct QueuedRecoveryCosign {
     joined: bool,
 }
 
-fn fold_recovery_cosign(work: &mut RecoveryWork, cosign: QueuedRecoveryCosign) {
+/// `tip_wall_ms` is the wall credited if THIS fold tips the count to R:
+/// the cosign's own wall on the live arm, the PROPOSAL's wall on the
+/// forward-ref drain (ZEB-1037 — see `RecoveryWork::t_r_reached`).
+fn fold_recovery_cosign(work: &mut RecoveryWork, cosign: QueuedRecoveryCosign, tip_wall_ms: u64) {
     if !cosign.joined {
         return;
     }
@@ -2880,8 +2902,7 @@ fn fold_recovery_cosign(work: &mut RecoveryWork, cosign: QueuedRecoveryCosign) {
         return;
     }
     if work.signers.insert(cosign.actor) {
-        work.sig_walls.push(cosign.wall_ms);
-        maybe_set_replay_deadline(work);
+        maybe_tip_recovery_threshold(work, tip_wall_ms);
     }
 }
 
@@ -2927,10 +2948,11 @@ fn evaluate_recovery_phases(
     // Pass 1: per-proposal phase ignoring rivals.
     for (id, work) in rec_proposals.iter() {
         let t0 = work.t0_wall_ms;
-        let r = work.threshold as usize;
-        let mut walls = work.sig_walls.clone();
-        walls.sort_unstable();
-        let t_r = walls.get(r.saturating_sub(1)).copied();
+        // ZEB-1037: t_R is the set-once fold-position tip, not the
+        // Rth-smallest per-cosign wall — backdated forward-ref cosigns
+        // can no longer drag the deadline below t₀ + W (see
+        // `RecoveryWork::t_r_reached`).
+        let t_r = work.t_r_reached;
         // Deadline exists only once R distinct signatures landed AND
         // the Rth arrived within the 30-day initiation window (the
         // ZEB-250 expiry constant, spec §3.3.1).
@@ -4598,36 +4620,42 @@ pub fn materialize_with_now(
                     veto_window_ms: config.veto_window_ms,
                     designates: config.designates.clone(),
                     config_digest: *config_digest,
-                    sig_walls: vec![event.at.wall_ms],
                     signers: BTreeSet::from([event.actor]),
+                    t_r_reached: None,
                     deadline_at_replay: None,
                     // RP3 verified new_admin Joined at proposal time; the
                     // per-event refresh below keeps this current until
                     // the deadline.
                     new_admin_joined: is_joined_member(&m, new_admin),
                 };
+                // R=1 proposals self-satisfy at bind (ZEB-1037: credits
+                // t₀, like everything folding at this position).
+                maybe_tip_recovery_threshold(&mut work, event.at.wall_ms);
                 // Fold queued forward-ref cosigns (ZEB-250 R2(b) mirror).
+                // ZEB-1037: a queued cosign CAN carry a backdated wall —
+                // the tip credits the PROPOSAL's wall, never the
+                // cosign's, so t_R (and the veto deadline) can never
+                // land before t₀ (see `RecoveryWork::t_r_reached`).
                 if let Some(queued) = rec_pending_cosigns.remove(&event.id) {
                     for cosign in queued {
-                        fold_recovery_cosign(&mut work, cosign);
+                        fold_recovery_cosign(&mut work, cosign, event.at.wall_ms);
                     }
                 }
-                // R=1 (or forward-ref-satisfied) proposals reach
-                // threshold at bind — freeze the snapshot cutoff here.
-                maybe_set_replay_deadline(&mut work);
                 rec_proposals.insert(event.id, work);
             }
             MembershipEventKind::RecoveryCosign { target_event_id } => {
                 // ZEB-713: record the position-local facts and fold (or
                 // queue when the target hasn't been reached in HLC order).
                 let cosign = QueuedRecoveryCosign {
-                    wall_ms: event.at.wall_ms,
                     actor: event.actor,
                     running_digest: running_recovery_digest(&m),
                     joined: is_joined_member(&m, &event.actor),
                 };
                 if let Some(work) = rec_proposals.get_mut(target_event_id) {
-                    fold_recovery_cosign(work, cosign);
+                    // Live arm: this cosign folds at its own position, so
+                    // its wall is the tip credit — sort order guarantees
+                    // it is ≥ t₀ (ZEB-1037).
+                    fold_recovery_cosign(work, cosign, event.at.wall_ms);
                 } else {
                     rec_pending_cosigns
                         .entry(*target_event_id)
@@ -15471,6 +15499,9 @@ mod zeb_713_recovery_materialize_tests {
     fn d2() -> OwnerAddr {
         OwnerAddr([0x12; 16])
     }
+    fn d3() -> OwnerAddr {
+        OwnerAddr([0x13; 16])
+    }
     fn m_new() -> OwnerAddr {
         OwnerAddr([0x21; 16])
     }
@@ -16020,6 +16051,80 @@ mod zeb_713_recovery_materialize_tests {
         let m = materialize_with_now(&events, admin1(), Some(T0 + W + 1));
         assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
         assert_eq!(view(&m, P1).deadline_ms, Some(T0 + W));
+    }
+
+    /// ZEB-1037 regression: BACKDATED forward-ref cosigns must not drag
+    /// t_R below t₀. Two colluding designates cosigning with walls more
+    /// than W in the past previously collapsed the veto window
+    /// (`deadline = t_R + W < t₀` ⇒ `[t₀, deadline]` empty ⇒ admin veto
+    /// structurally unreachable ⇒ Executed at materialize) — the whole
+    /// time-lock bypassed. The tip is now pinned at the fold position
+    /// (mirrors `ResetWork::t_q_reached`): queued cosigns tip at the
+    /// PROPOSAL's own wall, so the deadline is exactly t₀ + W.
+    #[test]
+    fn backdated_forward_ref_cosigns_cannot_collapse_veto_window() {
+        // Custom world: THREE designates (R=2) so two NON-proposer
+        // designates can both backdate — with only two, the proposer's
+        // own t₀ wall is always the Rth-smallest and the collapse is
+        // unrepresentable.
+        let t0b: u64 = 700_000_000; // > W + config wall: backdating below t₀ − W fits
+        let mut events = vec![
+            ev([0xA0; 16], admin1(), 500, MembershipEventKind::Join),
+            ev([0xA1; 16], d1(), 1_000, MembershipEventKind::Join),
+            ev([0xA2; 16], d2(), 1_100, MembershipEventKind::Join),
+            ev([0xA6; 16], d3(), 1_150, MembershipEventKind::Join),
+            ev([0xA3; 16], m_new(), 1_200, MembershipEventKind::Join),
+            ev(
+                [0xA5; 16],
+                admin1(),
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetRecoveryDesignates {
+                        designates: vec![d1(), d2(), d3()],
+                        threshold: 2,
+                        veto_window_ms: W,
+                    },
+                },
+            ),
+        ];
+        let digest = {
+            let m = materialize(&events, admin1());
+            recovery_config_digest(m.recovery_designates.as_ref().expect("configured"))
+                .expect("digest")
+        };
+        // Both cosigns backdated more than W before t₀ — they sort
+        // before the proposal, so they are forward-ref queued and
+        // drained at the proposal's fold.
+        events.push(cosign([0xC1; 16], d2(), 11_000));
+        events.push(cosign([0xC2; 16], d3(), 12_000));
+        events.push(ev(
+            P1,
+            d1(),
+            t0b,
+            MembershipEventKind::RecoveryProposal {
+                lost_admin: admin1(),
+                new_admin: m_new(),
+                config_digest: digest,
+            },
+        ));
+
+        // Just after t₀: R is reached, but the FULL [t₀, t₀+W] window
+        // must stand — not Executed via a deadline that predates t₀.
+        let m = materialize_with_now(&events, admin1(), Some(t0b + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::TimeLocked);
+        assert_eq!(view(&m, P1).deadline_ms, Some(t0b + W));
+
+        // An admin veto mid-window must land (previously structurally
+        // unreachable: the collapsed window was empty).
+        let mut vetoed = events.clone();
+        vetoed.push(veto([0xC3; 16], admin1(), t0b + W / 2));
+        let m = materialize_with_now(&vetoed, admin1(), Some(t0b + W + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Vetoed);
+
+        // And with no veto, the elapsed window still executes — the
+        // pin restores the time-lock; it does not freeze the proposal.
+        let m = materialize_with_now(&events, admin1(), Some(t0b + W + 1));
+        assert_eq!(view(&m, P1).phase, RecoveryPhase::Executed);
     }
 
     #[test]
