@@ -694,3 +694,104 @@ async fn relaunch_of_a_retry_poll_drops_stale_retry_of_link() {
          supersedes it"
     );
 }
+
+/// ZEB-1041: `replay_vk_lineage_voids` re-derives voids that a swallowed/
+/// stalled voting persist stranded (dfrost durable at the post-reset epoch,
+/// voting durable state never captured the sweep). In-order replay
+/// preserves attribution: a poll stranded by an older reset is voided
+/// under THAT reset's `reset_id`, later entries void only what remains,
+/// and the watermark lands on the newest entry. A poll minted at the
+/// current (post-reset) epoch is untouched, and a second replay of the
+/// same lineage is a no-op.
+#[tokio::test]
+async fn vk_lineage_replay_voids_stranded_polls_in_order() {
+    let community_id = SpaceId([0x52; 16]);
+    let creator = OwnerAddr([0xA0; 16]);
+    let poll_epoch1 = PollId([0x81; 32]);
+    let poll_epoch2 = PollId([0x82; 32]);
+    let poll_current = PollId([0x83; 32]);
+    let reset_a: EventId = [0xA1; 16];
+    let reset_b: EventId = [0xB2; 16];
+
+    // The ZEB-1041 fault scenario: two resets happened (epoch 1 → 2 → 3),
+    // but NEITHER sweep's voting persist survived — all three polls are
+    // un-voided in the restored voting log.
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    {
+        let mut log = voting_log.lock().await;
+        seed_poll(&mut log, poll_epoch1, creator, community_id, 1, None);
+        seed_poll(&mut log, poll_epoch2, creator, community_id, 2, None);
+        seed_poll(&mut log, poll_current, creator, community_id, 3, None);
+    }
+
+    let engine = engine_with_active_committee(community_id, voting_log.clone(), 3).await;
+
+    let lineage = [(1u64, reset_a), (2u64, reset_b)];
+    let voided = engine.replay_vk_lineage_voids(&lineage).await;
+    assert_eq!(voided, 2, "both stranded pre-reset polls must be voided");
+
+    {
+        let log = voting_log.lock().await;
+        let t3_e1 = log.polls[&poll_epoch1].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3_e1.voided,
+            Some(VoidedInfo {
+                reset_id: reset_a,
+                old_epoch: 1,
+            }),
+            "the epoch-1 poll is attributed to the FIRST reset, as the \
+             live callback would have recorded it"
+        );
+        let t3_e2 = log.polls[&poll_epoch2].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3_e2.voided,
+            Some(VoidedInfo {
+                reset_id: reset_b,
+                old_epoch: 2,
+            }),
+            "the epoch-2 poll is attributed to the SECOND reset"
+        );
+        let t3_cur = log.polls[&poll_current].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3_cur.voided, None,
+            "a poll minted at the current epoch survives the replay"
+        );
+        assert_eq!(
+            log.retired_epoch_watermark,
+            Some(VoidedInfo {
+                reset_id: reset_b,
+                old_epoch: 2,
+            }),
+            "the watermark lands on the newest lineage entry"
+        );
+    }
+
+    let again = engine.replay_vk_lineage_voids(&lineage).await;
+    assert_eq!(again, 0, "replaying the same lineage again is a no-op");
+}
+
+/// ZEB-1041: an empty lineage (no resets ever, or dfrost log absent at
+/// engine bring-up) is a complete no-op — no voids, no watermark.
+#[tokio::test]
+async fn vk_lineage_replay_empty_lineage_is_noop() {
+    let community_id = SpaceId([0x53; 16]);
+    let creator = OwnerAddr([0xA0; 16]);
+    let poll_id = PollId([0x84; 32]);
+
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    {
+        let mut log = voting_log.lock().await;
+        seed_poll(&mut log, poll_id, creator, community_id, 1, None);
+    }
+    let engine = engine_with_active_committee(community_id, voting_log.clone(), 1).await;
+
+    let voided = engine.replay_vk_lineage_voids(&[]).await;
+    assert_eq!(voided, 0);
+
+    let log = voting_log.lock().await;
+    assert_eq!(
+        log.polls[&poll_id].tier_state.as_tier3().unwrap().voided,
+        None
+    );
+    assert_eq!(log.retired_epoch_watermark, None);
+}

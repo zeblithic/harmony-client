@@ -1146,6 +1146,51 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         voided_count
     }
 
+    /// ZEB-1041: boot-time vk-lineage replay — re-run the reset void sweep
+    /// for every retired committee generation in `lineage` (chronological
+    /// `(old_epoch, reset_id)` pairs, extracted from the dfrost log's
+    /// `CommitteeState::vk_history` by the `ensure_voting_engine_for`
+    /// bring-up hook).
+    ///
+    /// Closes the cross-store durability window between `dfrost.cbor`
+    /// (750ms-debounced snapshot) and `voting.cbor` (immediate persist at
+    /// the void sweep): a fault that lost the sweep's voting persist —
+    /// `persist_now`'s logged-and-swallowed I/O error, or a crash landing
+    /// inside the debounce after the spawned void callback stalled —
+    /// leaves dfrost durable at the post-reset epoch while voting's
+    /// durable state never captured the voids. Nothing else re-derives
+    /// them on boot: dfrost restore is a struct swap (no callback
+    /// re-fire), and catch-up chains only reach nodes that are BEHIND.
+    /// Replaying the lineage through the idempotent sweep at engine
+    /// bring-up makes the window self-healing.
+    ///
+    /// In-order replay preserves attribution: a poll stranded by an older
+    /// reset is voided under THAT reset's `reset_id`, exactly as the live
+    /// callback would have recorded it, with later entries voiding only
+    /// what remains. The common case (nothing stranded, watermark already
+    /// at the newest entry) mutates nothing and never persists.
+    ///
+    /// Returns the total number of polls newly voided across all entries.
+    pub async fn replay_vk_lineage_voids(
+        &self,
+        lineage: &[(u64, crate::community_membership::EventId)],
+    ) -> usize {
+        let mut total = 0usize;
+        for &(old_epoch, reset_id) in lineage {
+            total += self.void_tier3_polls_for_reset(old_epoch, reset_id).await;
+        }
+        if total > 0 {
+            tracing::info!(
+                community_id = ?self.community_id,
+                lineage_entries = lineage.len(),
+                voided = total,
+                "voting engine: vk-lineage replay voided stranded polls \
+                 (ZEB-1041 cross-store durability window)"
+            );
+        }
+        total
+    }
+
     /// ZEB-1031 Task 7: relaunch a Tier-3 poll voided by a committee reset
     /// (spec §7). Authors a fresh `kd=cr` PollCreate copying the voided
     /// poll's parameters, carrying `predecessor: Some(old_poll_id)`, and
