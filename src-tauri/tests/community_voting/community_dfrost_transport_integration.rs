@@ -1166,7 +1166,8 @@ async fn dkg_two_engine_auto_orchestrated_from_initiate_no_manual_seeding() {
 
 use harmony_app::community_dfrost_log::SignPurpose;
 use harmony_app::community_membership::{
-    EventId, MaterializedMembership, ResetPhase, ResetProposalView, ResetVerdict,
+    EventId, MaterializedMembership, MemberState, MemberStatus, ResetPhase, ResetProposalView,
+    ResetVerdict,
 };
 use harmony_app::community_voting_log::{MembershipSnapshotResolver, SnapshotResolverError};
 
@@ -1617,9 +1618,28 @@ async fn reset_marker_and_consumed_response_auto_drive_across_two_engines_zeb103
     // Fixed Authorized reset proposal targeting the live committee's own
     // vk, pinning the successor to the SAME two members — both engines'
     // marker-authoring auto-drive is eligible from the moment they start.
+    // `members`/`power_levels` are populated (both alice and bob Joined
+    // power-100 admins) so `verify_reset_marker_admissible`'s RS-M5 gate
+    // genuinely admits them — review round 1 C1: a `MaterializedMembership::default()`
+    // fixture reads every actor as not-Joined and would make this an
+    // RS-M5 REJECTION rather than the auto-drive success this test
+    // proves.
     let proposal_id: EventId = [0x9B; 16];
     let new_members = vec![alice_addr, bob_addr];
     let mut membership = MaterializedMembership::default();
+    for addr in [alice_addr, bob_addr] {
+        membership.power_levels.insert(addr, 100);
+        membership.members.insert(
+            addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: hlc_at(0, "seed"),
+                left_at: None,
+                enrolled_device_keys: Default::default(),
+                revoked_device_keys: Default::default(),
+            },
+        );
+    }
     membership.reset_proposals.push(ResetProposalView {
         id: proposal_id,
         proposer: alice_addr,

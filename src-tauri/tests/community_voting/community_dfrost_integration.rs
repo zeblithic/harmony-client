@@ -53,6 +53,7 @@ use harmony_app::community_voting_core::{MemberAttrs, MembershipSnapshot};
 use harmony_app::community_voting_log::{MembershipSnapshotResolver, SnapshotResolverError};
 use harmony_app::dm_signing;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use harmony_app::{production_dkg_driver, DfrostCoreHandles, DfrostLogsMap};
 use tokio::sync::{mpsc, Mutex};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -3786,6 +3787,160 @@ async fn live_ingest_reset_marker_voids_open_tier3_polls_zeb1031() {
     assert_eq!(
         revoided, 0,
         "re-running void for the same reset must be a no-op"
+    );
+}
+
+/// ZEB-1031 Task 8 review I1: the reset-marker callback dispatch must ALSO
+/// fire on the LOCAL-AUTHOR path (`dfrost_author_reset_marker_core`, via
+/// the manual `author_dfrost_reset_marker` IPC or the orchestrator's
+/// `maybe_auto_drive_reset`) — not only on inbound ingest / catch-up
+/// adoption. Before the I1 fix, the authoring node's own open Tier-3 polls
+/// stayed open (never voided) and its `retired_epoch_watermark` never
+/// advanced, because `publish_event` records into the replay tracker
+/// BEFORE sending specifically so self-loopback is dropped at
+/// `process_inbound`'s dedup step — the author never re-ingests its own
+/// marker, so the ingest-side dispatch alone can never reach it.
+///
+/// Same fixture shape as `live_ingest_reset_marker_voids_open_tier3_polls_zeb1031`
+/// (one poll at epoch 1 — must void; one at epoch 2 — must stay untouched),
+/// but instead of feeding `marker1` in as an inbound packet, this authors
+/// it directly through the production `DkgDriver::author_reset_marker`
+/// path (`production_dkg_driver` over `DfrostCoreHandles`, sharing the SAME
+/// `dfrost_log`/`dfrost_reg` the voting engine's callback is subscribed to)
+/// — no second node, no inbound packet, involved.
+#[tokio::test]
+async fn local_author_reset_marker_voids_open_tier3_polls_zeb1031() {
+    use harmony_app::community_voting_core::PollId;
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, _alice_pub64) = fixture_identity(0xB3);
+    let (_bob_sk, bob_addr, _bob_pub64) = fixture_identity(0xB4);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xB3; 16]);
+    let vk1: [u8; 32] = [0xC3; 32];
+
+    // ── Dfrost side: an active epoch-1 committee. Alice (the authoring
+    //    node) holds this same log. ──
+    let dfrost_log = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+
+    let reset1_id: EventId = [0xD3; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+
+    let dfrost_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let (dpub_tx, mut dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+    tokio::spawn(async move { while dpub_rx.recv().await.is_some() {} });
+    let (_dsub_tx, dsub_rx) = mpsc::channel::<Vec<u8>>(4);
+    DfrostLogRegistry::register(
+        &dfrost_reg,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: dfrost_log.clone(),
+            publisher_tx: dpub_tx,
+            subscriber_rx: dsub_rx,
+            app_handle: None,
+            self_addr: alice_addr,
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver_with(&[]),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // ── Voting side: seed one poll at epoch 1 (will be voided) and one
+    //    at epoch 2 (created post-reset — must stay untouched). ──
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    let poll1_id = PollId([0x03; 32]);
+    let poll2_id = PollId([0x04; 32]);
+    {
+        let mut log = voting_log.lock().await;
+        seed_open_se_poll(&mut log, poll1_id, alice_addr, community_id, 1);
+        seed_open_se_poll(&mut log, poll2_id, alice_addr, community_id, 2);
+    }
+
+    let (v_pub_tx, mut v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    tokio::spawn(async move { while v_pub_rx.recv().await.is_some() {} });
+    let (_v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-t8-author".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: Arc::clone(&voting_log),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_cid, _seed, _epoch| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, dfrost_reg.clone(), requester).await;
+
+    // ── Author marker1 LOCALLY via the production driver — the exact
+    //    path `maybe_auto_drive_reset` / `author_dfrost_reset_marker`
+    //    take, never touching the inbound/catch-up ingest paths. ──
+    let mut dfrost_logs_map = HashMap::new();
+    dfrost_logs_map.insert(community_id, dfrost_log.clone());
+    let handles = DfrostCoreHandles::<tauri::test::MockRuntime>::for_tests(
+        Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-zeb1031-t8-author".to_string(),
+        ))),
+        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        "dev-zeb1031-t8-author".to_string(),
+        alice_addr,
+        Arc::new(alice_sk),
+        Arc::new(Mutex::new(dfrost_logs_map)) as DfrostLogsMap,
+        None,
+        Some(dfrost_reg.clone()),
+    );
+    let driver = production_dkg_driver::<tauri::test::MockRuntime>(handles, None);
+    driver
+        .author_reset_marker(community_id, reset1_id, digest1, vk1, 1, members.clone(), 2)
+        .await
+        .expect("author_reset_marker succeeds");
+
+    // The reset-marker callback dispatch spawns the void handler
+    // asynchronously — poll until it lands, exactly like the ingest-path
+    // sibling test above.
+    wait_for_voting_log("poll1 voided (authoring node)", &voting_log, |log| {
+        log.polls
+            .get(&poll1_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .and_then(|t3| t3.voided)
+            .is_some()
+    })
+    .await;
+
+    let log = voting_log.lock().await;
+    let t3_1 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+    let voided = t3_1.voided.expect("poll1 voided");
+    assert_eq!(
+        voided.reset_id, reset1_id,
+        "voided.reset_id must echo the marker's ri"
+    );
+    assert_eq!(
+        voided.old_epoch, 1,
+        "voided.old_epoch must echo the marker's oe"
+    );
+
+    let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+    assert!(
+        t3_2.voided.is_none(),
+        "poll at epoch 2 (post-reset) must stay untouched by a marker retiring epoch 1"
     );
 }
 

@@ -275,14 +275,16 @@ pub trait DkgDriver: Send + Sync {
     /// (ResetMarker) event for an Authorized reset proposal this node's
     /// own committee state can still satisfy. The caller (the
     /// orchestrator's `maybe_auto_drive_reset`, or the
-    /// `author_dfrost_reset_marker` manual-fallback IPC) has ALREADY
-    /// resolved `reset_digest`/`new_members`/`new_threshold` from the
-    /// current materialized membership — this method's job is exactly
+    /// `author_dfrost_reset_marker` manual-fallback IPC) has ALREADY run
+    /// `verify_reset_marker_admissible` (RS-M3/M4/M5) against the
+    /// current materialized membership and passed its returned
+    /// `(new_members, new_threshold)` pin straight through as
+    /// `new_members`/`new_threshold` here — this method's job is exactly
     /// `initiate_reset_response`'s division of labor: signing + local
-    /// apply + broadcast, never membership resolution (the engine holds
-    /// no signing key — see this trait's doc comment). Default: refuse —
-    /// pre-ZEB-1031 driver impls (tests) keep compiling without
-    /// auto-authoring markers.
+    /// apply + broadcast, never membership resolution or authorization
+    /// (the engine holds no signing key — see this trait's doc comment).
+    /// Default: refuse — pre-ZEB-1031 driver impls (tests) keep
+    /// compiling without auto-authoring markers.
     #[allow(clippy::too_many_arguments)]
     async fn author_reset_marker(
         &self,
@@ -2638,11 +2640,18 @@ async fn initiate_reset_response_ceremony_core(
 ///
 /// (a) Marker authoring: for every `Authorized` reset proposal whose
 /// claimed `(target_vk, target_epoch)` still matches this node's OWN
-/// held committee state, author + apply + broadcast the `rs` marker.
-/// Skipped (idempotent) once `vk_history` already carries the
-/// `reset_id` — the state-match check itself also naturally goes false
-/// the instant a marker (from any source — this node OR a peer) has
-/// applied, since `apply_reset_marker` deactivates the committee.
+/// held committee state (a cheap RS-M2/M6 local pre-check — the
+/// state-match half also naturally goes false the instant a marker,
+/// from any source, has applied, since `apply_reset_marker` deactivates
+/// the committee; skipped once `vk_history` already carries the
+/// `reset_id`), run the proposal through `verify_reset_marker_admissible`
+/// (RS-M3/M4/M5 — the SAME verifier the inbound-ingest and
+/// catch-up-adoption apply sites use) and, only if THIS node is
+/// eligible to author (power-100 admin or a member of the pinned
+/// successor committee), author + apply + broadcast the `rs` marker
+/// with the verifier's returned `(new_members, new_threshold)` pin
+/// (review round 1 C1: the local state-match check is NOT a substitute
+/// for RS-M5 — it says nothing about whether THIS node may author).
 ///
 /// (b) Consumed-response initiation: once THIS node is promoted into
 /// the successor committee (`active` and a held vk), and `vk_history`'s
@@ -2671,9 +2680,18 @@ async fn maybe_auto_drive_reset(
     };
 
     // (a) Marker authoring.
-    {
-        let membership = match resolver.reset_membership_now(community_id).await {
-            Ok(m) => m,
+    //
+    // Review round 1 I2: cheap pre-gate before paying for a full
+    // membership materialization. `should_author`'s state-match half
+    // (below) requires `active == true` with the vk/epoch matching some
+    // proposal's claim — a community whose dfrost log isn't currently
+    // active can never satisfy that for ANY proposal, so there is no
+    // point resolving membership at all in that case. This is a strict
+    // narrowing of an already-necessary condition, not a new heuristic.
+    let locally_active = dfrost_log.lock().await.committee_state.active;
+    let marker_membership = if locally_active {
+        match resolver.reset_membership_now(community_id).await {
+            Ok(m) => Some(m),
             Err(e) => {
                 tracing::debug!(
                     community_id = %hex::encode(community_id.0),
@@ -2681,14 +2699,28 @@ async fn maybe_auto_drive_reset(
                     "dfrost orchestrator: auto-drive reset marker — membership resolve failed \
                      this tick (will retry)",
                 );
-                return;
+                // Falls through to branch (b) below regardless — a
+                // transient resolve failure for marker-authoring must
+                // not also block the independent Consumed-response
+                // check.
+                None
             }
-        };
+        }
+    } else {
+        None
+    };
+    if let Some(membership) = marker_membership {
         for proposal in membership
             .reset_proposals
             .iter()
             .filter(|p| p.phase == ResetPhase::Authorized)
         {
+            // RS-M2/M6 local pre-check: does THIS node's own committee
+            // state still match what the proposal claims to retire, and
+            // has it not already recorded this reset? Cheap (one log
+            // lock, no signing/crypto) — filters out every proposal this
+            // node cannot possibly apply before paying for a digest
+            // recompute or the RS-M5 actor check below.
             let should_author = {
                 let log = dfrost_log.lock().await;
                 let already_recorded = log
@@ -2724,6 +2756,43 @@ async fn maybe_auto_drive_reset(
                     continue;
                 }
             };
+            // Review round 1 C1: `should_author` above is RS-M2/M6 (this
+            // node's own held state), NOT RS-M5 (is this node ELIGIBLE
+            // to author?). `committee_state.active`/`joint_verifying_key`
+            // are replicated facts, not "I hold a share" — a plain
+            // joiner that merely adopted the committee's quorum has both
+            // set (`adopt_initial_quorum`'s own doc: "a joiner has no
+            // local key package to reconcile") and would otherwise
+            // self-apply a marker every peer rejects. Run the SAME
+            // verifier the inbound-ingest and catch-up-adoption paths
+            // run, and use ITS returned pin (never the proposal's raw
+            // fields) — exactly what the manual `author_dfrost_reset_marker`
+            // IPC already does.
+            let payload = ResetMarkerPayload {
+                reset_proposal_id: proposal.id,
+                reset_digest: digest,
+                old_vk: proposal.target_vk,
+                old_epoch: proposal.target_epoch,
+                space_id: community_id,
+            };
+            let (new_members, new_threshold) = match verify_reset_marker_admissible(
+                &payload,
+                self_addr,
+                &community_id,
+                &membership,
+            ) {
+                Ok(pin) => pin,
+                Err(e) => {
+                    tracing::debug!(
+                        community_id = %hex::encode(community_id.0),
+                        proposal = %hex::encode(proposal.id),
+                        error = %e,
+                        "dfrost orchestrator: not eligible to author this reset marker \
+                         (RS-M5) — skipping",
+                    );
+                    continue;
+                }
+            };
             if let Err(e) = driver
                 .author_reset_marker(
                     community_id,
@@ -2731,8 +2800,8 @@ async fn maybe_auto_drive_reset(
                     digest,
                     proposal.target_vk,
                     proposal.target_epoch,
-                    proposal.new_members.clone(),
-                    proposal.new_threshold,
+                    new_members,
+                    new_threshold,
                 )
                 .await
             {
@@ -6811,11 +6880,55 @@ mod tests {
         }
     }
 
+    /// Build a `MaterializedMembership` carrying the given (already
+    /// `Authorized`) reset proposal plus the `members`/`power_levels`
+    /// maps `verify_reset_marker_admissible`'s RS-M5 gate reads. Mirrors
+    /// `test_membership` above (the `verify_reset_marker_admissible`
+    /// unit tests' fixture builder) — review round 1 C1: the ORIGINAL
+    /// auto-drive fixtures used `MaterializedMembership::default()`,
+    /// which reads every actor as not-Joined and so encoded an RS-M5
+    /// REJECTION as the thing under test, rather than a genuine
+    /// authorization. `joined` lists addrs that materialize as Joined
+    /// (an addr absent from it reads as not-Joined regardless of its
+    /// `power_levels` entry, matching `is_joined_member`'s pairing).
+    fn reset_membership_with_actor(
+        proposal: ResetProposalView,
+        joined: Vec<OwnerAddr>,
+        power_levels: Vec<(OwnerAddr, u8)>,
+    ) -> MaterializedMembership {
+        let mut m = MaterializedMembership {
+            power_levels: power_levels.into_iter().collect(),
+            members: joined
+                .into_iter()
+                .map(|addr| {
+                    (
+                        addr,
+                        crate::community_membership::MemberState {
+                            status: crate::community_membership::MemberStatus::Joined,
+                            joined_at: Hlc {
+                                wall_ms: 0,
+                                logical: 0,
+                                device_id: "t".into(),
+                            },
+                            left_at: None,
+                            enrolled_device_keys: Default::default(),
+                            revoked_device_keys: Default::default(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        m.reset_proposals.push(proposal);
+        m
+    }
+
     /// The orchestrator tick auto-authors the `rs` marker (via
     /// `DkgDriver::author_reset_marker`) for an `Authorized` proposal
     /// whose claimed `(target_vk, target_epoch)` matches this node's own
-    /// held committee state — no manual `author_dfrost_reset_marker` IPC
-    /// call.
+    /// held committee state AND whose actor passes RS-M5 (here: a
+    /// Joined power-100 admin) — no manual `author_dfrost_reset_marker`
+    /// IPC call.
     #[tokio::test]
     async fn orchestrator_auto_authors_reset_marker_zeb1031() {
         let community_id = SpaceId([0x41; 16]);
@@ -6824,15 +6937,11 @@ mod tests {
         let target_vk = [0x33u8; 32];
         let new_members = vec![OwnerAddr([0x03; 16]), OwnerAddr([0x04; 16])];
 
-        let mut membership = MaterializedMembership::default();
-        membership.reset_proposals.push(authorized_reset_view(
-            proposal_id,
-            admin,
-            target_vk,
-            1,
-            new_members.clone(),
-            2,
-        ));
+        let membership = reset_membership_with_actor(
+            authorized_reset_view(proposal_id, admin, target_vk, 1, new_members.clone(), 2),
+            vec![admin],
+            vec![(admin, 100)],
+        );
         let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
             Arc::new(FixedResetMembership(membership));
         let resolver: Arc<dyn IdentityResolver + Send + Sync> =
@@ -6876,12 +6985,17 @@ mod tests {
         .await;
     }
 
-    /// Idempotency: once `vk_history` already records the `reset_id`
-    /// (this node — or a peer via catch-up — already authored/applied
-    /// the marker), the tick must NOT fire another `author_reset_marker`
-    /// call, even though the membership resolver still reports the
-    /// proposal `Authorized` (the phase only advances to `Consumed` on a
-    /// valid `c`, which this test never supplies).
+    /// Idempotency, pinned against the mutation that would silently pass
+    /// it (review round 1 I3): seeds the SAME eligible state the happy
+    /// path above does (so a first, legitimate fire is guaranteed), lets
+    /// it fire exactly once, then — WITHOUT changing `active`/vk/epoch
+    /// (the mock driver, unlike the production one, never flips them) —
+    /// records the reset in `vk_history` to simulate the post-apply
+    /// effect, isolating `!already_recorded` as the ONLY thing left
+    /// preventing a second fire while `state_matches` stays true.
+    /// Falsifiable: reverting `state_matches && !already_recorded` to
+    /// bare `state_matches` makes the final assertion fail (the count
+    /// climbs past 1 across the extra ticks).
     #[tokio::test]
     async fn orchestrator_skips_reset_marker_already_recorded_zeb1031() {
         let community_id = SpaceId([0x42; 16]);
@@ -6890,15 +7004,11 @@ mod tests {
         let target_vk = [0x34u8; 32];
         let new_members = vec![OwnerAddr([0x05; 16]), OwnerAddr([0x06; 16])];
 
-        let mut membership = MaterializedMembership::default();
-        membership.reset_proposals.push(authorized_reset_view(
-            proposal_id,
-            admin,
-            target_vk,
-            1,
-            new_members,
-            2,
-        ));
+        let membership = reset_membership_with_actor(
+            authorized_reset_view(proposal_id, admin, target_vk, 1, new_members, 2),
+            vec![admin],
+            vec![(admin, 100)],
+        );
         let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
             Arc::new(FixedResetMembership(membership));
         let resolver: Arc<dyn IdentityResolver + Send + Sync> =
@@ -6919,12 +7029,23 @@ mod tests {
         .await;
         {
             let mut g = log.lock().await;
-            // Committee already moved past this reset (inactive, marker
-            // recorded) — the natural post-apply state, NOT the
-            // pre-apply active-and-matching state the previous test
-            // seeds.
-            g.committee_state.active = false;
-            g.committee_state.joint_verifying_key = None;
+            g.committee_state.active = true;
+            g.committee_state.joint_verifying_key = Some(target_vk);
+            g.committee_state.current_epoch = 1;
+        }
+
+        // First, legitimate fire.
+        wait_until("first author fires", || async {
+            driver.reset_markers.lock().await.len() == 1
+        })
+        .await;
+
+        // Simulate the post-apply effect the mock driver doesn't perform
+        // — `state_matches` stays true throughout (active/vk/epoch
+        // untouched), leaving the `already_recorded` guard as the sole
+        // thing preventing a re-fire.
+        {
+            let mut g = log.lock().await;
             g.committee_state
                 .vk_history
                 .push(crate::community_dfrost_log::VkLineageEntry {
@@ -6940,12 +7061,74 @@ mod tests {
                 });
         }
 
+        // Across (at least) two more tick intervals, the count must not
+        // climb past 1.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            driver.reset_markers.lock().await.len(),
+            1,
+            "already-recorded guard must prevent a second fire even though state_matches stays \
+             true"
+        );
+    }
+
+    /// RS-M5 negative (review round 1 C1): a Joined member who is
+    /// neither power-100 nor a member of the proposal's pinned successor
+    /// committee must NEVER auto-author a reset marker, even when this
+    /// node's own dfrost-log state matches the proposal's claimed
+    /// `(target_vk, target_epoch)` exactly (the RS-M2 local pre-check
+    /// alone is not authorization).
+    #[tokio::test]
+    async fn orchestrator_skips_reset_marker_ineligible_actor_zeb1031() {
+        let community_id = SpaceId([0x45; 16]);
+        let proposal_id: EventId = [0x55; 16];
+        let proposer = OwnerAddr([0xA5; 16]);
+        let self_addr = OwnerAddr([0x0B; 16]);
+        let target_vk = [0x38u8; 32];
+        // `self_addr` is deliberately excluded from `new_members`.
+        let new_members = vec![OwnerAddr([0x0C; 16]), OwnerAddr([0x0D; 16])];
+
+        let membership = reset_membership_with_actor(
+            authorized_reset_view(proposal_id, proposer, target_vk, 1, new_members, 2),
+            vec![self_addr],
+            // No `power_levels` entry — self_addr reads as power 0.
+            Vec::new(),
+        );
+        let membership_resolver: Arc<dyn MembershipSnapshotResolver> =
+            Arc::new(FixedResetMembership(membership));
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let driver = Arc::new(RecordingDriver::default());
+        let (_engine, log, _sub_tx) = start_orchestrated_engine(
+            community_id,
+            self_addr,
+            [0u8; 32],
+            resolver,
+            Some(driver.clone()),
+            Some(membership_resolver),
+            DfrostOrchestratorConfig {
+                tick_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+        {
+            let mut g = log.lock().await;
+            // State matches the proposal's claim exactly (RS-M2 would
+            // pass) — RS-M5 is the ONLY thing standing between this node
+            // and authoring.
+            g.committee_state.active = true;
+            g.committee_state.joint_verifying_key = Some(target_vk);
+            g.committee_state.current_epoch = 1;
+        }
+
         // No positive predicate to poll for a negative — sleep past
         // several ticks (10ms interval) and assert nothing fired.
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(
             driver.reset_markers.lock().await.is_empty(),
-            "an already-recorded reset must never re-fire author_reset_marker"
+            "a Joined non-admin, non-successor-member actor must never auto-author a reset \
+             marker (RS-M5), even when its own committee state matches the proposal exactly"
         );
     }
 

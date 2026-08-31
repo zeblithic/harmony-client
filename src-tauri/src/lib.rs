@@ -66740,17 +66740,35 @@ pub(crate) async fn dfrost_initiate_reset_response_core<R: tauri::Runtime>(
 
 /// ZEB-1031 Task 8: author + apply + broadcast this node's `rs`
 /// (ResetMarker) event. `reset_digest`/`new_members`/`new_threshold` are
-/// the caller's ALREADY-VERIFIED values (computed against the current
-/// materialized membership — via `verify_reset_marker_admissible` on the
-/// manual-fallback IPC path, or the equivalent state-match check on the
-/// orchestrator's auto-drive path). This function is exactly
-/// `apply_reset_marker`'s signing + local-apply + broadcast half,
-/// mirroring `dfrost_initiate_reset_response_core`'s division of labor.
+/// the caller's ALREADY-VERIFIED values — EVERY caller (the
+/// `author_dfrost_reset_marker` manual-fallback IPC AND the
+/// orchestrator's `maybe_auto_drive_reset`) runs the target proposal
+/// through `verify_reset_marker_admissible` (the SAME RS-M3/M4/M5
+/// verifier the inbound-ingest and catch-up-adoption paths use) and
+/// passes its returned `(new_members, new_threshold)` pin straight
+/// through — there is no separate, weaker admissibility check anywhere
+/// on this path (review round 1 C1: a local state-match heuristic used
+/// to stand in for RS-M5 here and let an ineligible member self-apply;
+/// removed). This function is exactly `apply_reset_marker`'s signing +
+/// local-apply + broadcast half, mirroring
+/// `dfrost_initiate_reset_response_core`'s division of labor.
 ///
 /// Idempotent: `DfrostLog::apply_reset_marker`'s own RS-M6 replay check
 /// makes a second call for an already-applied reset a benign `Ok(())`
 /// no-op (no re-publish — the orchestrator's rebroadcast cadence heals a
 /// missed original), never a duplicate marker.
+///
+/// Review round 1 I1: dispatches the SAME `dispatch_reset_marker_callbacks`
+/// hook the inbound-ingest (`process_inbound`) and catch-up-adoption
+/// (`apply_reset_chain`) apply sites dispatch, on both the `Applied` and
+/// `AlreadyMoved` arms (mirroring their "unconditional on a successful
+/// apply" discipline — `void_tier3_polls_for_reset` is idempotent, so a
+/// redundant dispatch on re-delivery is harmless). Without this, the
+/// node that AUTHORS a marker never voids its own open Tier-3 polls
+/// (spec §7) — `publish_event` records into the replay tracker BEFORE
+/// sending specifically so self-loopback is dropped at
+/// `process_inbound`'s dedup step, so the author never re-ingests its
+/// own marker and the ingest-side dispatch alone can never reach it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dfrost_author_reset_marker_core<R: tauri::Runtime>(
     handles: &DfrostCoreHandles<R>,
@@ -66813,35 +66831,55 @@ pub(crate) async fn dfrost_author_reset_marker_core<R: tauri::Runtime>(
     match apply_result {
         Ok(ResetMarkerApplied::Applied { .. }) => {
             match handles.dfrost_log_registry.as_ref() {
-                Some(registry) => match registry.get(space_id).await {
-                    Some(engine) => {
-                        if let Err(e) = engine.publish_event(event).await {
-                            tracing::warn!(
+                Some(registry) => {
+                    // I1: void this node's own open Tier-3 polls BEFORE
+                    // spending time on the broadcast round-trip — the
+                    // authoring node is the one most likely to be the
+                    // admin driving the reset, and its own voiding must
+                    // not depend on the broadcast (or any peer) at all.
+                    registry
+                        .dispatch_reset_marker_callbacks(old_epoch, proposal_id, &space_id)
+                        .await;
+                    match registry.get(space_id).await {
+                        Some(engine) => {
+                            if let Err(e) = engine.publish_event(event).await {
+                                tracing::warn!(
+                                    space_id = ?space_id,
+                                    error = %e,
+                                    "dfrost_author_reset_marker: broadcast failed (local apply \
+                                     succeeded)",
+                                );
+                            }
+                        }
+                        None => {
+                            tracing::debug!(
                                 space_id = ?space_id,
-                                error = %e,
-                                "dfrost_author_reset_marker: broadcast failed (local apply \
-                                 succeeded)",
+                                "dfrost_author_reset_marker: no engine registered for \
+                                 community — broadcast skipped",
                             );
                         }
                     }
-                    None => {
-                        tracing::debug!(
-                            space_id = ?space_id,
-                            "dfrost_author_reset_marker: no engine registered for community — \
-                             broadcast skipped",
-                        );
-                    }
-                },
+                }
                 None => {
                     tracing::debug!(
                         "dfrost_author_reset_marker: dfrost_log_registry is None — broadcast \
-                         skipped (test context?)",
+                         and callback dispatch skipped (test context?)",
                     );
                 }
             }
             Ok(())
         }
-        Ok(ResetMarkerApplied::AlreadyMoved) => Ok(()),
+        Ok(ResetMarkerApplied::AlreadyMoved) => {
+            // I1: dispatch unconditionally on ANY successful apply,
+            // matching the ingest/catch-up sites exactly — a benign
+            // idempotent re-dispatch, not a special case.
+            if let Some(registry) = handles.dfrost_log_registry.as_ref() {
+                registry
+                    .dispatch_reset_marker_callbacks(old_epoch, proposal_id, &space_id)
+                    .await;
+            }
+            Ok(())
+        }
         Err(e) => Err(format!(
             "dfrost_author_reset_marker: apply_reset_marker: {e:?}"
         )),
