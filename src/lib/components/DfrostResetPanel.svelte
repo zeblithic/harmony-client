@@ -100,6 +100,11 @@
   let showProposeForm = $state(false);
   let targetVkHex = $state('');
   let targetEpoch = $state('');
+  // Qodo #1 (round 3): provenance of the target fields. True while they
+  // hold a committee prefill — a later summary FAILURE must then clear
+  // them rather than let stale authoritative values masquerade as
+  // manual input. Hand-typed values (flag false) survive read failures.
+  let targetsFromPrefill = false;
   let selectedMembers = $state<Set<string>>(new Set());
   let newThreshold = $state(2);
   let vetoWindowHours = $state(RESET_VETO_WINDOW_DEFAULT_MS / HOUR_MS);
@@ -145,16 +150,28 @@
       // CodeAnt major 1 (round 1): never rewrite the target fields while
       // the confirm modal is up (or the submit is in flight) — the admin
       // must submit exactly the values they reviewed. On cancel, the
-      // next poll re-syncs; on submit, the backend's RS-P mirror rejects
-      // a genuinely stale epoch with a readable error.
+      // next poll re-syncs; on submit, the backend's target-vs-committee
+      // pre-check (`check_reset_target_matches_active_committee`)
+      // rejects a genuinely stale vk/epoch with a readable error.
       if (summary.active && summary.jointVk !== null && !confirmingPropose && !proposing) {
         targetVkHex = summary.jointVk;
         targetEpoch = String(summary.currentEpoch);
+        targetsFromPrefill = true;
       }
     } catch (e) {
       if (myCallId !== latestCommitteeCallId) return;
       committeeError = e instanceof Error ? e.message : String(e);
       committee = null;
+      // Qodo #1 (round 3): the read failed, so a previous prefill's
+      // authority is gone — clear it instead of letting it pose as
+      // manual input (same modal-freeze guard as the prefill itself;
+      // genuine hand-typed values keep targetsFromPrefill false and
+      // survive).
+      if (targetsFromPrefill && !confirmingPropose && !proposing) {
+        targetVkHex = '';
+        targetEpoch = '';
+        targetsFromPrefill = false;
+      }
     } finally {
       untrack(() => (committeeRefreshInFlight -= 1));
     }
@@ -165,12 +182,23 @@
     proposals = [];
     loadError = null;
     actionError = null;
-    // Clear cross-community carryover: a prefilled vk/epoch from the
-    // previous community must never survive into this one's form.
+    // Qodo #3 + Greptile P1 (round 3): a community switch resets the
+    // ENTIRE propose workflow, not just the target fields — an open
+    // form, an in-review confirm modal, and the successor selection all
+    // belong to the previous community, and the new community's summary
+    // would otherwise repopulate the target under a confirmation the
+    // admin reviewed for a different community entirely.
     committee = null;
     committeeError = null;
     targetVkHex = '';
     targetEpoch = '';
+    targetsFromPrefill = false;
+    showProposeForm = false;
+    confirmingPropose = false;
+    proposeError = null;
+    selectedMembers = new Set();
+    newThreshold = 2;
+    vetoWindowHours = RESET_VETO_WINDOW_DEFAULT_MS / HOUR_MS;
     void refresh();
     void refreshCommittee();
 
@@ -544,6 +572,9 @@
           <input
             type="text"
             bind:value={targetVkHex}
+            oninput={() => {
+              targetsFromPrefill = false;
+            }}
             placeholder="64-char hex — the committee being replaced"
             readonly={prefillLocked}
             class:prefilled={prefillLocked}
@@ -558,6 +589,7 @@
             value={targetEpoch}
             oninput={(e) => {
               targetEpoch = (e.target as HTMLInputElement).value;
+              targetsFromPrefill = false;
             }}
             readonly={prefillLocked}
             class:prefilled={prefillLocked}

@@ -562,6 +562,80 @@ describe('DfrostResetPanel', () => {
     });
   });
 
+  it('clears a prefilled target when a later summary read fails, but keeps hand-typed values', async () => {
+    // Qodo #1 (round 3): a summary failure drops the read-only lock, so
+    // a retained prefill would masquerade as manual input and submit a
+    // stale target. Values whose provenance is the prefill are cleared;
+    // genuinely hand-typed fallback input survives later failures.
+    let summaryCalls = 0;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_dfrost_reset_state') return Promise.resolve([]);
+      if (cmd === 'get_dfrost_committee_summary') {
+        summaryCalls += 1;
+        return summaryCalls === 1
+          ? Promise.resolve(makeSummary({ currentEpoch: 7 }))
+          : Promise.reject(new Error('transient read failure'));
+      }
+      return Promise.resolve(undefined);
+    });
+    const { getByText, container } = renderPanel();
+    await waitFor(() => {
+      expect(getByText('Propose a committee reset…')).toBeTruthy();
+    });
+    // Open the form: the open-time refresh (#2) fails → prefill cleared.
+    await fireEvent.click(getByText('Propose a committee reset…'));
+    const vkInput = container.querySelector(
+      'input[placeholder*="64-char hex"]',
+    ) as HTMLInputElement;
+    await waitFor(() => {
+      expect(vkInput.readOnly).toBe(false);
+      expect(vkInput.value).toBe('');
+    });
+    // Hand-typed fallback input survives the next failed refresh
+    // (close + reopen re-fires the open-time refresh, #3, which fails).
+    await fireEvent.input(vkInput, { target: { value: 'ab'.repeat(32) } });
+    await fireEvent.click(getByText('Cancel proposal'));
+    await fireEvent.click(getByText('Propose a committee reset…'));
+    await waitFor(() => {
+      expect(summaryCalls).toBeGreaterThanOrEqual(3);
+    });
+    expect(
+      (container.querySelector('input[placeholder*="64-char hex"]') as HTMLInputElement).value,
+    ).toBe('ab'.repeat(32));
+  });
+
+  it('resets the whole propose workflow — modal included — on community switch', async () => {
+    // Qodo #3 + Greptile P1 (round 3): without this, the new community's
+    // summary repopulates the target under a confirm modal the admin
+    // reviewed for the PREVIOUS community, submitting old-community
+    // successor selections into the new one.
+    mockResetState([], makeSummary({ currentEpoch: 7 }));
+    const { getByText, queryByText, container, rerender } = renderPanel();
+    await waitFor(() => {
+      expect(getByText('Propose a committee reset…')).toBeTruthy();
+    });
+    await fireEvent.click(getByText('Propose a committee reset…'));
+    await fireEvent.click(getByText('@bob').closest('button')!);
+    await fireEvent.click(getByText('@cyn').closest('button')!);
+    await waitFor(() => {
+      expect((getByText('Review proposal…') as HTMLButtonElement).disabled).toBe(false);
+    });
+    await fireEvent.click(getByText('Review proposal…'));
+    expect(getByText('Propose reset')).toBeTruthy(); // modal open
+
+    await rerender({ communityId: 'd1'.repeat(16) });
+
+    await waitFor(() => {
+      // Modal closed, form closed.
+      expect(queryByText('Propose reset')).toBeNull();
+      expect(getByText('Propose a committee reset…')).toBeTruthy();
+    });
+    // Reopening in the new community starts from a clean successor slate.
+    await fireEvent.click(getByText('Propose a committee reset…'));
+    expect(container.querySelectorAll('.pick-row.selected').length).toBe(0);
+    expect(invoke).not.toHaveBeenCalledWith('propose_dfrost_reset', expect.anything());
+  });
+
   it('falls back to manual entry when the committee summary read fails', async () => {
     (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
       if (cmd === 'get_dfrost_reset_state') return Promise.resolve([]);

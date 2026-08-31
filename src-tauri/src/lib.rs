@@ -55821,11 +55821,15 @@ pub(crate) async fn get_dfrost_committee_summary_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<DfrostCommitteeSummaryDto, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    // Qodo (PR #783 round 3): length gate BEFORE the decode so an
+    // oversized argument never allocates — the bounded pattern PR #530
+    // standardized, decoding straight into the fixed-size buffer.
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let mut id_bytes = [0u8; 16];
+    hex::decode_to_slice(&community_id, &mut id_bytes)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner, dfrost_logs) = {
@@ -55900,13 +55904,54 @@ pub struct ProposeDfrostResetResult {
     pub proposal_event_id: String,
 }
 
+/// ZEB-1042 round 3 (Qodo #2): RS-M2-shaped pre-check that the proposed
+/// target actually names the ACTIVE resettable committee. The membership
+/// log is dfrost-blind by design, so `verify_event`'s RS-P gates can
+/// never do this — without it a stale/bogus target is accepted, squats
+/// in the proposer's RS-P5 open-proposal slot for its whole veto window,
+/// and only its reset MARKER is refused (RS-M2) at the very end. Pure so
+/// it unit-tests without a node harness.
+fn check_reset_target_matches_active_committee(
+    cs: &crate::community_dfrost_log::CommitteeState,
+    target_vk: &[u8; 32],
+    target_epoch: u64,
+) -> Result<(), String> {
+    if cs.pending_reset.is_some() {
+        return Err(
+            "propose_dfrost_reset: a committee reset is already in progress \
+             (successor ceremony pending)"
+                .to_string(),
+        );
+    }
+    if !cs.active {
+        return Err("propose_dfrost_reset: no active D-FROST committee to reset".to_string());
+    }
+    if cs.joint_verifying_key != Some(*target_vk) {
+        return Err(
+            "propose_dfrost_reset: target_vk does not match the active committee's \
+             verifying key"
+                .to_string(),
+        );
+    }
+    if cs.current_epoch != target_epoch {
+        return Err(format!(
+            "propose_dfrost_reset: target_epoch {} does not match the active committee \
+             epoch {}",
+            target_epoch, cs.current_epoch
+        ));
+    }
+    Ok(())
+}
+
 /// ZEB-1031 §3.1/§9: admin IPC that proposes a D-FROST committee reset.
 /// Friendly pre-checks mirror `verify_event`'s RS-P1-RS-P5 gates
 /// (`community_membership.rs`) so the UI gets readable errors instead of
 /// insert rejections — same discipline as `initiate_admin_recovery_impl`'s
 /// RP1-RP6 mirror. `new_members` is sorted + deduped here (mirrors
 /// `dfrost_initiate_dkg_core`) rather than rejecting caller order — RS-P2
-/// requires the wire shape already sorted.
+/// requires the wire shape already sorted. Since ZEB-1042 the target
+/// vk/epoch must also name the active committee
+/// (`check_reset_target_matches_active_committee`).
 ///
 /// Authorization: caller must be Joined with power 100.
 pub(crate) async fn propose_dfrost_reset_impl(
@@ -55958,6 +56003,7 @@ pub(crate) async fn propose_dfrost_reset_impl(
         self_owner,
         community_registry,
         dm_outbox,
+        dfrost_logs,
         snapshot_generation,
     ) = {
         let g = state
@@ -55974,6 +56020,7 @@ pub(crate) async fn propose_dfrost_reset_impl(
             g.dm_outbox
                 .clone()
                 .ok_or_else(|| g.owner_not_loaded_msg())?,
+            std::sync::Arc::clone(&g.dfrost_logs),
             g.generation,
         )
     };
@@ -56091,6 +56138,33 @@ pub(crate) async fn propose_dfrost_reset_impl(
                     .to_string(),
             );
         }
+    }
+
+    // ZEB-1042 round 3 (Qodo #2): the target must name the ACTIVE
+    // committee — checked here at the IPC seam so a stale vk/epoch gets
+    // a readable error instead of an accepted-but-unconsumable proposal.
+    // Best-effort by construction: a committee transition in the instant
+    // between this check and the insert still falls through to RS-M2,
+    // the authoritative distributed gate; peer-authored proposals never
+    // pass through here at all.
+    {
+        let log_arc = {
+            let map = dfrost_logs.lock().await;
+            map.get(&space_id).cloned()
+        };
+        let Some(log_arc) = log_arc else {
+            return Err(
+                "propose_dfrost_reset: no D-FROST committee log for this community — \
+                 committee never initialised, nothing to reset"
+                    .to_string(),
+            );
+        };
+        let log = log_arc.lock().await;
+        check_reset_target_matches_active_committee(
+            &log.committee_state,
+            &target_vk,
+            target_epoch,
+        )?;
     }
 
     let proposal = {
@@ -57983,6 +58057,51 @@ mod dfrost_committee_summary_dto_tests {
         assert_eq!(dto.joint_vk, None);
         assert!(dto.member_addrs.is_empty());
         assert!(!dto.pending_reset);
+    }
+
+    /// ZEB-1042 round 3 (Qodo #2): the propose pre-check accepts exactly
+    /// the active committee's vk/epoch and rejects everything else with
+    /// a readable, cause-specific error.
+    #[test]
+    fn reset_target_check_matches_only_the_active_committee() {
+        use super::check_reset_target_matches_active_committee as check;
+
+        let vk = [0xAB; 32];
+        let active = CommitteeState {
+            active: true,
+            current_epoch: 3,
+            joint_verifying_key: Some(vk),
+            ..CommitteeState::default()
+        };
+        assert!(check(&active, &vk, 3).is_ok());
+
+        // Wrong epoch.
+        let err = check(&active, &vk, 2).unwrap_err();
+        assert!(err.contains("target_epoch"), "got: {err}");
+
+        // Wrong vk.
+        let err = check(&active, &[0xCD; 32], 3).unwrap_err();
+        assert!(err.contains("target_vk"), "got: {err}");
+
+        // Pre-DKG: nothing to reset.
+        let err = check(&CommitteeState::default(), &vk, 0).unwrap_err();
+        assert!(err.contains("no active"), "got: {err}");
+
+        // Mid-reset: pending_reset wins over every other diagnosis (the
+        // reachable shape is inactive+pinned, but the gate must name the
+        // in-flight reset, not "no active committee").
+        let mid_reset = CommitteeState {
+            active: false,
+            joint_verifying_key: None,
+            pending_reset: Some(crate::community_dfrost_log::PendingReset {
+                reset_id: [0x0E; 16],
+                new_members: vec![OwnerAddr([0x01; 16])],
+                new_threshold: 2,
+            }),
+            ..CommitteeState::default()
+        };
+        let err = check(&mid_reset, &vk, 3).unwrap_err();
+        assert!(err.contains("already in progress"), "got: {err}");
     }
 
     /// Wire-shape pin: serde must emit camelCase keys (`currentEpoch`,
