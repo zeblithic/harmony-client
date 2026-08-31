@@ -63180,7 +63180,9 @@ async fn ensure_voting_engine_for(
             .lock()
             .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
         if let std::collections::hash_map::Entry::Vacant(e) = g.entry(community_id) {
-            e.insert(engine);
+            // ZEB-1041: insert a clone so the winner path below can still
+            // drive the vk-lineage replay on the local Arc.
+            e.insert(std::sync::Arc::clone(&engine));
             true
         } else {
             false
@@ -63191,6 +63193,40 @@ async fn ensure_voting_engine_for(
         // engine's spawned task observes its publisher_rx peer dropping
         // (when req drops) and exits cleanly on next poll.
         return Ok(());
+    }
+
+    // ZEB-1041: replay the dfrost vk lineage through the idempotent reset
+    // void sweep before the engine goes live. Closes the cross-store
+    // durability window where a fault lost the sweep's immediate voting
+    // persist while the 750ms-debounced dfrost snapshot still captured the
+    // post-reset epoch — on reboot nothing else re-derives the voids
+    // (dfrost boot restore is a struct swap with no callback re-fire, and
+    // catch-up chains only reach nodes that are BEHIND). The dfrost log
+    // for this community was restored by `ensure_dfrost_engine_for` at the
+    // top of this function (ZEB-1018 orders it before the voting engine),
+    // so the lineage is complete here; an absent log (headless test paths
+    // with no dfrost registry) yields an empty-lineage no-op. Runs only on
+    // the insertion winner, once per engine lifetime — the live
+    // reset-marker callback owns everything after this point. If the
+    // voting reload failed above (persistence disarmed), the replay still
+    // corrects in-memory state while `persist_now` stays a no-op, matching
+    // the don't-clobber posture.
+    let dfrost_log_arc = {
+        let map = dfrost_logs.lock().await;
+        map.get(&community_id).cloned()
+    };
+    if let Some(log_arc) = dfrost_log_arc {
+        let lineage: Vec<(u64, crate::community_membership::EventId)> = {
+            let g = log_arc.lock().await;
+            g.committee_state
+                .vk_history
+                .iter()
+                .map(|entry| (entry.old_epoch, entry.reset_id))
+                .collect()
+        };
+        if !lineage.is_empty() {
+            engine.replay_vk_lineage_voids(&lineage).await;
+        }
     }
 
     // Won the race: spawn the Zenoh adapter on the topic. On send failure
