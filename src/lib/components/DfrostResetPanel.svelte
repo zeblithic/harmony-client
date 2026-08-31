@@ -132,7 +132,12 @@
       if (myCallId !== latestCommitteeCallId) return; // stale
       committee = summary;
       committeeError = null;
-      if (summary.active && summary.jointVk !== null) {
+      // CodeAnt major 1 (round 1): never rewrite the target fields while
+      // the confirm modal is up (or the submit is in flight) — the admin
+      // must submit exactly the values they reviewed. On cancel, the
+      // next poll re-syncs; on submit, the backend's RS-P mirror rejects
+      // a genuinely stale epoch with a readable error.
+      if (summary.active && summary.jointVk !== null && !confirmingPropose && !proposing) {
         targetVkHex = summary.jointVk;
         targetEpoch = String(summary.currentEpoch);
       }
@@ -277,6 +282,7 @@
   // bounds here so the form never advertises a config it will reject.
   let canSubmitPropose = $derived(
     !proposing &&
+      !noResettableCommittee &&
       targetVkHex.trim().length > 0 &&
       targetEpoch.trim().length > 0 &&
       selectedMembers.size >= 2 &&
@@ -289,6 +295,21 @@
   // mistyped vk/epoch against a known committee.
   let prefillLocked = $derived(
     committee !== null && committee.active && committee.jointVk !== null,
+  );
+
+  // CodeAnt major 2 (round 1): when the summary positively says there is
+  // no resettable committee — pre-DKG, or a reset already in flight
+  // (`apply_reset_marker` deactivates the committee when it pins
+  // `pending_reset`) — proposing is disabled. RS-P1–P5 never check the
+  // target against dfrost state (the membership log is dfrost-blind), so
+  // the backend would ACCEPT such a proposal and let it squat in the
+  // panel for its whole veto window even though its marker can never
+  // apply (RS-M2). Only a failed/unavailable summary keeps the manual
+  // fallback fully enabled — then we don't know, and the backend is the
+  // backstop.
+  let noResettableCommittee = $derived(
+    committee !== null &&
+      (committee.pendingReset || !committee.active || committee.jointVk === null),
   );
 
   function toggleProposeForm() {
@@ -347,13 +368,19 @@
 
   {#if committee}
     <p class="committee-summary" data-testid="dfrost-committee-summary">
-      {#if committee.active && committee.jointVk !== null}
+      {#if committee.pendingReset}
+        <!-- Reachable pendingReset shape: apply_reset_marker deactivates
+             the committee (active=false, vk=None) when it pins the
+             successor — so this branch comes FIRST, not as a badge on an
+             active committee (that combination is unrepresentable). -->
+        <span class="reset-in-progress">
+          Committee reset in progress — the previous committee is retired and
+          the successor's key ceremony is pending.
+        </span>
+      {:else if committee.active && committee.jointVk !== null}
         Current committee: epoch {committee.currentEpoch},
         {committee.threshold}-of-{committee.maxSigners},
         key <code>{shortHex(committee.jointVk)}</code>
-        {#if committee.pendingReset}
-          <span class="reset-in-progress">— reset in progress, successor ceremony pending</span>
-        {/if}
       {:else}
         No active D-FROST committee yet — there is nothing to reset until the
         first key ceremony completes.
@@ -467,7 +494,17 @@
   {/if}
 
   {#if canAdmin}
-    <button type="button" class="propose-toggle" onclick={toggleProposeForm}>
+    <button
+      type="button"
+      class="propose-toggle"
+      disabled={noResettableCommittee && !showProposeForm}
+      title={noResettableCommittee
+        ? committee?.pendingReset
+          ? 'A reset is already in progress.'
+          : 'There is no active committee to reset.'
+        : undefined}
+      onclick={toggleProposeForm}
+    >
       {showProposeForm ? 'Cancel proposal' : 'Propose a committee reset…'}
     </button>
 

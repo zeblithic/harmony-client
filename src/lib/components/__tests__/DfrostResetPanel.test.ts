@@ -58,9 +58,7 @@ function makeSummary(overrides: Partial<DfrostCommitteeSummaryDto> = {}): Dfrost
   };
 }
 
-/** Pre-DKG shape — no committee yet. The default for existing tests so
- *  the propose form keeps its manual-entry behavior unless a test opts
- *  into an active committee (ZEB-1042 prefill). */
+/** Pre-DKG shape — no committee yet. */
 const PRE_DKG_SUMMARY = makeSummary({
   active: false,
   currentEpoch: 0,
@@ -70,13 +68,22 @@ const PRE_DKG_SUMMARY = makeSummary({
   maxSigners: 0,
 });
 
+/** ZEB-1042 round 1: a KNOWN summary state now gates the propose form
+ *  (pre-DKG / pendingReset disable it; an active committee locks the
+ *  target fields), so tests that hand-type the target vk/epoch must run
+ *  on the one path where that's still possible — the summary read
+ *  failing ('error'). The default stays the failure path for exactly
+ *  those legacy manual-entry tests. */
 function mockResetState(
   proposals: ResetProposalDto[],
-  summary: DfrostCommitteeSummaryDto = PRE_DKG_SUMMARY,
+  summary: DfrostCommitteeSummaryDto | 'error' = 'error',
 ) {
   (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
     if (cmd === 'get_dfrost_reset_state') return Promise.resolve(proposals);
-    if (cmd === 'get_dfrost_committee_summary') return Promise.resolve(summary);
+    if (cmd === 'get_dfrost_committee_summary')
+      return summary === 'error'
+        ? Promise.reject(new Error('summary unavailable'))
+        : Promise.resolve(summary);
     return Promise.resolve(undefined);
   });
 }
@@ -395,28 +402,39 @@ describe('DfrostResetPanel', () => {
     });
   });
 
-  it('flags an in-flight reset when the summary carries pendingReset', async () => {
-    mockResetState([], makeSummary({ pendingReset: true }));
-    const { getByTestId } = renderPanel();
+  it('flags an in-flight reset and disables proposing while pendingReset', async () => {
+    // The REACHABLE pendingReset shape: apply_reset_marker deactivates
+    // the committee (active=false, vk=None) when it pins the successor —
+    // {active: true, pendingReset: true} is unrepresentable.
+    mockResetState(
+      [],
+      makeSummary({ active: false, jointVk: null, pendingReset: true }),
+    );
+    const { getByTestId, getByText } = renderPanel();
     await waitFor(() => {
-      expect(getByTestId('dfrost-committee-summary').textContent).toContain('reset in progress');
+      expect(getByTestId('dfrost-committee-summary').textContent).toContain(
+        'Committee reset in progress',
+      );
     });
+    const toggle = getByText('Propose a committee reset…') as HTMLButtonElement;
+    expect(toggle.disabled).toBe(true);
+    expect(toggle.title).toBe('A reset is already in progress.');
   });
 
-  it('renders the no-committee line pre-DKG and leaves the target fields editable', async () => {
-    mockResetState([]); // PRE_DKG_SUMMARY default
-    const { getByTestId, getByText, container } = renderPanel();
+  it('renders the no-committee line pre-DKG and disables proposing (nothing to reset)', async () => {
+    // CodeAnt major 2 (round 1): RS-P1–P5 never validate the target
+    // against dfrost state, so the backend would accept a proposal with
+    // no resettable committee behind it — the form must not offer one.
+    mockResetState([], PRE_DKG_SUMMARY);
+    const { getByTestId, getByText } = renderPanel();
     await waitFor(() => {
       expect(getByTestId('dfrost-committee-summary').textContent).toContain(
         'No active D-FROST committee yet',
       );
     });
-    await fireEvent.click(getByText('Propose a committee reset…'));
-    const vkInput = container.querySelector(
-      'input[placeholder*="64-char hex"]',
-    ) as HTMLInputElement;
-    expect(vkInput.readOnly).toBe(false);
-    expect(vkInput.value).toBe('');
+    const toggle = getByText('Propose a committee reset…') as HTMLButtonElement;
+    expect(toggle.disabled).toBe(true);
+    expect(toggle.title).toBe('There is no active committee to reset.');
   });
 
   it('prefills and locks the target vk/epoch from an active committee, and submits the prefilled values', async () => {
@@ -455,6 +473,53 @@ describe('DfrostResetPanel', () => {
         vetoWindowMs: 72 * 3_600_000,
       });
     });
+  });
+
+  it('freezes the prefilled target values while the confirm modal is open', async () => {
+    // CodeAnt major 1 (round 1): a 60s poll landing while the confirm
+    // modal is up must not rewrite targetVkHex/targetEpoch — the admin
+    // submits exactly the values they reviewed.
+    vi.useFakeTimers();
+    try {
+      let epoch = 7;
+      (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+        if (cmd === 'get_dfrost_reset_state') return Promise.resolve([]);
+        if (cmd === 'get_dfrost_committee_summary')
+          return Promise.resolve(makeSummary({ currentEpoch: epoch }));
+        return Promise.resolve(undefined);
+      });
+      const { getByText, container } = renderPanel();
+      // Flush the mount fetches (microtasks) and the render.
+      await vi.advanceTimersByTimeAsync(0);
+      await svelteTick();
+
+      await fireEvent.click(getByText('Propose a committee reset…'));
+      await vi.advanceTimersByTimeAsync(0); // form-open refreshCommittee
+      await svelteTick();
+      const epochInput = container.querySelector(
+        'input[type="number"][min="0"]',
+      ) as HTMLInputElement;
+      expect(epochInput.value).toBe('7');
+
+      await fireEvent.click(getByText('@bob').closest('button')!);
+      await fireEvent.click(getByText('@cyn').closest('button')!);
+      await fireEvent.click(getByText('Review proposal…'));
+
+      // Committee refresh completes elsewhere; the next poll observes it
+      // while the modal is up.
+      epoch = 8;
+      await vi.advanceTimersByTimeAsync(60_000);
+      await svelteTick();
+
+      await fireEvent.click(getByText('Propose reset'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(invoke).toHaveBeenCalledWith(
+        'propose_dfrost_reset',
+        expect.objectContaining({ targetEpoch: 7 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('falls back to manual entry when the committee summary read fails', async () => {
