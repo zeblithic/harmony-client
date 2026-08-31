@@ -60216,6 +60216,31 @@ async fn dfrost_reset_membership_for_community_at_hlc(
     ))
 }
 
+/// ZEB-1031 §9 review round 2 (I2): cheap existence pre-check shared by
+/// `dfrost_reset_membership_for_community`'s production seam and its own
+/// unit test. "Any reset proposals at all" is purely EVENT-driven — a
+/// `DfrostResetProposal` either landed in the log or it didn't — so the
+/// version-cached [`CommunityState::materialized`] view (recomputed only
+/// when the event log actually changes, i.e. free on every orchestrator
+/// tick for an idle community) answers that question correctly and
+/// cheaply. Only a proposal's PHASE (Collecting/Window/Authorized/Expired)
+/// is time-driven, so once at least one proposal exists we fall through to
+/// the full uncached [`CommunityState::materialize_now`] re-walk to get an
+/// accurate phase. This is the fix for the steady-state cost the reviewer
+/// flagged: an ACTIVE committee with zero reset proposals — the common
+/// case — now costs one cached read per 2s tick instead of a full clone +
+/// re-walk of the entire membership event log.
+fn dfrost_reset_membership_from_state(
+    state: &crate::community_state_crdt::CommunityState,
+    admin_addr: crate::owner_state_types::OwnerAddr,
+) -> crate::community_membership::MaterializedMembership {
+    let cached = state.materialized(admin_addr);
+    if cached.reset_proposals.is_empty() {
+        return cached;
+    }
+    state.materialize_now(admin_addr)
+}
+
 /// ZEB-1031: at-HEAD counterpart of `voting_build_snapshot_for_community`
 /// that returns the FULL `MaterializedMembership` — see
 /// `dfrost_reset_membership_for_community_at_hlc`'s doc for why the
@@ -60227,11 +60252,8 @@ async fn dfrost_reset_membership_for_community(
 ) -> Result<crate::community_membership::MaterializedMembership, String> {
     let (admin_addr, engine_state) =
         voting_resolve_membership_source(&crdt_state, &community_registry, space_id).await?;
-    let materialized = {
-        let g = engine_state.lock().await;
-        g.materialize_now(admin_addr)
-    };
-    Ok(materialized)
+    let g = engine_state.lock().await;
+    Ok(dfrost_reset_membership_from_state(&g, admin_addr))
 }
 
 /// ZEB-718: at boot, load a community's persisted voting log from disk and
@@ -90260,6 +90282,102 @@ mod zeb_714_recovery_state_tests {
         assert!(dto.config.is_none());
         assert!(dto.proposals.is_empty());
         assert!(!dto.self_is_designate);
+    }
+}
+
+// ── ZEB-1031 §9 review round 2 (I2): dfrost_reset_membership_from_state
+// existence pre-check — proves the cached-materialized() short-circuit
+// actually skips the uncached materialize_now walk when there are zero
+// reset proposals, and still falls through and resolves correctly when
+// one is present. Honest observability via `materialize_now_probe` (a
+// call counter), not timing or output shape.
+#[cfg(test)]
+mod zeb_1031_dfrost_reset_membership_probe_tests {
+    use super::*;
+    use crate::community_membership::{
+        MembershipEventKind, SignedMembershipEvent, RESET_VETO_WINDOW_FLOOR_MS,
+    };
+    use crate::community_state_crdt::materialize_now_probe;
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    const COM: SpaceId = SpaceId([0xd2; 16]);
+
+    fn admin() -> OwnerAddr {
+        OwnerAddr([0x31; 16])
+    }
+    fn m1() -> OwnerAddr {
+        OwnerAddr([0x32; 16])
+    }
+
+    fn ev(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// An "active committee" stand-in: two Joined members, admin() power-100
+    /// by materialize convention. Zero reset-proposal events.
+    fn base_state() -> crate::community_state_crdt::CommunityState {
+        let mut state = crate::community_state_crdt::CommunityState::new(COM);
+        state.insert_verified_for_test(ev([0xE0; 16], admin(), 500, MembershipEventKind::Join));
+        state.insert_verified_for_test(ev([0xE1; 16], m1(), 600, MembershipEventKind::Join));
+        state
+    }
+
+    #[test]
+    fn zero_proposals_skips_full_materialize() {
+        let state = base_state();
+        let before = materialize_now_probe::get(COM);
+        let m = dfrost_reset_membership_from_state(&state, admin());
+        assert!(m.reset_proposals.is_empty());
+        assert_eq!(
+            materialize_now_probe::get(COM),
+            before,
+            "zero-proposal resolve must not pay for a full materialize_now walk"
+        );
+    }
+
+    #[test]
+    fn with_proposal_falls_through_and_resolves_correctly() {
+        let mut state = base_state();
+        state.insert_verified_for_test(ev(
+            [0xE2; 16],
+            admin(),
+            10_000,
+            MembershipEventKind::DfrostResetProposal {
+                target_vk: [0x77; 32],
+                target_epoch: 1,
+                new_members: vec![admin(), m1()],
+                new_threshold: 2,
+                veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
+            },
+        ));
+        let before = materialize_now_probe::get(COM);
+        let m = dfrost_reset_membership_from_state(&state, admin());
+        assert_eq!(m.reset_proposals.len(), 1);
+        assert_eq!(m.reset_proposals[0].target_epoch, 1);
+        assert_eq!(
+            materialize_now_probe::get(COM),
+            before + 1,
+            "a present proposal must fall through to the full materialize_now walk"
+        );
     }
 }
 

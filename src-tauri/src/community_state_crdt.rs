@@ -489,6 +489,40 @@ pub(crate) mod quorum_sync_probe {
     }
 }
 
+/// ZEB-1031 §9 review round 2 (I2): counts calls to
+/// [`CommunityState::materialize_now`], the UNCACHED full-log re-walk. Same
+/// shape and rationale as [`quorum_sync_probe`] above — a test reads the
+/// count before and after its measured window and asserts on the DELTA, so
+/// the assertion is honest about whether the expensive path actually ran
+/// rather than inferring it from timing or output shape. `#[cfg(test)]` —
+/// never compiled into production.
+#[cfg(test)]
+pub(crate) mod materialize_now_probe {
+    use crate::owner_state_types::SpaceId;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static COUNTS: Mutex<Option<HashMap<SpaceId, u64>>> = Mutex::new(None);
+
+    /// Record one `materialize_now` call for `community_id`.
+    pub(crate) fn record(community_id: SpaceId) {
+        let mut g = COUNTS.lock().expect("materialize-now probe mutex poisoned");
+        *g.get_or_insert_with(HashMap::new)
+            .entry(community_id)
+            .or_insert(0) += 1;
+    }
+
+    /// Calls recorded for `community_id` so far. Read before and after the
+    /// measured window; assert on the difference.
+    pub(crate) fn get(community_id: SpaceId) -> u64 {
+        let mut g = COUNTS.lock().expect("materialize-now probe mutex poisoned");
+        g.get_or_insert_with(HashMap::new)
+            .get(&community_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 impl CommunityState {
     pub fn new(community_id: SpaceId) -> Self {
         Self {
@@ -798,6 +832,8 @@ impl CommunityState {
     /// Kept as a separate helper for tests and one-shot reads where
     /// cache pollution would be undesirable.
     pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
+        #[cfg(test)]
+        materialize_now_probe::record(self.community_id);
         let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
         // ZEB-846: forward-skew ceiling against this node's own wall clock; floor
         // stays `None` (this is the no-floor uncached read). `None` receiver_now
