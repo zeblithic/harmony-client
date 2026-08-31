@@ -76,6 +76,7 @@ fn delib_config() -> Tier3PollConfigPayload {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     }
 }
 

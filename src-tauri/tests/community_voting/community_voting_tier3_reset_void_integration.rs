@@ -57,11 +57,13 @@ fn se_config() -> Tier3PollConfigPayload {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     }
 }
 
 /// Seed a Tier-3 poll directly into `voting_log`, voided by `voided`
-/// (`None` for a live poll), created by `creator` at `community_epoch`.
+/// (`None` for a live poll), created by `creator` at `community_epoch`,
+/// with `se_config()`'s default parameters.
 fn seed_poll(
     voting_log: &mut VotingLog,
     poll_id: PollId,
@@ -70,7 +72,30 @@ fn seed_poll(
     community_epoch: u64,
     voided: Option<VoidedInfo>,
 ) {
-    let config = se_config();
+    seed_poll_with_config(
+        voting_log,
+        poll_id,
+        creator,
+        community_id,
+        community_epoch,
+        voided,
+        se_config(),
+    );
+}
+
+/// `seed_poll`, but with a caller-supplied config — e.g. one carrying a
+/// `retry_of` link, for the review I1 regression (relaunch must NOT carry
+/// a stale `retry_of` forward).
+#[allow(clippy::too_many_arguments)]
+fn seed_poll_with_config(
+    voting_log: &mut VotingLog,
+    poll_id: PollId,
+    creator: OwnerAddr,
+    community_id: SpaceId,
+    community_epoch: u64,
+    voided: Option<VoidedInfo>,
+    config: Tier3PollConfigPayload,
+) {
     let create_hlc = hlc(0, "seed");
     let meta = Tier3PollMeta {
         poll_id,
@@ -510,7 +535,7 @@ async fn voided_state_survives_persist_round_trip() {
     let cipher = harmony_app::device_dataset_file::test_cipher();
     save_voting_log(&cipher, &path, &log, &community_id).expect("save");
 
-    let (_events, _policy, poll_restore) =
+    let (_events, _policy, poll_restore, _watermark) =
         load_voting_log(&cipher, &path, &community_id).expect("load");
     let restore = poll_restore
         .get(&poll_id)
@@ -518,4 +543,83 @@ async fn voided_state_survives_persist_round_trip() {
     let restored_voided = restore.voided.expect("voided info persisted");
     assert_eq!(restored_voided.reset_id, reset_id);
     assert_eq!(restored_voided.old_epoch, 1);
+}
+
+/// ZEB-1031 Task 7 review I1: a voided poll that was ITSELF a retry of an
+/// earlier failed sortition (`retry_of: Some(X)`) must NOT carry that
+/// stale, exclusive-to-retries linkage forward on relaunch — `predecessor`
+/// is the correct provenance for a reset relaunch, and cloning `retry_of`
+/// wholesale would make the new poll look like "a retry of X" (misleading
+/// UI/provenance) instead of "a relaunch of the poll that was voided,
+/// which happened to itself be a retry of X".
+#[tokio::test]
+async fn relaunch_of_a_retry_poll_drops_stale_retry_of_link() {
+    let community_id = SpaceId([0x57; 16]);
+    let creator = OwnerAddr([0xA0; 16]);
+    let old_poll_id = PollId([0x67; 32]);
+    let some_failed_sortition_id = PollId([0x99; 32]);
+    let reset_id: EventId = [0x77; 16];
+
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    {
+        let mut log = voting_log.lock().await;
+        let retry_config = Tier3PollConfigPayload {
+            retry_of: Some(some_failed_sortition_id),
+            ..se_config()
+        };
+        seed_poll_with_config(
+            &mut log,
+            old_poll_id,
+            creator,
+            community_id,
+            1,
+            Some(VoidedInfo {
+                reset_id,
+                old_epoch: 1,
+            }),
+            retry_config,
+        );
+    }
+    // Sanity: the seeded poll really does carry the stale retry_of link
+    // this test exists to catch relaunch NOT dropping.
+    {
+        let log = voting_log.lock().await;
+        assert_eq!(
+            log.polls[&old_poll_id]
+                .tier_state
+                .as_tier3()
+                .unwrap()
+                .meta
+                .config
+                .retry_of,
+            Some(some_failed_sortition_id)
+        );
+    }
+
+    let engine = engine_with_active_committee(community_id, voting_log.clone(), 2).await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x47; 32]);
+    let new_poll_id = engine
+        .relaunch_voided_poll(
+            old_poll_id,
+            creator,
+            /* caller_is_power_100 */ false,
+            &signing_key,
+            hlc(10_000, "relauncher"),
+            None,
+        )
+        .await
+        .expect("relaunch by the original creator must succeed");
+
+    let log = voting_log.lock().await;
+    let new_t3 = log.polls[&new_poll_id].tier_state.as_tier3().unwrap();
+    assert_eq!(
+        new_t3.meta.config.predecessor,
+        Some(old_poll_id),
+        "predecessor is the correct provenance link for a reset relaunch"
+    );
+    assert_eq!(
+        new_t3.meta.config.retry_of, None,
+        "a stale retry_of link must NOT survive relaunch — predecessor \
+         supersedes it"
+    );
 }

@@ -278,6 +278,7 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
     // Build a poll state with 2 candidates (n=3 with status_quo).
     let meta = Tier3PollMeta {
@@ -587,6 +588,7 @@ async fn no_kd_ts_emission_when_not_committee_member() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
     let meta = Tier3PollMeta {
         poll_id,

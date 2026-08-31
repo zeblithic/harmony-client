@@ -413,6 +413,39 @@ pub struct Tier3PollConfigPayload {
     /// *committee reset* voiding an otherwise-live poll.
     #[serde(rename = "pv", skip_serializing_if = "Option::is_none", default)]
     pub predecessor: Option<PollId>,
+    /// ZEB-1031 Task 7 review C1: the D-FROST committee epoch active at
+    /// mint time, embedded in this SIGNED payload so every reader — this
+    /// node's own future replay AND every peer that ingests the event via
+    /// `process_inbound`/backfill apply — derives the SAME
+    /// `Tier3PollMeta.community_epoch`. Before this field existed, only
+    /// the author's own local-mint path patched `community_epoch` after
+    /// the fact (`VotingLog::set_tier3_poll_epoch`, called from
+    /// `VotingLogEngine::publish_event`'s pre-apply epoch read, which
+    /// never runs for peer-ingested creates by design) — every other
+    /// device materialized `community_epoch = 0` forever, making the
+    /// reset-voiding sweep (spec §7) treat every such poll as pre-reset
+    /// regardless of when it was actually created.
+    ///
+    /// `None` means a pre-Task-7 poll, from before this field existed.
+    /// Every materialization path treats an absent `ce` as epoch `0` —
+    /// correct by construction: a legacy poll necessarily predates every
+    /// reset this scheme can represent, so "voidable by any reset" is the
+    /// right disposition, not a fallback to paper over.
+    ///
+    /// Trust model: this payload is creator-signed, but `ce` is NOT
+    /// independently verified against real D-FROST state (unlike a reset
+    /// marker's `old_epoch`/`old_vk`, which ARE cryptographically pinned
+    /// via `dfrost_reset_digest` + membership evidence — see
+    /// `community_dfrost_types::ResetMarkerPayload`). A dishonest `ce`
+    /// only mis-dispositions the LIAR'S OWN poll: too low risks an
+    /// unwarranted void by a reset that hasn't actually superseded it
+    /// (self-inflicted, fixable by relaunch); too high means the
+    /// beacon-seed derivation (`derive_beacon_seed(poll_create_event_hash,
+    /// community_epoch)`) never matches a real VRF beacon at that epoch,
+    /// silently stalling the poll forever (also self-inflicted). Neither
+    /// gives an attacker any lever over another member's poll.
+    #[serde(rename = "ce", skip_serializing_if = "Option::is_none", default)]
+    pub ce: Option<u64>,
 }
 
 #[cfg(test)]
@@ -602,6 +635,7 @@ mod tier3_payload_tests {
             },
             retry_of: None,
             predecessor: None,
+            ce: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&payload, &mut encoded).expect("encode");
@@ -636,6 +670,7 @@ mod tier3_payload_tests {
             },
             retry_of: Some(prev_poll),
             predecessor: None,
+            ce: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&payload, &mut encoded).expect("encode");
@@ -2155,6 +2190,7 @@ mod build_tests {
             },
             retry_of: None,
             predecessor: None,
+            ce: None,
         };
         let hlc = Hlc {
             wall_ms: 1,

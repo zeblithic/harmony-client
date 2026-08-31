@@ -57825,6 +57825,31 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         }
     };
 
+    // ZEB-317: single-lock NodeState capture via the shared helper. Moved
+    // ahead of `cfg` construction (ZEB-1031 Task 7 review C1) — the
+    // committee-epoch pre-read below needs `handles.dfrost_log_registry`.
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
+
+    // ZEB-1031 Task 7 review C1: read the CURRENT committee epoch and
+    // embed it in `cfg.ce` BEFORE this event is ever signed — every
+    // future reader (this node's own future replay AND every peer that
+    // ingests the event) derives `Tier3PollMeta.community_epoch` from
+    // this SAME wire-carried value, unlike the pre-fix asymmetry where
+    // only the author's own local-mint pre-read patched it, leaving every
+    // other device's copy at the `0` fallback forever. This is required
+    // for EVERY Tier-3 poll (sortition, not just se-mode ratification,
+    // needs a real epoch for `derive_beacon_seed`), so it runs
+    // unconditionally, ahead of the se-mode-specific gate below (which
+    // still runs — with an active committee already guaranteed by this
+    // point, harmless-redundant, kept for its more specific error text).
+    let community_epoch =
+        crate::community_voting_log_engine::read_current_committee_epoch_for_tier3_create(
+            handles.dfrost_log_registry.as_ref(),
+            space_id,
+        )
+        .await
+        .map_err(|e| format!("voting_create_tier3_proposal: {e}"))?;
+
     // Note: `Tier3PollConfigPayload` has no `channel_id` field — the host
     // channel is carried by the chat-fanout body, not by the on-the-wire
     // voting payload. ZEB-295 Phase 6 Task 9: `privacy_mode` is now plumbed
@@ -57847,12 +57872,10 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         // ZEB-1031 Task 7: ordinary proposal creation is never a
         // relaunch — only `relaunch_voided_poll_impl` sets `predecessor`.
         predecessor: None,
+        ce: Some(community_epoch),
     };
     crate::community_voting_tier3::validate_tier3_poll_config(&cfg)
         .map_err(|e| format!("voting_create_tier3_proposal: invalid config: {e:?}"))?;
-
-    // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     // Build snapshot + check eligibility BEFORE signing. If we're not
     // eligible to participate in our own proposal, the UI should surface that
@@ -59334,7 +59357,7 @@ async fn reconcile_voting_from_state(
     })
     .await
     .map_err(|e| format!("voting reconcile load task join error: {e}"))?;
-    let (events, policy, poll_restore) = match loaded {
+    let (events, policy, poll_restore, retired_epoch_watermark) = match loaded {
         Ok(v) => v,
         Err(e) => {
             // A transient I/O error (file present but unreadable — `load`
@@ -59350,13 +59373,20 @@ async fn reconcile_voting_from_state(
     // A never-voted community with default policy is exactly what a lazy
     // spawn would create — nothing to restore. But a policy-only change
     // (IPC persists `policy` even before any event exists) must survive
-    // restart, so restore it into a fresh log below.
+    // restart, so restore it into a fresh log below. ZEB-1031 Task 7 review
+    // M1: the retired-epoch watermark ALSO survives here even with zero
+    // events — a community can have a persisted reset watermark with no
+    // local Tier-3 events at all, and a pre-reset-epoch poll's `kd=cr` could
+    // still sync in later via backfill/RBSR.
     if events.is_empty() {
-        if policy == crate::community_voting_conviction::CommunityVotingPolicy::default() {
+        if policy == crate::community_voting_conviction::CommunityVotingPolicy::default()
+            && retired_epoch_watermark.is_none()
+        {
             return Ok(());
         }
         let mut log = crate::community_voting_log::VotingLog::new();
         log.set_policy(policy);
+        log.retired_epoch_watermark = retired_epoch_watermark;
         {
             let mut map = voting_logs.lock().await;
             map.entry(community_id)
@@ -59371,6 +59401,13 @@ async fn reconcile_voting_from_state(
 
     let mut log = crate::community_voting_log::VotingLog::new();
     log.set_policy(policy);
+    // ZEB-1031 Task 7 review M1: restore the watermark BEFORE replay (unlike
+    // `poll_restore` below, applied AFTER — it needs the polls to already
+    // exist by id) so a pre-reset-epoch `kd=cr` being replayed RIGHT NOW
+    // (it synced in late, after the sweep that should have voided it, and
+    // the session ended before the live watermark check could catch it)
+    // still materializes already voided instead of resurrecting live.
+    log.retired_epoch_watermark = retired_epoch_watermark;
     let mut replayed = 0usize;
     for event in events {
         let snap = membership_resolver
@@ -59703,6 +59740,7 @@ mod zeb718_voting_reconcile_tests {
             },
             retry_of: None,
             predecessor: None,
+            ce: None,
         };
         let mut payload = Vec::new();
         ciborium::into_writer(&cfg, &mut payload).expect("encode tier3 cfg");

@@ -330,8 +330,11 @@ decryption shares are gone with the old committee; there is nothing to preserve
 reset; the creator (or an admin) gets a one-click **relaunch** that authors a fresh
 PollCreate copying the parameters, stamped at the current epoch, linking its
 predecessor. Re-voting is honest — the old votes are cryptographically unrecoverable.
-Tier-1/2 polls are untouched. Voiding is idempotent and replay-safe (derived from the
-marker, which is itself in the log).
+Tier-1/2 polls are untouched. Voiding is idempotent, and replay-safe against the
+marker's own re-delivery and — via a community-wide retired-epoch watermark advanced
+alongside the sweep — against a pre-reset poll that syncs in after the local sweep has
+already run; it is not a general guarantee against arbitrary interleavings beyond those
+two cases.
 
 ## 8. Constants and config
 

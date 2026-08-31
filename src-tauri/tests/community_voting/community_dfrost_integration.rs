@@ -3515,6 +3515,7 @@ fn seed_open_se_poll(
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
     let create_hlc = hlc(0, "seed");
     let meta = Tier3PollMeta {
@@ -3914,5 +3915,600 @@ async fn chain_adoption_reset_marker_voids_open_tier3_polls_zeb1031() {
     assert!(
         t3_3.voided.is_none(),
         "poll at the chain's final epoch (3) must stay untouched"
+    );
+}
+
+/// ZEB-1031 Task 7 review C1 (MANDATORY regression): drives the void sweep
+/// against a poll materialized through the REAL peer path — never
+/// hand-seeded, never dual-applied. Author (alice) mints a Tier-3
+/// PollCreate on engine A at community epoch 1; peer (bob) engine B
+/// materializes it via `process_inbound` deriving `community_epoch` from
+/// the wire-carried `cfg.ce` (NOT a local `set_tier3_poll_epoch` patch,
+/// which never runs for peer-ingested creates). A reset marker for
+/// `old_epoch = 1` applied on B's dfrost side via LIVE INGEST then voids
+/// B's peer-materialized copy of the poll — proving `community_epoch` is
+/// no longer a creator-local cache that only the author ever sees
+/// correctly. A second, post-reset poll at epoch 2 (same author→peer
+/// path) survives B's sweep untouched.
+#[tokio::test]
+async fn peer_materialized_poll_voids_via_wire_carried_epoch_zeb1031() {
+    use harmony_app::community_voting_core::{
+        build_signed_poll_create_tier3, derive_poll_id, Eligibility, MemberAttrs,
+        Tier3PollConfigPayload, VotingIdentityResolver,
+    };
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xF1);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xF2);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xF1; 16]);
+    let vk1: [u8; 32] = [0xA9; 32];
+
+    // ── Membership evidence for B's reset-marker admissibility (RS-M3/4/5) ──
+    let reset1_id: EventId = [0xB9; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset1_id,
+        proposer: alice_addr,
+        target_vk: vk1,
+        target_epoch: 1,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+    });
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+
+    // ── A's dfrost side (epoch 1) — so A can embed `ce` before signing ──
+    let dfrost_log_a = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+    let dfrost_reg_a = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    {
+        let (a_dpub_tx, _a_dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_a_dsub_tx, a_dsub_rx) = mpsc::channel::<Vec<u8>>(4);
+        DfrostLogRegistry::register(
+            &dfrost_reg_a,
+            DfrostLogEngineParams {
+                community_id,
+                dfrost_log: dfrost_log_a.clone(),
+                publisher_tx: a_dpub_tx,
+                subscriber_rx: a_dsub_rx,
+                app_handle: None,
+                self_addr: alice_addr,
+                self_x25519_priv: [0u8; 32],
+                identity_resolver: identity_resolver.clone(),
+                registry_weak: None,
+                driver: None,
+                membership_resolver: None,
+                orchestrator_config: Default::default(),
+                persist: None,
+            },
+        )
+        .await;
+    }
+
+    // ── B's dfrost side (epoch 1, same vk) — for applying the live reset marker ──
+    let dfrost_log_b = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+    let dfrost_reg_b = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let resolver_b = Arc::new(TestResetResolver::new(members.clone(), membership));
+    let (b_dtx, b_drx) = mpsc::channel::<Vec<u8>>(4);
+    {
+        let (b_dpub_tx, _b_dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+        DfrostLogRegistry::register(
+            &dfrost_reg_b,
+            DfrostLogEngineParams {
+                community_id,
+                dfrost_log: dfrost_log_b.clone(),
+                publisher_tx: b_dpub_tx,
+                subscriber_rx: b_drx,
+                app_handle: None,
+                self_addr: bob_addr,
+                self_x25519_priv: [0u8; 32],
+                identity_resolver: identity_resolver.clone(),
+                registry_weak: None,
+                driver: None,
+                membership_resolver: Some(resolver_b.clone()),
+                orchestrator_config: Default::default(),
+                persist: None,
+            },
+        )
+        .await;
+    }
+
+    // ── Voting engines A (author) and B (peer), bridged directly (real
+    //    packet delivery — mirrors a Zenoh pub/sub hop) ──
+    let voting_log_a = Arc::new(Mutex::new(VotingLog::new()));
+    let voting_log_b = Arc::new(Mutex::new(VotingLog::new()));
+
+    struct BridgeIdentity(Arc<dyn IdentityResolver + Send + Sync>);
+    #[async_trait::async_trait]
+    impl VotingIdentityResolver for BridgeIdentity {
+        async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
+            self.0.resolve(owner).await
+        }
+    }
+    struct BridgeMembership(MembershipSnapshot);
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for BridgeMembership {
+        async fn snapshot_at(
+            &self,
+            _community_id: SpaceId,
+            _hlc: &Hlc,
+        ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+            Ok(self.0.clone())
+        }
+    }
+    let voting_snapshot = MembershipSnapshot {
+        members: [
+            (
+                alice_addr,
+                MemberAttrs {
+                    power: 100,
+                    vouching_depth: 0,
+                },
+            ),
+            (
+                bob_addr,
+                MemberAttrs {
+                    power: 1,
+                    vouching_depth: 0,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let voting_identity_resolver = Arc::new(BridgeIdentity(identity_resolver.clone()));
+    let voting_membership_resolver = Arc::new(BridgeMembership(voting_snapshot.clone()));
+
+    let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (_a_sub_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let device_id_a = "dev-zeb1031-c1-a".to_string();
+    let hlc_tracker_a = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id_a.clone(),
+    )));
+    let engine_a = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: voting_log_a.clone(),
+        publisher_tx: a_pub_tx,
+        subscriber_rx: a_sub_rx,
+        hlc_tracker: Some(hlc_tracker_a),
+        device_id: Some(device_id_a),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester_a: BeaconRequester =
+        Arc::new(move |_c, _s, _e| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&engine_a, dfrost_reg_a.clone(), requester_a).await;
+
+    let (b_pub_tx, _b_pub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let device_id_b = "dev-zeb1031-c1-b".to_string();
+    let hlc_tracker_b = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id_b.clone(),
+    )));
+    let engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: voting_log_b.clone(),
+        publisher_tx: b_pub_tx,
+        subscriber_rx: b_sub_rx,
+        hlc_tracker: Some(hlc_tracker_b),
+        device_id: Some(device_id_b),
+        app_handle: None,
+        identity_resolver: Some(voting_identity_resolver),
+        membership_resolver: Some(voting_membership_resolver),
+    })
+    .await;
+    let requester_b: BeaconRequester =
+        Arc::new(move |_c, _s, _e| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&engine_b, dfrost_reg_b.clone(), requester_b).await;
+
+    // Bridge A's publisher output into B's subscriber input — real peer
+    // delivery, never a direct dual-apply.
+    tokio::spawn(async move {
+        while let Some(packet) = a_pub_rx.recv().await {
+            let _ = b_sub_tx.send(packet).await;
+        }
+    });
+
+    // ── A mints a REAL Tier-3 PollCreate at epoch 1 ──
+    let epoch1 = dfrost_reg_a
+        .get(community_id)
+        .await
+        .expect("A's dfrost engine")
+        .latest_committee_epoch()
+        .await
+        .expect("A's committee active");
+    assert_eq!(epoch1, 1);
+    let cfg1 = Tier3PollConfigPayload {
+        proposal_text: "pre-reset poll".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: None,
+        ce: Some(epoch1),
+    };
+    let event1 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg1, hlc(1_000, "alice"))
+        .expect("sign poll1");
+    let poll1_id = derive_poll_id(
+        &community_id,
+        &event1.signing_bytes().expect("signing bytes"),
+    );
+    engine_a
+        .publish_event(event1, Some(voting_snapshot.clone()))
+        .await
+        .expect("A publishes poll1");
+
+    // ── B materializes poll1 via process_inbound — the real peer path ──
+    wait_for_voting_log("B materializes poll1", &voting_log_b, |log| {
+        log.polls.contains_key(&poll1_id)
+    })
+    .await;
+    {
+        let log = voting_log_b.lock().await;
+        let t3 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3.meta.community_epoch, 1,
+            "B must derive community_epoch from the wire-carried ce, not a \
+             local set_tier3_poll_epoch patch (which never runs for \
+             peer-ingested creates)"
+        );
+        assert!(t3.voided.is_none());
+    }
+
+    // ── Apply the reset marker for old_epoch=1 on B's dfrost side, LIVE
+    //    INGEST (never hand-calling void_tier3_polls_for_reset) ──
+    let marker1_payload = ResetMarkerPayload {
+        reset_proposal_id: reset1_id,
+        reset_digest: digest1,
+        old_vk: vk1,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker1 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker1_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker1");
+    let mut packet = Vec::new();
+    ciborium::into_writer(&marker1, &mut packet).expect("encode marker1");
+    b_dtx
+        .send(packet)
+        .await
+        .expect("B's dfrost subscriber open");
+
+    // ── B's PEER-MATERIALIZED poll1 (never hand-seeded) gets voided ──
+    wait_for_voting_log(
+        "poll1 voided on B via wire-carried epoch",
+        &voting_log_b,
+        |log| {
+            log.polls
+                .get(&poll1_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .and_then(|t3| t3.voided)
+                .is_some()
+        },
+    )
+    .await;
+
+    // ── A mints a SECOND, post-reset poll at epoch 2 (successor committee) ──
+    {
+        let mut log = dfrost_log_a.lock().await;
+        log.committee_state.current_epoch = 2;
+    }
+    let epoch2 = dfrost_reg_a
+        .get(community_id)
+        .await
+        .expect("A's dfrost engine")
+        .latest_committee_epoch()
+        .await
+        .expect("A's committee active");
+    assert_eq!(epoch2, 2);
+    let cfg2 = Tier3PollConfigPayload {
+        proposal_text: "post-reset poll".into(),
+        ce: Some(epoch2),
+        ..cfg1
+    };
+    let event2 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg2, hlc(6_000, "alice"))
+        .expect("sign poll2");
+    let poll2_id = derive_poll_id(
+        &community_id,
+        &event2.signing_bytes().expect("signing bytes"),
+    );
+    engine_a
+        .publish_event(event2, Some(voting_snapshot))
+        .await
+        .expect("A publishes poll2");
+
+    // ── B materializes poll2 via process_inbound and it survives the
+    //    (already-run) sweep untouched ──
+    wait_for_voting_log("B materializes poll2", &voting_log_b, |log| {
+        log.polls.contains_key(&poll2_id)
+    })
+    .await;
+    let log = voting_log_b.lock().await;
+    let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+    assert_eq!(t3_2.meta.community_epoch, 2);
+    assert!(
+        t3_2.voided.is_none(),
+        "post-reset poll (peer-materialized via B's own process_inbound) \
+         must survive B's earlier sweep"
+    );
+}
+
+/// ZEB-1031 Task 7 review M1 (folded-in, spec §7 no-silent-stall
+/// guarantee): a pre-reset-epoch poll whose `kd=cr` event syncs in AFTER
+/// the local void sweep already ran (independent anti-entropy — dfrost
+/// catch-up and voting-log RBSR are separate wire protocols with no
+/// ordering guarantee between them) must arrive ALREADY VOIDED, not live.
+/// Order: sweep runs first (marker applied while the voting log is still
+/// empty — the retired-epoch watermark is set with zero polls to void),
+/// THEN the pre-reset poll's `kd=cr` syncs in via the real inbound path
+/// (never hand-seeded). A post-reset poll delivered the same way is
+/// unaffected.
+#[tokio::test]
+async fn late_syncing_pre_reset_poll_arrives_already_voided_via_watermark_zeb1031() {
+    use harmony_app::community_voting_core::{
+        build_signed_poll_create_tier3, derive_poll_id, Eligibility, Tier3PollConfigPayload,
+    };
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xD1);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xD2);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xD1; 16]);
+    let vk1: [u8; 32] = [0xE9; 32];
+
+    let reset1_id: EventId = [0xC9; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset1_id,
+        proposer: alice_addr,
+        target_vk: vk1,
+        target_epoch: 1,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+    });
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+    let resolver = Arc::new(TestResetResolver::new(members.clone(), membership));
+
+    // ── B's dfrost side (epoch 1) — wired for live-ingest marker apply ──
+    let dfrost_log = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+    let dfrost_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let (dtx, drx) = mpsc::channel::<Vec<u8>>(4);
+    let (dpub_tx, _dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+    DfrostLogRegistry::register(
+        &dfrost_reg,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: dfrost_log.clone(),
+            publisher_tx: dpub_tx,
+            subscriber_rx: drx,
+            app_handle: None,
+            self_addr: bob_addr,
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: identity_resolver.clone(),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // ── B's voting engine — EMPTY at the moment the sweep runs ──
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    // `verify_voting_event` (the inbound sig-verify gate) needs a REAL
+    // resolver — alice's pub64 must resolve for her signed kd=cr events
+    // to verify, or process_inbound silently drops them and this test's
+    // "arrives via the real inbound path" premise never fires.
+    struct BridgeVotingIdentity(Arc<dyn IdentityResolver + Send + Sync>);
+    #[async_trait::async_trait]
+    impl harmony_app::community_voting_core::VotingIdentityResolver for BridgeVotingIdentity {
+        async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
+            self.0.resolve(owner).await
+        }
+    }
+    struct BridgeMembership(Arc<TestResetResolver>);
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for BridgeMembership {
+        async fn snapshot_at(
+            &self,
+            community_id: SpaceId,
+            hlc: &Hlc,
+        ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+            self.0.snapshot_at(community_id, hlc).await
+        }
+    }
+    let (v_pub_tx, _v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-m1".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: voting_log.clone(),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: Some(Arc::new(BridgeVotingIdentity(identity_resolver.clone()))),
+        membership_resolver: Some(Arc::new(BridgeMembership(resolver))),
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_c, _s, _e| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, dfrost_reg, requester).await;
+
+    // ── Sweep runs FIRST: apply the reset marker while the voting log is
+    //    still empty (zero polls to void — only the watermark advances) ──
+    let marker1_payload = ResetMarkerPayload {
+        reset_proposal_id: reset1_id,
+        reset_digest: digest1,
+        old_vk: vk1,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker1 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker1_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker1");
+    let mut packet = Vec::new();
+    ciborium::into_writer(&marker1, &mut packet).expect("encode marker1");
+    dtx.send(packet).await.expect("dfrost subscriber open");
+
+    // Wait for the sweep's async dispatch to land — no polls exist yet to
+    // observe voiding on, so poll the watermark directly instead.
+    wait_for_voting_log(
+        "watermark advances from the empty-log sweep",
+        &voting_log,
+        |log| log.retired_epoch_watermark.is_some(),
+    )
+    .await;
+    {
+        let log = voting_log.lock().await;
+        let watermark = log.retired_epoch_watermark.expect("watermark set");
+        assert_eq!(watermark.reset_id, reset1_id);
+        assert_eq!(watermark.old_epoch, 1);
+        assert!(
+            log.polls.is_empty(),
+            "the sweep ran against an empty log — nothing to void yet"
+        );
+    }
+
+    // ── NOW the pre-reset poll's kd=cr syncs in — real inbound delivery,
+    //    never hand-seeded, never a dual-apply ──
+    let cfg1 = Tier3PollConfigPayload {
+        proposal_text: "late-syncing pre-reset poll".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: None,
+        ce: Some(1),
+    };
+    let event1 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg1, hlc(1_000, "alice"))
+        .expect("sign poll1");
+    let poll1_id = derive_poll_id(
+        &community_id,
+        &event1.signing_bytes().expect("signing bytes"),
+    );
+    let mut packet1 = Vec::new();
+    ciborium::into_writer(&event1, &mut packet1).expect("encode poll1");
+    v_sub_tx
+        .send(packet1)
+        .await
+        .expect("voting subscriber open");
+
+    wait_for_voting_log(
+        "B materializes the late pre-reset poll",
+        &voting_log,
+        |log| log.polls.contains_key(&poll1_id),
+    )
+    .await;
+    {
+        let log = voting_log.lock().await;
+        let t3 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+        let voided = t3.voided.expect(
+            "a pre-reset-epoch poll syncing in AFTER the sweep must materialize \
+             already voided via the retired-epoch watermark, not live",
+        );
+        assert_eq!(voided.reset_id, reset1_id);
+        assert_eq!(voided.old_epoch, 1);
+    }
+
+    // ── A post-reset poll delivered the same way is unaffected ──
+    let cfg2 = Tier3PollConfigPayload {
+        proposal_text: "post-reset poll, late sync".into(),
+        ce: Some(2),
+        ..cfg1
+    };
+    let event2 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg2, hlc(6_000, "alice"))
+        .expect("sign poll2");
+    let poll2_id = derive_poll_id(
+        &community_id,
+        &event2.signing_bytes().expect("signing bytes"),
+    );
+    let mut packet2 = Vec::new();
+    ciborium::into_writer(&event2, &mut packet2).expect("encode poll2");
+    v_sub_tx
+        .send(packet2)
+        .await
+        .expect("voting subscriber open");
+
+    wait_for_voting_log("B materializes the post-reset poll", &voting_log, |log| {
+        log.polls.contains_key(&poll2_id)
+    })
+    .await;
+    let log = voting_log.lock().await;
+    let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+    assert!(
+        t3_2.voided.is_none(),
+        "a post-reset poll must NOT be voided by a watermark from an earlier reset"
     );
 }

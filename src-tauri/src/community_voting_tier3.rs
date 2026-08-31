@@ -2541,6 +2541,7 @@ mod tests {
             },
             retry_of: None,
             predecessor: None,
+            ce: None,
         }
     }
 
@@ -3533,6 +3534,7 @@ mod tests {
             },
             retry_of: None,
             predecessor: None,
+            ce: None,
         }
     }
 

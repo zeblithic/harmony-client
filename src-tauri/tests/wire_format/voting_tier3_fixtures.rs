@@ -113,6 +113,7 @@ fn fixture_tier3_poll_create_payload() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
     round_trip_or_regen("tier3_poll_create.cbor", &pd);
     let mut bytes = Vec::new();
@@ -138,6 +139,7 @@ fn fixture_tier3_poll_create_with_retry_of() {
         },
         retry_of: Some(PollId([0xab; 32])),
         predecessor: None,
+        ce: None,
     };
     round_trip_or_regen("tier3_poll_create_retry.cbor", &pd);
     let mut bytes = Vec::new();
@@ -172,6 +174,7 @@ fn fixture_tier3_poll_create_with_predecessor() {
         },
         retry_of: None,
         predecessor: Some(PollId([0xcd; 32])),
+        ce: None,
     };
     round_trip_or_regen("tier3_poll_create_predecessor.cbor", &pd);
     let mut bytes = Vec::new();
@@ -180,6 +183,40 @@ fn fixture_tier3_poll_create_with_predecessor() {
     assert_two_char_keys(
         &bytes,
         &["pt", "ss", "dw", "fw", "rw", "pm", "im", "el", "pv"],
+    );
+}
+
+/// ZEB-1031 Task 7 review C1: the wire-carried committee epoch — `ce`
+/// present. A NEW pin (never edits the three above): optional-key
+/// evolution must leave the `ce`-less encodings byte-identical, which the
+/// three fixtures above (all now carrying an explicit `ce: None`, still
+/// absent from the wire) already prove.
+#[test]
+fn fixture_tier3_poll_create_with_ce() {
+    let pd = Tier3PollConfigPayload {
+        proposal_text: "Amend §3 (epoch-stamped)".into(),
+        sortition_size: 50,
+        deliberation_window_seconds: 604_800,
+        drafting_window_seconds: 604_800,
+        ratification_window_seconds: 604_800,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: None,
+        ce: Some(3),
+    };
+    round_trip_or_regen("tier3_poll_create_ce.cbor", &pd);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
+    // "ce" key is present when ce is Some; all keys must be 2-char.
+    assert_two_char_keys(
+        &bytes,
+        &["pt", "ss", "dw", "fw", "rw", "pm", "im", "el", "ce"],
     );
 }
 

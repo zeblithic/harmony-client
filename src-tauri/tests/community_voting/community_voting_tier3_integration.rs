@@ -592,6 +592,7 @@ pub fn default_tier3_config() -> Tier3PollConfigPayload {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     }
 }
 
@@ -893,6 +894,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -1399,6 +1401,7 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -1750,6 +1753,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -2068,6 +2072,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         },
         retry_of: Some(poll_id),
         predecessor: None,
+        ce: None,
     };
 
     let retry_create_event =
@@ -2159,6 +2164,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         },
         retry_of: Some(phantom_poll_id),
         predecessor: None,
+        ce: None,
     };
 
     let bad_nonexistent_event = build_tier3_poll_create_event(
@@ -2199,6 +2205,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         },
         retry_of: Some(retry_poll_id),
         predecessor: None,
+        ce: None,
     };
 
     let bad_nonfailed_event = build_tier3_poll_create_event(
@@ -2370,6 +2377,7 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -2624,6 +2632,7 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -2854,6 +2863,7 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -3087,6 +3097,7 @@ async fn engine_auto_cl_when_ratification_window_expires() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -3250,6 +3261,7 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -3469,6 +3481,7 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
         },
         retry_of: None,
         predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
