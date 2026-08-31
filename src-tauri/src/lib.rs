@@ -67601,26 +67601,27 @@ struct RegistryResetResponseAuthor {
 
 #[async_trait::async_trait]
 impl ResetResponseAuthor for RegistryResetResponseAuthor {
+    /// Look up the community's membership engine and route the event
+    /// through its verify-then-insert-then-emit-delta path.
     async fn author(
         &self,
         event: crate::community_membership::SignedMembershipEvent,
     ) -> Result<crate::community_state_crdt::InsertOutcome, String> {
         let space_id = event.community_id;
         let registry = self.registry.as_ref().ok_or_else(|| {
-            "dfrost_contribute_threshold_sign: community_registry unavailable — owner not \
-             loaded"
+            "RegistryResetResponseAuthor: community_registry unavailable — owner not loaded"
                 .to_string()
         })?;
         let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
             format!(
-                "dfrost_contribute_threshold_sign: no membership engine for community {} — \
+                "RegistryResetResponseAuthor: no membership engine for community {} — \
                  not currently joined",
                 hex::encode(space_id.0)
             )
         })?;
         engine_arc.insert_local_event(event).await.map_err(|e| {
             format!(
-                "dfrost_contribute_threshold_sign: insert_local_event \
+                "RegistryResetResponseAuthor: insert_local_event \
                  (DfrostResetResponse): {e}"
             )
         })

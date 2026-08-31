@@ -2959,27 +2959,36 @@ async fn beacon_completion_via_production_core_still_mints_vb_zeb1040() {
     let message_hash = [0x33; 32];
 
     // ── Round-1 on each node (purpose stays the Beacon default),
-    // broadcast over the real bridge ──
-    let ts_a = round1_commit_local(
-        &mut node_a.log.try_lock().unwrap(),
-        &alice,
-        &old.key_pkg_alice,
-        ceremony_id,
-        message_hash,
-        hlc(2_000, "alice"),
-    );
+    // broadcast over the real bridge. The orchestrator tick tasks are
+    // already contending for these log mutexes (15ms interval), so a
+    // `try_lock()` here can spuriously fail — take the async lock,
+    // scoped to just the round-1 stash. ──
+    let ts_a = {
+        let mut ga = node_a.log.lock().await;
+        round1_commit_local(
+            &mut ga,
+            &alice,
+            &old.key_pkg_alice,
+            ceremony_id,
+            message_hash,
+            hlc(2_000, "alice"),
+        )
+    };
     engine_a
         .publish_event(ts_a)
         .await
         .expect("alice broadcasts round-1 ts");
-    let ts_b = round1_commit_local(
-        &mut node_b.log.try_lock().unwrap(),
-        &bob,
-        &old.key_pkg_bob,
-        ceremony_id,
-        message_hash,
-        hlc(2_100, "bob"),
-    );
+    let ts_b = {
+        let mut gb = node_b.log.lock().await;
+        round1_commit_local(
+            &mut gb,
+            &bob,
+            &old.key_pkg_bob,
+            ceremony_id,
+            message_hash,
+            hlc(2_100, "bob"),
+        )
+    };
     engine_b
         .publish_event(ts_b)
         .await
