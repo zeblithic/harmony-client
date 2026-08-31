@@ -3276,7 +3276,11 @@ pub fn verify_reset_marker_admissible(
 /// gate is defense-in-depth layered on top of the pre-existing shape/
 /// membership checks, not itself a membership-integrity boundary, so a
 /// missing evidence source costs only the extra protection, never
-/// correctness.
+/// correctness. This fail-open is safe only via a coupling worth naming
+/// explicitly: the same underlying resolver, `voting_resolve_membership_source`,
+/// also backs the adoption call sites' OWN membership resolve — if that
+/// source is genuinely broken, the caller's resolve fails closed (rejects)
+/// before this gate's fail-open value would ever matter. Load-bearing for §6.1.
 async fn resolve_rejected_vks(
     orchestrator: &OrchestratorHandle,
     community_id: SpaceId,

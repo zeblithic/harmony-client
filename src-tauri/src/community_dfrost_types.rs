@@ -276,7 +276,7 @@ pub struct DkgCompletePayload {
 /// reset. Authored by any power-100 admin or any member of the pinned
 /// successor committee (`nm`) — a mechanical bridge; the actual
 /// authorization already happened in the membership log (the
-/// `DfrostResetProposal`/`DfrostResetCosign`/`DfrostResetCommitteeResponse`
+/// `DfrostResetProposal`/`DfrostResetCosign`/`DfrostResetResponse`
 /// family). `DfrostLog::apply_reset_marker` verifies RS-M1/M2/M6
 /// (space binding, held-state match, idempotent re-delivery); RS-M3/M4/M5
 /// (membership phase, digest recomputation, actor authorization) are

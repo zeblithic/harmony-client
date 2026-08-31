@@ -2279,7 +2279,7 @@ pub struct RecoveryProposalView {
 impl CanonicalPayloadSealed for RecoveryProposalView {}
 impl CanonicalPayload for RecoveryProposalView {}
 
-/// ZEB-1031 §3.3: verdict carried by a `DfrostResetCommitteeResponse`.
+/// ZEB-1031 §3.3: verdict carried by a `DfrostResetResponse`.
 /// 1-char serde codes (values, not keys — same convention as
 /// `RecoveryPhase`/`MemberStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2402,9 +2402,10 @@ impl CanonicalPayload for ResetPhase {}
 
 /// ZEB-1031 §4: derived per-proposal view built by
 /// `evaluate_reset_phases`'s materialize post-pass. Consumed by
-/// `verify_event`'s RS-P5/RS-R1/RS-R3 gates and by the D9 UI
-/// (`get_dfrost_reset_state`). All field keys are 2-char per the
-/// same-length-keys invariant at this nesting level.
+/// `verify_event`'s RS-P5/RS-R1/RS-R3 gates and, indirectly, by
+/// `get_dfrost_reset_state` — post-Task-9 the D9 UI reads the projected
+/// `ResetProposalDto`, not this type directly. All field keys are 2-char
+/// per the same-length-keys invariant at this nesting level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetProposalView {
     #[serde(

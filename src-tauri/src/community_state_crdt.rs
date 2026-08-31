@@ -504,7 +504,8 @@ pub(crate) mod materialize_now_probe {
 
     static COUNTS: Mutex<Option<HashMap<SpaceId, u64>>> = Mutex::new(None);
 
-    /// Record one `materialize_now` call for `community_id`.
+    /// Record one full (uncached) materialize call — `materialize_now` or
+    /// `materialized_with_now` — for `community_id`.
     pub(crate) fn record(community_id: SpaceId) {
         let mut g = COUNTS.lock().expect("materialize-now probe mutex poisoned");
         *g.get_or_insert_with(HashMap::new)
@@ -860,6 +861,8 @@ impl CommunityState {
         admin_addr: OwnerAddr,
         now_ms: u64,
     ) -> MaterializedMembership {
+        #[cfg(test)]
+        materialize_now_probe::record(self.community_id);
         let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
         // ZEB-846: recovery reads pass `wall_now_ms` here — it IS the receiver's
         // own clock, so it serves as BOTH the aging floor and the forward-skew

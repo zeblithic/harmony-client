@@ -132,6 +132,31 @@ fn signed_event_dfrost_reset_response_endorse_wire_bytes_pinned() {
 }
 
 #[test]
+fn signed_event_dfrost_reset_response_veto_wire_bytes_pinned() {
+    let event = fixture_signed_event(MembershipEventKind::DfrostResetResponse {
+        target_event_id: [0x30; 16],
+        verdict: ResetVerdict::Veto,
+        group_sig: [0xCC; 64],
+        new_vk: None,
+    });
+    let bytes = canonical_cbor_encode(&event).expect("encode");
+    let decoded: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, event, "roundtrip identity");
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    eprintln!("signed_event_dfrost_reset_response_veto hex: {hex}");
+    assert_eq!(
+        hex,
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467617a62766ca3627469503030303030303030303030303030303062766461766273675840cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc6261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "DfrostResetResponse (veto, new_vk absent) wire format changed"
+    );
+    // new_vk is None => skip_serializing_if elides "nv" entirely.
+    assert_two_char_keys(
+        &canonical_cbor_encode(&event.kind).expect("encode kind"),
+        &["ti", "vd", "sg"],
+    );
+}
+
+#[test]
 fn signed_event_dfrost_reset_response_consumed_wire_bytes_pinned() {
     let event = fixture_signed_event(MembershipEventKind::DfrostResetResponse {
         target_event_id: [0x30; 16],

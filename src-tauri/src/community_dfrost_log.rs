@@ -1772,7 +1772,9 @@ impl DfrostLog {
     /// Checks: committee not `active`; members sorted bytewise
     /// ascending + deduplicated, at least 2; `max_signers ==
     /// members.len()`; `2 <= threshold <= max_signers`; the actor is a
-    /// committee member; `epoch == current_epoch + 1`.
+    /// committee member; `epoch == current_epoch + 1`; and, when
+    /// `pending_reset` is set (ZEB-1031 §5.3), `members`/`threshold`
+    /// match the pinned successor set exactly.
     pub fn check_ceremony_init_admissible(
         &self,
         payload: &crate::community_dfrost_types::CeremonyInitPayload,

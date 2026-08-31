@@ -92,7 +92,10 @@ use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::community_voting_core::{MemberAttrs, MembershipSnapshot};
 use harmony_app::community_voting_log::{MembershipSnapshotResolver, SnapshotResolverError};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-use harmony_app::{dfrost_initiate_dkg_core, dm_signing, production_dkg_driver, DfrostCoreHandles};
+use harmony_app::{
+    dfrost_initiate_dkg_core, dfrost_reset_membership_from_state, dm_signing,
+    production_dkg_driver, DfrostCoreHandles,
+};
 
 type MockRt = tauri::test::MockRuntime;
 type DfrostLogsMap = Arc<Mutex<std::collections::HashMap<SpaceId, Arc<Mutex<DfrostLog>>>>>;
@@ -307,6 +310,15 @@ async fn reset_view(
 /// `DfrostLogEngine`'s auto-drive tick sees the SAME materialized view
 /// `reset_view` reads — advancing `now_ms` is how the disaster flow
 /// simulates the veto-window + finality wait without any real sleeping.
+///
+/// ZEB-1031 final whole-branch review C1: `reset_membership_now` routes
+/// through the PRODUCTION `dfrost_reset_membership_from_state` helper
+/// (injecting this struct's test clock through that helper's `now_ms`
+/// seam) rather than calling `materialized_with_now` directly — every
+/// prior reset-auto-drive test exercised a resolver that diverged from
+/// production on exactly the now-floor property the C1 fix restores, so
+/// this file drives the real production seam to close that class of
+/// masked regression.
 struct LiveMembershipResolver {
     state: Arc<Mutex<CommunityState>>,
     admin: OwnerAddr,
@@ -342,7 +354,11 @@ impl MembershipSnapshotResolver for LiveMembershipResolver {
         _community_id: SpaceId,
     ) -> Result<MaterializedMembership, SnapshotResolverError> {
         let g = self.state.lock().await;
-        Ok(g.materialized_with_now(self.admin, self.now_ms.load(Ordering::SeqCst)))
+        Ok(dfrost_reset_membership_from_state(
+            &g,
+            self.admin,
+            Some(self.now_ms.load(Ordering::SeqCst)),
+        ))
     }
 }
 

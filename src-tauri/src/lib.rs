@@ -59046,7 +59046,7 @@ async fn relaunch_voided_poll(
     relaunch_voided_poll_raw(state_lock.inner(), poll_id).await
 }
 
-/// ZEB-1031 Task 7: decoupled implementation of `voting_relaunch_voided_poll`
+/// ZEB-1031 Task 7: decoupled implementation of `relaunch_voided_poll`
 /// for integration testing. Mirrors `voting_get_tier3_poll_impl`'s test-only
 /// shim pattern — integration tests drive this directly with a raw
 /// `&Mutex<NodeState>` rather than a `tauri::State<'_, ...>`.
@@ -60282,20 +60282,44 @@ async fn dfrost_reset_membership_for_community_at_hlc(
 /// tick for an idle community) answers that question correctly and
 /// cheaply. Only a proposal's PHASE (Collecting/Window/Authorized/Expired)
 /// is time-driven, so once at least one proposal exists we fall through to
-/// the full uncached [`CommunityState::materialize_now`] re-walk to get an
-/// accurate phase. This is the fix for the steady-state cost the reviewer
-/// flagged: an ACTIVE committee with zero reset proposals — the common
-/// case — now costs one cached read per 2s tick instead of a full clone +
-/// re-walk of the entire membership event log.
-fn dfrost_reset_membership_from_state(
+/// a full uncached re-walk to get an accurate phase. This is the fix for
+/// the steady-state cost the reviewer flagged: an ACTIVE committee with
+/// zero reset proposals — the common case — now costs one cached read per
+/// 2s tick instead of a full clone + re-walk of the entire membership
+/// event log.
+///
+/// ZEB-1031 final whole-branch review C1: the fall-through now-floors via
+/// [`CommunityState::materialized_with_now`] using `now_ms`, matching the
+/// spec §4 evaluator contract (`T = max(max(event.wall_ms), now_ms)`). The
+/// OLD floor-less [`CommunityState::materialize_now`] left every
+/// engine-side auto-drive consumer frozen at the log's last event wall on
+/// an idle community — the marker-authoring / consumed-response auto-drive
+/// (and `resolve_rejected_vks`) could never see a proposal reach
+/// `Authorized` by pure time passing. `now_ms` is `None` only when the
+/// receiver clock is unreadable (`clock_trust::receiver_now_ms()`'s
+/// pre-epoch case), in which case this falls back to the old floor-less
+/// walk rather than gate on a fabricated `0` — the plane-wide `now == 0 ⇒
+/// gate disabled` convention: a bad LOCAL clock must never freeze/drop
+/// honest state.
+///
+/// `pub` so the Task 10 e2e's `LiveMembershipResolver` can route its
+/// test-controlled clock through this exact production seam instead of
+/// calling `materialized_with_now` directly — closing the divergence
+/// class where every reset-auto-drive test overrode the resolver instead
+/// of exercising this helper.
+pub fn dfrost_reset_membership_from_state(
     state: &crate::community_state_crdt::CommunityState,
     admin_addr: crate::owner_state_types::OwnerAddr,
+    now_ms: Option<u64>,
 ) -> crate::community_membership::MaterializedMembership {
     let cached = state.materialized(admin_addr);
     if cached.reset_proposals.is_empty() {
         return cached;
     }
-    state.materialize_now(admin_addr)
+    match now_ms {
+        Some(now) => state.materialized_with_now(admin_addr, now),
+        None => state.materialize_now(admin_addr),
+    }
 }
 
 /// ZEB-1031: at-HEAD counterpart of `voting_build_snapshot_for_community`
@@ -60310,7 +60334,11 @@ async fn dfrost_reset_membership_for_community(
     let (admin_addr, engine_state) =
         voting_resolve_membership_source(&crdt_state, &community_registry, space_id).await?;
     let g = engine_state.lock().await;
-    Ok(dfrost_reset_membership_from_state(&g, admin_addr))
+    Ok(dfrost_reset_membership_from_state(
+        &g,
+        admin_addr,
+        crate::clock_trust::receiver_now_ms(),
+    ))
 }
 
 /// ZEB-718: at boot, load a community's persisted voting log from disk and
@@ -90354,7 +90382,8 @@ mod zeb_714_recovery_state_tests {
 mod zeb_1031_dfrost_reset_membership_probe_tests {
     use super::*;
     use crate::community_membership::{
-        MembershipEventKind, SignedMembershipEvent, RESET_VETO_WINDOW_FLOOR_MS,
+        MembershipEventKind, ResetPhase, SignedMembershipEvent, RESET_FINALITY_MS,
+        RESET_VETO_WINDOW_FLOOR_MS,
     };
     use crate::community_state_crdt::materialize_now_probe;
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -90404,12 +90433,12 @@ mod zeb_1031_dfrost_reset_membership_probe_tests {
     fn zero_proposals_skips_full_materialize() {
         let state = base_state();
         let before = materialize_now_probe::get(COM);
-        let m = dfrost_reset_membership_from_state(&state, admin());
+        let m = dfrost_reset_membership_from_state(&state, admin(), Some(1_000));
         assert!(m.reset_proposals.is_empty());
         assert_eq!(
             materialize_now_probe::get(COM),
             before,
-            "zero-proposal resolve must not pay for a full materialize_now walk"
+            "zero-proposal resolve must not pay for a full materialize walk"
         );
     }
 
@@ -90429,13 +90458,92 @@ mod zeb_1031_dfrost_reset_membership_probe_tests {
             },
         ));
         let before = materialize_now_probe::get(COM);
-        let m = dfrost_reset_membership_from_state(&state, admin());
+        let m = dfrost_reset_membership_from_state(&state, admin(), Some(20_000));
         assert_eq!(m.reset_proposals.len(), 1);
         assert_eq!(m.reset_proposals[0].target_epoch, 1);
         assert_eq!(
             materialize_now_probe::get(COM),
             before + 1,
-            "a present proposal must fall through to the full materialize_now walk"
+            "a present proposal must fall through to the full uncached walk"
+        );
+    }
+
+    /// ZEB-1031 final whole-branch review C1: production-seam regression —
+    /// an idle membership log (nothing minted since the quorum-tipping
+    /// proposal) must still reach `Authorized` once the receiver's wall
+    /// clock has passed the disaster-path deadline, driven through the
+    /// PRODUCTION helper with no test-resolver override. Before the C1
+    /// fix, the fall-through always called the floor-less `materialize_now`
+    /// regardless of `now_ms`, so this proposal would read `Window`
+    /// forever no matter how far `now_ms` advanced — the auto-drive marker
+    /// (`maybe_auto_drive_reset`) would never fire and the disaster path
+    /// could never complete (spec §4.3's stale-committee-replay hole would
+    /// then reopen via Lapse).
+    #[test]
+    fn now_floor_advances_idle_log_to_authorized() {
+        // A community id distinct from `COM`, built without the shared
+        // `ev`/`base_state` helpers: `materialized_with_now` also feeds
+        // `materialize_now_probe` (so the full-walk assertion above stays
+        // meaningful regardless of which now-floored path runs), and
+        // `with_proposal_falls_through_and_resolves_correctly` measures
+        // that SAME counter via a before/after delta on `COM` — tests run
+        // in parallel, so this test must not increment `COM`'s counter or
+        // the two races against each other.
+        const COM2: SpaceId = SpaceId([0xd9; 16]);
+        fn ev2(
+            id: [u8; 16],
+            actor: OwnerAddr,
+            wall_ms: u64,
+            kind: MembershipEventKind,
+        ) -> SignedMembershipEvent {
+            SignedMembershipEvent {
+                signer_certs: Vec::new(),
+                id,
+                community_id: COM2,
+                actor,
+                at: Hlc {
+                    wall_ms,
+                    logical: 0,
+                    device_id: "test".into(),
+                },
+                kind,
+                sig: [0u8; 64],
+                countersig: None,
+                enrollment: None,
+            }
+        }
+        let mut state = crate::community_state_crdt::CommunityState::new(COM2);
+        state.insert_verified_for_test(ev2([0xE0; 16], admin(), 500, MembershipEventKind::Join));
+        state.insert_verified_for_test(ev2([0xE1; 16], m1(), 600, MembershipEventKind::Join));
+        // admin_quorum defaults to 1, so the proposer's own signature tips
+        // quorum immediately at t0 (ZEB-250 semantics: "proposer counts as
+        // signature 1") — this single event is both the proposal and the
+        // quorum-tipping event, `t_q = 10_000`.
+        state.insert_verified_for_test(ev2(
+            [0xE3; 16],
+            admin(),
+            10_000,
+            MembershipEventKind::DfrostResetProposal {
+                target_vk: [0x88; 32],
+                target_epoch: 1,
+                new_members: vec![admin(), m1()],
+                new_threshold: 2,
+                veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
+            },
+        ));
+        let past_deadline = 10_000 + RESET_VETO_WINDOW_FLOOR_MS + RESET_FINALITY_MS + 1;
+        let m = dfrost_reset_membership_from_state(&state, admin(), Some(past_deadline));
+        let proposal = m
+            .reset_proposals
+            .into_iter()
+            .next()
+            .expect("one reset proposal");
+        assert_eq!(
+            proposal.phase,
+            ResetPhase::Authorized,
+            "an idle log must still reach Authorized once the receiver clock passes \
+             t_q + veto_window + RESET_FINALITY_MS — the production now-floor must not \
+             stay frozen at the log's last event wall"
         );
     }
 }
