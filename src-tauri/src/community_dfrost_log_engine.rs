@@ -3840,11 +3840,11 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         // markers must apply in ascending epoch order (`apply_reset_
         // chain` walks the chain in order and a gap's successor marker
         // fails RS-M2 admissibility against pre-gap state), so links
-        // past a misfit are wasted verify work for the requester. The
-        // residual is a committee so large ONE link exceeds the frame
-        // (payload N in the low 40s — see
-        // `MAX_RESET_CHAIN_LINKS_PER_RESPONSE`'s sizing doc; trimming
-        // links to a threshold-quorum dk subset is the future lever).
+        // past a misfit are wasted verify work for the requester. Since
+        // ZEB-1045 each link arrives already trimmed to a threshold-
+        // quorum dk subset (O(t·N) bytes), so a misfit now needs a
+        // committee in the hundreds of members — see
+        // `MAX_RESET_CHAIN_LINKS_PER_RESPONSE`'s sizing doc.
         for (idx, link) in sel.reset_chain.iter().enumerate() {
             let mut buf = Vec::new();
             if let Err(e) = ciborium::ser::into_writer(std::slice::from_ref(link), &mut buf) {
@@ -3867,8 +3867,8 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                     served = idx,
                     remaining = sel.reset_chain.len() - idx,
                     "dfrost catchup respond: single reset-chain link exceeds the frame cap — \
-                     chain serving stopped (ZEB-1038 residual: committee too large for one \
-                     link per frame)",
+                     chain serving stopped (committee too large for one quorum-trimmed link \
+                     per frame; ZEB-1038/ZEB-1045)",
                 );
                 break;
             }
@@ -11158,16 +11158,20 @@ mod tests {
         .await
     }
 
-    /// ZEB-1038 regression: a 3-reset lineage on a 20-member committee is
-    /// O(N²) bytes per link — the combined chain exceeds the 64KiB frame
-    /// cap (the pre-fix shape encoded ALL links into ONE frame and
-    /// dropped it whole, so this requester/responder pair never healed).
-    /// The fix serves ONE link per `ResetChain` frame, oldest-first,
-    /// each individually inside `encode_frame`'s wire cap.
+    /// ZEB-1038 regression: a 3-reset lineage whose combined chain
+    /// exceeds the 64KiB frame cap (the pre-fix shape encoded ALL links
+    /// into ONE frame and dropped it whole, so this requester/responder
+    /// pair never healed). The fix serves ONE link per `ResetChain`
+    /// frame, oldest-first, each individually inside `encode_frame`'s
+    /// wire cap. Fixture: a 200-member committee — since the ZEB-1045
+    /// quorum trim each served link is threshold (2) events × an O(N)
+    /// payload, so N=200 keeps the three TRIMMED links (~32KiB each)
+    /// combining past the cap while each still fits alone (the original
+    /// fixture was 20 members × 20 untrimmed events per link).
     #[tokio::test]
     async fn reset_chain_served_one_link_per_frame_zeb1038() {
         let (sk, marker_actor, _pub64) = fixture_identity(0xE1);
-        let members = zeb1038_members(20, 0x01);
+        let members = zeb1038_members(200, 0x01);
         let mut log = crate::community_dfrost_log::DfrostLog::new();
         log.committee_state.active = true;
         log.committee_state.current_epoch = 4;
@@ -11176,7 +11180,14 @@ mod tests {
         log.committee_state.threshold = 2;
         log.committee_state.max_signers = members.len() as u16;
         for old_epoch in 1..=3u64 {
-            zeb1038_seed_reset(&mut log, &sk, marker_actor, old_epoch, &members, &members);
+            zeb1038_seed_reset(
+                &mut log,
+                &sk,
+                marker_actor,
+                old_epoch,
+                &members[..4],
+                &members,
+            );
         }
 
         let engine = zeb1038_engine(log).await;
