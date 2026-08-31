@@ -405,6 +405,66 @@ pub struct Tier3PollConfigPayload {
     pub eligibility: Eligibility,
     #[serde(rename = "ro", skip_serializing_if = "Option::is_none", default)]
     pub retry_of: Option<PollId>,
+    /// ZEB-1031 Task 7: `Some(old_poll_id)` when this poll is a relaunch
+    /// of a poll voided by a committee reset (spec §7). Omitted on
+    /// ordinary polls — optional-key evolution, legacy byte-identical
+    /// (mirrors `retry_of`'s addition). Distinct from `retry_of`: a
+    /// retry follows a *failed sortition*; a predecessor follows a
+    /// *committee reset* voiding an otherwise-live poll.
+    #[serde(rename = "pv", skip_serializing_if = "Option::is_none", default)]
+    pub predecessor: Option<PollId>,
+    /// ZEB-1031 Task 7 review C1: the D-FROST committee epoch active at
+    /// mint time, embedded in this SIGNED payload so every reader — this
+    /// node's own future replay AND every peer that ingests the event via
+    /// `process_inbound`/backfill apply — derives the SAME
+    /// `Tier3PollMeta.community_epoch`. Before this field existed, only
+    /// the author's own local-mint path patched `community_epoch` after
+    /// the fact (`VotingLog::set_tier3_poll_epoch`, called from
+    /// `VotingLogEngine::publish_event`'s pre-apply epoch read, which
+    /// never runs for peer-ingested creates by design) — every other
+    /// device materialized `community_epoch = 0` forever, making the
+    /// reset-voiding sweep (spec §7) treat every such poll as pre-reset
+    /// regardless of when it was actually created.
+    ///
+    /// `None` means a pre-Task-7 poll, from before this field existed.
+    /// Every materialization path treats an absent `ce` as epoch `0`.
+    ///
+    /// For a uniform fleet (every node ZEB-1031-aware), this is correct by
+    /// construction: a genuinely `ce`-less event necessarily predates the
+    /// existence of the reset feature itself, hence predates every reset
+    /// the community could represent — "voidable by any reset" is the
+    /// right disposition, not a fallback to paper over. (A node's OWN
+    /// pre-upgrade poll, whose true epoch survives separately via the
+    /// legacy `set_tier3_poll_epoch` overlay, is a different case — see
+    /// `reconcile_voting_from_state`'s replay-overlay ordering, ZEB-1031
+    /// Task 7 review round 3.)
+    ///
+    /// For a mixed-version fleet — an un-upgraded peer still broadcasting
+    /// `ce`-less creates into a community that has since run a reset — the
+    /// same epoch-0 disposition is *still* correct, for a structural reason
+    /// rather than a coincidence: a reset's `o`/`w`/`z` membership events
+    /// hard-fork the community state root (ZEB-1031 §6), so an un-upgraded
+    /// client cannot decode post-reset membership state at all — it cannot
+    /// be a live participant in that community. Any Tier-3 `PollCreate` it
+    /// could still somehow emit would bind the *retired* committee's `vk`
+    /// regardless of what epoch value gets attributed to it, so voiding a
+    /// live-ingested `ce`-less create in a post-reset community disposes of
+    /// genuinely stale state, not collateral damage from an absent field.
+    ///
+    /// Trust model: this payload is creator-signed, but `ce` is NOT
+    /// independently verified against real D-FROST state (unlike a reset
+    /// marker's `old_epoch`/`old_vk`, which ARE cryptographically pinned
+    /// via `dfrost_reset_digest` + membership evidence — see
+    /// `community_dfrost_types::ResetMarkerPayload`). A dishonest `ce`
+    /// only mis-dispositions the LIAR'S OWN poll: too low risks an
+    /// unwarranted void by a reset that hasn't actually superseded it
+    /// (self-inflicted, fixable by relaunch); too high means the
+    /// beacon-seed derivation (`derive_beacon_seed(poll_create_event_hash,
+    /// community_epoch)`) never matches a real VRF beacon at that epoch,
+    /// silently stalling the poll forever (also self-inflicted). Neither
+    /// gives an attacker any lever over another member's poll.
+    #[serde(rename = "ce", skip_serializing_if = "Option::is_none", default)]
+    pub ce: Option<u64>,
 }
 
 #[cfg(test)]
@@ -593,6 +653,8 @@ mod tier3_payload_tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&payload, &mut encoded).expect("encode");
@@ -626,6 +688,8 @@ mod tier3_payload_tests {
                 sortition_size: None,
             },
             retry_of: Some(prev_poll),
+            predecessor: None,
+            ce: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&payload, &mut encoded).expect("encode");
@@ -2144,6 +2208,8 @@ mod build_tests {
                 sortition_size: Some(20),
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let hlc = Hlc {
             wall_ms: 1,

@@ -602,6 +602,8 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -964,6 +966,8 @@ async fn ipc_tier3_engine_auto_kd_sf_on_mass_decline() {
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -1156,6 +1160,8 @@ async fn run_race_tolerant_inner(ss_hlc_wall: u64) -> (TwoVotingEngines, Option<
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
+        ce: None,
     };
 
     let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
@@ -1484,6 +1490,8 @@ async fn ipc_tier3_retry_of_via_ipc() {
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
+        ce: None,
     };
 
     let create_a = build_tier3_poll_create_event(proposer, &config_a, hlc_at(t0_a, "proposer-dev"));
@@ -1618,6 +1626,8 @@ async fn ipc_tier3_retry_of_via_ipc() {
             sortition_size: None,
         },
         retry_of: Some(poll_a_id),
+        predecessor: None,
+        ce: None,
     };
 
     let create_b = build_tier3_poll_create_event(proposer, &config_b, hlc_at(t0_b, "proposer-dev"));
@@ -2021,6 +2031,8 @@ async fn ipc_tier3_engine_auto_se_mode_two_engine_finalize() {
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
+        ce: None,
     };
     // Create at wall=0 so ratification_end = 180_000.
     let create_event = build_tier3_poll_create_event(&proposer, &config, hlc_at(0, "proposer"));

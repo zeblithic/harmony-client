@@ -16,8 +16,8 @@
 
 use harmony_app::community_dfrost_types::{
     CeremonyInitPayload, DfrostEventKind, DkgCompletePayload, DkgRoundPayload,
-    MemberVerifyingShare, RefreshRoundPayload, RepairRoundPayload, SignedCommitteeEvent,
-    ThresholdSignPayload, VrfBeaconPayload,
+    MemberVerifyingShare, RefreshRoundPayload, RepairRoundPayload, ResetMarkerPayload,
+    SignedCommitteeEvent, ThresholdSignPayload, VrfBeaconPayload,
 };
 use harmony_app::community_membership::RecipientCiphertext;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};
@@ -142,8 +142,15 @@ const EXPECTED_ENVELOPE_TS_HEX: &str = "a862746761646276720162747200626b64627473
 const EXPECTED_ENVELOPE_VB_HEX: &str = "a862746761646276720162747200626b64627662626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62706458b5a462636958206666666666666666666666666666666666666666666666666666666666666666626d735820555555555555555555555555555555555555555555555555555555555555555562736758409999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999962766658202222222222222222222222222222222222222222222222222222222222222222627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const EXPECTED_ENVELOPE_RF_ROUND1_HEX: &str = "a862746761646276720162747200626b64627266626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa627064584fa36263695820666666666666666666666666666666666666666666666666666666666666666662726e0162706b5820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const EXPECTED_ENVELOPE_RF_ROUND2_HEX: &str = "a862746761646276720162747200626b64627266626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6270645857a36263695820666666666666666666666666666666666666666666666666666666666666666662726e0262726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+// ZEB-1031: `rs` (ResetMarker) — a brand-new kind, additive per the
+// ZEB-1034 discipline above (:128-131): a fresh pin, no existing pin
+// touched. `FILL_AFTER` below regenerates it (see `rs_canonical_cbor`).
+const EXPECTED_RS_HEX: &str = "a5627269501111111111111111111111111111111162646758207777777777777777777777777777777777777777777777777777777777777777626f7658208888888888888888888888888888888888888888888888888888888888888888626f650362737050dddddddddddddddddddddddddddddddd";
 const EXPECTED_RP_ROUND1_HEX: &str = "a66263695820666666666666666666666666666666666666666666666666666666666666666662726e016265700162686c8150bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62776d1903e8626c6700";
 const EXPECTED_RP_ROUND2_HEX: &str = "a46263695820666666666666666666666666666666666666666666666666666666666666666662726e026265700162726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd";
+// ZEB-1031: envelope pin for `rs`, the first envelope test of a
+// brand-new kind code — additive, no existing pin touched.
+const EXPECTED_ENVELOPE_RS_HEX: &str = "a862746761646276720162747200626b64627273626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6270645877a5627269501111111111111111111111111111111162646758207777777777777777777777777777777777777777777777777777777777777777626f7658208888888888888888888888888888888888888888888888888888888888888888626f650362737050dddddddddddddddddddddddddddddddd627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const EXPECTED_ENVELOPE_RP_ROUND1_HEX: &str = "a862746761646276720162747200626b64627270626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa627064584da66263695820666666666666666666666666666666666666666666666666666666666666666662726e016265700162686c8150bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62776d1903e8626c6700627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const EXPECTED_ENVELOPE_RP_ROUND2_HEX: &str = "a862746761646276720162747200626b64627270626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa627064585ba46263695820666666666666666666666666666666666666666666666666666666666666666662726e026265700162726381a262726350bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb62637450dddddddddddddddddddddddddddddddd627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
@@ -290,6 +297,24 @@ fn rp_round2_payload() -> RepairRoundPayload {
         minted_wall_ms: None,
         minted_logical: None,
         recipient_ciphertexts: Some(vec![fixture_recipient_ciphertext()]),
+    }
+}
+
+// ZEB-1031: `rs` (ResetMarker) — the dfrost-log-side committee-reset
+// deactivation marker (spec §5). `sp` is mandatory (no `Option`, unlike
+// `DkgCompletePayload.space_id`) — a brand-new kind carries no legacy
+// tolerance.
+const FIXTURE_RESET_PROPOSAL_ID: [u8; 16] = [0x11; 16];
+const FIXTURE_RESET_DIGEST: [u8; 32] = [0x77; 32];
+const FIXTURE_OLD_VK: [u8; 32] = [0x88; 32];
+
+fn rs_payload() -> ResetMarkerPayload {
+    ResetMarkerPayload {
+        reset_proposal_id: FIXTURE_RESET_PROPOSAL_ID,
+        reset_digest: FIXTURE_RESET_DIGEST,
+        old_vk: FIXTURE_OLD_VK,
+        old_epoch: 3,
+        space_id: harmony_app::owner_state_types::SpaceId([0xdd; 16]),
     }
 }
 
@@ -455,6 +480,46 @@ fn rp_round2_canonical_cbor() {
     );
 }
 
+#[test]
+fn rs_canonical_cbor() {
+    let actual_hex = hex::encode(encode(&rs_payload()));
+    if EXPECTED_RS_HEX.contains("FILL_AFTER") {
+        panic!("REGENERATE EXPECTED_RS_HEX = \"{actual_hex}\";");
+    }
+    assert_eq!(
+        actual_hex, EXPECTED_RS_HEX,
+        "ResetMarkerPayload wire format changed"
+    );
+}
+
+/// ZEB-1031: structural assertion for the 5-key `rs` payload — mirrors
+/// `assert_envelope_structure`'s key-count/2-char-key checks, scoped to
+/// the payload's own top-level map (the ENVELOPE key count stays 8
+/// regardless of payload shape; `envelope_rs_canonical_cbor` below
+/// covers that via the shared helper).
+#[test]
+fn rs_payload_structure() {
+    let encoded = encode(&rs_payload());
+    let value: ciborium::Value = ciborium::from_reader(&encoded[..]).expect("decode payload");
+    let map = value.as_map().expect("top-level is a CBOR map");
+    assert_eq!(map.len(), 5, "ResetMarkerPayload must have exactly 5 keys");
+
+    let mut keys: Vec<&str> = Vec::with_capacity(5);
+    for (k, _) in map.iter() {
+        let s = k.as_text().expect("payload key is text");
+        assert_eq!(s.len(), 2, "payload key {s:?} violates 2-char invariant");
+        keys.push(s);
+    }
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    let mut expected = ["ri", "dg", "ov", "oe", "sp"];
+    expected.sort_unstable();
+    assert_eq!(
+        sorted, expected,
+        "ResetMarkerPayload key set must be exactly {{ri, dg, ov, oe, sp}}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Envelope byte-pinning tests + structural assertions
 // ---------------------------------------------------------------------------
@@ -607,4 +672,19 @@ fn envelope_rp_round2_canonical_cbor() {
         "RepairShare (rn=2) envelope wire format changed"
     );
     assert_envelope_structure(&encoded, "rp");
+}
+
+#[test]
+fn envelope_rs_canonical_cbor() {
+    let payload = encode(&rs_payload());
+    let encoded = encode_envelope(DfrostEventKind::ResetMarker, payload);
+    let actual_hex = hex::encode(&encoded);
+    if EXPECTED_ENVELOPE_RS_HEX.contains("FILL_AFTER") {
+        panic!("REGENERATE EXPECTED_ENVELOPE_RS_HEX = \"{actual_hex}\";");
+    }
+    assert_eq!(
+        actual_hex, EXPECTED_ENVELOPE_RS_HEX,
+        "ResetMarker envelope wire format changed"
+    );
+    assert_envelope_structure(&encoded, "rs");
 }

@@ -1,6 +1,7 @@
 //! ZEB-309 Phase 4a-main: Tier 3 poll state machine + drafting + DfrostLog coupling.
 //! See docs/specs/2026-05-20-zeb-309-phase4a-main-design.md §3 + §6 + §9.
 
+use crate::community_membership::EventId;
 use crate::community_voting_core::{
     CandidateEventHash, DeliberationStatementPayload, DeliberationVotePayload,
     DraftApprovalPayload, DraftCandidatePayload, MiniPublicDeclinePayload, PollEventKindCode,
@@ -9,9 +10,35 @@ use crate::community_voting_core::{
 };
 use crate::community_voting_sortition::{derive_beacon_seed, fisher_yates_select, SortitionResult};
 use crate::community_voting_star::{tally_star, StarResult};
-use crate::owner_state_types::{Hlc, OwnerAddr};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+
+/// ZEB-1031 Task 7: marks a Tier-3 poll as voided by a committee reset
+/// (spec §7). `reset_id`/`old_epoch` echo the `ResetMarkerApplied::Applied`
+/// fields the dfrost engine's void hook was invoked with, so a voided
+/// poll's export can explain *which* reset retired it.
+///
+/// Not derivable from the poll's own event replay — it is set by
+/// out-of-band engine mutation (`VotingLogEngine::void_tier3_polls_for_reset`)
+/// the same way `community_epoch` is patched by `set_tier3_poll_epoch` —
+/// so it must be persisted via the `PollRestore` overlay
+/// (`community_voting_persist.rs`) and preserved across
+/// `rebuild_from_events`, like `committee_oracle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoidedInfo {
+    #[serde(
+        rename = "ri",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub reset_id: EventId,
+    #[serde(rename = "oe")]
+    pub old_epoch: u64,
+}
 
 // ── Stage enum ────────────────────────────────────────────────────────────────
 
@@ -262,6 +289,15 @@ pub struct Tier3PollState {
     /// memoized: the `ts` DLEQ verdict depends on the fold-order-dependent ballot
     /// aggregate `c1_agg`, so it is not a pure function of `event_hash`.
     pub(crate) rb_nizk_verdicts: std::collections::BTreeMap<([u8; 32], u64), bool>,
+    /// ZEB-1031 Task 7: set when a committee reset retires this poll
+    /// (spec §7). Set out-of-band by
+    /// `VotingLogEngine::void_tier3_polls_for_reset`, not by any `kd=*`
+    /// event — `apply_event`'s terminal-state gate rejects every further
+    /// mutation once this is `Some` (mirrors the `Stage::Failed`/
+    /// `Stage::Finalized` rejection, but orthogonal to `stage`: a voided
+    /// poll's `stage` is left exactly where the reset caught it, so a
+    /// read path can still show what stage it died in).
+    pub voided: Option<VoidedInfo>,
 }
 
 // Hand-rolled Debug because `Arc<dyn CommitteeOracle>` is awkward to format
@@ -290,6 +326,7 @@ impl std::fmt::Debug for Tier3PollState {
             .field("secret_tally", &self.secret_tally)
             .field("committee_oracle", &"<oracle>")
             .field("rb_nizk_verdicts", &self.rb_nizk_verdicts.len())
+            .field("voided", &self.voided)
             .finish()
     }
 }
@@ -421,6 +458,8 @@ pub enum ApplyError {
     PollInFailedState,
     #[error("poll is Finalized")]
     PollInFinalizedState,
+    #[error("poll was voided by a committee reset")]
+    PollVoided,
     #[error("payload decode failed: {0}")]
     PayloadDecode(String),
     #[error("event kind {0:?} not valid for Tier 3")]
@@ -497,6 +536,7 @@ impl Tier3PollState {
             secret_tally: SecretTallyState::default(),
             committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
             rb_nizk_verdicts: std::collections::BTreeMap::new(),
+            voided: None,
         }
     }
 
@@ -531,10 +571,17 @@ impl Tier3PollState {
         // apply and never re-runs the Bulletproof NIZK. The verdicts are pure
         // functions of (event_hash, epoch), valid regardless of fold order.
         let verdicts = std::mem::take(&mut self.rb_nizk_verdicts);
+        // ZEB-1031 Task 7: `voided` is engine-set out-of-band (like
+        // `committee_oracle`), not derived from this poll's own event
+        // replay — a rebuild that dropped it would silently un-void a
+        // reset-retired poll the next time an out-of-order event
+        // triggered the canonical-order re-fold.
+        let voided = self.voided;
         *self = Tier3PollState::new_from_create(meta, electorate);
         self.committee_oracle = oracle;
         self.rebuild_count = rebuilds + 1;
         self.rb_nizk_verdicts = verdicts;
+        self.voided = voided;
 
         let mut sorted: Vec<&SignedVotingEvent> = events.iter().collect();
         // `sort_by_cached_key` over `sort_by(|a,b| key(a).cmp(&key(b)))`:
@@ -560,6 +607,17 @@ impl Tier3PollState {
             Stage::Failed => return Err(ApplyError::PollInFailedState),
             Stage::Finalized => return Err(ApplyError::PollInFinalizedState),
             _ => {}
+        }
+
+        // ZEB-1031 Task 7: a committee-reset-voided poll rejects every
+        // further mutation (ballots, beacons, partial decrypts, tallies —
+        // every kd=* kind dispatches through this single entry point).
+        // Checked separately from the terminal-`Stage` match above:
+        // voiding is orthogonal to stage (a poll caught mid-Ratification
+        // stays at that stage, just voided), and is not itself a `Stage`
+        // variant.
+        if self.voided.is_some() {
+            return Err(ApplyError::PollVoided);
         }
 
         // 2. Monotonic HLC check (defensive — upstream should enforce, but we
@@ -2482,6 +2540,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         }
     }
 
@@ -3473,6 +3533,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         }
     }
 

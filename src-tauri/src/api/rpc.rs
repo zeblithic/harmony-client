@@ -264,6 +264,56 @@ struct RecoveryProposalTargetArgs {
     proposal_event_id: String,
 }
 
+/// ZEB-1031 Task 8: `get_dfrost_reset_state`. `now_ms` is the D10 e2e's
+/// read-side as-of override — same pattern as `GetRecoveryStateArgs`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetDfrostResetStateArgs {
+    community_id: String,
+    #[serde(default)]
+    now_ms: Option<u64>,
+}
+
+/// ZEB-1031 Task 8: `propose_dfrost_reset` (spec §3.1).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProposeDfrostResetArgs {
+    community_id: String,
+    target_vk_hex: String,
+    target_epoch: u64,
+    new_members: Vec<String>,
+    new_threshold: u16,
+    veto_window_ms: u64,
+}
+
+/// ZEB-1031 Task 8: `cosign_dfrost_reset` / `author_dfrost_reset_marker` —
+/// both take just the target proposal's event id.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DfrostResetTargetArgs {
+    community_id: String,
+    target_event_id: String,
+}
+
+/// ZEB-1031 Task 8/review round 1 I4: `respond_dfrost_reset` (spec
+/// §3.3) — `verdict` is a plain string (`"endorse"`/`"veto"`), parsed at
+/// the impl layer via `parse_dfrost_reset_verdict`; `"consumed"` is
+/// rejected there (auto-driven, not user-invocable).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RespondDfrostResetArgs {
+    community_id: String,
+    target_event_id: String,
+    verdict: String,
+}
+
+/// ZEB-1031 Task 8: `relaunch_voided_poll` (spec §7/§9).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PollIdArgs {
+    poll_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateCommunityArgs {
@@ -1028,6 +1078,79 @@ pub fn build_registry() -> RpcRegistry {
                 crate::veto_admin_recovery_impl(state, a.community_id, a.proposal_event_id).await
             }
         }
+    );
+    // ZEB-1031 Task 8: D-FROST committee-reset ceremony IPCs (spec §9) —
+    // headless parity with the Tauri surface, same discipline as the
+    // ZEB-714 recovery verbs above.
+    rpc!(
+        m,
+        "get_dfrost_reset_state",
+        GetDfrostResetStateArgs,
+        |state, _sink, a| async move {
+            crate::get_dfrost_reset_state_impl(state, a.community_id, a.now_ms).await
+        }
+    );
+    rpc!(
+        m,
+        "propose_dfrost_reset",
+        ProposeDfrostResetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::propose_dfrost_reset_impl(
+                    state,
+                    a.community_id,
+                    a.target_vk_hex,
+                    a.target_epoch,
+                    a.new_members,
+                    a.new_threshold,
+                    a.veto_window_ms,
+                )
+                .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "cosign_dfrost_reset",
+        DfrostResetTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::cosign_dfrost_reset_impl(state, a.community_id, a.target_event_id).await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "respond_dfrost_reset",
+        RespondDfrostResetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::respond_dfrost_reset_impl(
+                    state,
+                    a.community_id,
+                    a.target_event_id,
+                    a.verdict,
+                )
+                .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "author_dfrost_reset_marker",
+        DfrostResetTargetArgs,
+        |state, _sink, a| {
+            async move {
+                crate::author_dfrost_reset_marker_impl(state, a.community_id, a.target_event_id)
+                    .await
+            }
+        }
+    );
+    rpc!(
+        m,
+        "relaunch_voided_poll",
+        PollIdArgs,
+        |state, _sink, a| async move { crate::relaunch_voided_poll_raw(state, a.poll_id).await }
     );
     rpc!(
         m,
@@ -2630,6 +2753,105 @@ mod tests {
         }
     }
 
+    /// ZEB-1031 Task 8: dispatch proof for the six D-FROST committee-
+    /// reset verbs (spec §9) — same discipline as
+    /// `recovery_rpcs_are_registered_and_wired` above: each must be
+    /// registered and its camelCase arg struct must accept the wire
+    /// shape, deterministically failing at the owner-not-loaded (or a
+    /// friendly pre-check) seam on a default `NodeState`.
+    #[tokio::test]
+    async fn dfrost_reset_rpcs_are_registered_and_wired() {
+        let reg = build_registry();
+        let community_id = "c0".repeat(16);
+        let target_event_id = "b0".repeat(16);
+        let reset_target = serde_json::json!({
+            "communityId": community_id,
+            "targetEventId": target_event_id,
+        });
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "get_dfrost_reset_state",
+                serde_json::json!({ "communityId": community_id, "nowMs": 1_700_000_000_000u64 }),
+            ),
+            (
+                "propose_dfrost_reset",
+                serde_json::json!({
+                    "communityId": community_id,
+                    "targetVkHex": "22".repeat(32),
+                    "targetEpoch": 1u64,
+                    "newMembers": ["11".repeat(16), "12".repeat(16)],
+                    "newThreshold": 2u16,
+                    "vetoWindowMs": 24u64 * 3_600_000,
+                }),
+            ),
+            ("cosign_dfrost_reset", reset_target.clone()),
+            (
+                "respond_dfrost_reset",
+                serde_json::json!({
+                    "communityId": community_id,
+                    "targetEventId": target_event_id,
+                    "verdict": "endorse",
+                }),
+            ),
+            ("author_dfrost_reset_marker", reset_target),
+            (
+                "relaunch_voided_poll",
+                serde_json::json!({ "pollId": "c0".repeat(32) }),
+            ),
+        ];
+        for (verb, args) in cases {
+            let state = Arc::new(Mutex::new(NodeState::default()));
+            match reg.dispatch(verb, state, test_sink(), args).await {
+                Err(RpcError::UnknownCommand) => panic!("{verb} must be registered"),
+                Err(RpcError::BadArgs(msg)) => {
+                    panic!("{verb}: arg struct rejected the wire shape: {msg}")
+                }
+                // Owner-not-loaded (or a friendly pre-check) — args
+                // parsed, impl reached.
+                Err(RpcError::Command(_)) => {}
+                Ok(v) => {
+                    panic!("{verb}: expected owner-not-loaded error on default state, got {v:?}")
+                }
+            }
+        }
+    }
+
+    /// ZEB-1031 Task 8: `respond_dfrost_reset` rejects verdict
+    /// `"consumed"` BEFORE touching `NodeState` — it is auto-driven by
+    /// the engine's orchestrator tick once the successor committee is
+    /// promoted (`maybe_auto_drive_reset`), never user-invocable. Pinned
+    /// to the exact error text so a future refactor can't silently widen
+    /// or narrow the rejection.
+    #[tokio::test]
+    async fn respond_dfrost_reset_rejects_consumed_verdict() {
+        let reg = build_registry();
+        let community_id = "c0".repeat(16);
+        let target_event_id = "b0".repeat(16);
+        let args = serde_json::json!({
+            "communityId": community_id,
+            "targetEventId": target_event_id,
+            "verdict": "consumed",
+        });
+        match reg
+            .dispatch(
+                "respond_dfrost_reset",
+                Arc::new(Mutex::new(NodeState::default())),
+                test_sink(),
+                args,
+            )
+            .await
+        {
+            Err(RpcError::Command(msg)) => {
+                assert_eq!(
+                    msg,
+                    "respond_dfrost_reset: verdict 'consumed' is auto-driven by the engine once \
+                     the successor committee is promoted — it cannot be invoked manually"
+                );
+            }
+            other => panic!("expected Command(_) rejecting verdict c, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn null_args_treated_as_empty() {
         let reg = build_registry();
@@ -3281,6 +3503,13 @@ mod tests {
             "initiate_admin_recovery",
             "cosign_admin_recovery",
             "veto_admin_recovery",
+            // D-FROST committee-reset ceremony (ZEB-1031 Task 8, spec §9)
+            "get_dfrost_reset_state",
+            "propose_dfrost_reset",
+            "cosign_dfrost_reset",
+            "respond_dfrost_reset",
+            "author_dfrost_reset_marker",
+            "relaunch_voided_poll",
             // tier-2 conviction voting (ZEB-720)
             "voting_create_tier2_proposal",
             "voting_signal_tier2",

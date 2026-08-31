@@ -7,7 +7,7 @@
 
 use harmony_app::{
     DeliberationStatementExport, MyDeliberationVoteExport, Tier3MyRole, Tier3PollExport,
-    Tier3PollSummary, Tier3StageTag,
+    Tier3PollSummary, Tier3StageTag, VoidedInfoDto,
 };
 
 /// Decode a CBOR buffer as a map of `String -> Value` and return the
@@ -122,6 +122,7 @@ fn tier3_poll_export_round_trips_through_cbor() {
         encrypted_tally_share_count: 0,
         encrypted_tally_threshold: 0,
         encrypted_tally_committee_size: 0,
+        voided: None,
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&export, &mut buf).expect("encode");
@@ -174,6 +175,7 @@ fn tier3_poll_export_round_trips_through_cbor() {
         "runnerUpEventHash",
         "sortitionSize",
         "stage",
+        "voided",
         "winnerEventHash",
     ];
     let actual = cbor_top_level_keys(&buf);
@@ -225,6 +227,7 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         sortition_size: 100,
         winner_text: None,
         privacy_mode: "pu".to_string(),
+        voided: None,
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&summary, &mut buf).expect("encode");
@@ -246,6 +249,7 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         "proposer",
         "sortitionSize",
         "stage",
+        "voided",
         "winnerText",
     ];
     let actual = cbor_top_level_keys(&buf);
@@ -253,6 +257,88 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         actual,
         expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         "Tier3PollSummary CBOR key drift — update TS Tier3PollSummary in lockstep",
+    );
+}
+
+/// ZEB-1031 Task 9: pin the NESTED `VoidedInfoDto` camelCase keys — the
+/// top-level key checks above only confirm `voided` is present, never
+/// descend into its object, so a rename of `resetId`/`oldEpoch` would
+/// otherwise slip through and silently break the TS DTO. Mirrors the
+/// `deliberationStatements` nested-array pin's rationale (ZEB-790).
+#[test]
+fn tier3_poll_export_voided_field_round_trips_with_correct_shape() {
+    let export = Tier3PollExport {
+        poll_id: "aa".repeat(32),
+        community_id: "11".repeat(16),
+        proposal_text: "Amend charter §3".to_string(),
+        proposer: "22".repeat(32),
+        stage: Tier3StageTag::Sortition,
+        poll_create_hlc_ms: 1_700_000_000_000,
+        poll_create_hlc_logical: 0,
+        poll_create_hlc_device_id: "dev-fixture".to_string(),
+        sortition_size: 100,
+        deliberation_window_seconds: 1_209_600,
+        drafting_window_seconds: 604_800,
+        ratification_window_seconds: 1_209_600,
+        incentive_mode: "d".to_string(),
+        mini_public: vec![],
+        backup_pool: vec![],
+        declined: vec![],
+        draft_candidates: vec![],
+        ratification_candidates: vec![],
+        my_role: Tier3MyRole::Observer,
+        my_drafting_approvals: vec![],
+        my_ratification_scores: None,
+        deliberation_statements: vec![],
+        my_deliberation_statement_count: 0,
+        my_deliberation_votes: vec![],
+        winner_event_hash: None,
+        runner_up_event_hash: None,
+        privacy_mode: "pu".to_string(),
+        encrypted_tally_share_count: 0,
+        encrypted_tally_threshold: 0,
+        encrypted_tally_committee_size: 0,
+        voided: Some(VoidedInfoDto {
+            reset_id: "cc".repeat(16),
+            old_epoch: 3,
+        }),
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&export, &mut buf).expect("encode");
+    let decoded: Tier3PollExport = ciborium::from_reader(&buf[..]).expect("decode");
+    let voided = decoded.voided.expect("voided must round-trip as Some");
+    assert_eq!(voided.reset_id, "cc".repeat(16));
+    assert_eq!(voided.old_epoch, 3);
+
+    // Descend into the "voided" object itself and pin its keys.
+    let v: ciborium::value::Value = ciborium::from_reader(&buf[..]).expect("decode as Value");
+    let top = match v {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map at root, got {other:?}"),
+    };
+    let voided_val = top
+        .into_iter()
+        .find_map(|(k, val)| match k {
+            ciborium::value::Value::Text(s) if s == "voided" => Some(val),
+            _ => None,
+        })
+        .expect("top-level key \"voided\" not found");
+    let voided_map = match voided_val {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected map under \"voided\", got {other:?}"),
+    };
+    let mut voided_keys: Vec<String> = voided_map
+        .into_iter()
+        .map(|(k, _)| match k {
+            ciborium::value::Value::Text(s) => s,
+            other => panic!("expected text key, got {other:?}"),
+        })
+        .collect();
+    voided_keys.sort();
+    assert_eq!(
+        voided_keys,
+        vec!["oldEpoch".to_string(), "resetId".to_string()],
+        "VoidedInfoDto CBOR key drift — update the TS shape in lockstep",
     );
 }
 

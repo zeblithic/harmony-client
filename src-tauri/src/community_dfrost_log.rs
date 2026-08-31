@@ -315,6 +315,23 @@ pub struct CommitteeState {
     /// lack the key) still load.
     #[serde(default)]
     pub pending_repair: Option<PendingRepair>,
+    /// ZEB-1031 §5.2: append-only lineage of retired committees, one
+    /// entry per applied `rs` reset marker. `#[serde(default)]` +
+    /// `skip_serializing_if` (empty ⇒ key omitted) so pre-ZEB-1031
+    /// `dfrost.cbor` snapshots — which never resets have touched — load
+    /// AND re-save byte-identical to their pre-1031 form. Growth is
+    /// bounded by resets, which are rare (mirrors `pending_repair`'s
+    /// snapshot-compat pattern).
+    #[serde(rename = "vh", default, skip_serializing_if = "Vec::is_empty")]
+    pub vk_history: Vec<VkLineageEntry>,
+    /// ZEB-1031 §5.2: the successor committee's pinned shape, set by
+    /// `apply_reset_marker` and cleared on that successor's `dk`
+    /// promotion (Task 4). `Some` gates `check_ceremony_init_admissible`
+    /// to accept ONLY a `di` claiming exactly this shape — see spec
+    /// §5.3. `#[serde(default)]` + `skip_serializing_if` for the same
+    /// pre-ZEB-1031 snapshot-compat reason as `vk_history`.
+    #[serde(rename = "pr", default, skip_serializing_if = "Option::is_none")]
+    pub pending_reset: Option<PendingReset>,
 }
 
 /// Wire shape used solely as a `serde(from = ...)` shim: identical to
@@ -334,6 +351,10 @@ struct CommitteeStateRaw {
     pub pending_refresh: Option<PendingCeremony>,
     #[serde(default)]
     pub pending_repair: Option<PendingRepair>,
+    #[serde(rename = "vh", default, skip_serializing_if = "Vec::is_empty")]
+    pub vk_history: Vec<VkLineageEntry>,
+    #[serde(rename = "pr", default, skip_serializing_if = "Option::is_none")]
+    pub pending_reset: Option<PendingReset>,
 }
 
 impl From<CommitteeStateRaw> for CommitteeState {
@@ -352,6 +373,8 @@ impl From<CommitteeStateRaw> for CommitteeState {
             pending_sign: raw.pending_sign,
             pending_refresh: raw.pending_refresh,
             pending_repair: raw.pending_repair,
+            vk_history: raw.vk_history,
+            pending_reset: raw.pending_reset,
         }
     }
 }
@@ -446,6 +469,39 @@ pub struct PendingCeremony {
     pub attempt: u32,
 }
 
+/// ZEB-1031 Task 6: what a `ts`/`vb` sign ceremony is FOR. `Beacon` (the
+/// pre-1031 default — VRF beacon draws for tier-3 sortition) completes
+/// by minting a `vb` event and advancing the beacon index, exactly as
+/// before this field existed. `ResetResponse` ceremonies never mint
+/// `vb` — the aggregate Schnorr signature is instead handed to
+/// `dfrost_contribute_threshold_sign`'s reset-response completion arm,
+/// which authors a `DfrostResetResponse` MEMBERSHIP event carrying it
+/// (spec §3.3). `#[serde(default)]` on the carrying field is load-
+/// bearing: every `PendingSignSession` persisted before this field
+/// existed decodes as `Beacon` — the only purpose that existed then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SignPurpose {
+    #[default]
+    Beacon,
+    ResetResponse {
+        proposal_id: crate::community_membership::EventId,
+        verdict: crate::community_membership::ResetVerdict,
+        /// ZEB-1031 review round 1 (M4): carried at initiation rather
+        /// than re-read from `committee_state.joint_verifying_key` at
+        /// completion. `Some` iff `verdict == Consumed` (mirrors the
+        /// wire `DfrostResetResponse.new_vk` shape). The completion arm
+        /// builds the event's `nv` directly from this field — a `dk`
+        /// promotion landing between initiation and completion can no
+        /// longer make the authored `nv` disagree with the vk the
+        /// signature is actually over. RS-R3 recomputes the message
+        /// hash from the event's OWN `new_vk` regardless, so a stale
+        /// carried value was already fail-closed (verify would reject),
+        /// but carrying it removes the race entirely rather than
+        /// relying on that backstop.
+        new_vk: Option<[u8; 32]>,
+    },
+}
+
 /// Per-signing-ceremony pending state. One entry per in-flight
 /// threshold-sign + VRF-beacon ceremony, keyed by `ceremony_id`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -470,6 +526,16 @@ pub struct PendingSignSession {
     /// secret nonces onto the disk substrate.
     #[serde(skip, default)]
     pub local_nonces: Option<Vec<u8>>,
+    /// ZEB-1031 Task 6: what this ceremony's completion authors. Set by
+    /// the initiating core (`initiate_reset_response_ceremony`'s driver
+    /// impl mutates it right after `apply_with_identity` creates the
+    /// session — the same post-apply-mutate pattern `local_nonces` uses)
+    /// for reset-response ceremonies; left at the `Beacon` default for
+    /// VRF-beacon ceremonies started via `dfrost_request_vrf_beacon`.
+    /// `#[serde(default)]`: pre-1031 persisted sessions decode as
+    /// `Beacon`.
+    #[serde(default)]
+    pub purpose: SignPurpose,
 }
 
 /// ZEB-1027: in-flight RTS share-repair ceremony state (the `rp` event
@@ -592,6 +658,52 @@ impl PendingRepair {
     }
 }
 
+/// ZEB-1031 §5.2: one retired committee's lineage record, appended to
+/// `CommitteeState.vk_history` by `apply_reset_marker`. Public data (a
+/// retired joint verifying key plus the reset that retired it) — safe
+/// to persist and to serve on catch-up (spec §6.3 chain-link healing).
+///
+/// All 5 keys are 2 characters (same-length-keys invariant, matching
+/// `ResetMarkerPayload`'s field naming — `old_vk`/`old_epoch`/
+/// `reset_id`/`digest` mirror `ov`/`oe`/`ri`/`dg` of the marker that
+/// produced this entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VkLineageEntry {
+    #[serde(rename = "ov", with = "serde_bytes")]
+    pub old_vk: [u8; 32],
+    #[serde(rename = "oe")]
+    pub old_epoch: u64,
+    #[serde(
+        rename = "ri",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub reset_id: crate::community_membership::EventId,
+    #[serde(rename = "dg", with = "serde_bytes")]
+    pub digest: [u8; 32],
+    #[serde(rename = "at")]
+    pub at: crate::owner_state_types::Hlc,
+}
+
+/// ZEB-1031 §5.2/§5.3: the successor committee's pinned shape, set by
+/// `apply_reset_marker` and consulted by `check_ceremony_init_admissible`
+/// (Task 4) to constrain the post-reset `di` to exactly this shape.
+/// Public data (member list + threshold, not secret material) — safe to
+/// persist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReset {
+    #[serde(
+        rename = "ri",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub reset_id: crate::community_membership::EventId,
+    #[serde(rename = "nm")]
+    pub new_members: Vec<OwnerAddr>,
+    #[serde(rename = "nt")]
+    pub new_threshold: u16,
+}
+
 /// Which pending-ceremony slot a `dk` event resolves to. R1 fix: refresh
 /// completes via the same `dk` event kind as initial DKG, so the dispatch
 /// has to inspect both slots before either rejecting (UnknownCeremony)
@@ -614,7 +726,10 @@ pub enum ApplyError {
     UnknownCeremony,
     /// `apply_dkg_complete` (or refresh-complete) saw two distinct `vk`
     /// values across confirmations, or a refresh attempted to change the
-    /// committee's joint verifying key.
+    /// committee's joint verifying key. Also covers `apply_reset_marker`'s
+    /// RS-M1 (wrong `sp`) and RS-M2 (a marker for a state this log never
+    /// held — see `ResetMarkerApplied::AlreadyMoved` for the genuine
+    /// re-delivery case, which is NOT an error).
     InvariantViolation,
     /// Event arrived with a kind that does not match this log's
     /// envelope tag (`tg != 'd'`) or whose `committee_tier` field is
@@ -626,6 +741,26 @@ pub enum ApplyError {
     /// stale-replace policy decides whether to `abort_pending_dkg()`
     /// first (quiet ceremony) or drop the newcomer (fresh ceremony).
     CeremonyInFlight,
+}
+
+/// Outcome of a successful `DfrostLog::apply_reset_marker` call (ZEB-1031
+/// §5.2). Both variants are `Ok` — `AlreadyMoved` is RS-M6's benign
+/// no-op for a duplicate/late marker, not a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMarkerApplied {
+    /// The marker deactivated the held committee. `old_epoch`/`reset_id`
+    /// echo the applied marker's `oe`/`ri` for the caller's bookkeeping
+    /// (e.g. the engine's void-polls hook, spec §7).
+    Applied {
+        old_epoch: u64,
+        reset_id: crate::community_membership::EventId,
+    },
+    /// RS-M6: the committee had already moved past this marker (a prior
+    /// application of the SAME `ri` already deactivated it, or a
+    /// successor has since promoted) and `vk_history` confirms this is a
+    /// genuine re-delivery, not a defect. Catch-up replay legitimately
+    /// re-delivers markers; this is the idempotent no-op response.
+    AlreadyMoved,
 }
 
 /// Errors surfaced by `verify_signed_committee_event`. Mirrors the
@@ -819,6 +954,19 @@ impl DfrostLog {
             DfrostEventKind::VrfBeacon => self.apply_vrf_beacon(&event),
             DfrostEventKind::ProactiveRefresh => self.apply_proactive_refresh(&event),
             DfrostEventKind::RepairShare => self.apply_repair_round(&event),
+            // ZEB-1031: `rs` carries only the marker payload (`ri`/`dg`/
+            // `ov`/`oe`/`sp`) — the successor pin (`new_members`/
+            // `new_threshold`) is resolved by the engine from membership
+            // state (spec §5, keeping this log membership-blind) and is
+            // NOT on the wire, so this single-event dispatcher has
+            // nothing to supply it with. `apply_reset_marker` is the
+            // sole entry point for `rs`; the engine calls it directly
+            // (mirroring how `adopt_initial_quorum`/`adopt_refresh_quorum`
+            // bypass this dispatcher for the same reason — external
+            // context the payload alone can't carry). Reaching this arm
+            // means an `rs` event was routed through the generic
+            // single-event path in error.
+            DfrostEventKind::ResetMarker => Err(ApplyError::InvariantViolation),
         };
         result?;
 
@@ -1259,6 +1407,7 @@ impl DfrostLog {
         &mut self,
         events: &[SignedCommitteeEvent],
         expected_space: &crate::owner_state_types::SpaceId,
+        rejected_vks: &std::collections::BTreeSet<[u8; 32]>,
     ) -> Result<u64, String> {
         use crate::community_dfrost_types::DkgCompletePayload;
 
@@ -1312,6 +1461,38 @@ impl DfrostLog {
             {
                 return Err(
                     "adopt_initial_quorum: dk events disagree on the ceremony payload".into(),
+                );
+            }
+        }
+
+        // ZEB-1031 §6.1: reject any dk quorum whose claimed joint
+        // verifying key is a REJECTED tv (Authorized — live replacement
+        // in progress — or Consumed-and-not-superseded) — checked
+        // FIRST, before any shape validation below, so a stale
+        // pre-reset quorum never even reaches the shape/threshold
+        // gates. Closes the stale-committee replay a colluding
+        // ex-committee could otherwise replay against a fresh joiner
+        // once Lapse (if any) clears the freeze.
+        if rejected_vks.contains(&first.joint_verifying_key) {
+            return Err(
+                "adopt_initial_quorum: dk quorum's joint verifying key is a rejected target \
+                 of a committee reset (ZEB-1031 provenance)"
+                    .into(),
+            );
+        }
+        // ZEB-1031 §5.3/§6.2 (controller ruling on a Task 4 plan gap):
+        // while a reset is pending on THIS log — a straggler that just
+        // applied its own marker via `apply_reset_marker` — the
+        // successor quorum being adopted must claim EXACTLY the pinned
+        // shape. Without this, a post-marker straggler would adopt ANY
+        // structurally-valid quorum, defeating the covert-replacement
+        // protection the pin exists for.
+        if let Some(pin) = &self.committee_state.pending_reset {
+            if first.members != pin.new_members || first.threshold != pin.new_threshold {
+                return Err(
+                    "adopt_initial_quorum: dk quorum does not match the pinned successor \
+                     shape from the committee reset in progress (ZEB-1031)"
+                        .into(),
                 );
             }
         }
@@ -1591,7 +1772,9 @@ impl DfrostLog {
     /// Checks: committee not `active`; members sorted bytewise
     /// ascending + deduplicated, at least 2; `max_signers ==
     /// members.len()`; `2 <= threshold <= max_signers`; the actor is a
-    /// committee member; `epoch == current_epoch + 1`.
+    /// committee member; `epoch == current_epoch + 1`; and, when
+    /// `pending_reset` is set (ZEB-1031 §5.3), `members`/`threshold`
+    /// match the pinned successor set exactly.
     pub fn check_ceremony_init_admissible(
         &self,
         payload: &crate::community_dfrost_types::CeremonyInitPayload,
@@ -1619,6 +1802,13 @@ impl DfrostLog {
         }
         if payload.epoch != self.committee_state.current_epoch + 1 {
             return Err(ApplyError::InvariantViolation);
+        }
+        // ZEB-1031 §5.3: if a reset is pending, the di must claim exactly
+        // the pinned successor member set and threshold.
+        if let Some(pin) = &self.committee_state.pending_reset {
+            if payload.members != pin.new_members || payload.threshold != pin.new_threshold {
+                return Err(ApplyError::InvariantViolation);
+            }
         }
         Ok(())
     }
@@ -1677,6 +1867,125 @@ impl DfrostLog {
     pub fn abort_pending_repair(&mut self) -> Option<[u8; 32]> {
         let aborted = self.committee_state.pending_repair.take()?;
         Some(aborted.ceremony_id)
+    }
+
+    /// Apply an `rs` (ResetMarker) event, closing out a
+    /// membership-authorized committee reset (ZEB-1031 spec §5).
+    ///
+    /// `expected_space` is this log's own community — the caller
+    /// (engine) always has it in scope, exactly like
+    /// `adopt_initial_quorum`/`adopt_refresh_quorum`'s `expected_space`
+    /// parameter ten screens up; unlike a stored field, a parameter
+    /// can't silently re-default on a restore path. `new_members`/
+    /// `new_threshold` are the successor committee's pinned shape,
+    /// resolved by the ENGINE from membership state (RS-M3/M4/M5 —
+    /// membership phase, digest recomputation, actor authorization —
+    /// are all verified there, against membership-log state this
+    /// dfrost log never sees, keeping the log membership-blind). This
+    /// function verifies only RS-M1 (space), RS-M2 (held-state match),
+    /// and RS-M6 (idempotent re-delivery) — the three gates checkable
+    /// from held dfrost state alone.
+    ///
+    /// Gate order: envelope/kind → decode → RS-M1 → RS-M2/RS-M6 →
+    /// effects. No partial state is written on any rejection — every
+    /// check runs before the mutation block.
+    pub fn apply_reset_marker(
+        &mut self,
+        event: &SignedCommitteeEvent,
+        expected_space: &crate::owner_state_types::SpaceId,
+        new_members: Vec<OwnerAddr>,
+        new_threshold: u16,
+    ) -> Result<ResetMarkerApplied, ApplyError> {
+        use crate::community_dfrost_types::ResetMarkerPayload;
+
+        // Same envelope gate as `apply`/`apply_with_identity` (single-
+        // sourced, ZEB-753), plus the kind guard `adopt_initial_quorum`
+        // runs for `dk` (`:1399-1401`-equivalent): without both, a
+        // malformed-envelope or wrong-kind event can mutate committee
+        // state here while `insert_applied`'s policy verify rejects it
+        // ONE STEP LATER — deactivation with no event behind it to
+        // explain it on catch-up.
+        check_envelope(event)?;
+        if event.kind != DfrostEventKind::ResetMarker {
+            return Err(ApplyError::UnexpectedEnvelope);
+        }
+
+        let payload: ResetMarkerPayload =
+            ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
+
+        // RS-M1: `sp` must equal this log's community — unconditional
+        // (mirrors `adopt_initial_quorum`'s strict style for a
+        // mandatory field, vs. `adopt_refresh_quorum`'s lenient
+        // tolerance for `dk`'s OPTIONAL legacy binding: `rs` is a
+        // brand-new kind with no pre-ZEB-1034 history, so there is no
+        // absent-binding case to tolerate).
+        if payload.space_id != *expected_space {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        // RS-M2: does the held state still match what this marker
+        // claims to retire?
+        let state_matches = self.committee_state.active
+            && self.committee_state.joint_verifying_key == Some(payload.old_vk)
+            && self.committee_state.current_epoch == payload.old_epoch;
+
+        if !state_matches {
+            // RS-M6: a genuine re-delivery of a marker that already
+            // applied is benign (catch-up replay legitimately
+            // re-delivers it) — recognized by `vk_history` already
+            // carrying this exact `reset_id`. Anything else (a marker
+            // for a state this log never held) is a defect, not a
+            // replay.
+            let already_recorded = self
+                .committee_state
+                .vk_history
+                .iter()
+                .any(|entry| entry.reset_id == payload.reset_proposal_id);
+            if already_recorded {
+                return Ok(ResetMarkerApplied::AlreadyMoved);
+            }
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        // Effects (spec §5.2): deactivate, record lineage, pin the
+        // successor shape.
+        self.committee_state.active = false;
+        self.committee_state.joint_verifying_key = None;
+        self.committee_state.vk_history.push(VkLineageEntry {
+            old_vk: payload.old_vk,
+            old_epoch: payload.old_epoch,
+            reset_id: payload.reset_proposal_id,
+            digest: payload.reset_digest,
+            at: event.hlc.clone(),
+        });
+        self.committee_state.pending_reset = Some(PendingReset {
+            reset_id: payload.reset_proposal_id,
+            new_members,
+            new_threshold,
+        });
+        // Every in-flight ceremony under the old vk is dead by
+        // definition — clear all four pending slots and the in-memory
+        // secrets bound to them, the way `abort_pending_dkg`/
+        // `abort_pending_refresh`/`abort_pending_repair` do
+        // individually.
+        self.committee_state.pending_dkg = None;
+        self.committee_state.pending_sign.clear();
+        self.committee_state.pending_refresh = None;
+        self.committee_state.pending_repair = None;
+        self.local_dkg_secret = None;
+        self.local_dkg_secret2 = None;
+        self.pending_rotated = None;
+        // `current_epoch` stays at `old_epoch` (spec §5.2) — the
+        // existing `epoch == current_epoch + 1` gate on `di` naturally
+        // yields the successor DKG at `old_epoch + 1` (Task 4 wires the
+        // `pending_reset` shape pin into that gate).
+
+        self.insert_applied(event.clone());
+
+        Ok(ResetMarkerApplied::Applied {
+            old_epoch: payload.old_epoch,
+            reset_id: payload.reset_proposal_id,
+        })
     }
 
     /// Apply a `dr` event (DKG round 1 broadcast or round 2 encrypted shares).
@@ -1929,6 +2238,10 @@ impl DfrostLog {
                 PendingSlot::Dkg => self.committee_state.pending_dkg = None,
                 PendingSlot::Refresh => self.committee_state.pending_refresh = None,
             }
+            // ZEB-1031 §5.3: if a reset was pending (only a post-reset DKG
+            // can reach this point when active=false and pending_reset=Some),
+            // clear the pin now that promotion is complete.
+            self.committee_state.pending_reset = None;
             // ZEB-1027: promotion ends the ceremony on this node — the
             // in-memory round secrets are dead transcript material and
             // MUST NOT leak into the next ceremony's part2/part3 inputs
@@ -2079,6 +2392,14 @@ impl DfrostLog {
                 message_hash: payload.message_hash,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                // ZEB-1031: the wire-level `ts` payload carries no
+                // purpose signal (it's opaque commitment/share bytes) —
+                // every replica creates the session at the Beacon
+                // default here; the LOCAL initiating core (whichever one
+                // this is) overwrites it to `ResetResponse` right after
+                // its own `apply_with_identity` call, mirroring how
+                // `local_nonces` is stashed post-apply below.
+                purpose: SignPurpose::default(),
             });
         // First-write-wins on message_hash — if a later `ts` claims a
         // different message for the same ceremony, that's an invariant
@@ -3920,6 +4241,7 @@ mod tests {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -4452,6 +4774,7 @@ mod tests {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -4860,6 +5183,7 @@ mod tests {
                 message_hash: agreed_msg,
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -4968,6 +5292,273 @@ mod tests {
             "local_nonces must be skipped during serialization (security)"
         );
         assert_eq!(decoded.message_hash, [0xBB; 32], "public fields preserved");
+    }
+
+    // ── ZEB-1031 Task 6: SignPurpose ──────────────────────────────────
+
+    #[test]
+    fn pending_sign_session_purpose_defaults_beacon_on_legacy_blob() {
+        // Mirrors the pre-ZEB-1031 PendingSignSession shape (no
+        // `purpose` field at all) to prove #[serde(default)] loads
+        // old-persisted sessions as SignPurpose::Beacon — the only
+        // purpose that existed before this field. `local_nonces` is
+        // omitted here too since it was already #[serde(skip)] before
+        // this task and carries no wire representation either way.
+        #[derive(Serialize)]
+        struct LegacyPendingSignSession {
+            message_hash: [u8; 32],
+            contributions: BTreeMap<OwnerAddr, (Vec<u8>, Vec<u8>)>,
+        }
+        let legacy = LegacyPendingSignSession {
+            message_hash: [0xCC; 32],
+            contributions: BTreeMap::new(),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&legacy, &mut buf).expect("encode legacy shape");
+        let decoded: PendingSignSession =
+            ciborium::from_reader(&buf[..]).expect("decode into current shape");
+        assert_eq!(
+            decoded.purpose,
+            SignPurpose::Beacon,
+            "a legacy session blob (no purpose field) must decode as Beacon"
+        );
+        assert_eq!(decoded.message_hash, [0xCC; 32], "public fields preserved");
+    }
+
+    #[test]
+    fn pending_sign_session_reset_response_purpose_round_trips() {
+        let session = PendingSignSession {
+            message_hash: [0xDD; 32],
+            purpose: SignPurpose::ResetResponse {
+                proposal_id: [0x77; 16],
+                verdict: crate::community_membership::ResetVerdict::Veto,
+                new_vk: None,
+            },
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&session, &mut buf).expect("encode");
+        let decoded: PendingSignSession = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(
+            decoded.purpose, session.purpose,
+            "ResetResponse purpose must round-trip exactly (proposal_id + verdict + new_vk)"
+        );
+    }
+
+    #[test]
+    fn pending_sign_session_reset_response_consumed_new_vk_round_trips() {
+        let session = PendingSignSession {
+            message_hash: [0xEE; 32],
+            purpose: SignPurpose::ResetResponse {
+                proposal_id: [0x78; 16],
+                verdict: crate::community_membership::ResetVerdict::Consumed,
+                new_vk: Some([0x99; 32]),
+            },
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&session, &mut buf).expect("encode");
+        let decoded: PendingSignSession = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(
+            decoded.purpose, session.purpose,
+            "Consumed's carried new_vk must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn apply_threshold_sign_creates_session_with_beacon_purpose_by_default() {
+        // The wire-level `ts` payload carries no purpose signal — every
+        // replica applying a `ts` event (whether or not this replica
+        // itself initiated a reset-response ceremony) creates the
+        // session at the Beacon default here. Regression guard for the
+        // pre-existing VRF-beacon ceremony flow: `apply_threshold_sign`
+        // must keep tagging fresh sessions Beacon so
+        // `dfrost_contribute_threshold_sign`'s aggregation-side match
+        // still takes the vb-mint arm for ordinary beacon ceremonies.
+        use crate::community_dfrost_types::ThresholdSignPayload;
+        use crate::owner_state_types::Hlc;
+
+        let (members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let kp = key_packages.get(&ids[0]).unwrap().clone();
+        let mut log = committee_log_from_material(&members, &ids, &pub_pkg, Some(kp));
+
+        let payload = ThresholdSignPayload {
+            ceremony_id: [0x11; 32],
+            message_hash: [0x22; 32],
+            commitment_bytes: vec![0xAB, 0xCD],
+            share_bytes: Vec::new(),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: members[0],
+            payload: pd,
+            sig: vec![0u8; 64],
+        })
+        .expect("ts applies");
+
+        let session = log
+            .committee_state
+            .pending_sign
+            .get(&[0x11; 32])
+            .expect("session created on first ts contribution");
+        assert_eq!(session.purpose, SignPurpose::Beacon);
+    }
+
+    /// Full happy-path replay of what
+    /// The mint-site's `DfrostResetResponse` construction — a REAL 2-of-3
+    /// FROST threshold signature over the endorse-domain message hash
+    /// (the SAME round1/round2/aggregate mechanics the Beacon path
+    /// shares), wrapped exactly as `dfrost_contribute_threshold_sign`'s
+    /// ResetResponse arm builds the event — passes RS-R3 against the
+    /// committee's own vk.
+    ///
+    /// Scope note (review round 1, I3): this test previously also
+    /// asserted `beacon_index`/`beacon_watermark`/`pending_sign`
+    /// postconditions that its OWN body established rather than
+    /// exercised (it removed the `pending_sign` entry itself, then
+    /// asserted it was gone; nothing in the body could ever mint a `vb`
+    /// either) — deleted as vacuous, not as a coverage regression. The
+    /// executed coverage those assertions were gesturing at —
+    /// initiation-side purpose tagging and ceremony-id convergence
+    /// across two real engines — now lives in
+    /// `community_dfrost_transport_integration.rs`'s
+    /// `reset_response_ceremony_converges_and_tags_purpose_across_two_engines_zeb1031`.
+    /// Executing the completion-sink `match purpose` itself (this test's
+    /// original aspiration for the `no_vb` half) needs
+    /// `dfrost_contribute_threshold_sign` extracted into a `_core` the
+    /// way `dfrost_initiate_reset_response_core` was — filed as
+    /// ZEB-1040, a follow-up, not attempted this round.
+    #[test]
+    fn reset_response_group_sig_passes_rsr3_against_committee_vk() {
+        use crate::community_membership::{
+            dfrost_reset_digest, dfrost_reset_message_hash, mint_test_owner, sign_event,
+            test_enroll_member, verify_event, EventId, EventPayload, MaterializedMembership,
+            MemberState, MemberStatus, MembershipEventKind, ResetPhase, ResetProposalView,
+            ResetVerdict, VerifyContext, DFROST_RESET_ENDORSE_DOMAIN,
+        };
+        use crate::owner_state_types::{Hlc, SpaceId};
+
+        let community_id = SpaceId([0x51; 16]);
+        let (_members, ids, key_packages, pub_pkg) = dkg_2of3_material();
+        let target_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+
+        let proposal_id: EventId = [0x91; 16];
+        let new_members = vec![OwnerAddr([0x71; 16]), OwnerAddr([0x72; 16])];
+        let digest =
+            dfrost_reset_digest(&community_id, &proposal_id, &target_vk, 1, &new_members, 2)
+                .expect("digest encode");
+        let message_hash = dfrost_reset_message_hash(DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+
+        // Real 2-of-3 threshold sign of the endorse-domain message —
+        // the SAME frost mechanics dfrost_contribute_threshold_sign's
+        // shared round1/round2/aggregate path runs regardless of
+        // ceremony purpose.
+        let mut rng = frost_ristretto255::rand_core::OsRng;
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            let (n, c) = frost_ristretto255::round1::commit(kp.signing_share(), &mut rng);
+            nonces.insert(*id, n);
+            commitments.insert(*id, c);
+        }
+        let signing_package = frost_ristretto255::SigningPackage::new(commitments, &message_hash);
+        let mut shares = BTreeMap::new();
+        for id in &ids[..2] {
+            let kp = key_packages.get(id).unwrap();
+            shares.insert(
+                *id,
+                frost_ristretto255::round2::sign(&signing_package, nonces.get(id).unwrap(), kp)
+                    .expect("round2 sign"),
+            );
+        }
+        let sig =
+            frost_ristretto255::aggregate(&signing_package, &shares, &pub_pkg).expect("aggregate");
+        let sig_bytes = sig.serialize().expect("sig serialize");
+        let group_sig: [u8; 64] = sig_bytes.try_into().expect("schnorr sig is 64 bytes");
+
+        // Build the response event exactly as the lib.rs match arm
+        // does: MembershipEventKind::DfrostResetResponse{target_event_id,
+        // verdict, group_sig, new_vk: None}, signed by a courier actor
+        // (RS-R1: any Joined member, not necessarily a committee
+        // member, for endorse/veto).
+        let courier = mint_test_owner(0x61);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            courier.owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "c".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: Default::default(),
+                revoked_device_keys: Default::default(),
+            },
+        );
+        test_enroll_member(&mut prior, &courier);
+        prior.reset_proposals.push(ResetProposalView {
+            id: proposal_id,
+            proposer: courier.owner,
+            target_vk,
+            target_epoch: 1,
+            new_members: new_members.clone(),
+            new_threshold: 2,
+            veto_window_ms: 24 * 3_600_000,
+            signers: std::collections::BTreeSet::from([courier.owner]),
+            proposed_at_wall_ms: 0,
+            deadline_ms: None,
+            authorized_at_ms: Some(100),
+            endorsed: true,
+            phase: ResetPhase::Authorized,
+            consumed_new_vk: None,
+            consumption_superseded: false,
+            effective_quorum: None,
+        });
+        let ctx = VerifyContext {
+            now_ms: None,
+            expected_community_id: community_id,
+            admin_addr: courier.owner,
+            is_invite_only: false,
+        };
+
+        let payload = EventPayload {
+            id: [0x99; 16],
+            community_id,
+            kind: MembershipEventKind::DfrostResetResponse {
+                target_event_id: proposal_id,
+                verdict: ResetVerdict::Endorse,
+                group_sig,
+                new_vk: None,
+            },
+            actor: courier.owner,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "c".into(),
+            },
+        };
+        let response_event =
+            sign_event(&payload, &courier.device_key).expect("sign_event succeeds");
+
+        assert_eq!(
+            verify_event(&response_event, &prior, &ctx),
+            Ok(()),
+            "the mint-site's DfrostResetResponse construction must pass RS-R3"
+        );
     }
 
     #[test]
@@ -7039,6 +7630,7 @@ mod tests {
                 message_hash: [0x88; 32],
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -7425,7 +8017,14 @@ mod tests {
         let events = vec![ev_a.clone(), ev_b];
 
         let mut log = DfrostLog::new();
-        assert_eq!(log.adopt_initial_quorum(&events, &zeb1034_space()), Ok(1));
+        assert_eq!(
+            log.adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
         assert!(log.committee_state.active);
         assert_eq!(log.committee_state.joint_verifying_key, Some(joint_vk));
         let expected_shares: BTreeMap<OwnerAddr, [u8; 32]> = verifying_shares
@@ -7508,7 +8107,7 @@ mod tests {
         let community_y = crate::owner_state_types::SpaceId([0x0E; 16]);
         let mut log = DfrostLog::new();
         let err = log
-            .adopt_initial_quorum(&events, &community_y)
+            .adopt_initial_quorum(&events, &community_y, &std::collections::BTreeSet::new())
             .expect_err("cross-community dk quorum must be rejected");
         assert!(
             err.contains("bound to a different community"),
@@ -7526,7 +8125,11 @@ mod tests {
             signed_dk(bob, 1_001, "b", &legacy_payload),
         ];
         let err = log
-            .adopt_initial_quorum(&legacy_events, &zeb1034_space())
+            .adopt_initial_quorum(
+                &legacy_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new(),
+            )
             .expect_err("unbound legacy dk quorum must be rejected");
         assert!(
             err.contains("no community binding"),
@@ -7535,7 +8138,14 @@ mod tests {
         assert!(!log.committee_state.active);
 
         // Correctly-bound evidence at the right community still adopts.
-        assert_eq!(log.adopt_initial_quorum(&events, &zeb1034_space()), Ok(1));
+        assert_eq!(
+            log.adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
         assert!(log.committee_state.active);
     }
 
@@ -7579,7 +8189,11 @@ mod tests {
         ];
         let mut log = DfrostLog::new();
         assert_eq!(
-            log.adopt_initial_quorum(&initial_events, &zeb1034_space()),
+            log.adopt_initial_quorum(
+                &initial_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
             Ok(1)
         );
 
@@ -7746,7 +8360,11 @@ mod tests {
 
         for (name, events) in &cases {
             let mut log = DfrostLog::new();
-            let result = log.adopt_initial_quorum(events, &zeb1034_space());
+            let result = log.adopt_initial_quorum(
+                events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new(),
+            );
             assert!(result.is_err(), "case {name} should reject: {result:?}");
             // ZEB-1034 (PR#780 round-1): each case must fail on ITS OWN
             // defect — a binding-gate error here means the base fixture
@@ -7770,9 +8388,188 @@ mod tests {
             signed_dk(bob, 1_001, "b", &p),
         ];
         assert!(active_log
-            .adopt_initial_quorum(&events, &zeb1034_space())
+            .adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            )
             .is_err());
         assert_eq!(active_log.event_count(), 0);
+    }
+
+    /// ZEB-1031 §6.1: `adopt_initial_quorum`'s `rejected_vks` gate —
+    /// a quorum whose joint verifying key is in the rejected set is
+    /// rejected with the provenance error, BEFORE any shape validation
+    /// (a malformed-but-rejected quorum still gets the provenance
+    /// error, not a shape error); the empty-set case is prior
+    /// behaviour (adopts normally).
+    #[test]
+    fn adopt_initial_quorum_rejected_vks_gate_zeb1031() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let joint_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let verifying_shares: Vec<MemberVerifyingShare> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MemberVerifyingShare {
+                member: *m,
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pub_pkg.verifying_shares().get(&ids[i]).unwrap(),
+                ),
+            })
+            .collect();
+        let payload = DkgCompletePayload {
+            ceremony_id: [0x41; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares,
+            epoch: 1,
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 3,
+            space_id: Some(zeb1034_space()),
+        };
+        let events = vec![
+            signed_dk(alice, 1_000, "a", &payload),
+            signed_dk(bob, 1_001, "b", &payload),
+        ];
+
+        // In-set: rejected with the provenance error, nothing adopted.
+        let mut rejected = std::collections::BTreeSet::new();
+        rejected.insert(joint_vk);
+        let mut log = DfrostLog::new();
+        let err = log
+            .adopt_initial_quorum(&events, &zeb1034_space(), &rejected)
+            .expect_err("rejected vk must not be adopted");
+        assert!(
+            err.contains("rejected") && err.contains("ZEB-1031"),
+            "unexpected error: {err}"
+        );
+        assert!(!log.committee_state.active);
+        assert_eq!(log.event_count(), 0, "no partial insert");
+
+        // Empty set: prior behaviour — adopts normally.
+        let mut log2 = DfrostLog::new();
+        assert_eq!(
+            log2.adopt_initial_quorum(
+                &events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
+        assert!(log2.committee_state.active);
+        assert_eq!(log2.committee_state.joint_verifying_key, Some(joint_vk));
+    }
+
+    /// ZEB-1031 §5.3/§6.2 (controller ruling): `adopt_initial_quorum`
+    /// enforces the `pending_reset` pin — when a reset is pending on
+    /// THIS log (a straggler that just applied its own marker), a dk
+    /// quorum whose shape doesn't match the pinned `new_members`/
+    /// `new_threshold` is rejected, even though it is otherwise
+    /// structurally valid; the pinned-shape quorum is adopted.
+    #[test]
+    fn adopt_initial_quorum_pending_reset_pin_zeb1031() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+
+        let (members, ids, _key_packages, pub_pkg) = dkg_2of3_material();
+        let alice = members[0];
+        let bob = members[1];
+        let carol = members[2];
+        let joint_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_pkg.verifying_key());
+        let verifying_shares: Vec<MemberVerifyingShare> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MemberVerifyingShare {
+                member: *m,
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(
+                    pub_pkg.verifying_shares().get(&ids[i]).unwrap(),
+                ),
+            })
+            .collect();
+
+        // Pin the successor to exactly {alice, bob}, threshold 2 (a
+        // strict subset of the 2-of-3 material's 3-member committee —
+        // proves the pin, not merely the pre-existing shape gates,
+        // rejects the mismatched quorum below).
+        let mut log = DfrostLog::new();
+        log.committee_state.pending_reset = Some(PendingReset {
+            reset_id: [0x50; 16],
+            new_members: vec![alice, bob],
+            new_threshold: 2,
+        });
+
+        // Wrong shape: claims all 3 members (structurally valid on its
+        // own — passes every pre-existing adopt_initial_quorum check)
+        // but does not match the pin.
+        let wrong_shape_payload = DkgCompletePayload {
+            ceremony_id: [0x51; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares: verifying_shares.clone(),
+            epoch: 1,
+            members: members.clone(),
+            threshold: 2,
+            max_signers: 3,
+            space_id: Some(zeb1034_space()),
+        };
+        let wrong_events = vec![
+            signed_dk(alice, 1_000, "a", &wrong_shape_payload),
+            signed_dk(bob, 1_001, "b", &wrong_shape_payload),
+            signed_dk(carol, 1_002, "c", &wrong_shape_payload),
+        ];
+        let err = log
+            .adopt_initial_quorum(
+                &wrong_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new(),
+            )
+            .expect_err("wrong-shape quorum must be rejected while a reset is pending");
+        assert!(
+            err.contains("pinned successor shape") && err.contains("ZEB-1031"),
+            "unexpected error: {err}"
+        );
+        assert!(!log.committee_state.active);
+        assert_eq!(log.event_count(), 0, "no partial insert");
+        assert!(
+            log.committee_state.pending_reset.is_some(),
+            "pin survives the rejected attempt"
+        );
+
+        // Pinned-shape quorum ({alice, bob}, threshold 2) is adopted.
+        let pinned_shares: Vec<MemberVerifyingShare> = verifying_shares
+            .into_iter()
+            .filter(|mvs| mvs.member == alice || mvs.member == bob)
+            .collect();
+        let pinned_vk = [0x60; 32];
+        let pinned_payload = DkgCompletePayload {
+            ceremony_id: [0x52; 32],
+            joint_verifying_key: pinned_vk,
+            verifying_shares: pinned_shares,
+            epoch: 1,
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+            space_id: Some(zeb1034_space()),
+        };
+        let pinned_events = vec![
+            signed_dk(alice, 2_000, "a", &pinned_payload),
+            signed_dk(bob, 2_001, "b", &pinned_payload),
+        ];
+        assert_eq!(
+            log.adopt_initial_quorum(
+                &pinned_events,
+                &zeb1034_space(),
+                &std::collections::BTreeSet::new()
+            ),
+            Ok(1)
+        );
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(pinned_vk));
+        assert_eq!(log.committee_state.members, vec![alice, bob]);
     }
 
     #[test]
@@ -7790,6 +8587,7 @@ mod tests {
                 message_hash: [0xbb; 32],
                 contributions: BTreeMap::new(),
                 local_nonces: None,
+                purpose: SignPurpose::default(),
             },
         );
 
@@ -8066,6 +8864,7 @@ mod tests {
                     message_hash,
                     contributions: BTreeMap::new(),
                     local_nonces: None,
+                    purpose: SignPurpose::default(),
                 },
             );
         };
@@ -8356,6 +9155,650 @@ mod tests {
             log.find_vrf_beacon_output_by_seed(&seed, log.committee_state.current_epoch),
             Some(beacon_output),
             "the oracle now derives the message hash from the adopted epoch"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ZEB-1031: `apply_reset_marker` — RS-M1/M2/M6.
+    // -----------------------------------------------------------------
+
+    const RESET_PROPOSAL_ID: crate::community_membership::EventId = [0x11; 16];
+    const RESET_DIGEST: [u8; 32] = [0x22; 32];
+
+    /// ZEB-1031 helper: build an `rs` (ResetMarker) event with a fake
+    /// signature (apply does not verify — that's the engine's job, same
+    /// convention as `di_event`).
+    fn rs_event(
+        actor: OwnerAddr,
+        reset_proposal_id: crate::community_membership::EventId,
+        reset_digest: [u8; 32],
+        old_vk: [u8; 32],
+        old_epoch: u64,
+        space_id: crate::owner_state_types::SpaceId,
+        wall_ms: u64,
+    ) -> crate::community_dfrost_types::SignedCommitteeEvent {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, ResetMarkerPayload, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+        let payload = ResetMarkerPayload {
+            reset_proposal_id,
+            reset_digest,
+            old_vk,
+            old_epoch,
+            space_id,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ResetMarker,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor,
+            payload: pd,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// ZEB-1031: an active committee at `(vk, epoch)` — the fixture
+    /// every reset-marker test starts from. Every test passes
+    /// `&zeb1034_space()` as `apply_reset_marker`'s `expected_space`
+    /// except the dedicated wrong-space one.
+    fn active_committee_for_reset(
+        vk: [u8; 32],
+        epoch: u64,
+        members: Vec<OwnerAddr>,
+        threshold: u16,
+    ) -> DfrostLog {
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.joint_verifying_key = Some(vk);
+        log.committee_state.current_epoch = epoch;
+        log.committee_state.max_signers = members.len() as u16;
+        log.committee_state.members = members;
+        log.committee_state.threshold = threshold;
+        log
+    }
+
+    #[test]
+    fn reset_marker_happy_path_deactivates_and_pins_successor_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![OwnerAddr([0x03; 16]), OwnerAddr([0x04; 16])];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+        // Seed every pending slot so the effects assertions below prove
+        // they all get cleared by the marker apply.
+        log.committee_state.pending_dkg = Some(PendingCeremony::default());
+        log.committee_state.pending_refresh = Some(PendingCeremony::default());
+        log.committee_state.pending_repair = Some(PendingRepair::new(
+            [0x77; 32],
+            alice,
+            3,
+            vec![bob],
+            1_000,
+            0,
+        ));
+        log.committee_state
+            .pending_sign
+            .insert([0x88; 32], PendingSignSession::default());
+
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+
+        let result = log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2);
+        assert_eq!(
+            result,
+            Ok(ResetMarkerApplied::Applied {
+                old_epoch: 3,
+                reset_id: RESET_PROPOSAL_ID,
+            })
+        );
+
+        assert!(!log.committee_state.active);
+        assert!(log.committee_state.joint_verifying_key.is_none());
+        assert_eq!(
+            log.committee_state.current_epoch, 3,
+            "current_epoch stays at old_epoch — the di epoch+1 gate yields the successor"
+        );
+        assert_eq!(log.committee_state.vk_history.len(), 1);
+        let entry = &log.committee_state.vk_history[0];
+        assert_eq!(entry.old_vk, old_vk);
+        assert_eq!(entry.old_epoch, 3);
+        assert_eq!(entry.reset_id, RESET_PROPOSAL_ID);
+        assert_eq!(entry.digest, RESET_DIGEST);
+        assert_eq!(entry.at, ev.hlc);
+
+        let pin = log
+            .committee_state
+            .pending_reset
+            .as_ref()
+            .expect("pending_reset set");
+        assert_eq!(pin.reset_id, RESET_PROPOSAL_ID);
+        assert_eq!(pin.new_members, new_members);
+        assert_eq!(pin.new_threshold, 2);
+
+        assert!(log.committee_state.pending_dkg.is_none());
+        assert!(log.committee_state.pending_refresh.is_none());
+        assert!(log.committee_state.pending_repair.is_none());
+        assert!(log.committee_state.pending_sign.is_empty());
+        assert_eq!(log.event_count(), 1, "the marker itself joins the log");
+    }
+
+    #[test]
+    fn reset_marker_rs_m1_wrong_space_rejected_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let old_vk = [0xaa; 32];
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
+        // The marker itself carries a VALID `sp` — the mismatch is
+        // between the marker's claim and the caller's own ground truth
+        // (`expected_space`), which is what RS-M1 actually guards
+        // against (a marker minted for a different community).
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        let wrong_space = crate::owner_state_types::SpaceId([0x99; 16]);
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &wrong_space, vec![alice], 1),
+            Err(ApplyError::InvariantViolation)
+        );
+        // No partial state change.
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(old_vk));
+        assert_eq!(log.committee_state.current_epoch, 3);
+        assert!(log.committee_state.vk_history.is_empty());
+        assert!(log.committee_state.pending_reset.is_none());
+        assert_eq!(log.event_count(), 0);
+    }
+
+    #[test]
+    fn reset_marker_rs_m2_not_active_rejected_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let old_vk = [0xaa; 32];
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
+        log.committee_state.active = false;
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
+            Err(ApplyError::InvariantViolation)
+        );
+        assert!(log.committee_state.vk_history.is_empty());
+        assert!(log.committee_state.pending_reset.is_none());
+        assert_eq!(log.event_count(), 0);
+    }
+
+    #[test]
+    fn reset_marker_rs_m2_vk_mismatch_rejected_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let held_vk = [0xaa; 32];
+        let marker_vk = [0xbb; 32];
+        let mut log = active_committee_for_reset(held_vk, 3, vec![alice], 1);
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            marker_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
+            Err(ApplyError::InvariantViolation)
+        );
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(held_vk));
+        assert!(log.committee_state.vk_history.is_empty());
+        assert_eq!(log.event_count(), 0);
+    }
+
+    #[test]
+    fn reset_marker_rs_m2_epoch_mismatch_rejected_zeb1031() {
+        // Simulate a mid-flight refresh: the marker targets epoch 3, but
+        // the committee has already advanced to epoch 4 by apply time —
+        // membership cannot see dfrost state, so this staleness is
+        // enforced here, not in the lifecycle (spec §5.1).
+        let alice = OwnerAddr([0x01; 16]);
+        let vk = [0xaa; 32];
+        let mut log = active_committee_for_reset(vk, 4, vec![alice], 1);
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
+            Err(ApplyError::InvariantViolation)
+        );
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.current_epoch, 4);
+        assert!(log.committee_state.vk_history.is_empty());
+        assert_eq!(log.event_count(), 0);
+    }
+
+    #[test]
+    fn reset_marker_rs_m6_replay_after_applied_is_already_moved_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![OwnerAddr([0x03; 16])];
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+
+        let first = log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 1);
+        assert_eq!(
+            first,
+            Ok(ResetMarkerApplied::Applied {
+                old_epoch: 3,
+                reset_id: RESET_PROPOSAL_ID,
+            })
+        );
+
+        // Catch-up replay legitimately re-delivers the SAME marker —
+        // benign no-op, not an error.
+        let second = log.apply_reset_marker(&ev, &zeb1034_space(), new_members, 1);
+        assert_eq!(second, Ok(ResetMarkerApplied::AlreadyMoved));
+
+        // The replay leaves state exactly as the first apply left it.
+        assert_eq!(log.committee_state.vk_history.len(), 1);
+        assert!(log.committee_state.pending_reset.is_some());
+        assert_eq!(log.event_count(), 1, "the replay is not re-inserted");
+    }
+
+    /// Asserts committee state is byte-unchanged from a freshly-built
+    /// `active_committee_for_reset(old_vk, 3, [alice], 1)` fixture — the
+    /// shared assertion for I2's envelope/kind-guard regression tests
+    /// (both must reject BEFORE any mutation, not one step later inside
+    /// `insert_applied`'s policy verify).
+    fn assert_reset_marker_state_untouched(log: &DfrostLog, old_vk: [u8; 32]) {
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(old_vk));
+        assert_eq!(log.committee_state.current_epoch, 3);
+        assert!(log.committee_state.vk_history.is_empty());
+        assert!(log.committee_state.pending_reset.is_none());
+        assert!(log.committee_state.pending_dkg.is_none());
+        assert!(log.committee_state.pending_refresh.is_none());
+        assert!(log.committee_state.pending_repair.is_none());
+        assert!(log.committee_state.pending_sign.is_empty());
+        assert_eq!(log.event_count(), 0);
+    }
+
+    #[test]
+    fn reset_marker_bad_tier_rejected_before_mutation_zeb1031() {
+        // I2: a non-zero `committee_tier` must be rejected by the SAME
+        // envelope gate `apply`/`apply_with_identity` run — BEFORE any
+        // state mutation. Without it, `committee_tier`/`tag` (both
+        // attacker-chosen fields on a signed event) let a malformed
+        // envelope deactivate the committee while
+        // `insert_applied`'s policy verify rejects the event one step
+        // later — a `tracing::warn!`, never surfaced to the caller, and
+        // no event lands in the log to explain the mutation.
+        let alice = OwnerAddr([0x01; 16]);
+        let old_vk = [0xaa; 32];
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
+        let mut ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        ev.committee_tier = 7;
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
+            Err(ApplyError::UnexpectedEnvelope)
+        );
+        assert_reset_marker_state_untouched(&log, old_vk);
+    }
+
+    #[test]
+    fn reset_marker_wrong_kind_rejected_before_mutation_zeb1031() {
+        // I2: an event carrying an `rs`-shaped payload under a
+        // DIFFERENT `kind` (e.g. `DkgComplete`) must be rejected —
+        // without the kind guard it applies AND is stored under the
+        // wrong kind, so the log holds a `DkgComplete` event whose
+        // payload cannot decode as `DkgCompletePayload`, which fails
+        // `PayloadDecode` for every peer on catch-up.
+        let alice = OwnerAddr([0x01; 16]);
+        let old_vk = [0xaa; 32];
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice], 1);
+        let mut ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        ev.kind = crate::community_dfrost_types::DfrostEventKind::DkgComplete;
+
+        assert_eq!(
+            log.apply_reset_marker(&ev, &zeb1034_space(), vec![alice], 1),
+            Err(ApplyError::UnexpectedEnvelope)
+        );
+        assert_reset_marker_state_untouched(&log, old_vk);
+    }
+
+    // ZEB-1031 Task 4: successor-DKG pin tests
+    //
+    // After a reset marker is applied, the DfrostLog's pending_reset is set
+    // with the pinned new_members and new_threshold. A successor di must
+    // claim exactly this shape, else it is rejected. On dk promotion, the
+    // pending_reset is cleared.
+
+    #[test]
+    fn reset_dkg_pin_di_wrong_members_rejected_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        assert!(log.committee_state.pending_reset.is_some());
+
+        // Try to apply di with wrong members (alice + carol instead of
+        // carol + dave) — should be rejected as InvariantViolation.
+        assert_eq!(
+            log.check_ceremony_init_admissible(
+                &crate::community_dfrost_types::CeremonyInitPayload {
+                    ceremony_id: [0x42; 32],
+                    members: vec![alice, carol],
+                    threshold: 2,
+                    max_signers: 2,
+                    epoch: 4,
+                    minted_wall_ms: 6_000,
+                    minted_logical: 0,
+                },
+                &alice
+            ),
+            Err(ApplyError::InvariantViolation),
+            "di with wrong members should be rejected when pending_reset is set"
+        );
+    }
+
+    #[test]
+    fn reset_dkg_pin_di_wrong_threshold_rejected_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        assert!(log.committee_state.pending_reset.is_some());
+
+        // Try to apply di with correct members but wrong threshold
+        // (1 instead of 2) — should be rejected as InvariantViolation.
+        let payload = crate::community_dfrost_types::CeremonyInitPayload {
+            ceremony_id: [0x42; 32],
+            members: new_members.clone(),
+            threshold: 1, // Wrong!
+            max_signers: 2,
+            epoch: 4,
+            minted_wall_ms: 6_000,
+            minted_logical: 0,
+        };
+
+        assert_eq!(
+            log.check_ceremony_init_admissible(&payload, &carol),
+            Err(ApplyError::InvariantViolation),
+            "di with wrong threshold should be rejected when pending_reset is set"
+        );
+    }
+
+    #[test]
+    fn reset_dkg_pin_di_exact_shape_admitted_zeb1031() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        assert!(log.committee_state.pending_reset.is_some());
+
+        // Apply di with exact pinned shape — should be admitted.
+        let payload = crate::community_dfrost_types::CeremonyInitPayload {
+            ceremony_id: [0x42; 32],
+            members: new_members.clone(),
+            threshold: 2,
+            max_signers: 2,
+            epoch: 4,
+            minted_wall_ms: 6_000,
+            minted_logical: 0,
+        };
+
+        assert_eq!(
+            log.check_ceremony_init_admissible(&payload, &carol),
+            Ok(()),
+            "di with exact pinned shape should be admitted"
+        );
+    }
+
+    #[test]
+    fn reset_dkg_pin_promotion_clears_pending_reset_zeb1031() {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let carol = OwnerAddr([0x03; 16]);
+        let dave = OwnerAddr([0x04; 16]);
+        let old_vk = [0xaa; 32];
+        let new_vk = [0xbb; 32];
+        let new_members = vec![carol, dave];
+
+        let mut log = active_committee_for_reset(old_vk, 3, vec![alice, bob], 2);
+
+        // Apply the reset marker to set pending_reset.
+        let rs_ev = rs_event(
+            alice,
+            RESET_PROPOSAL_ID,
+            RESET_DIGEST,
+            old_vk,
+            3,
+            zeb1034_space(),
+            5_000,
+        );
+        log.apply_reset_marker(&rs_ev, &zeb1034_space(), new_members.clone(), 2)
+            .expect("marker applies");
+
+        // Verify state after marker: deactivated, pending_reset set, vk_history recorded.
+        assert!(!log.committee_state.active);
+        assert!(log.committee_state.joint_verifying_key.is_none());
+        assert_eq!(log.committee_state.current_epoch, 3);
+        assert_eq!(log.committee_state.vk_history.len(), 1);
+        let pin = log
+            .committee_state
+            .pending_reset
+            .as_ref()
+            .expect("pending_reset set");
+        assert_eq!(pin.new_members, new_members);
+        assert_eq!(pin.new_threshold, 2);
+
+        // Seed a di (ceremony init) with exact pinned shape.
+        let ceremony_id = [0x42u8; 32];
+        log.apply(di_event(
+            carol,
+            new_members.clone(),
+            2,
+            4,
+            ceremony_id,
+            6_000,
+        ))
+        .expect("di seeds pending_dkg");
+
+        assert!(log.committee_state.pending_dkg.is_some());
+
+        // Build and apply dk (DKG complete) events to reach quorum and promote.
+        let payload = DkgCompletePayload {
+            ceremony_id,
+            joint_verifying_key: new_vk,
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: carol,
+                    verifying_share: [0xc1; 32],
+                },
+                MemberVerifyingShare {
+                    member: dave,
+                    verifying_share: [0xd1; 32],
+                },
+            ],
+            epoch: 4,
+            members: new_members.clone(),
+            threshold: 2,
+            max_signers: 2,
+            space_id: None,
+        };
+
+        let mut wall = 7_000u64;
+        // Apply dk events from carol and dave to reach quorum (threshold=2).
+        for confirmer in [carol, dave] {
+            let mut pd = Vec::new();
+            ciborium::into_writer(&payload, &mut pd).unwrap();
+            log.apply(crate::community_dfrost_types::SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: crate::community_dfrost_types::DfrostEventKind::DkgComplete,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: confirmer,
+                payload: pd,
+                sig: vec![0u8; 64],
+            })
+            .expect("dk applies");
+            wall += 1;
+        }
+
+        // Verify state after promotion:
+        assert!(log.committee_state.active, "committee promoted");
+        assert_eq!(
+            log.committee_state.joint_verifying_key,
+            Some(new_vk),
+            "new vk installed"
+        );
+        assert_eq!(log.committee_state.current_epoch, 4, "epoch advanced");
+        assert_eq!(
+            log.committee_state.members, new_members,
+            "new members installed"
+        );
+        assert_eq!(log.committee_state.threshold, 2, "new threshold installed");
+
+        // The critical assertion: pending_reset is cleared on promotion.
+        assert_eq!(
+            log.committee_state.pending_reset, None,
+            "pending_reset cleared on dk promotion"
+        );
+
+        // Verify vk_history lineage is still present.
+        assert_eq!(
+            log.committee_state.vk_history.len(),
+            1,
+            "vk_history still carries the lineage entry"
+        );
+        let lineage = &log.committee_state.vk_history[0];
+        assert_eq!(lineage.old_vk, old_vk, "lineage records old vk");
+        assert_eq!(lineage.old_epoch, 3, "lineage records old epoch");
+        assert_eq!(
+            lineage.reset_id, RESET_PROPOSAL_ID,
+            "lineage records reset_id"
         );
     }
 }

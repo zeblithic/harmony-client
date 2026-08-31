@@ -507,12 +507,112 @@ pub enum MembershipEventKind {
         )]
         target_event_id: EventId,
     },
+
+    /// ZEB-1031 §3.1: authored by a power-100 admin to propose resetting
+    /// a D-FROST committee. `target_vk`/`target_epoch` keep membership-
+    /// log verification a pure function of the membership log — every
+    /// threshold signature in §3.3 verifies against the proposal's
+    /// CLAIMED vk, never against live dfrost state (the dfrost marker,
+    /// §5, cross-checks against the real committee and refuses to apply
+    /// if the claim is wrong, so a lying proposal is a dead end).
+    /// `new_members`/`new_threshold` pin the successor: after
+    /// deactivation, only a `di` claiming exactly this shape is
+    /// admissible (§5.3) — the post-deactivation covert-replacement
+    /// protection. `veto_window_ms` is per-proposal (instead of a
+    /// community config knob) so the cosigning quorum approves the
+    /// window together with the reset.
+    ///
+    /// Verify gates RS-P1–RS-P5 (spec §3.1). Variant tag "o" (1-char
+    /// value, unused before this). Inner field keys are 2-char
+    /// (tv/te/nm/nt/vw) per the same-length-keys invariant.
+    #[serde(rename = "o")]
+    DfrostResetProposal {
+        /// The joint vk being reset (claimed; cross-checked by the
+        /// dfrost marker at apply time, never trusted here).
+        #[serde(
+            rename = "tv",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        target_vk: [u8; 32],
+        /// The committee epoch being reset.
+        #[serde(rename = "te")]
+        target_epoch: u64,
+        /// Pinned successor member set.
+        #[serde(rename = "nm")]
+        new_members: Vec<OwnerAddr>,
+        /// Pinned successor threshold.
+        #[serde(rename = "nt")]
+        new_threshold: u16,
+        /// Per-proposal veto window, clamped to
+        /// `[RESET_VETO_WINDOW_FLOOR_MS, RESET_VETO_WINDOW_CEILING_MS]`.
+        #[serde(rename = "vw")]
+        veto_window_ms: u64,
+    },
+
+    /// ZEB-1031 §3.2: admin-quorum co-signature on a
+    /// `DfrostResetProposal`. ZEB-250 semantics verbatim: power-100
+    /// cosigners, proposer counts as signature 1, effective at
+    /// `admin_quorum` total distinct admin signatures. Lenient
+    /// forward-ref (pairing at materialize), like `AdminCountersign` /
+    /// `RecoveryCosign`. Variant tag "w" (1-char value, unused before
+    /// this).
+    #[serde(rename = "w")]
+    DfrostResetCosign {
+        #[serde(
+            rename = "ti",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        target_event_id: EventId,
+    },
+
+    /// ZEB-1031 §3.3: the committee's voice on a reset — one kind,
+    /// three verdicts (`ResetVerdict`). `group_sig` is a threshold
+    /// Schnorr signature (R ‖ z) over the verdict's domain-tagged
+    /// message hash (`dfrost_reset_message_hash`), verified against the
+    /// proposal's claimed `target_vk` (endorse/veto) or the response's
+    /// own `new_vk` (consumed — the successor committee attesting its
+    /// own birth, §4.3). `new_vk` is present iff `verdict == Consumed`.
+    /// Variant tag "z" (1-char value, unused before this).
+    #[serde(rename = "z")]
+    DfrostResetResponse {
+        /// The reset proposal this response answers.
+        #[serde(
+            rename = "ti",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        target_event_id: EventId,
+        #[serde(rename = "vd")]
+        verdict: ResetVerdict,
+        /// Threshold Schnorr signature (R ‖ z), 64 bytes.
+        #[serde(
+            rename = "sg",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        group_sig: [u8; 64],
+        /// Present iff `verdict == Consumed`: the successor committee's
+        /// new joint verifying key.
+        #[serde(
+            rename = "nv",
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_optional_bytes_as_bstr",
+            deserialize_with = "deserialize_optional_bytes_from_bstr"
+        )]
+        new_vk: Option<[u8; 32]>,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
 impl CanonicalPayload for MembershipEventKind {}
 
 use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr};
+use crate::owner_state_types::{
+    deserialize_optional_bytes_from_bstr, serialize_optional_bytes_as_bstr,
+};
 use crate::owner_state_types::{Hlc, SpaceId};
 // ZEB-548 Stage 2: the reachability skew bound now lives in `reachability_record`
 // (its true home); imported here so the membership-reachability check keeps using
@@ -1096,6 +1196,40 @@ pub enum VerifyError {
     /// ZEB-713: RecoveryVeto target_event_id is malformed (all-zero).
     RecoveryVetoTargetIdMalformed,
 
+    // ── ZEB-1031 D-FROST committee-reset verify rules ──
+    /// ZEB-1031 RS-P1: DfrostResetProposal actor is not a currently-
+    /// Joined power-100 admin. Unlike ZEB-713 recovery, ordinary admins
+    /// exist for this action — no bootstrap exception (spec §3.1).
+    DfrostResetProposalActorNotAdmin,
+    /// ZEB-1031 RS-P2: new_members is not sorted ascending / deduped /
+    /// `len >= 2`, or a listed member is not currently Joined.
+    DfrostResetProposalBadMembers,
+    /// ZEB-1031 RS-P3: new_threshold violates
+    /// `2 <= nt <= new_members.len()`.
+    DfrostResetProposalBadThreshold,
+    /// ZEB-1031 RS-P4: veto_window_ms outside
+    /// `[RESET_VETO_WINDOW_FLOOR_MS, RESET_VETO_WINDOW_CEILING_MS]`.
+    DfrostResetProposalBadWindow,
+    /// ZEB-1031 RS-P5: actor already has an open (Collecting/Window/
+    /// Authorized) reset proposal (structural spam bound, mirrors RP6).
+    DfrostResetProposalActorHasOpenProposal,
+    /// ZEB-1031 RS-C1: DfrostResetCosign actor is not a currently-Joined
+    /// power-100 admin.
+    DfrostResetCosignActorNotAdmin,
+    /// ZEB-1031: DfrostResetCosign target_event_id is malformed
+    /// (all-zero).
+    DfrostResetCosignTargetIdMalformed,
+    /// ZEB-1031 RS-R1: DfrostResetResponse actor is not currently
+    /// Joined, or (for `verdict == Consumed`) is not a member of the
+    /// target proposal's pinned `new_members`.
+    DfrostResetResponseActorNotEligible,
+    /// ZEB-1031 RS-R3: group_sig does not verify as a Schnorr signature
+    /// over the verdict's domain-tagged message hash against the bound
+    /// key (`target_vk` for endorse/veto, `new_vk` for consumed).
+    DfrostResetResponseSigInvalid,
+    /// ZEB-1031 RS-R4: new_vk must be present iff `verdict == Consumed`.
+    DfrostResetResponseShapeInvalid,
+
     // ── ZEB-321 RCH1-RCH5 ReachabilityAnnounce verify rules ──
     //
     // RCH1 (outer SignedMembershipEvent signature) is enforced by the
@@ -1404,6 +1538,42 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::RecoveryVetoTargetIdMalformed => {
                 write!(f, "ZEB-713: RecoveryVeto target_event_id is malformed")
+            }
+            VerifyError::DfrostResetProposalActorNotAdmin => {
+                write!(f, "ZEB-1031 RS-P1: reset proposal actor is not a Joined power-100 admin")
+            }
+            VerifyError::DfrostResetProposalBadMembers => {
+                write!(
+                    f,
+                    "ZEB-1031 RS-P2: new_members not sorted/deduped/len>=2, or a member not Joined"
+                )
+            }
+            VerifyError::DfrostResetProposalBadThreshold => {
+                write!(f, "ZEB-1031 RS-P3: new_threshold out of range [2, new_members.len()]")
+            }
+            VerifyError::DfrostResetProposalBadWindow => {
+                write!(f, "ZEB-1031 RS-P4: veto_window_ms outside the floor/ceiling clamp")
+            }
+            VerifyError::DfrostResetProposalActorHasOpenProposal => {
+                write!(f, "ZEB-1031 RS-P5: actor already has an open reset proposal")
+            }
+            VerifyError::DfrostResetCosignActorNotAdmin => {
+                write!(f, "ZEB-1031 RS-C1: reset cosign actor is not a Joined power-100 admin")
+            }
+            VerifyError::DfrostResetCosignTargetIdMalformed => {
+                write!(f, "ZEB-1031: DfrostResetCosign target_event_id is malformed")
+            }
+            VerifyError::DfrostResetResponseActorNotEligible => {
+                write!(
+                    f,
+                    "ZEB-1031 RS-R1: reset response actor not eligible (not Joined, or not in pinned new_members for a consumed verdict)"
+                )
+            }
+            VerifyError::DfrostResetResponseSigInvalid => {
+                write!(f, "ZEB-1031 RS-R3: reset response group_sig failed verification")
+            }
+            VerifyError::DfrostResetResponseShapeInvalid => {
+                write!(f, "ZEB-1031 RS-R4: new_vk must be present iff verdict is Consumed")
             }
             VerifyError::ReachabilityInnerSigInvalid => {
                 write!(f, "ZEB-321 RCH2 inner ReachabilityAnnounce signature invalid")
@@ -1927,6 +2097,15 @@ pub struct MaterializedMembership {
     /// byte-compat.
     #[serde(rename = "rp", default, skip_serializing_if = "Vec::is_empty")]
     pub recovery_proposals: Vec<RecoveryProposalView>,
+
+    /// ZEB-1031: derived per-proposal D-FROST committee-reset lifecycle
+    /// view, populated by `materialize_with_now`'s post-pass
+    /// (`evaluate_reset_phases`) — consumed by `verify_event`'s RS-P5
+    /// gate and by the D9 UI. Sorted by `(proposed_at_wall_ms, id)` for
+    /// deterministic encoding, mirroring `recovery_proposals`.
+    /// Empty-elided for snapshot byte-compat.
+    #[serde(rename = "rs", default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_proposals: Vec<ResetProposalView>,
 }
 
 impl Default for MaterializedMembership {
@@ -1942,6 +2121,7 @@ impl Default for MaterializedMembership {
             power_thresholds: POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
+            reset_proposals: Vec::new(),
         }
     }
 }
@@ -2098,6 +2278,210 @@ pub struct RecoveryProposalView {
 
 impl CanonicalPayloadSealed for RecoveryProposalView {}
 impl CanonicalPayload for RecoveryProposalView {}
+
+/// ZEB-1031 §3.3: verdict carried by a `DfrostResetResponse`.
+/// 1-char serde codes (values, not keys — same convention as
+/// `RecoveryPhase`/`MemberStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResetVerdict {
+    #[serde(rename = "e")]
+    Endorse,
+    #[serde(rename = "v")]
+    Veto,
+    #[serde(rename = "c")]
+    Consumed,
+}
+
+impl CanonicalPayloadSealed for ResetVerdict {}
+impl CanonicalPayload for ResetVerdict {}
+
+/// ZEB-1031 §3.3: the binding digest every reset response and marker
+/// verifies. Recomputed by verifiers, never trusted from the wire.
+/// Fail-closed on encode error (`recovery_config_digest` discipline).
+pub fn dfrost_reset_digest(
+    space_id: &SpaceId,
+    proposal_id: &EventId,
+    target_vk: &[u8; 32],
+    target_epoch: u64,
+    new_members: &[OwnerAddr],
+    new_threshold: u16,
+) -> Result<[u8; 32], CryptoError> {
+    #[derive(Serialize)]
+    struct ResetDigestInput<'a> {
+        #[serde(rename = "sp")]
+        space_id: &'a SpaceId,
+        #[serde(rename = "pi", serialize_with = "serialize_bytes_as_bstr")]
+        proposal_id: &'a EventId,
+        #[serde(rename = "tv", serialize_with = "serialize_bytes_as_bstr")]
+        target_vk: &'a [u8; 32],
+        #[serde(rename = "te")]
+        target_epoch: u64,
+        #[serde(rename = "nm")]
+        new_members: &'a [OwnerAddr],
+        #[serde(rename = "nt")]
+        new_threshold: u16,
+    }
+    let input = ResetDigestInput {
+        space_id,
+        proposal_id,
+        target_vk,
+        target_epoch,
+        new_members,
+        new_threshold,
+    };
+    // Plain `ciborium::ser::into_writer`, not `canonical_cbor_encode`:
+    // `ResetDigestInput` is a throwaway local shape (never round-tripped,
+    // never certified), so it doesn't carry `CanonicalPayload` — mirrors
+    // `SignedCommitteeEvent::signing_bytes`'s local `SigInput` pattern
+    // (community_dfrost_types.rs).
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&input, &mut bytes)
+        .map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// ZEB-1031 §3.3: 32-byte message handed to the threshold-sign ceremony
+/// for a reset response. `new_vk` is appended for the consumed domain
+/// only — callers pass `None` for the endorse/veto domains.
+pub fn dfrost_reset_message_hash(
+    domain: &'static str,
+    digest: &[u8; 32],
+    new_vk: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(domain.as_bytes());
+    h.update(digest);
+    if let Some(nv) = new_vk {
+        h.update(nv);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// ZEB-1031 §4.1: lifecycle phase of a materialized D-FROST
+/// committee-reset proposal. 1-char serde codes (values, not keys —
+/// same convention as `RecoveryPhase`). Populated by Task 2's
+/// `evaluate_reset_phases`; the bare type exists here so `verify_event`
+/// RS-P5 compiles against `MaterializedMembership.reset_proposals`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResetPhase {
+    /// Fewer than `admin_quorum` distinct admin signatures so far and
+    /// `ADMIN_PROPOSAL_EXPIRY_MS` has not lapsed.
+    #[serde(rename = "c")]
+    Collecting,
+    /// Quorum reached; waiting out the veto window
+    /// (`deadline_ms = t_q + vw`).
+    #[serde(rename = "w")]
+    Window,
+    /// Either the veto window elapsed plus the finality margin with no
+    /// effective veto (disaster path), or an effective endorse landed
+    /// (cooperative path).
+    #[serde(rename = "a")]
+    Authorized,
+    /// A valid `c` (consumed) response exists — the successor committee
+    /// attested its own birth. Terminal; permanently rejects `target_vk`
+    /// for joiner adoption (spec §6.1) unless later superseded.
+    #[serde(rename = "n")]
+    Consumed,
+    /// Killed by an effective committee veto. Terminal.
+    #[serde(rename = "v")]
+    Vetoed,
+    /// Quorum was not reached within `ADMIN_PROPOSAL_EXPIRY_MS` of `t0`.
+    /// Terminal.
+    #[serde(rename = "x")]
+    Expired,
+    /// Authorized but unconsumed for `RESET_AUTHORIZED_LAPSE_MS` past
+    /// authorization. Terminal — lifts the joiner-adoption rejection so
+    /// a failed reset cannot permanently freeze adoption of the living
+    /// committee.
+    #[serde(rename = "l")]
+    Lapsed,
+}
+
+impl CanonicalPayloadSealed for ResetPhase {}
+impl CanonicalPayload for ResetPhase {}
+
+/// ZEB-1031 §4: derived per-proposal view built by
+/// `evaluate_reset_phases`'s materialize post-pass. Consumed by
+/// `verify_event`'s RS-P5/RS-R1/RS-R3 gates and, indirectly, by
+/// `get_dfrost_reset_state` — post-Task-9 the D9 UI reads the projected
+/// `ResetProposalDto`, not this type directly. All field keys are 2-char
+/// per the same-length-keys invariant at this nesting level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetProposalView {
+    #[serde(
+        rename = "id",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub id: EventId,
+    #[serde(rename = "pr")]
+    pub proposer: OwnerAddr,
+    #[serde(
+        rename = "tv",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub target_vk: [u8; 32],
+    #[serde(rename = "te")]
+    pub target_epoch: u64,
+    #[serde(rename = "nm")]
+    pub new_members: Vec<OwnerAddr>,
+    #[serde(rename = "nt")]
+    pub new_threshold: u16,
+    #[serde(rename = "vw")]
+    pub veto_window_ms: u64,
+    /// Distinct valid admin signers so far (proposer included). Sorted
+    /// (BTreeSet) for deterministic encoding.
+    #[serde(rename = "sn")]
+    pub signers: BTreeSet<OwnerAddr>,
+    /// t₀ (proposal HLC wall_ms).
+    #[serde(rename = "t0")]
+    pub proposed_at_wall_ms: u64,
+    /// `t_q + vw` — Some once quorum landed (Window and beyond), None
+    /// while Collecting.
+    #[serde(rename = "dl", skip_serializing_if = "Option::is_none", default)]
+    pub deadline_ms: Option<u64>,
+    /// The wall_ms at which this proposal became Authorized (either
+    /// `max(w_endorse, t_q)` on the cooperative path, or
+    /// `deadline_ms + RESET_FINALITY_MS` on the disaster path). `Some`
+    /// once Authorized or beyond.
+    #[serde(rename = "aa", skip_serializing_if = "Option::is_none", default)]
+    pub authorized_at_ms: Option<u64>,
+    /// True iff Authorized was reached via an effective endorse
+    /// (cooperative path) rather than the disaster-path finality wait.
+    #[serde(rename = "en")]
+    pub endorsed: bool,
+    #[serde(rename = "ph")]
+    pub phase: ResetPhase,
+    /// The successor joint verifying key from a valid `c` (consumed)
+    /// response. `Some` iff `phase` is `Consumed`.
+    #[serde(
+        rename = "cv",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_bytes_as_bstr",
+        deserialize_with = "deserialize_optional_bytes_from_bstr"
+    )]
+    pub consumed_new_vk: Option<[u8; 32]>,
+    /// ZEB-1031 §6.1 supersession: true iff a Consumed rejection for
+    /// `target_vk` was lifted by a later valid veto response
+    /// threshold-signed under the same `target_vk` (on any reset
+    /// proposal).
+    #[serde(rename = "cs")]
+    pub consumption_superseded: bool,
+    /// Review round 1 (CR): the admin-quorum value in effect at the
+    /// event that tipped `signers` to quorum — `ResetWork::t_q_reached`'s
+    /// companion, NOT the live `adminQuorum`. A later `ChangeQuorum`
+    /// must not relabel an already-authorized proposal's signature
+    /// count. `None` while Collecting (no tip yet); callers render the
+    /// live admin quorum in that phase. Default-elided so pre-existing
+    /// encodings stay byte-identical (the `"aq"`/`"vb"` pattern).
+    #[serde(rename = "eq", skip_serializing_if = "Option::is_none", default)]
+    pub effective_quorum: Option<u8>,
+}
+
+impl CanonicalPayloadSealed for ResetProposalView {}
+impl CanonicalPayload for ResetProposalView {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberState {
@@ -2660,6 +3044,375 @@ fn evaluate_recovery_phases(
     out
 }
 
+/// ZEB-1031: per-proposal working state accumulated during the main
+/// replay pass, mirroring `RecoveryWork`. A work entry exists for
+/// every `DfrostResetProposal` event — `verify_event` (RS-P1-P5)
+/// already gated it before it reached the log, and unlike
+/// `RecoveryProposal` there is no versioned config-generation digest
+/// to re-check at bind time, so the work entry is created
+/// unconditionally.
+///
+/// Proposal-data fields are SNAPSHOTS copied verbatim from the
+/// proposal event at fold time. This is load-bearing (review I5):
+/// every deferred RS-R1/RS-R3 re-check against a response recomputes
+/// the digest from these exact fields, never from live running state,
+/// so a later event can't retroactively change what an honest
+/// signature is checked against.
+struct ResetWork {
+    proposer: OwnerAddr,
+    space_id: SpaceId,
+    target_vk: [u8; 32],
+    target_epoch: u64,
+    new_members: Vec<OwnerAddr>,
+    new_threshold: u16,
+    veto_window_ms: u64,
+    t0_wall_ms: u64,
+    signers: BTreeSet<OwnerAddr>,
+    /// ZEB-1031 review I1 ruling: the wall_ms of the event that tipped
+    /// `signers` to (or past) the LIVE `admin_quorum` at ITS OWN fold
+    /// position — ZEB-250's tipping-position semantics, verbatim, per
+    /// spec §3.2 ("effective at `admin_quorum` total distinct admin
+    /// signatures"). NOT a bind-time snapshot: a `ChangeQuorum` landing
+    /// mid-collection changes what a still-Collecting proposal needs,
+    /// exactly like an ordinary `AdminProposal`. Set at most once
+    /// (`maybe_tip_reset_quorum`'s `is_none()` guard) — the FIRST event
+    /// whose fold pushes `signers.len()` to or past the quorum in
+    /// effect right then wins, even if a later `ChangeQuorum` would
+    /// have required more.
+    ///
+    /// Always `>= t0_wall_ms` by construction (review I2): the live
+    /// cosign arm uses the cosign's own wall (which cannot sort before
+    /// the proposal's — the total order used by the main replay pass is
+    /// primarily wall_ms, so a cosign whose wall truly precedes t0
+    /// would have sorted into the forward-ref queue instead), and the
+    /// forward-ref drain uses the PROPOSAL's own wall (t0), never a
+    /// queued cosign's — a queued cosign CAN be backdated (clock skew),
+    /// and crediting its own wall for the tip would collapse the veto
+    /// window to before t0, making the committee veto structurally
+    /// unreachable (the I2 hazard).
+    t_q_reached: Option<u64>,
+    /// Review round 1 (CR): `admin_quorum_now` at the SAME tipping event
+    /// that set `t_q_reached` — set together, in `maybe_tip_reset_quorum`,
+    /// never independently. Projected onto `ResetProposalView::effective_quorum`.
+    effective_quorum: Option<u8>,
+    /// VALID responses only — the RS-R1 consumed-half and RS-R3 group
+    /// signature have already been re-checked at fold time (review I5,
+    /// `fold_reset_response`): (wall_ms, response event id, verdict,
+    /// new_vk).
+    responses: Vec<(u64, EventId, ResetVerdict, Option<[u8; 32]>)>,
+}
+
+/// ZEB-1031 review I1 ruling: apply ZEB-250's tipping-position quorum
+/// test — mirrors `admin_quorum_now = m.admin_quorum as usize` read
+/// LIVE at the tipping event's own log position
+/// (`MembershipEventKind::AdminProposal`'s self-satisfy arm and
+/// `AdminCountersign`'s arm both do this; never a bind-time snapshot).
+/// `>=` (not `==`) is the ZEB-250 R2 fix (a) catch-up rule: a
+/// forward-ref-drained proposal can already be at or above quorum
+/// before this runs, and a `ChangeQuorum` that LOWERS the requirement
+/// mid-collection must not need a fresh signature to notice.
+///
+/// `at_wall_ms` is the tipping event's own wall — see `ResetWork::t_q_reached`
+/// for why callers must never pass a queued cosign's (possibly
+/// backdated) wall here.
+fn maybe_tip_reset_quorum(work: &mut ResetWork, admin_quorum_now: u8, at_wall_ms: u64) {
+    if work.t_q_reached.is_none()
+        && admin_quorum_now > 0
+        && work.signers.len() >= admin_quorum_now as usize
+    {
+        work.t_q_reached = Some(at_wall_ms);
+        work.effective_quorum = Some(admin_quorum_now);
+    }
+}
+
+/// Forward-ref admin cosign, queued until its target proposal is
+/// reached in HLC order (mirrors `QueuedRecoveryCosign`). RS-C1 has no
+/// dynamic half — actor-Joined/power-100 is checked unconditionally at
+/// verify time against `prior_state`, not deferred — so only
+/// distinctness is folded here. No wall_ms: the forward-ref drain path
+/// deliberately never consults a queued cosign's own wall for the
+/// quorum tip (review I2 — see `ResetWork::t_q_reached`); the live
+/// cosign arm has the event itself for that.
+struct QueuedResetCosign {
+    actor: OwnerAddr,
+}
+
+/// Insert a distinct cosigner. Returns `true` iff newly inserted (the
+/// RS-C2 distinctness half, deferred to materialize) — callers use this
+/// to gate the tipping check so a duplicate cosign is a true no-op.
+fn fold_reset_cosign(work: &mut ResetWork, actor: OwnerAddr) -> bool {
+    work.signers.insert(actor)
+}
+
+/// Forward-ref response, queued until its target proposal is reached.
+/// Carries the raw payload fields `fold_reset_response` needs to redo
+/// the deferred RS-R1 consumed-half + RS-R3 signature check once the
+/// `ResetWork` exists.
+struct QueuedResetResponse {
+    wall_ms: u64,
+    response_id: EventId,
+    actor: OwnerAddr,
+    verdict: ResetVerdict,
+    group_sig: [u8; 64],
+    new_vk: Option<[u8; 32]>,
+}
+
+/// ZEB-1031 (review I5 carry-forward): re-check the deferred halves of
+/// RS-R1 (a `c` author must be a pinned `new_members` member) and
+/// RS-R3 (`group_sig` verifies over the digest recomputed from
+/// `work`'s VERBATIM proposal fields). `verify_event` only performs
+/// these checks when the target proposal is already materialized at
+/// the response's own position; forward-ref responses — and, for
+/// correctness regardless of delivery order, every response — get the
+/// authoritative re-check here. An invalid response is silently
+/// dropped: it is never counted toward first-response-wins or
+/// consumption.
+fn fold_reset_response(work: &mut ResetWork, proposal_id: EventId, response: QueuedResetResponse) {
+    if matches!(response.verdict, ResetVerdict::Consumed)
+        && !work.new_members.contains(&response.actor)
+    {
+        return;
+    }
+    let Ok(digest) = dfrost_reset_digest(
+        &work.space_id,
+        &proposal_id,
+        &work.target_vk,
+        work.target_epoch,
+        &work.new_members,
+        work.new_threshold,
+    ) else {
+        // Fail-closed on encode error (recovery_config_digest discipline).
+        return;
+    };
+    let (domain, verify_vk) = match response.verdict {
+        ResetVerdict::Endorse => (DFROST_RESET_ENDORSE_DOMAIN, &work.target_vk),
+        ResetVerdict::Veto => (DFROST_RESET_VETO_DOMAIN, &work.target_vk),
+        ResetVerdict::Consumed => match response.new_vk.as_ref() {
+            Some(nv) => (DFROST_RESET_CONSUMED_DOMAIN, nv),
+            // RS-R4 already guarantees Some at verify time; fail closed
+            // defensively against a corrupted replayed event.
+            None => return,
+        },
+    };
+    let message_hash = dfrost_reset_message_hash(domain, &digest, response.new_vk.as_ref());
+    if crate::community_dfrost_crypto::verify_schnorr_signature(
+        verify_vk,
+        &message_hash,
+        &response.group_sig,
+    )
+    .is_err()
+    {
+        return;
+    }
+    work.responses.push((
+        response.wall_ms,
+        response.response_id,
+        response.verdict,
+        response.new_vk,
+    ));
+}
+
+/// ZEB-1031: one proposal's lifecycle outcome from
+/// `evaluate_reset_phases`. `consumed_at_ms` is internal-only (not
+/// carried onto `ResetProposalView`) — the materialize post-pass uses
+/// it to evaluate §6.1 supersession.
+#[derive(Clone, Copy)]
+struct ResetOutcome {
+    phase: ResetPhase,
+    /// `t_q + vw` — Some once quorum landed (Window and beyond).
+    deadline_ms: Option<u64>,
+    /// `Some` once Authorized or beyond (Consumed/Lapsed retain it —
+    /// it is a historical fact about how/when authorization happened).
+    authorized_at_ms: Option<u64>,
+    endorsed: bool,
+    consumed_new_vk: Option<[u8; 32]>,
+    /// wall_ms of the winning `c` response. `Some` iff `phase` is
+    /// `Consumed`.
+    consumed_at_ms: Option<u64>,
+}
+
+/// ZEB-1031: evaluate every reset proposal's lifecycle phase at time
+/// reference `t` (spec §4). Pure in its inputs — mirrors
+/// `evaluate_recovery_phases` structurally, called from the
+/// materialize post-pass with `t = max(events_max, now_ms)` (the same
+/// now-floor recovery uses). `work.t_q_reached` is data by this point —
+/// the fold already applied ZEB-250's dynamic tipping-position
+/// semantics (review I1; see `maybe_tip_reset_quorum`), so this
+/// function stays a pure function of `(t_q_reached, t0, responses, t)`
+/// with no notion of a "current" `admin_quorum` at all. Deltas from the
+/// recovery evaluator: `c` (Consumed) responses are evaluated
+/// separately from the e/v first-response-wins contest and only count
+/// once Authorized is reached (spec §4.3); there is no rival tie-break
+/// pass — target_vk collisions across proposals are a §6.1 adoption
+/// concern, not a lifecycle one.
+fn evaluate_reset_phases(
+    work_map: &BTreeMap<EventId, ResetWork>,
+    t: u64,
+) -> BTreeMap<EventId, ResetOutcome> {
+    let mut out: BTreeMap<EventId, ResetOutcome> = BTreeMap::new();
+
+    for (id, work) in work_map.iter() {
+        let t0 = work.t0_wall_ms;
+        let t_q_raw = work.t_q_reached;
+
+        // Quorum-reached-in-time gate + fail-closed deadline arithmetic
+        // — mirrors evaluate_recovery_phases's collect_expired/deadline
+        // computation exactly (an overflowed window must not authorize
+        // immediately; ZEB-1031 review item 12).
+        let (deadline, collect_expired) = match t_q_raw {
+            Some(tq) if tq.saturating_sub(t0) <= ADMIN_PROPOSAL_EXPIRY_MS => {
+                match tq.checked_add(work.veto_window_ms) {
+                    Some(d) => (Some(d), false),
+                    None => (None, true),
+                }
+            }
+            Some(_) => (None, true),
+            None => (None, t.saturating_sub(t0) > ADMIN_PROPOSAL_EXPIRY_MS),
+        };
+        // Only a validly (in-window, non-overflowing) reached quorum
+        // counts for the cooperative endorse-immediate path too — a
+        // corrupted-looking window fails closed on both paths.
+        let t_q: Option<u64> = if collect_expired { None } else { t_q_raw };
+
+        // ZEB-1031 review fix-round-2 (M1 regression): the response
+        // validity window's upper bound must be a FIXED fact about the
+        // event log — never a function of the evaluation-time `t` —
+        // or a terminal Vetoed/Authorized-via-endorse verdict could
+        // flip away on a later re-evaluation of the identical log
+        // (exactly the bug: `!collect_expired`, which depends on `t`,
+        // silently erased a genuine in-window committee veto once `t`
+        // advanced far enough). While Collecting (no valid quorum —
+        // `deadline` is `None`, whether because quorum hasn't landed
+        // yet or landed too late), the window is the collecting window
+        // itself, `[t0, t0 + ADMIN_PROPOSAL_EXPIRY_MS]`; once quorum
+        // validly lands it is `[t0, deadline]` as before. `saturating_add`
+        // (not `checked_add`): a `None` here would need `t0` within
+        // ~30 days of `u64::MAX`, an unreachable wall-clock value that
+        // upstream forward-skew gates already exclude, so there is no
+        // meaningful "fail closed" direction to pick — the saturated
+        // value serves as a de facto unreachable bound.
+        let response_window_end =
+            deadline.unwrap_or_else(|| t0.saturating_add(ADMIN_PROPOSAL_EXPIRY_MS));
+
+        // First-response-wins among valid e/v responses with wall in
+        // [t0, response_window_end] — open-ended (within the fixed
+        // collecting window) while Collecting (spec §4.2: a veto is
+        // effective even before quorum lands). `c` responses are
+        // excluded from this contest entirely (spec §4.3).
+        let winner = work
+            .responses
+            .iter()
+            .filter(|(wall, _, verdict, _)| {
+                matches!(verdict, ResetVerdict::Endorse | ResetVerdict::Veto)
+                    && *wall >= t0
+                    && *wall <= response_window_end
+            })
+            .min_by_key(|(wall, rid, _, _)| (*wall, *rid));
+
+        let (mut phase, authorized_at_ms, endorsed) = match winner {
+            // A veto inside the fixed window is TERMINAL — unconditional,
+            // never re-litigated against `collect_expired` (which is a
+            // function of `t` and therefore not eligible to un-decide an
+            // already-decided verdict; see the fix-round-2 note above).
+            Some((_, _, ResetVerdict::Veto, _)) => (ResetPhase::Vetoed, None, false),
+            // Cooperative path: an effective endorse authorizes
+            // immediately at max(w_endorse, t_q) once quorum lands; no
+            // window ever opens (spec §4.1). Observed during Collecting
+            // with quorum never validly reached, it ages out to Expired
+            // exactly like the no-response case does (an unconsummated
+            // endorse alone authorizes nothing without quorum).
+            Some((w_wall, _, ResetVerdict::Endorse, _)) => match t_q {
+                Some(tq) => (ResetPhase::Authorized, Some((*w_wall).max(tq)), true),
+                None if collect_expired => (ResetPhase::Expired, None, false),
+                None => (ResetPhase::Collecting, None, false),
+            },
+            _ if collect_expired => (ResetPhase::Expired, None, false),
+            // Disaster path: Window until T > deadline + F with no
+            // effective veto, then Authorized at deadline + F.
+            _ => match t_q {
+                None => (ResetPhase::Collecting, None, false),
+                Some(_) => {
+                    let d = deadline.expect("t_q valid implies deadline computed");
+                    match d.checked_add(RESET_FINALITY_MS) {
+                        Some(fd) if t > fd => (ResetPhase::Authorized, Some(fd), false),
+                        _ => (ResetPhase::Window, None, false),
+                    }
+                }
+            },
+        };
+
+        // Consumed / Lapsed overlay — meaningful only once Authorized.
+        // A `c` response counts only if its wall is at/after
+        // authorization and strictly before the lapse cutoff: this is
+        // exactly why a `c` cannot exist pre-Authorized (filtered by
+        // `wall >= a`) and why a `c` arriving after Lapsed does not
+        // resurrect (filtered by `wall < cut`, so a late `c` simply
+        // fails to count and the Lapsed transition below still fires).
+        let mut consumed_new_vk = None;
+        let mut consumed_at_ms = None;
+        if phase == ResetPhase::Authorized {
+            let a = authorized_at_ms.expect("Authorized implies authorized_at_ms");
+            // Fail-closed on overflow: no cutoff means the reset never
+            // lapses (the conservative choice — it keeps the
+            // joiner-adoption rejection in place rather than lifting it).
+            let lapse_cutoff = a.checked_add(RESET_AUTHORIZED_LAPSE_MS);
+            let consumption = work
+                .responses
+                .iter()
+                .filter(|(wall, _, verdict, nv)| {
+                    matches!(verdict, ResetVerdict::Consumed)
+                        && nv.is_some()
+                        && *wall >= a
+                        && lapse_cutoff.map(|cut| *wall < cut).unwrap_or(true)
+                })
+                .min_by_key(|(wall, rid, _, _)| (*wall, *rid));
+            if let Some((c_wall, _, _, nv)) = consumption {
+                phase = ResetPhase::Consumed;
+                consumed_new_vk = *nv;
+                consumed_at_ms = Some(*c_wall);
+            } else if lapse_cutoff.map(|cut| t > cut).unwrap_or(false) {
+                phase = ResetPhase::Lapsed;
+            }
+        }
+
+        out.insert(
+            *id,
+            ResetOutcome {
+                phase,
+                deadline_ms: deadline,
+                authorized_at_ms,
+                endorsed,
+                consumed_new_vk,
+                consumed_at_ms,
+            },
+        );
+    }
+
+    out
+}
+
+/// ZEB-1031 §6.1: the set of `target_vk`s currently rejected for
+/// fresh-joiner dk-quorum adoption — Authorized (live replacement in
+/// progress) or Consumed-and-not-superseded (permanent, unless a later
+/// valid veto proves the old committee still lives under that vk).
+/// Lapsed/Vetoed/Expired proposals impose no rejection: the reset
+/// failed or was abandoned, so the old committee may be the living one.
+pub fn dfrost_reset_rejected_vks(views: &[ResetProposalView]) -> BTreeSet<[u8; 32]> {
+    let mut rejected = BTreeSet::new();
+    for view in views {
+        match view.phase {
+            ResetPhase::Authorized => {
+                rejected.insert(view.target_vk);
+            }
+            ResetPhase::Consumed if !view.consumption_superseded => {
+                rejected.insert(view.target_vk);
+            }
+            _ => {}
+        }
+    }
+    rejected
+}
+
 pub fn materialize_with_now(
     events: &[SignedMembershipEvent],
     admin_addr: OwnerAddr,
@@ -2913,6 +3666,22 @@ pub fn materialize_with_now(
     // changes) — a change landing inside a proposal's [t₀, deadline]
     // kills it (spec §3.3.4).
     let mut rec_config_change_walls: Vec<u64> = Vec::new();
+
+    // ZEB-1031: D-FROST committee-reset working state (spec §4), same
+    // shape as the recovery working state above — bind-valid proposals
+    // accumulate cosigns/responses during the main pass; lifecycle
+    // phases are evaluated in a POST-pass against the now-floor
+    // (`evaluate_reset_phases`), for the same R4-6 reason recovery
+    // uses one: execution/authorization is triggered by TIME passing,
+    // not by any event.
+    let mut reset_work: BTreeMap<EventId, ResetWork> = BTreeMap::new();
+    // Forward-ref cosigns (ZEB-250 R2(b) pattern, mirrors
+    // rec_pending_cosigns): (wall, actor) per unseen target proposal.
+    let mut pending_reset_cosigns: std::collections::HashMap<EventId, Vec<QueuedResetCosign>> =
+        std::collections::HashMap::new();
+    // Forward-ref responses, keyed by unseen target proposal id.
+    let mut pending_reset_responses: std::collections::HashMap<EventId, Vec<QueuedResetResponse>> =
+        std::collections::HashMap::new();
 
     for (idx, event) in sorted.iter().enumerate() {
         match &event.kind {
@@ -3878,6 +4647,92 @@ pub fn materialize_with_now(
                     rec_vetoes.push((*target_event_id, event.at.wall_ms, event.actor));
                 }
             }
+            MembershipEventKind::DfrostResetProposal {
+                target_vk,
+                target_epoch,
+                new_members,
+                new_threshold,
+                veto_window_ms,
+            } => {
+                // ZEB-1031: verify_event (RS-P1-P5) already gated this
+                // event before it reached the log — unlike
+                // RecoveryProposal there is no versioned config digest
+                // to re-check at bind time, so the work entry is
+                // created unconditionally.
+                let mut work = ResetWork {
+                    proposer: event.actor,
+                    space_id: event.community_id,
+                    target_vk: *target_vk,
+                    target_epoch: *target_epoch,
+                    new_members: new_members.clone(),
+                    new_threshold: *new_threshold,
+                    veto_window_ms: *veto_window_ms,
+                    t0_wall_ms: event.at.wall_ms,
+                    signers: BTreeSet::from([event.actor]),
+                    t_q_reached: None,
+                    effective_quorum: None,
+                    responses: Vec::new(),
+                };
+                if let Some(queued) = pending_reset_cosigns.remove(&event.id) {
+                    for cosign in queued {
+                        fold_reset_cosign(&mut work, cosign.actor);
+                    }
+                }
+                // ZEB-1031 review I1/I2: ZEB-250 R2 fix (a)'s catch-up
+                // rule, applied at the proposal's OWN position — this
+                // one check covers both the self-satisfy path
+                // (admin_quorum == 1, proposer alone) and a
+                // forward-ref drain that already reached quorum before
+                // the proposer's arm ran. Deliberately uses the
+                // proposal's own wall (t0), never a queued cosign's —
+                // see `ResetWork::t_q_reached`.
+                maybe_tip_reset_quorum(&mut work, m.admin_quorum, event.at.wall_ms);
+                if let Some(queued) = pending_reset_responses.remove(&event.id) {
+                    for response in queued {
+                        fold_reset_response(&mut work, event.id, response);
+                    }
+                }
+                reset_work.insert(event.id, work);
+            }
+            MembershipEventKind::DfrostResetCosign { target_event_id } => {
+                if let Some(work) = reset_work.get_mut(target_event_id) {
+                    // Live arm: this cosign's own wall cannot precede
+                    // t0 (it would have sorted into the forward-ref
+                    // queue instead — see `ResetWork::t_q_reached`), so
+                    // crediting it directly is safe.
+                    if fold_reset_cosign(work, event.actor) {
+                        maybe_tip_reset_quorum(work, m.admin_quorum, event.at.wall_ms);
+                    }
+                } else {
+                    pending_reset_cosigns
+                        .entry(*target_event_id)
+                        .or_default()
+                        .push(QueuedResetCosign { actor: event.actor });
+                }
+            }
+            MembershipEventKind::DfrostResetResponse {
+                target_event_id,
+                verdict,
+                group_sig,
+                new_vk,
+            } => {
+                let response = QueuedResetResponse {
+                    wall_ms: event.at.wall_ms,
+                    response_id: event.id,
+                    actor: event.actor,
+                    verdict: *verdict,
+                    group_sig: *group_sig,
+                    new_vk: *new_vk,
+                };
+                if let Some(work) = reset_work.get_mut(target_event_id) {
+                    fold_reset_response(work, *target_event_id, response);
+                } else {
+                    pending_reset_responses
+                        .entry(*target_event_id)
+                        .or_default()
+                        .push(response);
+                }
+            }
         }
 
         // PR #497 R2 (Greptile P1): refresh each open proposal's
@@ -3995,6 +4850,59 @@ pub fn materialize_with_now(
         .collect();
     view.sort_by_key(|v| (v.proposed_at_wall_ms, v.id));
     m.recovery_proposals = view;
+
+    // ZEB-1031: evaluate every reset proposal's lifecycle at the same
+    // now-floor (spec §4 — pure derived state), then build the derived
+    // view for RS-P5/RS-R1/RS-R3 and the D9 UI, sorted by (t₀, id) for
+    // deterministic encoding (mirrors recovery_proposals above).
+    let reset_outcomes = evaluate_reset_phases(&reset_work, current_max_wall_ms);
+    let mut reset_view: Vec<ResetProposalView> = reset_work
+        .iter()
+        .map(|(id, work)| {
+            let outcome = &reset_outcomes[id];
+            ResetProposalView {
+                id: *id,
+                proposer: work.proposer,
+                target_vk: work.target_vk,
+                target_epoch: work.target_epoch,
+                new_members: work.new_members.clone(),
+                new_threshold: work.new_threshold,
+                veto_window_ms: work.veto_window_ms,
+                signers: work.signers.clone(),
+                proposed_at_wall_ms: work.t0_wall_ms,
+                deadline_ms: outcome.deadline_ms,
+                authorized_at_ms: outcome.authorized_at_ms,
+                endorsed: outcome.endorsed,
+                phase: outcome.phase,
+                consumed_new_vk: outcome.consumed_new_vk,
+                consumption_superseded: false,
+                effective_quorum: work.effective_quorum,
+            }
+        })
+        .collect();
+    reset_view.sort_by_key(|v| (v.proposed_at_wall_ms, v.id));
+
+    // ZEB-1031 §6.1 supersession: a Consumed rejection for target_vk is
+    // lifted by any LATER (by wall) valid veto response threshold-
+    // signed under that same target_vk, on ANY reset proposal — not
+    // necessarily this one (admins can author a fresh proposal purely
+    // as a veto vehicle once the original lapses/consumes, spec §6.1).
+    for view in reset_view.iter_mut() {
+        if view.phase != ResetPhase::Consumed {
+            continue;
+        }
+        let consumed_at = reset_outcomes[&view.id]
+            .consumed_at_ms
+            .expect("Consumed implies consumed_at_ms");
+        let tv = view.target_vk;
+        view.consumption_superseded = reset_work.values().any(|w| {
+            w.target_vk == tv
+                && w.responses.iter().any(|(wall, _, verdict, _)| {
+                    matches!(verdict, ResetVerdict::Veto) && *wall > consumed_at
+                })
+        });
+    }
+    m.reset_proposals = reset_view;
 
     m
 }
@@ -4702,6 +5610,157 @@ pub fn verify_event(
                 return Err(VerifyError::RecoveryVetoTargetIdMalformed);
             }
         }
+        MembershipEventKind::DfrostResetProposal {
+            new_members,
+            new_threshold,
+            veto_window_ms,
+            ..
+        } => {
+            // ZEB-1031 §3.1 — gates RS-P1-RS-P5.
+
+            // RS-P1: actor is a currently-Joined power-100 admin. Unlike
+            // ZEB-713 recovery, ordinary admins exist for this action —
+            // deliberately NO bootstrap exception (reset proposers are
+            // ordinary live admins).
+            let reset_proposer_power = prior_state
+                .power_levels
+                .get(&event.actor)
+                .copied()
+                .unwrap_or(0);
+            if reset_proposer_power != 100 || !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::DfrostResetProposalActorNotAdmin);
+            }
+            // RS-P2: new_members sorted ascending, deduped, len >= 2;
+            // every member currently Joined (mirrors
+            // check_ceremony_init_admissible's sorted/dedup/len logic,
+            // community_dfrost_log.rs:1606).
+            let mut sorted_members = new_members.clone();
+            sorted_members.sort();
+            sorted_members.dedup();
+            if sorted_members != *new_members
+                || new_members.len() < 2
+                || !new_members
+                    .iter()
+                    .all(|member| is_joined_member(prior_state, member))
+            {
+                return Err(VerifyError::DfrostResetProposalBadMembers);
+            }
+            // RS-P3: 2 <= new_threshold <= new_members.len().
+            let Ok(member_count) = u16::try_from(new_members.len()) else {
+                return Err(VerifyError::DfrostResetProposalBadThreshold);
+            };
+            if *new_threshold < 2 || *new_threshold > member_count {
+                return Err(VerifyError::DfrostResetProposalBadThreshold);
+            }
+            // RS-P4: veto_window_ms within the clamp.
+            if *veto_window_ms < RESET_VETO_WINDOW_FLOOR_MS
+                || *veto_window_ms > RESET_VETO_WINDOW_CEILING_MS
+            {
+                return Err(VerifyError::DfrostResetProposalBadWindow);
+            }
+            // RS-P5: actor has no other open (Collecting/Window/
+            // Authorized) reset proposal — structural spam bound,
+            // mirrors RP6. Reads the derived view built by
+            // `evaluate_reset_phases`'s materialize post-pass
+            // (behavioural coverage: `reset_lifecycle_tests::rsp5_*`).
+            let has_open = prior_state.reset_proposals.iter().any(|p| {
+                p.proposer == event.actor
+                    && matches!(
+                        p.phase,
+                        ResetPhase::Collecting | ResetPhase::Window | ResetPhase::Authorized
+                    )
+            });
+            if has_open {
+                return Err(VerifyError::DfrostResetProposalActorHasOpenProposal);
+            }
+        }
+        MembershipEventKind::DfrostResetCosign { target_event_id } => {
+            // ZEB-1031 §3.2 RS-C1 (static half): actor Joined power-100.
+            // Distinctness and quorum counting are materialize-time
+            // concerns (lenient forward-ref, mirrors AdminCountersign /
+            // RecoveryCosign).
+            let reset_cosign_power = prior_state
+                .power_levels
+                .get(&event.actor)
+                .copied()
+                .unwrap_or(0);
+            if reset_cosign_power != 100 || !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::DfrostResetCosignActorNotAdmin);
+            }
+            if target_event_id.iter().all(|b| *b == 0) {
+                return Err(VerifyError::DfrostResetCosignTargetIdMalformed);
+            }
+        }
+        MembershipEventKind::DfrostResetResponse {
+            target_event_id,
+            verdict,
+            group_sig,
+            new_vk,
+        } => {
+            // ZEB-1031 §3.3 — gates RS-R1, RS-R2 (lenient forward-ref,
+            // no dedicated discriminant), RS-R3, RS-R4.
+
+            // RS-R4: new_vk present iff verdict == Consumed.
+            let shape_ok = match verdict {
+                ResetVerdict::Consumed => new_vk.is_some(),
+                ResetVerdict::Endorse | ResetVerdict::Veto => new_vk.is_none(),
+            };
+            if !shape_ok {
+                return Err(VerifyError::DfrostResetResponseShapeInvalid);
+            }
+            // RS-R1 (actor half): actor must be currently Joined.
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::DfrostResetResponseActorNotEligible);
+            }
+            // RS-R2/R3/R1 (consumed-membership half): lenient forward-ref
+            // — when the target proposal is not yet in the derived view,
+            // skip the proposal-dependent halves (materialize re-checks
+            // once the proposal lands; mirrors RecoveryCosign's
+            // forward-ref comment above).
+            if let Some(target) = prior_state
+                .reset_proposals
+                .iter()
+                .find(|p| p.id == *target_event_id)
+            {
+                // RS-R1 (consumed half): a `c` author must be a pinned
+                // successor member — the courier gate; the threshold
+                // signature (RS-R3) is the real authorization.
+                if matches!(verdict, ResetVerdict::Consumed)
+                    && !target.new_members.contains(&event.actor)
+                {
+                    return Err(VerifyError::DfrostResetResponseActorNotEligible);
+                }
+                // RS-R3: recompute the binding digest and verify the
+                // threshold Schnorr signature against the verdict's
+                // domain-tagged message hash. Fail-closed on digest
+                // encode error (recovery_config_digest discipline).
+                let digest = dfrost_reset_digest(
+                    &ctx.expected_community_id,
+                    &target.id,
+                    &target.target_vk,
+                    target.target_epoch,
+                    &target.new_members,
+                    target.new_threshold,
+                )
+                .map_err(|_| VerifyError::DfrostResetResponseSigInvalid)?;
+                let (domain, verify_vk) = match verdict {
+                    ResetVerdict::Endorse => (DFROST_RESET_ENDORSE_DOMAIN, &target.target_vk),
+                    ResetVerdict::Veto => (DFROST_RESET_VETO_DOMAIN, &target.target_vk),
+                    // RS-R4 already guarantees new_vk is Some here.
+                    ResetVerdict::Consumed => (
+                        DFROST_RESET_CONSUMED_DOMAIN,
+                        new_vk.as_ref().expect("RS-R4 shape gate guarantees Some"),
+                    ),
+                };
+                let message_hash = dfrost_reset_message_hash(domain, &digest, new_vk.as_ref());
+                crate::community_dfrost_crypto::verify_schnorr_signature(
+                    verify_vk,
+                    &message_hash,
+                    group_sig,
+                )
+                .map_err(|_| VerifyError::DfrostResetResponseSigInvalid)?;
+            }
+        }
         MembershipEventKind::ReachabilityAnnounce { .. } => {
             // ZEB-321: membership status (RCH5) is enforced in the
             // per-kind power-rules block below, alongside the inner-sig
@@ -5108,6 +6167,13 @@ pub fn verify_event(
             // halves) are handled in the joined-membership block above.
             // Window/digest/distinctness checks are materialize-time
             // concerns (lenient forward-ref). No separate power rule.
+        }
+        MembershipEventKind::DfrostResetProposal { .. }
+        | MembershipEventKind::DfrostResetCosign { .. }
+        | MembershipEventKind::DfrostResetResponse { .. } => {
+            // ZEB-1031: all reset gates (RS-P1-P5, RS-C1, RS-R1/R3/R4)
+            // are handled in the joined-membership block above. No
+            // separate power rule.
         }
         MembershipEventKind::ReachabilityAnnounce { payload } => {
             // ZEB-321 RCH1-RCH5 enforcement.
@@ -5605,7 +6671,15 @@ pub fn verify_snapshot_event(
 /// True iff `addr` is currently a Joined member in `state`. Pure
 /// helper — no logging, no allocation. Used by verify_event to gate
 /// moderation actions and counter-signing on active membership.
-fn is_joined_member(state: &MaterializedMembership, addr: &OwnerAddr) -> bool {
+///
+/// `pub(crate)` (ZEB-1031 review I1): `power_levels` entries are
+/// deliberately NOT cleaned up on Kick/Leave/Ban (documented above at
+/// the bootstrap-power-100 note and reiterated at every reset-side
+/// power gate — RS-P1/RS-C1/RS-R1 below all pair a power read with
+/// this check), so a kicked ex-admin or removed `nm` member would
+/// otherwise still read power-100 forever. `community_dfrost_log_engine.rs`'s
+/// `verify_reset_marker_admissible` (RS-M5) needs the same pairing.
+pub(crate) fn is_joined_member(state: &MaterializedMembership, addr: &OwnerAddr) -> bool {
     state
         .members
         .get(addr)
@@ -5767,6 +6841,40 @@ pub const RECOVERY_VETO_WINDOW_CEILING_MS: u64 = 365 * 86_400_000;
 /// delay, not authorship — it can be generous because the veto window W
 /// (≥ 7 d) already did the waiting.
 pub const RECOVERY_ROTATION_FINALITY_MS: u64 = 48 * 3_600_000;
+
+/// ZEB-1031 RS-P4 / spec §8: floor on `DfrostResetProposal.veto_window_ms`.
+/// 24h — enforced at verify time on every replica.
+pub const RESET_VETO_WINDOW_FLOOR_MS: u64 = 24 * 3_600_000;
+
+/// ZEB-1031 RS-P4 / spec §8: ceiling on `DfrostResetProposal.veto_window_ms`.
+/// 30d — same overflow/JS-number-exactness rationale as
+/// `RECOVERY_VETO_WINDOW_CEILING_MS`.
+pub const RESET_VETO_WINDOW_CEILING_MS: u64 = 30 * 86_400_000;
+
+/// ZEB-1031 spec §4.1/§8: disaster-path finality margin. Same VALUE as
+/// `RECOVERY_ROTATION_FINALITY_MS` but a separate constant per spec §8
+/// ("same value ... separate constant") — the two ceremonies are
+/// independently tunable even though they start identical.
+pub const RESET_FINALITY_MS: u64 = 48 * 3_600_000;
+
+/// ZEB-1031 spec §4.1/§8: an Authorized reset unconsumed for this long
+/// lapses (Authorized → Lapsed), lifting the joiner-adoption rejection
+/// so a failed/abandoned reset cannot permanently freeze adoption of a
+/// living committee.
+pub const RESET_AUTHORIZED_LAPSE_MS: u64 = 30 * 86_400_000;
+
+/// ZEB-1031 spec §3.3: domain tag for the endorse verdict's signed
+/// message hash. Verified against the proposal's claimed `target_vk`.
+pub const DFROST_RESET_ENDORSE_DOMAIN: &str = "harmony-dfrost-reset-endorse-v1";
+
+/// ZEB-1031 spec §3.3: domain tag for the veto verdict's signed message
+/// hash. Verified against the proposal's claimed `target_vk`.
+pub const DFROST_RESET_VETO_DOMAIN: &str = "harmony-dfrost-reset-veto-v1";
+
+/// ZEB-1031 spec §3.3: domain tag for the consumed verdict's signed
+/// message hash. Verified against the response's own `new_vk` — the
+/// successor committee attesting its own birth (§4.3).
+pub const DFROST_RESET_CONSUMED_DOMAIN: &str = "harmony-dfrost-reset-consumed-v1";
 
 /// ZEB-714: for a `pending_rotation_for` target whose kick was DERIVED
 /// by recovery execution (no Kick/Leave event exists to cite), the
@@ -15755,6 +16863,2230 @@ mod zeb_713_recovery_verify_tests {
             verify_event(&evt, &w.prior, &w.ctx),
             Err(VerifyError::RecoveryVetoTargetIdMalformed)
         );
+    }
+}
+
+// ── ZEB-1031 Task 1: D-FROST committee-reset verify_event tests ──────────────
+
+#[cfg(test)]
+mod reset_verify_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xd1; 16]);
+
+    fn hlc(wall_ms: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: dev.into(),
+        }
+    }
+
+    fn joined_state(wall_ms: u64, dev: &str) -> MemberState {
+        MemberState {
+            status: MemberStatus::Joined,
+            joined_at: hlc(wall_ms, dev),
+            left_at: None,
+            enrolled_device_keys: BTreeSet::new(),
+            revoked_device_keys: BTreeSet::new(),
+        }
+    }
+
+    fn sign_with_identity(payload: EventPayload, owner: &TestOwner) -> SignedMembershipEvent {
+        sign_event(&payload, &owner.device_key).expect("sign_event must succeed")
+    }
+
+    /// Fixture world: one power-100 admin (proposer/cosigner), two
+    /// Joined regular members (the reset's pinned successor set), and
+    /// one further Joined regular member NOT in that set (used for
+    /// RS-R1 eligibility tests).
+    struct World {
+        admin: TestOwner,
+        m1: TestOwner,
+        m2: TestOwner,
+        member: TestOwner,
+        prior: MaterializedMembership,
+        ctx: VerifyContext,
+    }
+
+    fn world() -> World {
+        let admin = mint_test_owner(0x21);
+        let m1 = mint_test_owner(0x22);
+        let m2 = mint_test_owner(0x23);
+        let member = mint_test_owner(0x24);
+        let mut prior = MaterializedMembership::default();
+        for (o, dev) in [(&admin, "a"), (&m1, "m1"), (&m2, "m2"), (&member, "m")] {
+            prior.members.insert(o.owner, joined_state(0, dev));
+        }
+        prior.power_levels.insert(admin.owner, 100);
+        for o in [&admin, &m1, &m2, &member] {
+            test_enroll_member(&mut prior, o);
+        }
+        let ctx = VerifyContext {
+            now_ms: None,
+            expected_community_id: COM,
+            admin_addr: admin.owner,
+            is_invite_only: false,
+        };
+        World {
+            admin,
+            m1,
+            m2,
+            member,
+            prior,
+            ctx,
+        }
+    }
+
+    /// `[m1, m2]` sorted ascending by `OwnerAddr` bytes — the shape
+    /// RS-P2 requires.
+    fn sorted_new_members(w: &World) -> Vec<OwnerAddr> {
+        let mut v = vec![w.m1.owner, w.m2.owner];
+        v.sort();
+        v
+    }
+
+    fn proposal_event(
+        actor: &TestOwner,
+        target_vk: [u8; 32],
+        target_epoch: u64,
+        new_members: Vec<OwnerAddr>,
+        new_threshold: u16,
+        veto_window_ms: u64,
+    ) -> SignedMembershipEvent {
+        sign_with_identity(
+            EventPayload {
+                id: [0x81; 16],
+                community_id: COM,
+                kind: MembershipEventKind::DfrostResetProposal {
+                    target_vk,
+                    target_epoch,
+                    new_members,
+                    new_threshold,
+                    veto_window_ms,
+                },
+                actor: actor.owner,
+                at: hlc(10_000, "p"),
+            },
+            actor,
+        )
+    }
+
+    fn cosign_event(actor: &TestOwner, target: EventId) -> SignedMembershipEvent {
+        sign_with_identity(
+            EventPayload {
+                id: [0x82; 16],
+                community_id: COM,
+                kind: MembershipEventKind::DfrostResetCosign {
+                    target_event_id: target,
+                },
+                actor: actor.owner,
+                at: hlc(10_100, "c"),
+            },
+            actor,
+        )
+    }
+
+    fn response_event(
+        actor: &TestOwner,
+        target: EventId,
+        verdict: ResetVerdict,
+        group_sig: [u8; 64],
+        new_vk: Option<[u8; 32]>,
+    ) -> SignedMembershipEvent {
+        sign_with_identity(
+            EventPayload {
+                id: [0x83; 16],
+                community_id: COM,
+                kind: MembershipEventKind::DfrostResetResponse {
+                    target_event_id: target,
+                    verdict,
+                    group_sig,
+                    new_vk,
+                },
+                actor: actor.owner,
+                at: hlc(10_200, "r"),
+            },
+            actor,
+        )
+    }
+
+    /// Push a `ResetProposalView` directly into `w.prior.reset_proposals`
+    /// — the Task 2 materialize post-pass isn't implemented yet, so
+    /// tests that need a "target proposal in the log" for RS-R1/RS-R3's
+    /// proposal-dependent halves construct the derived view by hand,
+    /// exactly like `zeb_713_recovery_verify_tests`'s
+    /// `rp6_open_proposal_by_same_actor_rejected` does for
+    /// `recovery_proposals`.
+    /// Bundles the proposal-data fields for `push_target_proposal` so
+    /// that helper stays under clippy's `too_many_arguments` limit.
+    struct TargetProposalFields {
+        target_vk: [u8; 32],
+        target_epoch: u64,
+        new_members: Vec<OwnerAddr>,
+        new_threshold: u16,
+    }
+
+    fn push_target_proposal(
+        w: &mut World,
+        id: EventId,
+        proposer: OwnerAddr,
+        fields: TargetProposalFields,
+        phase: ResetPhase,
+    ) {
+        w.prior.reset_proposals.push(ResetProposalView {
+            id,
+            proposer,
+            target_vk: fields.target_vk,
+            target_epoch: fields.target_epoch,
+            new_members: fields.new_members,
+            new_threshold: fields.new_threshold,
+            veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
+            signers: BTreeSet::from([proposer]),
+            proposed_at_wall_ms: 10_000,
+            deadline_ms: None,
+            authorized_at_ms: None,
+            endorsed: false,
+            phase,
+            consumed_new_vk: None,
+            consumption_superseded: false,
+            effective_quorum: None,
+        });
+    }
+
+    /// A locally-generated (non-threshold) FROST-Ristretto255 keypair.
+    /// A single-party Schnorr signature under this key is verified by
+    /// exactly the same `verify_schnorr_signature` helper a real
+    /// threshold-aggregated signature is (indistinguishable on the
+    /// wire), so it is sufficient for exercising RS-R3.
+    fn test_keypair(seed: u8) -> (frost_ristretto255::SigningKey, [u8; 32]) {
+        let sk = frost_ristretto255::SigningKey::deserialize(&[seed; 32]).expect("valid scalar");
+        let vk = frost_ristretto255::VerifyingKey::from(&sk);
+        let vk_bytes = crate::community_dfrost_crypto::verifying_key_to_bytes(&vk);
+        (sk, vk_bytes)
+    }
+
+    fn sign_reset_message(
+        sk: &frost_ristretto255::SigningKey,
+        domain: &'static str,
+        digest: &[u8; 32],
+        new_vk: Option<&[u8; 32]>,
+    ) -> [u8; 64] {
+        let msg = dfrost_reset_message_hash(domain, digest, new_vk);
+        let sig = sk.sign(frost_ristretto255::rand_core::OsRng, &msg);
+        let bytes = sig.serialize().expect("sig serialize");
+        bytes.try_into().expect("schnorr signature is 64 bytes")
+    }
+
+    // ── RS-P1 (DfrostResetProposal actor) ──
+
+    #[test]
+    fn rsp1_non_admin_proposer_rejected() {
+        let w = world();
+        let evt = proposal_event(
+            &w.member,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalActorNotAdmin)
+        );
+    }
+
+    #[test]
+    fn rsp1_power100_proposer_accepted() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RS-P2 (new_members shape) ──
+
+    #[test]
+    fn rsp2_unsorted_members_rejected() {
+        let w = world();
+        let mut new_members = sorted_new_members(&w);
+        new_members.reverse();
+        // Only meaningful if m1 != m2 (mint_test_owner is deterministic
+        // per seed, so this always holds), otherwise reverse() is a
+        // no-op and the test would vacuously pass.
+        assert_ne!(new_members, sorted_new_members(&w));
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            new_members,
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadMembers)
+        );
+    }
+
+    #[test]
+    fn rsp2_duplicate_members_rejected() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            vec![w.m1.owner, w.m1.owner],
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadMembers)
+        );
+    }
+
+    #[test]
+    fn rsp2_len1_rejected() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            vec![w.m1.owner],
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadMembers)
+        );
+    }
+
+    #[test]
+    fn rsp2_member_not_joined_rejected() {
+        let mut w = world();
+        w.prior.members.get_mut(&w.m2.owner).unwrap().status = MemberStatus::Left;
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadMembers)
+        );
+    }
+
+    // ── RS-P3 (new_threshold range) ──
+
+    #[test]
+    fn rsp3_threshold_too_low_rejected() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            1,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadThreshold)
+        );
+    }
+
+    #[test]
+    fn rsp3_threshold_too_high_rejected() {
+        let w = world();
+        let members = sorted_new_members(&w);
+        let too_high = members.len() as u16 + 1;
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            members,
+            too_high,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadThreshold)
+        );
+    }
+
+    // ── RS-P4 (veto_window_ms clamp) ──
+
+    #[test]
+    fn rsp4_window_below_floor_rejected() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS - 1,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadWindow)
+        );
+    }
+
+    #[test]
+    fn rsp4_window_above_ceiling_rejected() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            2,
+            RESET_VETO_WINDOW_CEILING_MS + 1,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalBadWindow)
+        );
+    }
+
+    #[test]
+    fn rsp4_window_floor_accepted() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    #[test]
+    fn rsp4_window_ceiling_accepted() {
+        let w = world();
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            sorted_new_members(&w),
+            2,
+            RESET_VETO_WINDOW_CEILING_MS,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RS-P5 (open-proposal spam bound) ──
+    //
+    // Fix round 1 (review I1): behaviourally exercise both halves of the
+    // predicate — proposer match AND phase-in-{Collecting,Window,Authorized}
+    // — via `push_target_proposal`, the same hand-constructed-view technique
+    // `rsr1_consumed_actor_not_pinned_member_rejected`/`rsr3_*` already use.
+    // (These tests construct the view by hand to isolate the static gate
+    // logic; `reset_lifecycle_tests::rsp5_behavioural_*` covers the same
+    // gate end-to-end through the real materialize post-pass.)
+
+    #[test]
+    fn rsp5_open_proposal_by_same_actor_rejected() {
+        let mut w = world();
+        let admin_owner = w.admin.owner;
+        let new_members = sorted_new_members(&w);
+        push_target_proposal(
+            &mut w,
+            [0x99; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk: [0xAA; 32],
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Collecting,
+        );
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            new_members,
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetProposalActorHasOpenProposal)
+        );
+    }
+
+    #[test]
+    fn rsp5_terminal_proposal_does_not_block() {
+        let mut w = world();
+        let admin_owner = w.admin.owner;
+        let new_members = sorted_new_members(&w);
+        push_target_proposal(
+            &mut w,
+            [0x99; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk: [0xAA; 32],
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Vetoed,
+        );
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            new_members,
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    #[test]
+    fn rsp5_open_proposal_by_different_actor_does_not_block() {
+        let mut w = world();
+        // A second power-100 admin whose open proposal must NOT block
+        // w.admin's own proposal — exercises the proposer-match half of
+        // the predicate independently of the phase-set half.
+        let admin2 = mint_test_owner(0x25);
+        w.prior.members.insert(admin2.owner, joined_state(0, "a2"));
+        w.prior.power_levels.insert(admin2.owner, 100);
+        test_enroll_member(&mut w.prior, &admin2);
+        let new_members = sorted_new_members(&w);
+        push_target_proposal(
+            &mut w,
+            [0x99; 16],
+            admin2.owner,
+            TargetProposalFields {
+                target_vk: [0xAA; 32],
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Collecting,
+        );
+        let evt = proposal_event(
+            &w.admin,
+            [0xAA; 32],
+            1,
+            new_members,
+            2,
+            RESET_VETO_WINDOW_FLOOR_MS,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RS-C1 (DfrostResetCosign actor) ──
+
+    #[test]
+    fn rsc1_non_admin_cosigner_rejected() {
+        let w = world();
+        let evt = cosign_event(&w.member, [0x81; 16]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetCosignActorNotAdmin)
+        );
+    }
+
+    #[test]
+    fn rsc1_zero_target_rejected() {
+        let w = world();
+        let evt = cosign_event(&w.admin, [0u8; 16]);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetCosignTargetIdMalformed)
+        );
+    }
+
+    #[test]
+    fn rsc1_valid_forward_ref_accepted() {
+        // Target proposal not in the log — lenient forward-ref, mirrors
+        // AdminCountersign / RecoveryCosign.
+        let w = world();
+        let evt = cosign_event(&w.admin, [0x81; 16]);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RS-R1 (DfrostResetResponse actor eligibility) ──
+
+    #[test]
+    fn rsr1_consumed_actor_not_pinned_member_rejected() {
+        let mut w = world();
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk: [0xAA; 32],
+                target_epoch: 1,
+                new_members,
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        // `w.member` is Joined but NOT in the pinned new_members set.
+        let evt = response_event(
+            &w.member,
+            [0x91; 16],
+            ResetVerdict::Consumed,
+            [0u8; 64],
+            Some([0xBB; 32]),
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseActorNotEligible)
+        );
+    }
+
+    #[test]
+    fn rsr1_endorse_veto_from_any_joined_member_passes_actor_gate() {
+        // Forward-ref (no target pushed): RS-R1's unconditional
+        // "actor Joined" half is the only check that can fire, and any
+        // Joined member — not just a pinned successor member — passes
+        // it for endorse/veto.
+        let w = world();
+        let evt = response_event(
+            &w.member,
+            [0x91; 16],
+            ResetVerdict::Endorse,
+            [0u8; 64],
+            None,
+        );
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+        let evt = response_event(&w.member, [0x92; 16], ResetVerdict::Veto, [0u8; 64], None);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // ── RS-R3 (group_sig verification) ──
+
+    #[test]
+    fn rsr3_bad_sig_rejected() {
+        let mut w = world();
+        let (_sk, target_vk) = test_keypair(0x01);
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk,
+                target_epoch: 1,
+                new_members,
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        // Garbage signature — the target proposal IS in the log, so
+        // RS-R3 must actually run (not skip via forward-ref leniency).
+        let evt = response_event(
+            &w.admin,
+            [0x91; 16],
+            ResetVerdict::Endorse,
+            [0xFF; 64],
+            None,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseSigInvalid)
+        );
+    }
+
+    #[test]
+    fn rsr3_valid_endorse_sig_accepted() {
+        let mut w = world();
+        let (sk, target_vk) = test_keypair(0x02);
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        let digest = dfrost_reset_digest(&COM, &[0x91; 16], &target_vk, 1, &new_members, 2)
+            .expect("digest encode");
+        let sig = sign_reset_message(&sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        let evt = response_event(&w.admin, [0x91; 16], ResetVerdict::Endorse, sig, None);
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    #[test]
+    fn rsr3_valid_consumed_sig_accepted() {
+        let mut w = world();
+        // Consumed is verified against `new_vk` (the successor
+        // committee's own key), never `target_vk` — so `target_vk` here
+        // is just data pinned on the proposal, not a key anyone signs
+        // under.
+        let target_vk = [0xAA; 32];
+        let (successor_sk, new_vk) = test_keypair(0x03);
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        let digest = dfrost_reset_digest(&COM, &[0x91; 16], &target_vk, 1, &new_members, 2)
+            .expect("digest encode");
+        let sig = sign_reset_message(
+            &successor_sk,
+            DFROST_RESET_CONSUMED_DOMAIN,
+            &digest,
+            Some(&new_vk),
+        );
+        // Author must be a pinned successor member for RS-R1's consumed
+        // half; w.m1 is in new_members.
+        let evt = response_event(&w.m1, [0x91; 16], ResetVerdict::Consumed, sig, Some(new_vk));
+        assert_eq!(verify_event(&evt, &w.prior, &w.ctx), Ok(()));
+    }
+
+    // Fix round 1 (review I2): domain separation across verdicts. A
+    // threshold signature the committee produced under one domain-tagged
+    // message must never verify under another verdict's message — the
+    // whole reason three separate domain tags exist (spec §3.3). Sign
+    // under one domain, submit labelled as a DIFFERENT verdict, and
+    // confirm RS-R3 rejects it (rather than accidentally accepting
+    // because the digest and vk happen to match).
+
+    #[test]
+    fn rsr3_endorse_sig_rejected_when_relabelled_veto() {
+        let mut w = world();
+        let (sk, target_vk) = test_keypair(0x04);
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        let digest = dfrost_reset_digest(&COM, &[0x91; 16], &target_vk, 1, &new_members, 2)
+            .expect("digest encode");
+        // Signed under the ENDORSE domain...
+        let sig = sign_reset_message(&sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        // ...but submitted as a Veto response.
+        let evt = response_event(&w.admin, [0x91; 16], ResetVerdict::Veto, sig, None);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseSigInvalid)
+        );
+    }
+
+    // ZEB-1031 Task 6: direct pin (rather than relying only on the
+    // relabelled-sig rejections above) — endorse and veto derive
+    // DIFFERENT message hashes from the SAME digest, since Task 6's
+    // sign-ceremony domain selection depends on this holding for every
+    // digest, not just the fixture digests those tests happen to use.
+    #[test]
+    fn dfrost_reset_message_hash_domain_separated_endorse_veto() {
+        let digest = [0x5Au8; 32];
+        let endorse_hash = dfrost_reset_message_hash(DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        let veto_hash = dfrost_reset_message_hash(DFROST_RESET_VETO_DOMAIN, &digest, None);
+        assert_ne!(
+            endorse_hash, veto_hash,
+            "endorse and veto domains must never collide for the same digest"
+        );
+    }
+
+    #[test]
+    fn rsr3_veto_sig_rejected_when_relabelled_endorse() {
+        let mut w = world();
+        let (sk, target_vk) = test_keypair(0x05);
+        let new_members = sorted_new_members(&w);
+        let admin_owner = w.admin.owner;
+        push_target_proposal(
+            &mut w,
+            [0x91; 16],
+            admin_owner,
+            TargetProposalFields {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members.clone(),
+                new_threshold: 2,
+            },
+            ResetPhase::Authorized,
+        );
+        let digest = dfrost_reset_digest(&COM, &[0x91; 16], &target_vk, 1, &new_members, 2)
+            .expect("digest encode");
+        // Signed under the VETO domain...
+        let sig = sign_reset_message(&sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        // ...but submitted as an Endorse response.
+        let evt = response_event(&w.admin, [0x91; 16], ResetVerdict::Endorse, sig, None);
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseSigInvalid)
+        );
+    }
+
+    // ── RS-R4 (verdict/new_vk shape) ──
+
+    #[test]
+    fn rsr4_new_vk_present_with_endorse_rejected() {
+        let w = world();
+        let evt = response_event(
+            &w.admin,
+            [0x91; 16],
+            ResetVerdict::Endorse,
+            [0u8; 64],
+            Some([0xBB; 32]),
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseShapeInvalid)
+        );
+    }
+
+    #[test]
+    fn rsr4_new_vk_absent_with_consumed_rejected() {
+        let w = world();
+        let evt = response_event(
+            &w.admin,
+            [0x91; 16],
+            ResetVerdict::Consumed,
+            [0u8; 64],
+            None,
+        );
+        assert_eq!(
+            verify_event(&evt, &w.prior, &w.ctx),
+            Err(VerifyError::DfrostResetResponseShapeInvalid)
+        );
+    }
+
+    // ── dfrost_reset_digest input-binding matrix (review I3) ──
+    //
+    // Mirrors community_dfrost_types.rs's
+    // `derive_dkg_ceremony_id_binds_all_inputs`: same inputs must produce
+    // the same digest, and perturbing ANY single input must change it.
+    // `space_id` binds against cross-community replay and `proposal_id`
+    // binds a response to one specific proposal (spec §3.3) — neither
+    // was previously exercised.
+
+    #[test]
+    fn dfrost_reset_digest_binds_all_inputs() {
+        let space = COM;
+        let proposal_id: EventId = [0x91; 16];
+        let target_vk = [0xA1; 32];
+        let target_epoch = 7u64;
+        let new_members = vec![OwnerAddr([0x10; 16]), OwnerAddr([0x20; 16])];
+        let new_threshold = 2u16;
+
+        let base = dfrost_reset_digest(
+            &space,
+            &proposal_id,
+            &target_vk,
+            target_epoch,
+            &new_members,
+            new_threshold,
+        )
+        .expect("digest encode");
+
+        // Determinism: same inputs, same digest.
+        assert_eq!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode"),
+            "same inputs must produce the same digest"
+        );
+
+        // space_id (cross-community replay binding).
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &SpaceId([0xBB; 16]),
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // proposal_id (binds a response to one specific proposal).
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &[0x92; 16],
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // target_vk.
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &[0xA2; 32],
+                target_epoch,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // target_epoch.
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch + 1,
+                &new_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // new_members.
+        let other_members = vec![OwnerAddr([0x10; 16]), OwnerAddr([0x30; 16])];
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &other_members,
+                new_threshold,
+            )
+            .expect("digest encode")
+        );
+        // new_threshold.
+        assert_ne!(
+            base,
+            dfrost_reset_digest(
+                &space,
+                &proposal_id,
+                &target_vk,
+                target_epoch,
+                &new_members,
+                new_threshold + 1,
+            )
+            .expect("digest encode")
+        );
+    }
+}
+
+// ── ZEB-1031 Task 2: reset lifecycle evaluator + materialize integration ─────
+
+#[cfg(test)]
+mod reset_lifecycle_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xd2; 16]);
+    const VW: u64 = RESET_VETO_WINDOW_FLOOR_MS;
+    const T0: u64 = 100_000;
+    const P1: EventId = [0xC0; 16];
+    const P2: EventId = [0xC9; 16];
+
+    fn admin1() -> OwnerAddr {
+        OwnerAddr([0x01; 16])
+    }
+    fn admin2() -> OwnerAddr {
+        OwnerAddr([0x02; 16])
+    }
+    fn admin3() -> OwnerAddr {
+        OwnerAddr([0x03; 16])
+    }
+    fn m1() -> OwnerAddr {
+        OwnerAddr([0x21; 16])
+    }
+    fn m2() -> OwnerAddr {
+        OwnerAddr([0x22; 16])
+    }
+    fn new_members() -> Vec<OwnerAddr> {
+        // Already ascending: 0x21 < 0x22 (RS-P2 shape, mirrored here for
+        // realism even though materialize doesn't re-check it).
+        vec![m1(), m2()]
+    }
+
+    fn ev(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// Base world: two power-100 admins (admin_quorum raised to 2 —
+    /// case 1 in the task brief needs a real 2-signer quorum) and the
+    /// two pinned successor members, all Joined.
+    fn base_events() -> Vec<SignedMembershipEvent> {
+        vec![
+            ev([0xA0; 16], admin1(), 500, MembershipEventKind::Join),
+            ev([0xA1; 16], admin2(), 600, MembershipEventKind::Join),
+            ev([0xA2; 16], m1(), 700, MembershipEventKind::Join),
+            ev([0xA3; 16], m2(), 800, MembershipEventKind::Join),
+            ev(
+                [0xA4; 16],
+                admin1(),
+                900,
+                MembershipEventKind::SetPower {
+                    target: admin2(),
+                    level: 100,
+                },
+            ),
+            // admin_quorum starts at 1, so this self-satisfies at admin1
+            // alone, raising it to 2 before any reset proposal lands.
+            ev(
+                [0xA5; 16],
+                admin1(),
+                1_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+                },
+            ),
+        ]
+    }
+
+    fn proposal(id: EventId, target_vk: [u8; 32], wall_ms: u64) -> SignedMembershipEvent {
+        ev(
+            id,
+            admin1(),
+            wall_ms,
+            MembershipEventKind::DfrostResetProposal {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members(),
+                new_threshold: 2,
+                veto_window_ms: VW,
+            },
+        )
+    }
+
+    fn cosign(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        target: EventId,
+    ) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::DfrostResetCosign {
+                target_event_id: target,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn response(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        target: EventId,
+        wall_ms: u64,
+        verdict: ResetVerdict,
+        group_sig: [u8; 64],
+        new_vk: Option<[u8; 32]>,
+    ) -> SignedMembershipEvent {
+        ev(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::DfrostResetResponse {
+                target_event_id: target,
+                verdict,
+                group_sig,
+                new_vk,
+            },
+        )
+    }
+
+    fn digest_for(proposal_id: EventId, target_vk: [u8; 32]) -> [u8; 32] {
+        dfrost_reset_digest(&COM, &proposal_id, &target_vk, 1, &new_members(), 2)
+            .expect("digest encode")
+    }
+
+    fn view(m: &MaterializedMembership, id: EventId) -> &ResetProposalView {
+        m.reset_proposals
+            .iter()
+            .find(|p| p.id == id)
+            .expect("proposal view present")
+    }
+
+    /// A locally-generated (non-threshold) FROST-Ristretto255 keypair —
+    /// mirrors `reset_verify_tests::test_keypair`. A single-party
+    /// Schnorr signature under this key is verified by exactly the
+    /// same `verify_schnorr_signature` helper a real threshold-
+    /// aggregated signature is.
+    fn test_keypair(seed: u8) -> (frost_ristretto255::SigningKey, [u8; 32]) {
+        let sk = frost_ristretto255::SigningKey::deserialize(&[seed; 32]).expect("valid scalar");
+        let vk = frost_ristretto255::VerifyingKey::from(&sk);
+        let vk_bytes = crate::community_dfrost_crypto::verifying_key_to_bytes(&vk);
+        (sk, vk_bytes)
+    }
+
+    fn sign_reset_message(
+        sk: &frost_ristretto255::SigningKey,
+        domain: &'static str,
+        digest: &[u8; 32],
+        new_vk: Option<&[u8; 32]>,
+    ) -> [u8; 64] {
+        let msg = dfrost_reset_message_hash(domain, digest, new_vk);
+        let sig = sk.sign(frost_ristretto255::rand_core::OsRng, &msg);
+        let bytes = sig.serialize().expect("sig serialize");
+        bytes.try_into().expect("schnorr signature is 64 bytes")
+    }
+
+    // ── Case 1: Window then Authorized after the finality margin ──
+
+    #[test]
+    fn window_then_authorized_after_finality() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 1_000;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let deadline = t_q + VW;
+
+        let at_deadline_plus_1 = materialize_with_now(&events, admin1(), Some(deadline + 1));
+        let pv = view(&at_deadline_plus_1, P1);
+        assert_eq!(pv.phase, ResetPhase::Window);
+        assert_eq!(pv.deadline_ms, Some(deadline));
+        assert_eq!(pv.authorized_at_ms, None);
+
+        let authorized_time = deadline + RESET_FINALITY_MS + 1;
+        let authorized = materialize_with_now(&events, admin1(), Some(authorized_time));
+        let pv = view(&authorized, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert_eq!(pv.authorized_at_ms, Some(deadline + RESET_FINALITY_MS));
+        assert!(!pv.endorsed);
+    }
+
+    // ── Case 2: idle-community progression via now-floor alone ──
+
+    #[test]
+    fn idle_community_authorizes_on_now_floor_alone() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 1_000;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let deadline = t_q + VW;
+
+        // No now-floor: events_max_wall_ms alone (the cosign's wall) —
+        // nowhere near deadline + F.
+        let stuck = materialize(&events, admin1());
+        assert_eq!(view(&stuck, P1).phase, ResetPhase::Window);
+
+        let live = materialize_with_now(&events, admin1(), Some(deadline + RESET_FINALITY_MS + 1));
+        assert_eq!(view(&live, P1).phase, ResetPhase::Authorized);
+    }
+
+    // ── Case 2b: CR review round 1 — effective_quorum stays pinned ──
+
+    /// A `ChangeQuorum` proposal landing after this reset proposal has
+    /// already tipped to quorum — and even after it reaches Authorized —
+    /// must not retroactively relabel `effective_quorum`. It stays
+    /// pinned to the admin_quorum value live at the tipping event,
+    /// exactly like `t_q_reached` (ZEB-1031 review I1's ruling).
+    #[test]
+    fn effective_quorum_pinned_when_quorum_raised_after_authorization() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events(); // admin_quorum = 2 after this
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 1_000;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1)); // tips at quorum=2
+        let deadline = t_q + VW;
+        let authorized_at = deadline + RESET_FINALITY_MS;
+
+        // Raise the LIVE admin_quorum to 3 well after the tip (and after
+        // authorization) via a real 2-of-2-at-quorum-2 promote + ChangeQuorum
+        // — mirrors `materialize_proposal_effective_when_two_countersigns_reach_quorum_3`'s
+        // recipe, just under the already-raised quorum=2 baseline.
+        let admin3_join = authorized_at + 900;
+        events.push(ev(
+            [0xCF; 16],
+            admin3(),
+            admin3_join,
+            MembershipEventKind::Join,
+        ));
+        let promote_id: EventId = [0xD0; 16];
+        events.push(ev(
+            promote_id,
+            admin1(),
+            authorized_at + 1_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower {
+                    target: admin3(),
+                    level: 100,
+                },
+            },
+        ));
+        events.push(ev(
+            [0xD1; 16],
+            admin2(),
+            authorized_at + 1_100,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: promote_id,
+            },
+        ));
+        let quorum_id: EventId = [0xD2; 16];
+        events.push(ev(
+            quorum_id,
+            admin1(),
+            authorized_at + 1_200,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+            },
+        ));
+        events.push(ev(
+            [0xD3; 16],
+            admin2(),
+            authorized_at + 1_300,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: quorum_id,
+            },
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(authorized_at + 2_000));
+        assert_eq!(m.admin_quorum, 3, "live admin_quorum did raise to 3");
+
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert_eq!(
+            pv.effective_quorum,
+            Some(2),
+            "effective_quorum must stay pinned to the quorum live at the \
+             tip, not the later-raised live admin_quorum"
+        );
+    }
+
+    // ── Case 3: veto during Collecting wins over a later endorse ──
+
+    #[test]
+    fn veto_during_collecting_wins_over_later_endorse() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        // No cosign — only the proposer's signature; still Collecting.
+        let digest = digest_for(P1, target_vk);
+        let veto_wall = T0 + 100;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+        let endorse_wall = T0 + 200;
+        let endorse_sig =
+            sign_reset_message(&committee_sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC3; 16],
+            m1(),
+            P1,
+            endorse_wall,
+            ResetVerdict::Endorse,
+            endorse_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(endorse_wall + 10));
+        assert_eq!(view(&m, P1).phase, ResetPhase::Vetoed);
+    }
+
+    // ── Case 4: earlier endorse beats a later veto, authorizes immediately ──
+
+    #[test]
+    fn endorse_before_veto_wins_and_authorizes_immediately() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let digest = digest_for(P1, target_vk);
+        let w1 = T0 + 100;
+        let endorse_sig =
+            sign_reset_message(&committee_sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            w1,
+            ResetVerdict::Endorse,
+            endorse_sig,
+            None,
+        ));
+        let w2 = T0 + 200;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC3; 16],
+            m2(),
+            P1,
+            w2,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+        // Quorum lands after both responses.
+        let t_q = T0 + 300;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+
+        let m = materialize_with_now(&events, admin1(), Some(t_q + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert_eq!(pv.authorized_at_ms, Some(t_q));
+        assert!(pv.endorsed);
+    }
+
+    // ── Case 5: same-wall endorse/veto tie-break by lower event_id ──
+
+    #[test]
+    fn same_wall_endorse_veto_tie_break_by_event_id() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let digest = digest_for(P1, target_vk);
+        let tie_wall = t_q + 10;
+        let endorse_sig =
+            sign_reset_message(&committee_sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        // 0xC2 < 0xC3 — the veto's event id is lower, so it must win
+        // the tie despite being pushed second.
+        events.push(response(
+            [0xC3; 16],
+            m2(),
+            P1,
+            tie_wall,
+            ResetVerdict::Endorse,
+            endorse_sig,
+            None,
+        ));
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            tie_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(tie_wall + 10));
+        assert_eq!(view(&m, P1).phase, ResetPhase::Vetoed);
+    }
+
+    // ── Case 6: response past t_q + vw is inert ──
+
+    #[test]
+    fn late_veto_past_deadline_is_inert() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let deadline = t_q + VW;
+        let digest = digest_for(P1, target_vk);
+        let late_wall = deadline + 1;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            late_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(deadline + RESET_FINALITY_MS + 1));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert!(!pv.endorsed);
+    }
+
+    // ── Case 7: no quorum within ADMIN_PROPOSAL_EXPIRY_MS → Expired ──
+
+    #[test]
+    fn no_quorum_within_expiry_expires() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        // No cosign at all — quorum (2) never reached.
+        let m = materialize_with_now(&events, admin1(), Some(T0 + ADMIN_PROPOSAL_EXPIRY_MS + 1));
+        assert_eq!(view(&m, P1).phase, ResetPhase::Expired);
+    }
+
+    // ── Case 8: Authorized lapses unconsumed; a late `c` does not resurrect ──
+
+    #[test]
+    fn authorized_lapses_and_late_c_does_not_resurrect() {
+        let (_, target_vk) = test_keypair(0x06);
+        let (successor_sk, new_vk) = test_keypair(0x07);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let deadline = t_q + VW;
+        let authorized_at = deadline + RESET_FINALITY_MS;
+
+        let lapsed = materialize_with_now(
+            &events,
+            admin1(),
+            Some(authorized_at + RESET_AUTHORIZED_LAPSE_MS + 1),
+        );
+        let pv = view(&lapsed, P1);
+        assert_eq!(pv.phase, ResetPhase::Lapsed);
+        assert_eq!(pv.authorized_at_ms, Some(authorized_at));
+
+        // A `c` whose wall lands AFTER the lapse cutoff must not
+        // resurrect the proposal.
+        let digest = digest_for(P1, target_vk);
+        let late_c_wall = authorized_at + RESET_AUTHORIZED_LAPSE_MS + 100;
+        let c_sig = sign_reset_message(
+            &successor_sk,
+            DFROST_RESET_CONSUMED_DOMAIN,
+            &digest,
+            Some(&new_vk),
+        );
+        events.push(response(
+            [0xC4; 16],
+            m1(),
+            P1,
+            late_c_wall,
+            ResetVerdict::Consumed,
+            c_sig,
+            Some(new_vk),
+        ));
+        let still_lapsed = materialize_with_now(&events, admin1(), Some(late_c_wall + 10));
+        let pv = view(&still_lapsed, P1);
+        assert_eq!(pv.phase, ResetPhase::Lapsed);
+        assert_eq!(pv.consumed_new_vk, None);
+    }
+
+    // ── Case 9: valid consumption after Authorized; ignored pre-Authorized ──
+
+    #[test]
+    fn valid_consumption_after_authorized_consumes() {
+        let (_, target_vk) = test_keypair(0x06);
+        let (successor_sk, new_vk) = test_keypair(0x07);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let deadline = t_q + VW;
+        let authorized_at = deadline + RESET_FINALITY_MS;
+        let digest = digest_for(P1, target_vk);
+        let c_wall = authorized_at + 1_000;
+        let c_sig = sign_reset_message(
+            &successor_sk,
+            DFROST_RESET_CONSUMED_DOMAIN,
+            &digest,
+            Some(&new_vk),
+        );
+        events.push(response(
+            [0xC4; 16],
+            m1(),
+            P1,
+            c_wall,
+            ResetVerdict::Consumed,
+            c_sig,
+            Some(new_vk),
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(c_wall + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Consumed);
+        assert_eq!(pv.consumed_new_vk, Some(new_vk));
+    }
+
+    #[test]
+    fn consumption_response_during_collecting_is_ignored() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let (successor_sk, new_vk) = test_keypair(0x07);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let digest = digest_for(P1, target_vk);
+        // A `c` authored during Collecting (before quorum, before ever
+        // reaching Authorized) — a pinned successor member CAN produce
+        // a validly-signed `c` at any time (spec §10: the signature is
+        // under a self-chosen new_vk), so this must be filtered by the
+        // lifecycle, not by RS-R1/RS-R3.
+        let early_c_wall = T0 + 50;
+        let c_sig = sign_reset_message(
+            &successor_sk,
+            DFROST_RESET_CONSUMED_DOMAIN,
+            &digest,
+            Some(&new_vk),
+        );
+        events.push(response(
+            [0xC4; 16],
+            m1(),
+            P1,
+            early_c_wall,
+            ResetVerdict::Consumed,
+            c_sig,
+            Some(new_vk),
+        ));
+
+        let collecting = materialize_with_now(&events, admin1(), Some(early_c_wall + 10));
+        let pv = view(&collecting, P1);
+        assert_eq!(pv.phase, ResetPhase::Collecting);
+        assert_eq!(pv.consumed_new_vk, None);
+
+        // The early `c` must not have "won" anything: quorum then a
+        // veto after it should decide the outcome normally.
+        let t_q = early_c_wall + 100;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let veto_wall = t_q + 50;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC5; 16],
+            m2(),
+            P1,
+            veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+        let vetoed = materialize_with_now(&events, admin1(), Some(veto_wall + 10));
+        assert_eq!(view(&vetoed, P1).phase, ResetPhase::Vetoed);
+    }
+
+    // ── Case 10: RS-P5 behavioural, via the real materialize path ──
+
+    /// Unlike the other cases, RS-P5's own gate lives in `verify_event`
+    /// — proving it "behavioural" means a REAL signed+enrolled actor,
+    /// not the `sig: [0;64]` placeholder the materialize-only tests
+    /// use. Mirrors `reset_verify_tests::world()`'s identity setup, but
+    /// via a materialize-derived `prior` (real `reset_proposals`)
+    /// instead of a hand-pushed view.
+    #[test]
+    fn rsp5_behavioural_open_proposal_blocks() {
+        let proposer = mint_test_owner(0x31);
+        let (_, target_vk) = test_keypair(0x06);
+        let events = vec![
+            ev([0xA0; 16], proposer.owner, 500, MembershipEventKind::Join),
+            ev([0xA1; 16], admin2(), 600, MembershipEventKind::Join),
+            ev([0xA2; 16], m1(), 700, MembershipEventKind::Join),
+            ev([0xA3; 16], m2(), 800, MembershipEventKind::Join),
+            ev(
+                [0xA4; 16],
+                proposer.owner,
+                900,
+                MembershipEventKind::SetPower {
+                    target: admin2(),
+                    level: 100,
+                },
+            ),
+            ev(
+                [0xA5; 16],
+                proposer.owner,
+                1_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+                },
+            ),
+            ev(
+                P1,
+                proposer.owner,
+                T0,
+                MembershipEventKind::DfrostResetProposal {
+                    target_vk,
+                    target_epoch: 1,
+                    new_members: new_members(),
+                    new_threshold: 2,
+                    veto_window_ms: VW,
+                },
+            ),
+        ];
+        // No cosign — still Collecting.
+        let mut prior = materialize_with_now(&events, proposer.owner, Some(T0 + 10));
+        test_enroll_member(&mut prior, &proposer);
+        assert_eq!(view(&prior, P1).phase, ResetPhase::Collecting);
+
+        let ctx = VerifyContext {
+            now_ms: Some(T0 + 10),
+            expected_community_id: COM,
+            admin_addr: proposer.owner,
+            is_invite_only: false,
+        };
+        let second_payload = EventPayload {
+            id: [0xD0; 16],
+            community_id: COM,
+            kind: MembershipEventKind::DfrostResetProposal {
+                target_vk: [0xBB; 32],
+                target_epoch: 1,
+                new_members: new_members(),
+                new_threshold: 2,
+                veto_window_ms: VW,
+            },
+            actor: proposer.owner,
+            at: Hlc {
+                wall_ms: T0 + 20,
+                logical: 0,
+                device_id: "p2".into(),
+            },
+        };
+        let second = sign_event(&second_payload, &proposer.device_key).expect("sign_event");
+        assert_eq!(
+            verify_event(&second, &prior, &ctx),
+            Err(VerifyError::DfrostResetProposalActorHasOpenProposal)
+        );
+    }
+
+    #[test]
+    fn rsp5_behavioural_terminal_proposal_does_not_block() {
+        let proposer = mint_test_owner(0x35);
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = vec![
+            ev([0xA0; 16], proposer.owner, 500, MembershipEventKind::Join),
+            ev([0xA1; 16], admin2(), 600, MembershipEventKind::Join),
+            ev([0xA2; 16], m1(), 700, MembershipEventKind::Join),
+            ev([0xA3; 16], m2(), 800, MembershipEventKind::Join),
+            ev(
+                [0xA4; 16],
+                proposer.owner,
+                900,
+                MembershipEventKind::SetPower {
+                    target: admin2(),
+                    level: 100,
+                },
+            ),
+            ev(
+                [0xA5; 16],
+                proposer.owner,
+                1_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+                },
+            ),
+            ev(
+                P1,
+                proposer.owner,
+                T0,
+                MembershipEventKind::DfrostResetProposal {
+                    target_vk,
+                    target_epoch: 1,
+                    new_members: new_members(),
+                    new_threshold: 2,
+                    veto_window_ms: VW,
+                },
+            ),
+        ];
+        let digest = digest_for(P1, target_vk);
+        let veto_wall = T0 + 50;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        let mut prior = materialize_with_now(&events, proposer.owner, Some(veto_wall + 10));
+        test_enroll_member(&mut prior, &proposer);
+        assert_eq!(view(&prior, P1).phase, ResetPhase::Vetoed);
+
+        let ctx = VerifyContext {
+            now_ms: Some(veto_wall + 10),
+            expected_community_id: COM,
+            admin_addr: proposer.owner,
+            is_invite_only: false,
+        };
+        let second_payload = EventPayload {
+            id: [0xD0; 16],
+            community_id: COM,
+            kind: MembershipEventKind::DfrostResetProposal {
+                target_vk: [0xBB; 32],
+                target_epoch: 1,
+                new_members: new_members(),
+                new_threshold: 2,
+                veto_window_ms: VW,
+            },
+            actor: proposer.owner,
+            at: Hlc {
+                wall_ms: veto_wall + 20,
+                logical: 0,
+                device_id: "p2".into(),
+            },
+        };
+        let second = sign_event(&second_payload, &proposer.device_key).expect("sign_event");
+        assert_eq!(verify_event(&second, &prior, &ctx), Ok(()));
+    }
+
+    // ── Case 11: dfrost_reset_rejected_vks + §6.1 supersession ──
+
+    #[test]
+    fn rejected_vks_reflects_phase() {
+        fn mk(
+            id: EventId,
+            target_vk: [u8; 32],
+            phase: ResetPhase,
+            consumption_superseded: bool,
+        ) -> ResetProposalView {
+            ResetProposalView {
+                id,
+                proposer: admin1(),
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members(),
+                new_threshold: 2,
+                veto_window_ms: VW,
+                signers: BTreeSet::from([admin1()]),
+                proposed_at_wall_ms: T0,
+                deadline_ms: None,
+                authorized_at_ms: None,
+                endorsed: false,
+                phase,
+                consumed_new_vk: None,
+                consumption_superseded,
+                effective_quorum: None,
+            }
+        }
+        let views = vec![
+            mk([0x01; 16], [0xA1; 32], ResetPhase::Authorized, false),
+            mk([0x02; 16], [0xA2; 32], ResetPhase::Consumed, false),
+            mk([0x03; 16], [0xA3; 32], ResetPhase::Lapsed, false),
+            mk([0x04; 16], [0xA4; 32], ResetPhase::Vetoed, false),
+            mk([0x05; 16], [0xA5; 32], ResetPhase::Expired, false),
+            mk([0x06; 16], [0xA6; 32], ResetPhase::Consumed, true),
+            mk([0x07; 16], [0xA7; 32], ResetPhase::Collecting, false),
+            mk([0x08; 16], [0xA8; 32], ResetPhase::Window, false),
+        ];
+        let rejected = dfrost_reset_rejected_vks(&views);
+        assert!(rejected.contains(&[0xA1; 32]), "Authorized rejected");
+        assert!(rejected.contains(&[0xA2; 32]), "Consumed rejected");
+        assert!(!rejected.contains(&[0xA3; 32]), "Lapsed not rejected");
+        assert!(!rejected.contains(&[0xA4; 32]), "Vetoed not rejected");
+        assert!(!rejected.contains(&[0xA5; 32]), "Expired not rejected");
+        assert!(
+            !rejected.contains(&[0xA6; 32]),
+            "superseded Consumed not rejected"
+        );
+        assert!(!rejected.contains(&[0xA7; 32]), "Collecting not rejected");
+        assert!(!rejected.contains(&[0xA8; 32]), "Window not rejected");
+        assert_eq!(rejected.len(), 2);
+    }
+
+    #[test]
+    fn consumed_supersession_via_later_veto_on_second_proposal() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let (successor_sk, new_vk) = test_keypair(0x07);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q1 = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q1, P1));
+        let deadline1 = t_q1 + VW;
+        let authorized_at1 = deadline1 + RESET_FINALITY_MS;
+        let digest1 = digest_for(P1, target_vk);
+        let c_wall = authorized_at1 + 1_000;
+        let c_sig = sign_reset_message(
+            &successor_sk,
+            DFROST_RESET_CONSUMED_DOMAIN,
+            &digest1,
+            Some(&new_vk),
+        );
+        events.push(response(
+            [0xC4; 16],
+            m1(),
+            P1,
+            c_wall,
+            ResetVerdict::Consumed,
+            c_sig,
+            Some(new_vk),
+        ));
+
+        // Sanity: Consumed and not yet superseded.
+        let consumed_only = materialize_with_now(&events, admin1(), Some(c_wall + 10));
+        let pv1 = view(&consumed_only, P1);
+        assert_eq!(pv1.phase, ResetPhase::Consumed);
+        assert!(!pv1.consumption_superseded);
+
+        // Admins author a second proposal against the SAME target_vk
+        // purely as a veto vehicle (spec §6.1) — the living committee
+        // proves it still lives under target_vk via a valid veto
+        // response LATER than the consumption's own wall.
+        let t2_0 = c_wall + 500;
+        events.push(proposal(P2, target_vk, t2_0));
+        let digest2 = digest_for(P2, target_vk);
+        let later_veto_wall = c_wall + 1_000;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest2, None);
+        events.push(response(
+            [0xCA; 16],
+            m1(),
+            P2,
+            later_veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(later_veto_wall + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Consumed, "phase itself unchanged");
+        assert!(pv.consumption_superseded, "rejection lifted");
+
+        let rejected = dfrost_reset_rejected_vks(&m.reset_proposals);
+        assert!(!rejected.contains(&target_vk));
+    }
+
+    // ── Case 12: checked_add overflow on t_q + vw fails closed ──
+
+    #[test]
+    fn checked_add_overflow_on_deadline_fails_closed() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        // t_q is reached validly (within 30d of t0), but veto_window_ms
+        // is chosen so t_q + vw overflows u64 — this must fail closed
+        // to Expired, never wrap to a tiny deadline and authorize.
+        let huge_vw = u64::MAX - 10;
+        events.push(ev(
+            P1,
+            admin1(),
+            T0,
+            MembershipEventKind::DfrostResetProposal {
+                target_vk,
+                target_epoch: 1,
+                new_members: new_members(),
+                new_threshold: 2,
+                veto_window_ms: huge_vw,
+            },
+        ));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+
+        let m = materialize_with_now(&events, admin1(), Some(t_q + 100));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Expired);
+        assert_eq!(pv.deadline_ms, None);
+    }
+
+    // ── Fix round 1 (review I1): dynamic quorum, ZEB-250 tipping-position
+    // semantics — a mid-collection ChangeQuorum raise is honoured ──
+
+    #[test]
+    fn admin_quorum_raised_mid_collection_requires_the_new_count() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events(); // admin_quorum == 2 here
+        events.push(ev([0xA6; 16], admin3(), 1_100, MembershipEventKind::Join));
+        events.push(ev(
+            [0xA7; 16],
+            admin1(),
+            1_200,
+            MembershipEventKind::SetPower {
+                target: admin3(),
+                level: 100,
+            },
+        ));
+        events.push(proposal(P1, target_vk, T0)); // proposer counts as signer 1 of 2
+
+        // ChangeQuorum{2 -> 3} lands mid-collection — needs 2 signatures
+        // to pass ITSELF under the OLD quorum of 2 (admin1 proposes,
+        // admin2 countersigns).
+        let raise_id: EventId = [0xA8; 16];
+        events.push(ev(
+            raise_id,
+            admin1(),
+            T0 + 10,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+            },
+        ));
+        events.push(ev(
+            [0xA9; 16],
+            admin2(),
+            T0 + 20,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: raise_id,
+            },
+        ));
+
+        // A 2nd reset cosign lands — under the OLD quorum (2) this would
+        // tip (proposer + admin2 == 2), but admin_quorum is now 3.
+        let t_q_attempt = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q_attempt, P1));
+        let still_collecting = materialize_with_now(&events, admin1(), Some(t_q_attempt + 10));
+        let pv = view(&still_collecting, P1);
+        assert_eq!(pv.phase, ResetPhase::Collecting);
+        assert_eq!(pv.deadline_ms, None);
+
+        // The 3rd signature tips it, using the LIVE (raised) quorum.
+        let t_q = t_q_attempt + 50;
+        events.push(cosign([0xC2; 16], admin3(), t_q, P1));
+        let tipped = materialize_with_now(&events, admin1(), Some(t_q + 10));
+        let pv = view(&tipped, P1);
+        assert_eq!(pv.phase, ResetPhase::Window);
+        assert_eq!(pv.deadline_ms, Some(t_q + VW));
+    }
+
+    // ── Fix round 1 (review I2): backdated cosigns must not collapse the
+    // veto window — t_q pins to the proposal's own wall (t0), never a
+    // queued cosign's ──
+
+    #[test]
+    fn backdated_cosigns_do_not_collapse_the_veto_window() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events(); // admin_quorum == 2
+                                        // Backdated cosign — wall BEFORE t0 — sorts ahead of the
+                                        // proposal in the total order and forward-ref queues. (500ms
+                                        // back, not `VW` back — T0 is small enough in this fixture that
+                                        // subtracting a full veto window would underflow u64.)
+        events.push(cosign([0xC1; 16], admin2(), T0 - 500, P1));
+        events.push(proposal(P1, target_vk, T0));
+
+        let m = materialize_with_now(&events, admin1(), Some(T0 + 10));
+        let pv = view(&m, P1);
+        // Pinned to t0 (the proposal's own wall), never the backdated
+        // cosign's wall — the FULL window, not collapsed to before t0.
+        assert_eq!(pv.deadline_ms, Some(T0 + VW));
+        assert_eq!(pv.phase, ResetPhase::Window);
+
+        // A committee veto shortly after the proposal is NOT inert — the
+        // I2 hazard would have made the window empty (deadline < t0).
+        let digest = digest_for(P1, target_vk);
+        let veto_wall = T0 + 100;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+        let vetoed = materialize_with_now(&events, admin1(), Some(veto_wall + 10));
+        assert_eq!(view(&vetoed, P1).phase, ResetPhase::Vetoed);
+    }
+
+    // ── Fix round 1 (review I3): forward-ref folding + fold_reset_response's
+    // negative paths — the I5 carry-forward obligation, exercised end to end ──
+
+    #[test]
+    fn forward_ref_cosign_before_proposal_still_counts_toward_quorum() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events(); // admin_quorum == 2
+                                        // Cosign sorts BEFORE the proposal (earlier wall) — forward-ref
+                                        // queued, then drained when the proposal's own arm runs.
+        events.push(cosign([0xC1; 16], admin2(), T0 - 500, P1));
+        events.push(proposal(P1, target_vk, T0));
+
+        let m = materialize_with_now(&events, admin1(), Some(T0 + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Window);
+        assert!(pv.signers.contains(&admin2()));
+        assert_eq!(pv.deadline_ms, Some(T0 + VW));
+    }
+
+    #[test]
+    fn forward_ref_response_before_proposal_is_folded_and_effective() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events(); // admin_quorum == 2
+        let digest = digest_for(P1, target_vk);
+        // Same wall as t0, but a lower event id — event_sort_key ties on
+        // wall_ms/logical/device_id (identical across this module's
+        // fixtures) and breaks on `id`, so this genuinely sorts BEFORE
+        // the proposal and forward-ref queues, while still landing
+        // exactly at t0 (passing the `wall >= t0` win-contest filter).
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xB0; 16],
+            m1(),
+            P1,
+            T0,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+        events.push(proposal(P1, target_vk, T0));
+
+        let m = materialize_with_now(&events, admin1(), Some(T0 + 10));
+        // The forward-ref-queued veto won — proving fold_reset_response
+        // ran (and validated) via the pending_reset_responses drain
+        // path, not only the live arm.
+        assert_eq!(view(&m, P1).phase, ResetPhase::Vetoed);
+    }
+
+    #[test]
+    fn tampered_signature_response_is_dropped_and_never_wins() {
+        let (_, target_vk) = test_keypair(0x06);
+        let (wrong_sk, _) = test_keypair(0x07); // a DIFFERENT keypair
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let digest = digest_for(P1, target_vk);
+        // Signed with the wrong key — verify_schnorr_signature rejects it
+        // against target_vk, so fold_reset_response drops it silently.
+        let bad_sig = sign_reset_message(&wrong_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        let veto_wall = T0 + 100;
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            veto_wall,
+            ResetVerdict::Veto,
+            bad_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(veto_wall + 10));
+        // A dropped response leaves the phase exactly as if it never
+        // existed — still Collecting (quorum never reached: no cosigns).
+        assert_eq!(view(&m, P1).phase, ResetPhase::Collecting);
+    }
+
+    #[test]
+    fn consumed_response_from_non_pinned_actor_is_dropped() {
+        let (_, target_vk) = test_keypair(0x06);
+        let (successor_sk, new_vk) = test_keypair(0x07);
+        let mut events = base_events(); // admin_quorum == 2
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let deadline = t_q + VW;
+        let authorized_at = deadline + RESET_FINALITY_MS;
+        let digest = digest_for(P1, target_vk);
+        let c_wall = authorized_at + 1_000;
+        // admin1 is NOT in new_members ([m1, m2]) — RS-R1's consumed-half
+        // must drop this at fold time (review I5), even though the
+        // signature itself is otherwise valid.
+        let c_sig = sign_reset_message(
+            &successor_sk,
+            DFROST_RESET_CONSUMED_DOMAIN,
+            &digest,
+            Some(&new_vk),
+        );
+        events.push(response(
+            [0xC4; 16],
+            admin1(),
+            P1,
+            c_wall,
+            ResetVerdict::Consumed,
+            c_sig,
+            Some(new_vk),
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(c_wall + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert_eq!(pv.consumed_new_vk, None);
+    }
+
+    #[test]
+    fn duplicate_cosign_from_same_admin_is_a_no_op() {
+        let (_, target_vk) = test_keypair(0x06);
+        let mut events = base_events(); // admin_quorum == 2
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        // Duplicate cosign from the SAME admin at a later wall — must not
+        // move t_q_reached (already set) or double-count the signer.
+        events.push(cosign([0xC2; 16], admin2(), t_q + 1_000, P1));
+
+        let m = materialize_with_now(&events, admin1(), Some(t_q + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.signers.len(), 2);
+        // Pinned to the FIRST cosign's wall, not the duplicate's.
+        assert_eq!(pv.deadline_ms, Some(t_q + VW));
+    }
+
+    // ── Fix round 1 (review M1): a genuinely Expired proposal (no quorum
+    // within ADMIN_PROPOSAL_EXPIRY_MS) is not overridden by a late veto ──
+
+    #[test]
+    fn late_veto_after_expiry_does_not_override_expired() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        // No cosigns at all — quorum (2) never reached.
+        let digest = digest_for(P1, target_vk);
+        let late_veto_wall = T0 + ADMIN_PROPOSAL_EXPIRY_MS + 1_000;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            late_veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(late_veto_wall + 10));
+        assert_eq!(view(&m, P1).phase, ResetPhase::Expired);
+    }
+
+    // ── Fix round 2 (review M1 regression): Vetoed is TERMINAL — an
+    // in-window veto must not flip to Expired on a later re-evaluation of
+    // the identical event log ──
+
+    #[test]
+    fn early_veto_stays_vetoed_at_any_later_evaluation_time() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        // No cosigns at all — quorum (2) never reached, so this is the
+        // exact same event log as `late_veto_after_expiry_does_not_
+        // override_expired`, EXCEPT the veto's own wall is well inside
+        // the collecting window this time.
+        let digest = digest_for(P1, target_vk);
+        let early_veto_wall = T0 + 100;
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            early_veto_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        // Evaluated shortly after the veto: Vetoed.
+        let soon = materialize_with_now(&events, admin1(), Some(early_veto_wall + 10));
+        assert_eq!(view(&soon, P1).phase, ResetPhase::Vetoed);
+
+        // Evaluated long past ADMIN_PROPOSAL_EXPIRY_MS — the SAME log,
+        // only `now_ms` differs. Must still be Vetoed: the veto already
+        // decided this proposal's fate inside the collecting window: a
+        // later evaluation time cannot un-decide it.
+        let much_later = materialize_with_now(
+            &events,
+            admin1(),
+            Some(T0 + ADMIN_PROPOSAL_EXPIRY_MS + 10_000_000),
+        );
+        assert_eq!(view(&much_later, P1).phase, ResetPhase::Vetoed);
+    }
+
+    // ── Fix round 1 (review M2/M3): one-directional test strengthenings ──
+
+    #[test]
+    fn same_wall_endorse_veto_tie_break_endorse_wins_when_lower_id() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1));
+        let digest = digest_for(P1, target_vk);
+        let tie_wall = t_q + 10;
+        let endorse_sig =
+            sign_reset_message(&committee_sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        let veto_sig = sign_reset_message(&committee_sk, DFROST_RESET_VETO_DOMAIN, &digest, None);
+        // This time 0xC2 (endorse) < 0xC3 (veto) — endorse must win.
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            tie_wall,
+            ResetVerdict::Endorse,
+            endorse_sig,
+            None,
+        ));
+        events.push(response(
+            [0xC3; 16],
+            m2(),
+            P1,
+            tie_wall,
+            ResetVerdict::Veto,
+            veto_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(tie_wall + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert!(pv.endorsed);
+        assert_eq!(pv.authorized_at_ms, Some(tie_wall.max(t_q)));
+    }
+
+    #[test]
+    fn endorse_after_quorum_authorizes_at_endorse_wall() {
+        let (committee_sk, target_vk) = test_keypair(0x06);
+        let mut events = base_events();
+        events.push(proposal(P1, target_vk, T0));
+        let t_q = T0 + 50;
+        events.push(cosign([0xC1; 16], admin2(), t_q, P1)); // quorum lands first
+        let digest = digest_for(P1, target_vk);
+        let w_endorse = t_q + 500; // endorse lands AFTER quorum
+        let endorse_sig =
+            sign_reset_message(&committee_sk, DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
+        events.push(response(
+            [0xC2; 16],
+            m1(),
+            P1,
+            w_endorse,
+            ResetVerdict::Endorse,
+            endorse_sig,
+            None,
+        ));
+
+        let m = materialize_with_now(&events, admin1(), Some(w_endorse + 10));
+        let pv = view(&m, P1);
+        assert_eq!(pv.phase, ResetPhase::Authorized);
+        assert_eq!(pv.authorized_at_ms, Some(w_endorse)); // max(w_endorse, t_q) == w_endorse
+        assert!(pv.endorsed);
     }
 }
 

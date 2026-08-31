@@ -2,8 +2,8 @@
 //!
 //! Parallels `community_voting_core::SignedVotingEvent`, but the envelope
 //! tag is `'d'` (DFrost) instead of `'p'` (Poll) and the kind discriminator
-//! covers the seven committee-ceremony events
-//! (`di`/`dr`/`dk`/`ts`/`vb`/`rf`/`rp`).
+//! covers the eight committee-ceremony events
+//! (`di`/`dr`/`dk`/`ts`/`vb`/`rf`/`rp`/`rs`).
 //!
 //! Same-length-keys invariant: every top-level CBOR map in this module
 //! uses 2-character keys, matching the `SignedVotingEvent` envelope
@@ -20,8 +20,10 @@
 //! implementation encoder remains a separate followup"). Cross-impl
 //! interoperability is therefore out of scope for Phase 4a-foundation.
 
-use crate::community_membership::RecipientCiphertext;
-use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use crate::community_membership::{EventId, RecipientCiphertext};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr, SpaceId,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -35,7 +37,7 @@ const VRF_SEED_DS: &[u8] = b"dfrost-vrf-seed-v1";
 /// derivations are domain-independent under the random-oracle model.
 const VRF_OUTPUT_DS: &[u8] = b"dfrost-vrf-output-v1";
 
-/// Discriminator for the 7 D-FROST committee event kinds. Wire-encoded
+/// Discriminator for the 8 D-FROST committee event kinds. Wire-encoded
 /// as a 2-char string in the envelope's `kd` field.
 ///
 /// * `CeremonyInit` (`di`) — ZEB-1022: authenticated ceremony bootstrap
@@ -50,6 +52,10 @@ const VRF_OUTPUT_DS: &[u8] = b"dfrost-vrf-output-v1";
 /// * `RepairShare` (`rp`) — ZEB-1027: FROST Repairable-Threshold-Scheme
 ///   rounds restoring a member's LOST signing share (rn=1 request,
 ///   rn=2 helper deltas, rn=3 helper sigmas).
+/// * `ResetMarker` (`rs`) — ZEB-1031: the dfrost-log-side deactivation
+///   marker closing out a membership-authorized committee reset (spec
+///   §5). Deactivates the current committee and pins the successor
+///   DKG's shape; see `ResetMarkerPayload`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DfrostEventKind {
     #[serde(rename = "di")]
@@ -66,6 +72,8 @@ pub enum DfrostEventKind {
     ProactiveRefresh,
     #[serde(rename = "rp")]
     RepairShare,
+    #[serde(rename = "rs")]
+    ResetMarker,
 }
 
 /// Wire envelope for every D-FROST committee event. Structurally
@@ -261,6 +269,56 @@ pub struct DkgCompletePayload {
     /// `RefreshRoundPayload.attempt`). New mints always populate it.
     #[serde(rename = "sp", skip_serializing_if = "Option::is_none", default)]
     pub space_id: Option<crate::owner_state_types::SpaceId>,
+}
+
+/// Payload for `DfrostEventKind::ResetMarker` (`rs`). ZEB-1031 §5: the
+/// dfrost-log-side event closing out a membership-authorized committee
+/// reset. Authored by any power-100 admin or any member of the pinned
+/// successor committee (`nm`) — a mechanical bridge; the actual
+/// authorization already happened in the membership log (the
+/// `DfrostResetProposal`/`DfrostResetCosign`/`DfrostResetResponse`
+/// family). `DfrostLog::apply_reset_marker` verifies RS-M1/M2/M6
+/// (space binding, held-state match, idempotent re-delivery); RS-M3/M4/M5
+/// (membership phase, digest recomputation, actor authorization) are
+/// verified by the engine BEFORE this event is applied — this payload
+/// carries no membership evidence, keeping the dfrost log
+/// membership-blind.
+///
+/// `sp` is **mandatory** (post-ZEB-1034 discipline: a brand-new kind
+/// carries no legacy tolerance) — unlike `DkgCompletePayload.space_id`,
+/// there is no pre-ZEB-1034 `rs` history to stay compatible with.
+///
+/// All 5 keys are 2 characters (same-length-keys invariant).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetMarkerPayload {
+    /// The membership-log `DfrostResetProposal` id this marker closes
+    /// out. Recomputed/cross-checked against the membership log's
+    /// materialized reset state by the engine (RS-M3/M4), not here.
+    #[serde(
+        rename = "ri",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub reset_proposal_id: EventId,
+    /// `dfrost_reset_digest(..)` output the membership-side proposal and
+    /// every response bind to (Task 1). Recomputed and cross-checked by
+    /// the engine (RS-M4), not here.
+    #[serde(rename = "dg", with = "serde_bytes")]
+    pub reset_digest: [u8; 32],
+    /// The joint verifying key of the committee being retired. Must
+    /// match the held `joint_verifying_key` at apply time (RS-M2).
+    #[serde(rename = "ov", with = "serde_bytes")]
+    pub old_vk: [u8; 32],
+    /// The epoch of the committee being retired. Must match the held
+    /// `current_epoch` at apply time (RS-M2) — this is where a
+    /// mid-flight refresh kills a stale reset, since membership cannot
+    /// see dfrost state.
+    #[serde(rename = "oe")]
+    pub old_epoch: u64,
+    /// ZEB-1034: the community this marker belongs to (RS-M1,
+    /// unconditional — mandatory field, no `Option`).
+    #[serde(rename = "sp")]
+    pub space_id: SpaceId,
 }
 
 /// Payload for `DfrostEventKind::ThresholdSign` (`ts`). One per
@@ -588,6 +646,7 @@ mod tests {
             (DfrostEventKind::VrfBeacon, "vb"),
             (DfrostEventKind::ProactiveRefresh, "rf"),
             (DfrostEventKind::RepairShare, "rp"),
+            (DfrostEventKind::ResetMarker, "rs"),
         ] {
             let mut buf = Vec::new();
             ciborium::into_writer(&kind, &mut buf).unwrap();

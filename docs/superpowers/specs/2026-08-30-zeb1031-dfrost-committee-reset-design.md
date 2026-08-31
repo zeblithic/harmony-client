@@ -114,7 +114,7 @@ at materialize), like `AdminCountersign`.
 **Verify gates (RS-C):** RS-C1 actor Joined power-100; RS-C2 not a duplicate signer for
 this target (evaluated at materialize; duplicates are no-ops).
 
-### 3.3 `DfrostResetCommitteeResponse` (tag `z`)
+### 3.3 `DfrostResetResponse` (tag `z`)
 
 The committee's voice — one kind, three verdicts:
 
@@ -241,7 +241,12 @@ mechanical bridge; the authorization already happened in the membership log.
 - RS-M6: duplicate and late markers are benign. Once the state has moved (deactivation
   happened, or the successor promoted), RS-M2 no longer matches; such markers MUST be
   treated as idempotent no-ops rather than log-poisoning errors, because catch-up replay
-  legitimately re-delivers them.
+  legitimately re-delivers them. This idempotence is guaranteed only where a lineage
+  entry for the marker's reset already exists; on a lineage-less replica (e.g. a fresh
+  joiner post-adoption, empty `vk_history`) a re-delivered marker instead returns
+  `InvariantViolation` at the log-API layer — system-level handling downgrades this to a
+  warn-and-drop (not catch-up-hint-worthy), so the intent holds, but the MUST above is a
+  property of the engine, not of every individual apply call.
 
 ### 5.2 Apply effects (the deactivation event)
 
@@ -330,8 +335,11 @@ decryption shares are gone with the old committee; there is nothing to preserve
 reset; the creator (or an admin) gets a one-click **relaunch** that authors a fresh
 PollCreate copying the parameters, stamped at the current epoch, linking its
 predecessor. Re-voting is honest — the old votes are cryptographically unrecoverable.
-Tier-1/2 polls are untouched. Voiding is idempotent and replay-safe (derived from the
-marker, which is itself in the log).
+Tier-1/2 polls are untouched. Voiding is idempotent, and replay-safe against the
+marker's own re-delivery and — via a community-wide retired-epoch watermark advanced
+alongside the sweep — against a pre-reset poll that syncs in after the local sweep has
+already run; it is not a general guarantee against arbitrary interleavings beyond those
+two cases.
 
 ## 8. Constants and config
 
@@ -365,9 +373,24 @@ promotion — humans initiate and veto; mechanics are automated.
   cryptographically. A committee that cannot produce a threshold signature is, by
   definition, the thing the reset exists to replace. Recourse beyond that is social
   (fork), as with ZEB-212.
+- **Auto-drive removes the human-latency pad on `RESET_FINALITY_MS`.** The marker and
+  `c`-response engine auto-drive (§9) fires the instant the phase flips to `Authorized`
+  / promotion completes, rather than waiting on a human to notice and act — the latency
+  that historically padded the 48h finality margin against a late in-window veto is
+  gone. §6.1's veto-supersession rule is the designed recourse if this ever matters in
+  practice: a late-propagating veto still lifts a Consumed rejection retroactively.
 - **A lone catch-up responder can still deny** (serve nothing). Unchanged ZEB-1030
   disclosed residual; this design removes its ability to serve *stale or foreign*
   committees undetected.
+- **Truncated-lineage responders erode straggler-healing availability as membership
+  churns.** `adopt_initial_quorum`/`adopt_refresh_quorum` never populate `vk_history`, so
+  an honest, fully-current responder that bootstrapped (or healed) post-reset holds an
+  empty or truncated lineage and serves no reset chain, or only a suffix of one, even
+  though it is genuinely current. This is distinct from the lone-responder denial above
+  — that is a hostile responder withholding service; this is every honest post-reset
+  joiner structurally unable to help a straggler on an older lineage. If the only
+  reachable responders for a straggler are such nodes, the straggler gets no healing path
+  from them.
 - **A pinned successor member can grief consumption** (author a fake `c` with a wrong
   `nv` — the threshold signature is under `nv` itself, which any keypair satisfies).
   Roughly equivalent power to refusing the DKG, which they already hold (dealer-based

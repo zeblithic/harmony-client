@@ -69,6 +69,9 @@ function createAdapterMock(summaries: Tier3PollSummary[] = []) {
   vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3DraftCandidate').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3DraftApproval').mockReturnValue(() => {});
+  // ZEB-1031 §7/§9 — voided-poll event + relaunch IPC.
+  vi.spyOn(adapter, 'subscribeTier3Voided').mockReturnValue(() => {});
+  vi.spyOn(adapter, 'relaunchVoidedPoll').mockResolvedValue('ff'.repeat(32));
   // ZEB-1018 — D-FROST ceremony event subscribers.
   vi.spyOn(adapter, 'subscribeDfrostDkgProgress').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeDfrostBeaconReady').mockReturnValue(() => {});
@@ -187,6 +190,7 @@ describe('Tier3ProposalPanel', () => {
     vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3DraftCandidate').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3DraftApproval').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3Voided').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeDfrostDkgProgress').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeDfrostBeaconReady').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeDfrostRefreshProgress').mockReturnValue(() => {});
@@ -498,5 +502,203 @@ describe('Tier3ProposalPanel', () => {
     }
   });
 
+  // ── ZEB-1031 §7/§9: voided-poll banner + relaunch ────────────────────────
+
+  it('renders the voided banner with a short hex reset id and suppresses the stage controls', async () => {
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue({
+      ...makeExportFixture(),
+      stage: 'so',
+      voided: { resetId: 'ab'.repeat(16), oldEpoch: 3 },
+    });
+
+    const { findByText, queryByText, getByTestId } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+    await fireEvent.click(await findByText('Existing proposal'));
+
+    const banner = await waitFor(() => getByTestId('voided-banner'));
+    expect(banner.textContent).toContain('ab'.repeat(16).slice(0, 8));
+    expect(banner.textContent).toMatch(/unrecoverable/);
+    expect(banner.textContent).toMatch(/re-voting is honest/);
+    // Voided is orthogonal to stage — the poll stayed at 'so', but its
+    // interactive stage-dispatch controls must not render.
+    expect(queryByText(/Awaiting sortition draw/)).toBeNull();
+  });
+
+  it('hides Relaunch for a viewer who is neither the creator nor an admin', async () => {
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue({
+      ...makeExportFixture(),
+      proposer: 'ee'.repeat(32), // not TEST_MY_ADDR
+      voided: { resetId: 'ab'.repeat(16), oldEpoch: 3 },
+    });
+
+    const { findByText, queryByText, getByTestId } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR, myPower: 0 },
+    });
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => getByTestId('voided-banner'));
+    expect(queryByText('Relaunch')).toBeNull();
+  });
+
+  it('shows Relaunch for the poll creator, calls relaunchVoidedPoll with the pollId, and navigates to the new poll', async () => {
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue({
+      ...makeExportFixture(),
+      proposer: TEST_MY_ADDR,
+      voided: { resetId: 'ab'.repeat(16), oldEpoch: 3 },
+    });
+
+    const { findByText, getByTestId } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR, myPower: 0 },
+    });
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => getByTestId('voided-banner'));
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    await fireEvent.click(await findByText('Relaunch'));
+
+    await waitFor(() => expect(adapter.relaunchVoidedPoll).toHaveBeenCalledWith(TEST_POLL_ID));
+    // Navigates the detail pane to the newly relaunched poll.
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledWith('ff'.repeat(32)));
+  });
+
+  it('shows Relaunch for an admin (myPower >= 100) even when not the creator', async () => {
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue({
+      ...makeExportFixture(),
+      proposer: 'ee'.repeat(32), // not TEST_MY_ADDR
+      voided: { resetId: 'ab'.repeat(16), oldEpoch: 3 },
+    });
+
+    const { findByText, getByTestId } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR, myPower: 100 },
+    });
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => getByTestId('voided-banner'));
+    expect(await findByText('Relaunch')).toBeTruthy();
+  });
+
+  it('surfaces a relaunchVoidedPoll rejection via the standard error-extraction convention', async () => {
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue({
+      ...makeExportFixture(),
+      proposer: TEST_MY_ADDR,
+      voided: { resetId: 'ab'.repeat(16), oldEpoch: 3 },
+    });
+    vi.spyOn(adapter, 'relaunchVoidedPoll').mockRejectedValue(new Error('not authorized'));
+
+    const { findByText, getByTestId } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => getByTestId('voided-banner'));
+    await fireEvent.click(await findByText('Relaunch'));
+    expect(await findByText('not authorized')).toBeTruthy();
+  });
+
+  it('clears a stale relaunchError banner when the selection moves to a different poll', async () => {
+    // CodeAnt nitpick 3 (review round 1): a failed relaunch's error must
+    // not linger into an unrelated poll's banner once the user selects
+    // away from the poll that failed.
+    const OTHER_POLL_ID = 'bb'.repeat(32);
+    const otherSummary: Tier3PollSummary = {
+      ...makeSummaryFixture(),
+      pollId: OTHER_POLL_ID,
+      proposalText: 'Other proposal',
+    };
+    const adapter = createAdapterMock([makeSummaryFixture(), otherSummary]);
+    vi.spyOn(adapter, 'getTier3Poll').mockImplementation(async (pollId: string) => {
+      if (pollId === OTHER_POLL_ID) {
+        return { ...makeExportFixture(), pollId: OTHER_POLL_ID, proposalText: 'Other proposal' };
+      }
+      return {
+        ...makeExportFixture(),
+        proposer: TEST_MY_ADDR,
+        voided: { resetId: 'ab'.repeat(16), oldEpoch: 3 },
+      };
+    });
+    vi.spyOn(adapter, 'relaunchVoidedPoll').mockRejectedValue(new Error('not authorized'));
+
+    const { findByText, queryByText, getByTestId } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => getByTestId('voided-banner'));
+    await fireEvent.click(await findByText('Relaunch'));
+    expect(await findByText('not authorized')).toBeTruthy();
+
+    await fireEvent.click(await findByText('Other proposal'));
+    await waitFor(() => expect(queryByText('not authorized')).toBeNull());
+  });
+
+  it('refetches list + detail on voting-tier3-voided matching selected community + poll', async () => {
+    let voidedHandler:
+      | ((p: { pollId: string; communityId: string; resetId: string; oldEpoch: number }) => void)
+      | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeTier3Voided').mockImplementation((h) => {
+      voidedHandler = h as typeof voidedHandler;
+      return () => {};
+    });
+
+    const { findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(voidedHandler).not.toBeNull();
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    voidedHandler!({
+      communityId: TEST_COMMUNITY_ID,
+      pollId: TEST_POLL_ID,
+      resetId: 'ab'.repeat(16),
+      oldEpoch: 3,
+    });
+
+    // Unlike the mini-public-decline / draft-candidate / draft-approval
+    // events, voiding is out-of-band engine mutation that also changes the
+    // list-row badge — so it refetches BOTH the summaries and the detail
+    // (mirrors subscribeTier3Finalized's dual refetch).
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(adapter.getTier3Poll).toHaveBeenCalledWith(TEST_POLL_ID);
+    await waitFor(() => expect(adapter.listTier3Polls).toHaveBeenCalledTimes(1));
+  });
+
+  it('ignores voting-tier3-voided with mismatched communityId', async () => {
+    let voidedHandler:
+      | ((p: { pollId: string; communityId: string; resetId: string; oldEpoch: number }) => void)
+      | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeTier3Voided').mockImplementation((h) => {
+      voidedHandler = h as typeof voidedHandler;
+      return () => {};
+    });
+
+    const { findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+    await findByText('Existing proposal');
+    await waitFor(() => expect(voidedHandler).not.toBeNull());
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    voidedHandler!({
+      communityId: 'ff'.repeat(16),
+      pollId: TEST_POLL_ID,
+      resetId: 'ab'.repeat(16),
+      oldEpoch: 3,
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(adapter.getTier3Poll).not.toHaveBeenCalled();
+    expect(adapter.listTier3Polls).not.toHaveBeenCalled();
+  });
 });
 

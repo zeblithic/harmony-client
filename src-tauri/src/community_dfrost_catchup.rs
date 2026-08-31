@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::community_dfrost_log::DfrostLog;
-use crate::community_dfrost_types::{DfrostEventKind, DkgCompletePayload, SignedCommitteeEvent};
+use crate::community_dfrost_types::{
+    DfrostEventKind, DkgCompletePayload, ResetMarkerPayload, SignedCommitteeEvent,
+};
 use crate::owner_state_types::OwnerAddr;
 
 /// Wire version for the catch-up request/frame codec. Bumped on any
@@ -28,10 +30,14 @@ use crate::owner_state_types::OwnerAddr;
 pub const CATCHUP_VERSION: u8 = 1;
 
 /// Inbound size cap for one encoded [`CatchupRequest`] or [`CatchupFrame`].
-/// A single frame carries at most one `SignedCommitteeEvent` — small CBOR,
-/// well under this bound for any realistic committee (mirrors
-/// `MAX_DFROST_PAYLOAD_BYTES` in `event_loop.rs`). Checked before decode
-/// to prevent peer-controlled allocation.
+/// A `Status`/`DkEvidence`/`Beacon` frame carries at most one
+/// `SignedCommitteeEvent` — small CBOR, well under this bound for any
+/// realistic committee (mirrors `MAX_DFROST_PAYLOAD_BYTES` in
+/// `event_loop.rs`). A `ResetChain` frame (ZEB-1031 §6.3) is the
+/// exception: it carries up to [`MAX_RESET_CHAIN_LINKS_PER_RESPONSE`]
+/// links, each a marker plus a handful of `dk` events — see that
+/// constant's doc for the sizing math against this bound. Checked
+/// before decode to prevent peer-controlled allocation.
 pub const MAX_DFROST_CATCHUP_FRAME_BYTES: usize = 64 * 1024;
 
 /// Per-round buffer ceiling for a requester draining a responder's reply
@@ -55,6 +61,38 @@ pub const MAX_CATCHUP_BEACONS_PER_ROUND: usize = 64;
 /// is generous: a legitimate round only ever needs a handful of
 /// independent responders to make its case.
 pub const MAX_CATCHUP_RESPONDER_GROUPS: usize = 16;
+
+/// ZEB-1031 §6.3 review I3: cap on the number of reset-chain links
+/// (`ResetChainLink`, each a marker plus its successor `dk` quorum)
+/// served in ONE `CatchupBody::ResetChain` frame. `select_reset_chain`
+/// serves the OLDEST needed links first (its natural iteration order
+/// over `vk_history`, ascending `old_epoch`), so a chain longer than
+/// this cap heals over multiple catch-up rounds — the requester's own
+/// epoch/`pending_reset` state advances past whatever was applied last
+/// round, resuming the walk with no separate cursor needed (the house
+/// pattern behind the 300s catch-up cadence generally).
+///
+/// Enforced on BOTH sides: the responder truncates before encoding
+/// (`select_reset_chain`), and the requester independently caps what
+/// it will decode+verify from one frame (`catchup_decode_and_verify`)
+/// — the same defence-in-depth posture as `MAX_CATCHUP_RESPONDER_GROUPS`/
+/// `MAX_CATCHUP_BEACONS_PER_ROUND`, whose docs reason about exactly this
+/// per-frame `Ed25519::verify_strict` cost; a `ResetChain` frame is the
+/// one fan-out point in this module that was unbounded before this cap.
+///
+/// Sizing against [`MAX_DFROST_CATCHUP_FRAME_BYTES`] (64 KiB): a
+/// `SignedCommitteeEvent` (marker or `dk`) is on the order of a few
+/// hundred bytes to low kilobytes (a 64-byte sig, a 16-byte actor, an
+/// HLC, and a small CBOR payload — a `dk`'s per-member verifying-share
+/// list is the variable part, scaling with committee size). One link is
+/// a marker plus one `dk` event per confirming member, so this cap
+/// keeps a realistic-committee chain comfortably inside the frame
+/// bound while still being a real, documented ceiling — not the sole
+/// backstop: `catchup_respond` still checks the ENCODED length and
+/// drops the whole frame (never serves a truncated one) if a given
+/// round's capped link set still exceeds it (an unusually large
+/// committee, say).
+pub const MAX_RESET_CHAIN_LINKS_PER_RESPONSE: usize = 8;
 
 /// ZEB-1030 PR#778 round-1: margin subtracted from
 /// [`MAX_DFROST_CATCHUP_FRAME_BYTES`] when capping PLAINTEXT frame/request
@@ -103,7 +141,8 @@ pub struct CatchupStatus {
     pub active: bool,
 }
 
-/// Externally-tagged enum — encodes as a 1-entry map {"st"|"dk"|"vb": ...}.
+/// Externally-tagged enum — encodes as a 1-entry map
+/// {"st"|"dk"|"vb"|"rc": ...}.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CatchupBody {
     #[serde(rename = "st")]
@@ -114,6 +153,30 @@ pub enum CatchupBody {
     /// Verbatim ciborium-encoded `SignedCommitteeEvent` (kind `vb`).
     #[serde(rename = "vb")]
     Beacon(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// ZEB-1031 §6.3: ciborium-encoded `Vec<ResetChainLink>` — the
+    /// responder's reset-chain healing payload for a straggler stuck
+    /// pre-reset (spec §6.2). A NEW variant, so a legacy (pre-ZEB-1031)
+    /// decoder that never sees this tag is unaffected — every existing
+    /// `Status`/`DkEvidence`/`Beacon` frame encodes byte-identically to
+    /// before; an old peer that DOES receive a `ResetChain` frame drops
+    /// just that one frame (the established per-frame decode-failure
+    /// tolerance — see `decode_frame`'s callers), never the whole round.
+    #[serde(rename = "rc")]
+    ResetChain(#[serde(with = "serde_bytes")] Vec<u8>),
+}
+
+/// ZEB-1031 §6.3: one link of a reset chain — the `rs` marker that
+/// retired a committee plus the successor epoch's retained `dk` quorum
+/// events (possibly empty, if the successor DKG hasn't completed on
+/// this responder yet). Interleaved `marker₁, quorum₁, marker₂,
+/// quorum₂, …` across links for a multi-reset chain (spec §6.2).
+/// 2-char keys per the module's same-length-keys invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetChainLink {
+    #[serde(rename = "mk")]
+    pub marker: SignedCommitteeEvent,
+    #[serde(rename = "dk")]
+    pub dk_events: Vec<SignedCommitteeEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +326,91 @@ pub struct CatchupSelection {
     /// (ZEB-1036) every member of a TIED beacon group regardless of
     /// watermark. OLDEST-first, capped at `max_beacons`.
     pub beacons: Vec<SignedCommitteeEvent>,
+    /// ZEB-1031 §6.3: reset-chain healing links, oldest reset first.
+    /// Empty unless this responder's `vk_history` holds a reset the
+    /// requester's implied epoch predates.
+    pub reset_chain: Vec<ResetChainLink>,
+}
+
+/// `dk` (DkgComplete) events at exactly `epoch`, one per distinct actor
+/// (newest per actor in synthesized-id/HLC order — `log.events()` is
+/// already HLC-ordered, so a later `insert` for the same actor key
+/// naturally overwrites the earlier one). Shared by `select_catchup`'s
+/// current-epoch retrieval and the reset-chain's per-link successor-
+/// epoch retrieval (ZEB-1031 §6.3 — "reuse that retrieval").
+fn dk_events_for_epoch(log: &DfrostLog, epoch: u64) -> Vec<SignedCommitteeEvent> {
+    let mut newest_per_actor: BTreeMap<OwnerAddr, SignedCommitteeEvent> = BTreeMap::new();
+    for ev in log.events() {
+        if ev.kind != DfrostEventKind::DkgComplete {
+            continue;
+        }
+        let payload: DkgCompletePayload = match ciborium::de::from_reader(&ev.payload[..]) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if payload.epoch != epoch {
+            continue;
+        }
+        newest_per_actor.insert(ev.actor, ev.clone());
+    }
+    newest_per_actor.into_values().collect()
+}
+
+/// ZEB-1031 §6.3: build the reset-chain healing links for a requester
+/// whose implied epoch (`req.epoch`; `0` for an inactive/fresh
+/// requester) predates one or more of this responder's recorded
+/// resets. For each `vk_history` entry with `req.epoch <= old_epoch`
+/// (monotonically increasing across resets, so this naturally selects
+/// "that entry forward"), attach the retained `rs` marker event for
+/// that reset plus the successor epoch's `dk` quorum (which may still
+/// be empty if this responder hasn't itself completed that successor
+/// DKG yet — the requester picks the chain back up on a later round).
+///
+/// ZEB-1031 review I3: capped at [`MAX_RESET_CHAIN_LINKS_PER_RESPONSE`]
+/// links, OLDEST first (the natural ascending-`old_epoch` iteration
+/// order over `vk_history`) — a chain longer than the cap is served
+/// across multiple rounds; see that constant's doc for the reasoning
+/// and the frame-size math.
+fn select_reset_chain(log: &DfrostLog, req: &CatchupRequest) -> Vec<ResetChainLink> {
+    if log.committee_state.vk_history.is_empty() {
+        return Vec::new();
+    }
+    let mut links = Vec::new();
+    for entry in &log.committee_state.vk_history {
+        if links.len() >= MAX_RESET_CHAIN_LINKS_PER_RESPONSE {
+            break;
+        }
+        if req.epoch > entry.old_epoch {
+            continue;
+        }
+        let marker = log.events().find(|ev| {
+            if ev.kind != DfrostEventKind::ResetMarker {
+                return false;
+            }
+            let payload: ResetMarkerPayload = match ciborium::de::from_reader(&ev.payload[..]) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            payload.reset_proposal_id == entry.reset_id
+        });
+        let Some(marker) = marker else {
+            // Defensive: a vk_history entry with no retained marker
+            // event would be an apply-layer bug (`apply_reset_marker`
+            // always inserts the event it just applied) — skip rather
+            // than serve a link with no marker to verify against.
+            tracing::warn!(
+                reset_id = ?entry.reset_id,
+                "dfrost catchup: vk_history entry has no retained rs marker event — skipped",
+            );
+            continue;
+        };
+        let successor_epoch = entry.old_epoch.saturating_add(1);
+        links.push(ResetChainLink {
+            marker: marker.clone(),
+            dk_events: dk_events_for_epoch(log, successor_epoch),
+        });
+    }
+    links
 }
 
 /// Pure responder selection. `None` ⇒ nothing to serve (inactive
@@ -403,34 +551,42 @@ pub fn select_catchup(
         .map(|&i| admitted[i].event.clone())
         .collect();
 
-    // Rule 2: requester fully current (active at the current epoch, and
-    // no beacon above its watermark — nor any tied group to heal) ⇒
-    // nothing to serve.
+    // ZEB-1031 §6.3: reset-chain healing links. Computed only in this
+    // (Rule 1-passed, responder active) branch — a responder that is
+    // ITSELF mid-reset (deactivated, not yet promoted) serves nothing
+    // at all here (Rule 1 above).
+    //
+    // ZEB-1031 review I2: `select_reset_chain` serves exactly what
+    // THIS responder's own `vk_history` holds — a partial (or empty)
+    // lineage, never mis-sliced or panicked on (it filters/iterates
+    // the vec as-is; an empty `vk_history` short-circuits to `Vec::
+    // new()`). "Every active responder's vk_history is the complete
+    // lineage" is FALSE: `adopt_initial_quorum`/`adopt_refresh_quorum`
+    // never touch `vk_history`, so a node that bootstrapped as a fresh
+    // joiner (or healed via an ordinary refresh quorum) after a reset
+    // is active with an empty or truncated `vk_history` and serves no
+    // chain, or only a suffix of one, even though it genuinely IS
+    // current. If the only reachable responders for a straggler are
+    // such nodes, the straggler gets no healing path from them — this
+    // joins the disclosed denial residuals of spec §10 (a lone/limited
+    // responder set can withhold service) rather than being narrower
+    // or more self-healing than that family; it is NOT bounded to
+    // "wait for this one responder's own DKG to finish" the way a
+    // solitary mid-reset responder's gap is.
+    let reset_chain = select_reset_chain(log, req);
+
+    // Rule 2: requester fully current (active at the current epoch, no
+    // beacon above its watermark — nor any tied group to heal — and no
+    // reset chain to serve) ⇒ nothing to serve.
     let requester_current = req.active && req.epoch == current_epoch;
-    if requester_current && beacons.is_empty() {
+    if requester_current && beacons.is_empty() && reset_chain.is_empty() {
         return None;
     }
 
     // dk_events: only when the requester is behind the current epoch
-    // (inactive, or active at an older epoch). Collapse to newest per
-    // actor — iterating in HLC order means a later `insert` for the same
-    // actor key naturally overwrites the earlier one.
+    // (inactive, or active at an older epoch).
     let dk_events = if !req.active || req.epoch < current_epoch {
-        let mut newest_per_actor: BTreeMap<OwnerAddr, SignedCommitteeEvent> = BTreeMap::new();
-        for ev in log.events() {
-            if ev.kind != DfrostEventKind::DkgComplete {
-                continue;
-            }
-            let payload: DkgCompletePayload = match ciborium::de::from_reader(&ev.payload[..]) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if payload.epoch != current_epoch {
-                continue;
-            }
-            newest_per_actor.insert(ev.actor, ev.clone());
-        }
-        newest_per_actor.into_values().collect()
+        dk_events_for_epoch(log, current_epoch)
     } else {
         Vec::new()
     };
@@ -442,6 +598,7 @@ pub fn select_catchup(
         },
         dk_events,
         beacons,
+        reset_chain,
     })
 }
 
@@ -587,6 +744,195 @@ mod tests {
         log
     }
 
+    /// ZEB-1031: `rs` (ResetMarker) event builder for `select_reset_chain`
+    /// coverage. `reset_proposal_id` is the join key `select_reset_chain`
+    /// uses to find the retained marker for a `vk_history` entry.
+    fn test_rs_event(
+        reset_proposal_id: [u8; 16],
+        old_vk: [u8; 32],
+        old_epoch: u64,
+        hlc: Hlc,
+    ) -> SignedCommitteeEvent {
+        let payload = ResetMarkerPayload {
+            reset_proposal_id,
+            reset_digest: [0u8; 32],
+            old_vk,
+            old_epoch,
+            space_id: crate::owner_state_types::SpaceId([0u8; 16]),
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::ser::into_writer(&payload, &mut payload_bytes).unwrap();
+        SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ResetMarker,
+            hlc,
+            actor: test_owner(0xAD),
+            payload: payload_bytes,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// Seed a `vk_history` entry PLUS its retained `rs` marker event in
+    /// one call — the shape `select_reset_chain` expects (a lineage
+    /// entry with no retained marker is the defensive-skip case,
+    /// covered separately by NOT calling this).
+    fn seed_reset(log: &mut DfrostLog, reset_id: [u8; 16], old_vk: [u8; 32], old_epoch: u64) {
+        let marker_hlc = test_hlc(old_epoch * 1000, 0, "admin");
+        log.insert_event_for_test(test_rs_event(
+            reset_id,
+            old_vk,
+            old_epoch,
+            marker_hlc.clone(),
+        ));
+        log.committee_state
+            .vk_history
+            .push(crate::community_dfrost_log::VkLineageEntry {
+                old_vk,
+                old_epoch,
+                reset_id,
+                digest: [0u8; 32],
+                at: marker_hlc,
+            });
+    }
+
+    #[test]
+    fn select_reset_chain_empty_vk_history_returns_empty_zeb1031() {
+        let log = test_active_log(1);
+        assert!(log.committee_state.vk_history.is_empty());
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 0,
+            active: false,
+            beacon_watermark: None,
+        };
+        assert!(select_reset_chain(&log, &req).is_empty());
+    }
+
+    #[test]
+    fn select_reset_chain_epoch_equals_old_epoch_boundary_is_served_zeb1031() {
+        let mut log = test_active_log(2);
+        seed_reset(&mut log, [0x01; 16], [0xAA; 32], 1);
+        // req.epoch == entry.old_epoch: the straggler's OWN pre-reset
+        // epoch — must be served (`<=`, not `<`).
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: None,
+        };
+        let links = select_reset_chain(&log, &req);
+        assert_eq!(links.len(), 1, "req.epoch == old_epoch must be served");
+        assert_eq!(links[0].marker.kind, DfrostEventKind::ResetMarker);
+    }
+
+    #[test]
+    fn select_reset_chain_epoch_past_old_epoch_is_not_served_zeb1031() {
+        let mut log = test_active_log(2);
+        seed_reset(&mut log, [0x01; 16], [0xAA; 32], 1);
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 2, // strictly past old_epoch=1: this reset is already known
+            active: true,
+            beacon_watermark: None,
+        };
+        assert!(select_reset_chain(&log, &req).is_empty());
+    }
+
+    /// Defensive skip (community_dfrost_catchup.rs's own doc on the
+    /// `let Some(marker) = marker else { .. continue; }` branch):
+    /// a `vk_history` entry with no retained `rs` event is skipped,
+    /// not a panic or a malformed link.
+    #[test]
+    fn select_reset_chain_skips_entry_with_no_retained_marker_zeb1031() {
+        let mut log = test_active_log(1);
+        // vk_history entry WITHOUT calling seed_reset's insert_event_for_test.
+        log.committee_state
+            .vk_history
+            .push(crate::community_dfrost_log::VkLineageEntry {
+                old_vk: [0xAA; 32],
+                old_epoch: 0,
+                reset_id: [0x02; 16],
+                digest: [0u8; 32],
+                at: test_hlc(500, 0, "admin"),
+            });
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 0,
+            active: false,
+            beacon_watermark: None,
+        };
+        assert!(
+            select_reset_chain(&log, &req).is_empty(),
+            "entry with no retained marker must be skipped, not panic"
+        );
+    }
+
+    /// Two-reset chain: both links present, oldest first, each with
+    /// its own successor `dk` quorum attached.
+    #[test]
+    fn select_reset_chain_two_link_chain_zeb1031() {
+        let mut log = test_active_log(3);
+        seed_reset(&mut log, [0x01; 16], [0xAA; 32], 1);
+        seed_reset(&mut log, [0x02; 16], [0xBB; 32], 2);
+        // Successor dk quorum for the SECOND reset (epoch 3).
+        log.insert_event_for_test(test_dk_event(3, test_owner(1), test_hlc(3100, 0, "dev1")));
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 0,
+            active: false,
+            beacon_watermark: None,
+        };
+        let links = select_reset_chain(&log, &req);
+        assert_eq!(links.len(), 2, "both resets served");
+        assert_eq!(
+            links[0].marker.hlc.wall_ms, 1000,
+            "oldest reset (old_epoch=1) first"
+        );
+        assert_eq!(links[1].marker.hlc.wall_ms, 2000, "newest reset second");
+        assert!(
+            links[0].dk_events.is_empty(),
+            "no epoch-2 dk quorum was seeded — link 1 has none yet"
+        );
+        assert_eq!(
+            links[1].dk_events.len(),
+            1,
+            "epoch-3 dk quorum attached to link 2"
+        );
+    }
+
+    /// ZEB-1031 review I3: a chain longer than the per-response cap
+    /// truncates to the cap, oldest-first — the remainder heals on a
+    /// later round (the requester's own advancing epoch resumes past
+    /// whatever was served here).
+    #[test]
+    fn select_reset_chain_caps_at_max_links_oldest_first_zeb1031() {
+        let mut log = test_active_log(MAX_RESET_CHAIN_LINKS_PER_RESPONSE as u64 + 5);
+        for i in 0..(MAX_RESET_CHAIN_LINKS_PER_RESPONSE + 3) {
+            seed_reset(&mut log, [i as u8; 16], [0xAA; 32], i as u64);
+        }
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 0,
+            active: false,
+            beacon_watermark: None,
+        };
+        let links = select_reset_chain(&log, &req);
+        assert_eq!(
+            links.len(),
+            MAX_RESET_CHAIN_LINKS_PER_RESPONSE,
+            "truncated to the cap"
+        );
+        for (i, link) in links.iter().enumerate() {
+            assert_eq!(
+                link.marker.hlc.wall_ms,
+                i as u64 * 1000,
+                "oldest-first order preserved under the cap"
+            );
+        }
+    }
+
     fn assert_top_level_two_char_keys(bytes: &[u8]) {
         let val: ciborium::Value = ciborium::de::from_reader(bytes).unwrap();
         let map = val.as_map().expect("top-level value is a map");
@@ -672,6 +1018,92 @@ mod tests {
             let fbytes = encode_frame(&frame).unwrap();
             assert_eq!(decode_frame(&fbytes).unwrap(), frame);
             assert_frame_two_char_keys(&fbytes);
+        }
+    }
+
+    /// ZEB-1031 review I4: the catch-up wire evolution (`CatchupBody::
+    /// ResetChain` + `ResetChainLink`) had zero tests — round-trip AND
+    /// the module's same-length-keys invariant, both at the frame level
+    /// (`bd` → `{"rc": <bytes>}`) and inside the `ResetChainLink`
+    /// struct itself (`mk`/`dk`) once its bytes are decoded.
+    #[test]
+    fn catchup_body_reset_chain_round_trip_and_key_shape_zeb1031() {
+        let marker = test_rs_event([0x01; 16], [0xAA; 32], 1, test_hlc(1000, 0, "admin"));
+        let dk = test_dk_event(2, test_owner(1), test_hlc(2000, 0, "dev1"));
+        let links = vec![ResetChainLink {
+            marker: marker.clone(),
+            dk_events: vec![dk.clone()],
+        }];
+        let mut link_bytes = Vec::new();
+        ciborium::ser::into_writer(&links, &mut link_bytes).unwrap();
+        let frame = CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [7u8; 8],
+            body: CatchupBody::ResetChain(link_bytes),
+        };
+        let fbytes = encode_frame(&frame).unwrap();
+        assert_eq!(decode_frame(&fbytes).unwrap(), frame, "frame round-trips");
+        assert_frame_two_char_keys(&fbytes);
+
+        // Decode the inner ResetChainLink bytes as a bare CBOR value and
+        // check ITS keys too — `assert_frame_two_char_keys` only walks
+        // one level into `bd`'s externally-tagged map, not the `rc`
+        // variant's OWN nested bytes.
+        let CatchupBody::ResetChain(inner) = &decode_frame(&fbytes).unwrap().body else {
+            panic!("decoded body is not ResetChain");
+        };
+        let decoded_links: Vec<ResetChainLink> = ciborium::de::from_reader(&inner[..]).unwrap();
+        assert_eq!(decoded_links, links, "ResetChainLink round-trips");
+        let link_val: ciborium::Value = ciborium::de::from_reader(&inner[..]).unwrap();
+        let link_arr = link_val.as_array().expect("links is a CBOR array");
+        for link in link_arr {
+            let link_map = link.as_map().expect("ResetChainLink is a map");
+            let keys: Vec<&str> = link_map.iter().filter_map(|(k, _)| k.as_text()).collect();
+            assert_eq!(keys.len(), 2, "ResetChainLink has exactly mk/dk");
+            for k in &keys {
+                assert_eq!(
+                    k.len(),
+                    2,
+                    "ResetChainLink key {k:?} violates 2-char invariant"
+                );
+            }
+            assert!(keys.contains(&"mk"), "marker key present");
+            assert!(keys.contains(&"dk"), "dk_events key present");
+        }
+    }
+
+    /// ZEB-1031 review I4 / spec §11 ("legacy no-reset communities
+    /// unaffected"): a responder with an EMPTY `vk_history` (no reset
+    /// has ever happened) never emits a `ResetChain` frame, for any
+    /// requester shape — `catchup_respond`'s existing frame set is
+    /// byte-identical to pre-ZEB-1031 in this case.
+    #[test]
+    fn select_catchup_no_reset_history_never_emits_reset_chain_zeb1031() {
+        let mut log = test_active_log(1);
+        log.insert_event_for_test(test_dk_event(1, test_owner(1), test_hlc(1000, 0, "dev1")));
+        assert!(log.committee_state.vk_history.is_empty());
+
+        for req in [
+            CatchupRequest {
+                version: CATCHUP_VERSION,
+                epoch: 0,
+                active: false,
+                beacon_watermark: None,
+            },
+            CatchupRequest {
+                version: CATCHUP_VERSION,
+                epoch: 1,
+                active: true,
+                beacon_watermark: None,
+            },
+        ] {
+            let sel = select_catchup(&log, &req, MAX_CATCHUP_BEACONS_PER_ROUND, 0);
+            if let Some(sel) = sel {
+                assert!(
+                    sel.reset_chain.is_empty(),
+                    "no vk_history ⇒ reset_chain always empty"
+                );
+            }
         }
     }
 

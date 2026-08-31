@@ -534,6 +534,7 @@
         {communityId}
         adapter={votingAdapter}
         myAddr={ownAddress}
+        {myPower}
       />
     {:else if activeView === 'proposals' && votingAdapter}
       <CommunityProposalsPanel

@@ -12697,7 +12697,8 @@ pub fn spawn_dfrost_log_zenoh_adapter(
                                 };
                                 match outcome {
                                     crate::community_dfrost_log_engine::CatchupOutcome::AdoptedRefresh { .. }
-                                    | crate::community_dfrost_log_engine::CatchupOutcome::AdoptedInitial { .. } => {
+                                    | crate::community_dfrost_log_engine::CatchupOutcome::AdoptedInitial { .. }
+                                    | crate::community_dfrost_log_engine::CatchupOutcome::AdoptedResetChain { .. } => {
                                         tracing::info!(
                                             topic = %catchup_topic_req,
                                             ?outcome,

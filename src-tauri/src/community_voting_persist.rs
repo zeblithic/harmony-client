@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::community_voting_conviction::CommunityVotingPolicy;
 use crate::community_voting_core::{PollId, PollMeta, SignedVotingEvent};
 use crate::community_voting_log::{TierState, VotingLog};
+use crate::community_voting_tier3::VoidedInfo;
 use crate::owner_state_types::SpaceId;
 
 /// Current on-disk schema version. Bump on any breaking layout change;
@@ -61,6 +62,15 @@ pub struct PollRestore {
     /// means "no Tier-3 epoch overlay", identical to prior behaviour.
     #[serde(default)]
     pub tier3_community_epoch: Option<u64>,
+    /// ZEB-1031 Task 7: `Tier3PollState.voided`, set out-of-band by
+    /// `VotingLogEngine::void_tier3_polls_for_reset` (not by any event —
+    /// replay alone never voids a poll). Without this overlay a restart
+    /// would resurrect a reset-voided poll as live-and-mutable again.
+    /// `#[serde(default)]` for the same pre-field-existence decode reason
+    /// as `tier3_community_epoch`. `None` for non-Tier-3 polls and for
+    /// Tier-3 polls never voided.
+    #[serde(default)]
+    pub voided: Option<VoidedInfo>,
 }
 
 /// The persisted record. `version` + `community_id` ride inside the
@@ -74,6 +84,17 @@ struct PersistedVotingLog {
     events: Vec<SignedVotingEvent>,
     policy: CommunityVotingPolicy,
     poll_restore: HashMap<PollId, PollRestore>,
+    /// ZEB-1031 Task 7 review M1: the community-wide retired-epoch
+    /// watermark (`VotingLog.retired_epoch_watermark`) — NOT per-poll, so
+    /// it lives at this top level rather than inside `PollRestore`.
+    /// Restored BEFORE the boot replay loop runs (unlike `poll_restore`,
+    /// which needs the polls to already exist by id) so a pre-reset-epoch
+    /// poll whose `kd=cr` event is only NOW being replayed (it synced in
+    /// late, after the sweep that should have voided it) still
+    /// materializes voided. `#[serde(default)]` so a `voting.cbor` written
+    /// before this field existed still decodes.
+    #[serde(default)]
+    retired_epoch_watermark: Option<crate::community_voting_tier3::VoidedInfo>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -125,12 +146,14 @@ pub fn snapshot_for_persist(log: &VotingLog, community_id: &SpaceId) -> VotingLo
                 .tier_state
                 .as_tier3()
                 .map(|t3| t3.meta.community_epoch);
+            let voided = state.tier_state.as_tier3().and_then(|t3| t3.voided);
             (
                 *pid,
                 PollRestore {
                     meta: state.meta.clone(),
                     tier2_timing,
                     tier3_community_epoch,
+                    voided,
                 },
             )
         })
@@ -141,6 +164,7 @@ pub fn snapshot_for_persist(log: &VotingLog, community_id: &SpaceId) -> VotingLo
         events: log.events.clone(),
         policy: log.policy().clone(),
         poll_restore,
+        retired_epoch_watermark: log.retired_epoch_watermark,
     })
 }
 
@@ -203,13 +227,15 @@ pub fn save_policy_only(
 ) -> Result<(), PersistError> {
     // `load_voting_log` returns `Err` ONLY on a non-NotFound I/O error
     // (present-but-unreadable); missing → empty, corrupt → quarantine + empty.
-    let (events, _old_policy, poll_restore) = load_voting_log(cipher, path, community_id)?;
+    let (events, _old_policy, poll_restore, retired_epoch_watermark) =
+        load_voting_log(cipher, path, community_id)?;
     let record = PersistedVotingLog {
         version: VOTING_LOG_SCHEMA_VERSION,
         community_id: *community_id,
         events,
         policy: new_policy.clone(),
         poll_restore,
+        retired_epoch_watermark,
     };
     let mut bytes = Vec::new();
     ciborium::into_writer(&record, &mut bytes)
@@ -247,10 +273,18 @@ pub fn load_voting_log(
         Vec<SignedVotingEvent>,
         CommunityVotingPolicy,
         HashMap<PollId, PollRestore>,
+        Option<crate::community_voting_tier3::VoidedInfo>,
     ),
     PersistError,
 > {
-    let empty = || (Vec::new(), CommunityVotingPolicy::default(), HashMap::new());
+    let empty = || {
+        (
+            Vec::new(),
+            CommunityVotingPolicy::default(),
+            HashMap::new(),
+            None,
+        )
+    };
     let label = crate::community_state_persist::seal_label(expected_id, VOTING_FILENAME);
     // ZEB-983 envelope beneath the contract: missing → empty; envelope
     // Crypto (AEAD/tag/malformed) → SAME quarantine branch as a decode
@@ -284,7 +318,12 @@ pub fn load_voting_log(
             // Eager migration: reseal a legacy plaintext file only after
             // version + community_id + decode all validated.
             crate::device_dataset_file::reseal_if_legacy(cipher, path, &label, &image);
-            Ok((record.events, record.policy, record.poll_restore))
+            Ok((
+                record.events,
+                record.policy,
+                record.poll_restore,
+                record.retired_epoch_watermark,
+            ))
         }
         Err(decode_err) => {
             quarantine_corrupted(path, &decode_err.to_string());
@@ -369,7 +408,7 @@ mod tests {
             &cid,
         )
         .unwrap();
-        let (events, policy, _poll_meta) =
+        let (events, policy, _poll_meta, _watermark) =
             load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert_eq!(events, log.events);
         assert_eq!(&policy, log.policy());
@@ -380,7 +419,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cid = SpaceId([5u8; 16]);
         let path = voting_path_for(dir.path(), &cid);
-        let (events, policy, poll_meta) =
+        let (events, policy, poll_meta, _watermark) =
             load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
         assert!(poll_meta.is_empty());
@@ -403,7 +442,7 @@ mod tests {
             &cid_a,
         )
         .unwrap();
-        let (events, _policy, _pm) =
+        let (events, _policy, _pm, _watermark) =
             load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid_b).unwrap();
         assert!(
             events.is_empty(),
@@ -428,12 +467,13 @@ mod tests {
             events: vec![test_event(1, 0, "d")],
             policy: CommunityVotingPolicy::default(),
             poll_restore: HashMap::new(),
+            retired_epoch_watermark: None,
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&record, &mut bytes).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        let (events, _, _) =
+        let (events, _, _, _) =
             load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
     }
@@ -445,7 +485,7 @@ mod tests {
         let path = voting_path_for(dir.path(), &cid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
-        let (events, policy, _pm) =
+        let (events, policy, _pm, _watermark) =
             load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert!(events.is_empty());
         assert_eq!(policy, CommunityVotingPolicy::default());
@@ -484,7 +524,7 @@ mod tests {
         )
         .unwrap();
 
-        let (events, policy, _pm) =
+        let (events, policy, _pm, _watermark) =
             load_voting_log(&crate::device_dataset_file::test_cipher(), &path, &cid).unwrap();
         assert_eq!(events, log.events, "policy-only write must preserve events");
         assert_eq!(policy, new_policy, "policy must be updated");
@@ -529,13 +569,14 @@ mod tests {
             events: Vec::new(),
             policy: CommunityVotingPolicy::default(),
             poll_restore: HashMap::new(),
+            retired_epoch_watermark: None,
         };
         let mut legacy = Vec::new();
         ciborium::into_writer(&record, &mut legacy).unwrap();
         std::fs::write(&path, &legacy).unwrap();
 
         let cipher = crate::device_dataset_file::test_cipher();
-        let (events, _policy, _pm) = load_voting_log(&cipher, &path, &cid).unwrap();
+        let (events, _policy, _pm, _watermark) = load_voting_log(&cipher, &path, &cid).unwrap();
         assert!(events.is_empty());
 
         let raw = std::fs::read(&path).unwrap();
@@ -567,7 +608,7 @@ mod tests {
         raw[last] ^= 0xFF;
         std::fs::write(&path, &raw).unwrap();
 
-        let (events, _p, _pm) = load_voting_log(&cipher, &path, &cid).unwrap();
+        let (events, _p, _pm, _watermark) = load_voting_log(&cipher, &path, &cid).unwrap();
         assert!(events.is_empty(), "quarantine + empty");
         assert!(
             std::fs::read_dir(dir.path())

@@ -469,6 +469,52 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     _phantom: PhantomData<fn() -> R>,
 }
 
+/// ZEB-1031 Task 7 review C1: read the current D-FROST committee epoch for
+/// `community_id`, or a `DfrostNotReady` error if no active committee
+/// exists. Shared by every Tier-3 PollCreate minting path — the returned
+/// epoch MUST be embedded in the payload's `ce` field (via
+/// `Tier3PollConfigPayload.ce`) BEFORE the event is signed, so every future
+/// reader (this node's own future replay AND every peer that ingests the
+/// event via `process_inbound`/backfill) derives the SAME
+/// `Tier3PollMeta.community_epoch` — not just the author's local copy, the
+/// pre-Task-7-fix-round asymmetry `void_tier3_polls_for_reset`'s review
+/// exposed.
+///
+/// Cluster E fix (CodeRabbit major, R2 bot review): rejecting here rather
+/// than accepting with epoch=0 avoids a poll that can never match a beacon
+/// (no beacon is ever derived from epoch=0 unless the community happens to
+/// still be at genesis). ZEB-1024: "ready" requires an ACTIVE committee,
+/// not merely a running engine.
+///
+/// `publish_event`'s own Tier-3-create branch keeps an independent copy of
+/// this same gate as a fallback for a `ce`-less (pre-Task-7-review or
+/// un-migrated) payload — see that branch's doc for why the two are not
+/// simply merged into one call site.
+pub(crate) async fn read_current_committee_epoch_for_tier3_create<R: tauri::Runtime>(
+    dfrost_registry: Option<&Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<R>>>,
+    community_id: SpaceId,
+) -> Result<u64, String> {
+    let Some(reg) = dfrost_registry else {
+        return Err("DfrostNotReady: D-FROST registry not installed; \
+                     retry Tier 3 PollCreate after install_dfrost_handle"
+            .into());
+    };
+    let Some(engine) = reg.get(community_id).await else {
+        return Err(
+            "DfrostNotReady: no D-FROST engine running for this community; \
+             retry Tier 3 PollCreate after D-FROST is initialized"
+                .into(),
+        );
+    };
+    match engine.latest_committee_epoch().await {
+        Some(epoch) => Ok(epoch),
+        None => Err("DfrostNotReady: D-FROST committee is not active for \
+                      this community (no completed DKG); complete a DKG \
+                      ceremony, then retry Tier 3 PollCreate"
+            .into()),
+    }
+}
+
 impl<R: tauri::Runtime> VotingLogEngine<R> {
     pub fn community_id(&self) -> SpaceId {
         self.community_id
@@ -883,6 +929,27 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 }
             })
             .await;
+
+        // ZEB-1031 Task 7: subscribe to dfrost committee-reset-marker
+        // applies (spec §7). Same Weak-capture pattern as the beacon
+        // subscription above — no reference cycle. Fires from BOTH dfrost
+        // apply sites (live ingest + catch-up chain adoption), so a
+        // straggler healing through the reset chain voids its stale
+        // Tier-3 polls exactly like a live node.
+        let engine_weak_reset = Arc::downgrade(this);
+        registry
+            .subscribe_reset_markers(move |old_epoch, reset_id, community_id| {
+                if let Some(engine) = engine_weak_reset.upgrade() {
+                    let community_id = *community_id;
+                    // Callback is synchronous; spawn the async void handler.
+                    tokio::spawn(async move {
+                        engine
+                            .on_dfrost_reset_marker(old_epoch, reset_id, community_id)
+                            .await;
+                    });
+                }
+            })
+            .await;
     }
 
     /// Handle a VRF beacon arrival from DfrostLog.
@@ -947,6 +1014,286 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             )
             .await;
         }
+    }
+
+    /// Handle a committee-reset-marker arrival from DfrostLog (ZEB-1031
+    /// Task 7, spec §7).
+    ///
+    /// Spawned by the dfrost reset-marker callback (see
+    /// `install_dfrost_handle`) whenever EITHER dfrost apply site — live
+    /// ingest or catch-up chain adoption — successfully applies an `rs`
+    /// marker for ANY community; filters to this engine's own community
+    /// the same way `on_dfrost_beacon` does.
+    async fn on_dfrost_reset_marker(
+        self: &Arc<Self>,
+        old_epoch: u64,
+        reset_id: crate::community_membership::EventId,
+        community_id: SpaceId,
+    ) {
+        if community_id != self.community_id {
+            return;
+        }
+        let voided = self.void_tier3_polls_for_reset(old_epoch, reset_id).await;
+        if voided > 0 {
+            tracing::info!(
+                community_id = ?self.community_id,
+                old_epoch,
+                voided,
+                "voting engine: voided open Tier-3 polls on committee reset"
+            );
+        }
+    }
+
+    /// ZEB-1031 Task 7: void every OPEN Tier-3 poll whose `community_epoch`
+    /// predates (or equals) a retired committee's `old_epoch` (spec §7).
+    /// "Open" excludes polls already in a terminal `Stage` (`Finalized`/
+    /// `Failed`) — those can no longer accept mutations regardless, and
+    /// voiding one would be a meaningless annotation on completed
+    /// history. Idempotent: an already-voided poll is skipped and does
+    /// not count toward the returned total, so re-running for the same
+    /// `(old_epoch, reset_id)` (or a later reset chained on top) is safe.
+    ///
+    /// `pub` (not `pub(crate)`) so integration tests — a separate crate
+    /// from `harmony-app`'s perspective — can call it directly to assert
+    /// idempotency without re-driving a full dfrost apply.
+    ///
+    /// Returns the number of polls newly voided by this call.
+    pub async fn void_tier3_polls_for_reset(
+        &self,
+        old_epoch: u64,
+        reset_id: crate::community_membership::EventId,
+    ) -> usize {
+        use crate::community_voting_tier3::{Stage, VoidedInfo};
+
+        let mut voided_count = 0usize;
+        let mut watermark_advanced = false;
+        // ZEB-1031 Task 9: voided polls, collected for the post-lock event
+        // emit below — voiding is out-of-band engine mutation (no `kd=*`
+        // event drives it), so it is otherwise invisible to every existing
+        // `voting-tier3-*` event (all fired from `apply_event`'s dispatch).
+        let mut newly_voided: Vec<PollId> = Vec::new();
+        {
+            let mut log = self.voting_log.lock().await;
+            for state in log.polls.values_mut() {
+                let Some(t3) = state.tier_state.as_tier3_mut() else {
+                    continue;
+                };
+                if t3.voided.is_some() {
+                    continue; // idempotent: already voided
+                }
+                if matches!(t3.stage, Stage::Finalized | Stage::Failed) {
+                    continue; // not "open" — nothing left to void
+                }
+                if t3.meta.community_epoch > old_epoch {
+                    continue; // minted at/after the successor epoch
+                }
+                t3.voided = Some(VoidedInfo {
+                    reset_id,
+                    old_epoch,
+                });
+                voided_count += 1;
+                newly_voided.push(state.meta.poll_id);
+            }
+            // ZEB-1031 Task 7 review M1: advance the community-wide
+            // retired-epoch watermark whenever this call names a NEW
+            // highest `old_epoch` — independent of whether it voided any
+            // polls THIS time (a 0-new-voids call still means "we now
+            // know about a reset at this old_epoch", which matters for a
+            // pre-reset-epoch poll that syncs in later via an independent
+            // anti-entropy path). Materialization consults this watermark
+            // to auto-void a late-arriving pre-reset create instead of
+            // relying on a sweep that already ran and will never re-run
+            // for that poll.
+            let is_new_high = match log.retired_epoch_watermark {
+                Some(w) => old_epoch > w.old_epoch,
+                None => true,
+            };
+            if is_new_high {
+                log.retired_epoch_watermark = Some(VoidedInfo {
+                    reset_id,
+                    old_epoch,
+                });
+                watermark_advanced = true;
+            }
+        }
+        if voided_count > 0 || watermark_advanced {
+            self.persist_now().await;
+        }
+        // ZEB-1031 Task 9: notify the UI per newly-voided poll, mirroring
+        // `maybe_emit_tier3_lifecycle_events`'s guard/failure-handling shape
+        // (missing AppHandle = test-only mode, no-op; emit failure is
+        // logged and non-fatal — the state mutation + persist already
+        // succeeded above).
+        if let Some(app_handle) = self.app_handle.as_ref() {
+            let community_id_hex = hex::encode(self.community_id.0);
+            let reset_id_hex = hex::encode(reset_id);
+            for pid in &newly_voided {
+                let payload = crate::VotingTier3VoidedPayload {
+                    poll_id: hex::encode(pid.0),
+                    community_id: community_id_hex.clone(),
+                    reset_id: reset_id_hex.clone(),
+                    old_epoch,
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-voided", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %hex::encode(pid.0),
+                        "voting-tier3-voided emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+        voided_count
+    }
+
+    /// ZEB-1031 Task 7: relaunch a Tier-3 poll voided by a committee reset
+    /// (spec §7). Authors a fresh `kd=cr` PollCreate copying the voided
+    /// poll's parameters, carrying `predecessor: Some(old_poll_id)`, and
+    /// publishes it through the SAME local-mint dispatch every other
+    /// Tier-3 PollCreate uses (`publish_event`).
+    ///
+    /// Epoch handling (review round 2, C1): the current-committee-epoch
+    /// pre-read and D-FROST-readiness gate now happen HERE, before
+    /// signing, via `read_current_committee_epoch_for_tier3_create` —
+    /// the read has to precede signing so the epoch is part of what's
+    /// signed. `publish_event`'s own pre-read/gate is skipped for this
+    /// event, since `cfg.ce` already carries a value by the time it gets
+    /// there (see `publish_event`'s Tier3-create block: it only runs its
+    /// own gate+read when `cfg.ce.is_none()`). `publish_event` still
+    /// supplies persistence and the beacon-request trigger, unmodified.
+    ///
+    /// Authorization: `caller` must be the voided poll's original creator,
+    /// or `caller_is_power_100` must be `true` — resolved by the caller
+    /// (the IPC layer) from a fresh membership snapshot, since this engine
+    /// has no general-purpose "is this addr an admin" query of its own.
+    ///
+    /// A free function (not a `#[tauri::command]`) deliberately: testable
+    /// directly against an engine + seeded `voting_log`, without wiring a
+    /// full `NodeState` (mirrors this codebase's established "Path C"
+    /// engine-layer testing convention — see
+    /// `community_voting_tier3_ipc_integration.rs`'s module doc).
+    ///
+    /// Returns the new poll's `PollId`.
+    pub async fn relaunch_voided_poll(
+        self: &Arc<Self>,
+        old_poll_id: PollId,
+        caller: OwnerAddr,
+        caller_is_power_100: bool,
+        signing_key: &ed25519_dalek::SigningKey,
+        hlc: Hlc,
+        snapshot: Option<crate::community_voting_core::MembershipSnapshot>,
+    ) -> Result<PollId, String> {
+        // Read the voided poll's config + creator. Held only for the
+        // read — dropped before any await below.
+        let (mut cfg, creator) = {
+            let log = self.voting_log.lock().await;
+            let state = log.polls.get(&old_poll_id).ok_or_else(|| {
+                format!(
+                    "relaunch_voided_poll: poll {} not found",
+                    hex::encode(old_poll_id.0)
+                )
+            })?;
+            let t3 = state.tier_state.as_tier3().ok_or_else(|| {
+                format!(
+                    "relaunch_voided_poll: poll {} is not a Tier 3 poll",
+                    hex::encode(old_poll_id.0)
+                )
+            })?;
+            if t3.voided.is_none() {
+                return Err(format!(
+                    "relaunch_voided_poll: poll {} has not been voided by a committee reset",
+                    hex::encode(old_poll_id.0)
+                ));
+            }
+            (t3.meta.config.clone(), state.meta.creator)
+        };
+
+        if caller != creator && !caller_is_power_100 {
+            return Err(format!(
+                "relaunch_voided_poll: caller {} is neither the original creator {} nor power-100",
+                hex::encode(caller.0),
+                hex::encode(creator.0)
+            ));
+        }
+
+        // Copy the voided poll's parameters, pointing the new poll back
+        // at it. Everything else (proposal text, windows, eligibility,
+        // privacy_mode, incentive_mode) rides through unchanged.
+        cfg.predecessor = Some(old_poll_id);
+        // ZEB-1031 Task 7 review I1: `retry_of` is a DIFFERENT, exclusive
+        // linkage (a retry follows a *failed sortition*; a predecessor
+        // follows a *committee reset*) — cloning the old poll's config
+        // wholesale would silently carry a stale sortition-retry claim
+        // onto the relaunched poll if the voided poll happened to itself
+        // be a retry. `predecessor` is the correct provenance now; drop
+        // any inherited `retry_of`.
+        cfg.retry_of = None;
+        // ZEB-1031 Task 7 review C1: read the CURRENT committee epoch and
+        // embed it in the signed payload — this MUST happen before
+        // signing (the value has to be part of what's signed) so every
+        // reader, not just this node, derives the same
+        // `Tier3PollMeta.community_epoch` for the relaunched poll.
+        let epoch = read_current_committee_epoch_for_tier3_create(
+            self.dfrost_registry.lock().await.as_ref(),
+            self.community_id,
+        )
+        .await?;
+        cfg.ce = Some(epoch);
+        crate::community_voting_tier3::validate_tier3_poll_config(&cfg)
+            .map_err(|e| format!("relaunch_voided_poll: invalid config: {e:?}"))?;
+
+        let event = crate::community_voting_core::build_signed_poll_create_tier3(
+            signing_key,
+            caller,
+            &cfg,
+            hlc,
+        )
+        .map_err(|e| format!("relaunch_voided_poll: build_signed: {e:?}"))?;
+
+        // Compute the new PollId BEFORE publish (same derivation
+        // `voting_create_tier3_proposal` uses) so we can return it
+        // without a re-read.
+        let signing_bytes = event
+            .signing_bytes()
+            .map_err(|e| format!("relaunch_voided_poll: signing_bytes: {e:?}"))?;
+        let new_poll_id =
+            crate::community_voting_core::derive_poll_id(&self.community_id, &signing_bytes);
+
+        // CR review round 1 (narrowed): re-check for a live non-terminal
+        // successor of `old_poll_id` as late as possible, immediately
+        // before publish, to shrink (not close) the race window opened
+        // by dropping `voting_log` above this function's first read.
+        // Deliberately NOT enforced at apply/materialization: rejecting a
+        // signed PollCreate based on the LOCAL ARRIVAL ORDER
+        // of a concurrent create would make acceptance depend on gossip
+        // order rather than event content, which diverges replicas that
+        // see the two creates in a different order (the ZEB-1032
+        // arrival-order lesson). A lost race here still yields two valid
+        // successor polls for the same predecessor — benign provenance
+        // noise, disclosed, not the replica-divergence hazard the
+        // apply-side gate would introduce.
+        {
+            use crate::community_voting_tier3::Stage;
+            let log = self.voting_log.lock().await;
+            let already_has_live_successor = log.polls.values().any(|state| {
+                state.tier_state.as_tier3().is_some_and(|t3| {
+                    t3.meta.config.predecessor == Some(old_poll_id)
+                        && !matches!(t3.stage, Stage::Finalized | Stage::Failed)
+                })
+            });
+            if already_has_live_successor {
+                return Err(format!(
+                    "relaunch_voided_poll: poll {} already has a live successor",
+                    hex::encode(old_poll_id.0)
+                ));
+            }
+        }
+
+        self.publish_event(event, snapshot)
+            .await
+            .map_err(|e| format!("relaunch_voided_poll: publish: {e}"))?;
+
+        Ok(new_poll_id)
     }
 
     /// Compute Fisher-Yates sortition and publish a kd=ss SortitionSelection event.
@@ -2159,62 +2506,61 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             tracker.record(&event);
         }
 
-        // (3) For Tier 3 PollCreate: read the current D-FROST epoch BEFORE apply
-        // so we can store it atomically with the new poll state. This avoids the
-        // epoch-refresh race where a CHURP refresh could land between apply and
-        // beacon request, causing epoch mismatch (Cluster 1+2 fix, R1 bot review).
+        // (3) For Tier 3 PollCreate: `cfg.ce` (ZEB-1031 Task 7 review C1) is
+        // now the authoritative source for `Tier3PollMeta.community_epoch` —
+        // `apply_with_snapshot`'s Tier-3 branch reads it directly, uniformly
+        // for local mint, peer `process_inbound`, AND backfill apply. Both
+        // production minting paths (`voting_create_tier3_proposal`,
+        // `relaunch_voided_poll`) now embed `ce` via
+        // `read_current_committee_epoch_for_tier3_create` BEFORE signing —
+        // so for a properly-migrated caller, there is nothing left to patch
+        // here, and CRITICALLY nothing to independently re-read: doing so
+        // would risk this node's own local materialization diverging from
+        // what's baked into the SIGNED payload every peer will use (e.g. a
+        // CHURP refresh landing in the gap between the caller's pre-sign
+        // read and this one), reintroducing exactly the asymmetry this
+        // field exists to close.
         //
-        // Cluster E fix (CodeRabbit major, R2 bot review): if the D-FROST registry or engine
-        // is not ready, REJECT the PollCreate rather than accepting it with epoch=0. A poll
-        // with epoch=0 will stall — no beacon will ever match a seed derived from epoch=0
-        // unless the community happened to use epoch 0 (which is only possible at inception).
-        // The caller (IPC layer) receives a meaningful error and can retry after D-FROST starts.
-        //
-        // ZEB-1024: "ready" additionally requires an ACTIVE committee, not merely a running
-        // engine. Since #768 every joined community runs a dfrost engine at boot, so an
-        // engine-exists check is trivially true — the poll would be created and then stall
-        // silently in Sortition (`dfrost_request_vrf_beacon` rejects without an active
-        // committee). Gate here so the authoring node gets the fast, actionable error back.
-        // Peer-ingested PollCreate events never hit this path by design.
-        let tier3_create_epoch: Option<(PollId, u64)> = if event.kind
-            == PollEventKindCode::PollCreate
-            && event.tier == Tier::Sortition
-        {
-            let epoch = {
-                let dr = self.dfrost_registry.lock().await;
-                if let Some(reg) = dr.as_ref() {
-                    if let Some(engine) = reg.get(self.community_id).await {
-                        match engine.latest_committee_epoch().await {
-                            Some(epoch) => epoch,
-                            None => {
-                                return Err("DfrostNotReady: D-FROST committee is not active for \
-                                         this community (no completed DKG); complete a DKG \
-                                         ceremony, then retry Tier 3 PollCreate"
-                                    .into());
-                            }
-                        }
-                    } else {
-                        return Err(
-                            "DfrostNotReady: no D-FROST engine running for this community; \
-                                 retry Tier 3 PollCreate after D-FROST is initialized"
-                                .into(),
-                        );
-                    }
+        // The gate below (`DfrostNotReady`) and its post-apply
+        // `set_tier3_poll_epoch` patch stay ONLY as a fallback for a
+        // `ce`-less payload — a caller that predates this fix (none in
+        // production today) or a direct `publish_event` caller in a test
+        // (several in this file's own test module construct events via
+        // `tier3_poll_create_event()`, which does not set `ce`). Cluster E
+        // fix (CodeRabbit major, R2 bot review): reject rather than accept
+        // with epoch=0 — a poll with epoch=0 stalls (no beacon is ever
+        // derived from epoch=0 unless the community is still at genesis).
+        // ZEB-1024: "ready" requires an ACTIVE committee, not merely a
+        // running engine. Peer-ingested PollCreate events never hit this
+        // path by design (`process_inbound`/backfill call
+        // `apply_with_snapshot` directly, never `publish_event`).
+        let tier3_create_epoch: Option<(PollId, u64)> =
+            if event.kind == PollEventKindCode::PollCreate && event.tier == Tier::Sortition {
+                let cfg: crate::community_voting_core::Tier3PollConfigPayload =
+                    ciborium::de::from_reader(&event.payload[..]).map_err(|e| {
+                        format!("decode Tier3PollConfigPayload for epoch pre-read: {e}")
+                    })?;
+                if cfg.ce.is_some() {
+                    // Wire-carried epoch already governs materialization —
+                    // nothing to gate or patch (see comment above).
+                    None
                 } else {
-                    return Err("DfrostNotReady: D-FROST registry not installed; \
-                             retry Tier 3 PollCreate after install_dfrost_handle"
-                        .into());
+                    let epoch = read_current_committee_epoch_for_tier3_create(
+                        self.dfrost_registry.lock().await.as_ref(),
+                        self.community_id,
+                    )
+                    .await?;
+                    // Derive poll_id from signing bytes (same derivation as apply_with_snapshot).
+                    let sb = event
+                        .signing_bytes()
+                        .map_err(|e| format!("signing_bytes for epoch pre-read: {e}"))?;
+                    let poll_id =
+                        crate::community_voting_core::derive_poll_id(&self.community_id, &sb);
+                    Some((poll_id, epoch))
                 }
+            } else {
+                None
             };
-            // Derive poll_id from signing bytes (same derivation as apply_with_snapshot).
-            let sb = event
-                .signing_bytes()
-                .map_err(|e| format!("signing_bytes for epoch pre-read: {e}"))?;
-            let poll_id = crate::community_voting_core::derive_poll_id(&self.community_id, &sb);
-            Some((poll_id, epoch))
-        } else {
-            None
-        };
 
         // ZEB-310 Task 12: snapshot the affected poll's current stage BEFORE
         // apply so the post-apply hook can detect Deliberation→Drafting and
@@ -4526,12 +4872,13 @@ mod tests {
             path.exists(),
             "voting.cbor must exist after a persisted mutation"
         );
-        let (events, _policy, poll_restore) = crate::community_voting_persist::load_voting_log(
-            &crate::device_dataset_file::test_cipher(),
-            &path,
-            &community_id,
-        )
-        .unwrap();
+        let (events, _policy, poll_restore, _watermark) =
+            crate::community_voting_persist::load_voting_log(
+                &crate::device_dataset_file::test_cipher(),
+                &path,
+                &community_id,
+            )
+            .unwrap();
         assert_eq!(events, vec![ev], "persisted log reloads the applied event");
         // The applied PollCreate materialized one poll, so its restore persists.
         assert_eq!(
@@ -4957,6 +5304,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let mut payload = Vec::new();
         ciborium::into_writer(&config, &mut payload).expect("encode tier3 cfg");
@@ -7212,6 +7561,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -8003,6 +8354,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -8196,6 +8549,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -8390,6 +8745,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -9115,6 +9472,8 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");

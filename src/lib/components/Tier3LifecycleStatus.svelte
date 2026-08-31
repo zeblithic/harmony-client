@@ -24,7 +24,12 @@
   // (Phase 4a-main does not surface kd=ss arrival ETA — only stage chips.)
 </script>
 
-{#if summary.stage === 'fa'}
+{#if summary.voided}
+  <!-- ZEB-1031 §7/§9: a reset-voided poll takes priority over the
+       ordinary stage/finalized/failed badges — it stays at whatever
+       stage it was voided at, but that stage is no longer actionable. -->
+  <div class="voided-badge">🚫 Voided</div>
+{:else if summary.stage === 'fa'}
   <div class="failed-badge">⚠ Sortition failed (backup pool exhausted)</div>
 {:else if summary.stage === 'fi'}
   <div class="finalized-badge">
@@ -69,6 +74,10 @@
     color: var(--status-open-fg);
   }
   .failed-badge {
+    color: var(--vote-against);
+    font-weight: 600;
+  }
+  .voided-badge {
     color: var(--vote-against);
     font-weight: 600;
   }

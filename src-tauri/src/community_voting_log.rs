@@ -18,7 +18,7 @@ use crate::community_voting_core::{
     PollMeta, SignedVotingEvent, Tier, Tier3PollConfigPayload,
 };
 use crate::community_voting_sortition::canonical_electorate_order;
-use crate::community_voting_tier3::{Tier3PollMeta, Tier3PollState};
+use crate::community_voting_tier3::{Tier3PollMeta, Tier3PollState, VoidedInfo};
 use crate::owner_state_types::Hlc;
 
 /// Resolves the community's membership snapshot at a specific HLC,
@@ -37,6 +37,47 @@ pub trait MembershipSnapshotResolver: Send + Sync {
         community_id: crate::owner_state_types::SpaceId,
         hlc: &crate::owner_state_types::Hlc,
     ) -> Result<crate::community_voting_core::MembershipSnapshot, SnapshotResolverError>;
+
+    /// ZEB-1031 §5.1/§6.1: resolve the FULL materialized membership
+    /// state — including `reset_proposals`, not just the narrow
+    /// `MembershipSnapshot` projection `snapshot_at` returns — strictly
+    /// BEFORE `hlc` (same at-event-HLC discipline as `snapshot_at`, via
+    /// `prior_state_at_hlc`). Consumed by the D-FROST engine's
+    /// `verify_reset_marker_admissible` (RS-M3/M4/M5), which must
+    /// evaluate reset-proposal phase/digest/actor-power at the marker
+    /// event's OWN envelope HLC so the verdict is deterministic across
+    /// replicas regardless of arrival order.
+    ///
+    /// Default: unsupported (`Err`) — only the production
+    /// `NodeStateMembershipResolver` overrides this; the voting/channel-
+    /// log resolvers this trait already serves have no use for it.
+    async fn reset_membership_at(
+        &self,
+        _community_id: crate::owner_state_types::SpaceId,
+        _hlc: &crate::owner_state_types::Hlc,
+    ) -> Result<crate::community_membership::MaterializedMembership, SnapshotResolverError> {
+        Err(SnapshotResolverError::BackendError(
+            "reset membership evidence not supported by this resolver (ZEB-1031)".into(),
+        ))
+    }
+
+    /// ZEB-1031 §6.1: resolve the CURRENT (at-HEAD) materialized
+    /// membership state. Used by `adopt_initial_quorum`/
+    /// `adopt_refresh_quorum` call sites to compute
+    /// `dfrost_reset_rejected_vks` against THIS replica's own live
+    /// view — deliberately never a peer-supplied HLC, since a stale
+    /// event's HLC could hide a reset authorized after it, defeating
+    /// the exact replay this gate exists to close.
+    ///
+    /// Default: unsupported (`Err`).
+    async fn reset_membership_now(
+        &self,
+        _community_id: crate::owner_state_types::SpaceId,
+    ) -> Result<crate::community_membership::MaterializedMembership, SnapshotResolverError> {
+        Err(SnapshotResolverError::BackendError(
+            "reset membership evidence not supported by this resolver (ZEB-1031)".into(),
+        ))
+    }
 }
 
 /// Why `MembershipSnapshotResolver::snapshot_at` failed.
@@ -76,6 +117,22 @@ pub struct VotingLog {
     /// via signed event). Default = all-fields-false so existing
     /// communities preserve pre-policy behavior.
     policy: crate::community_voting_conviction::CommunityVotingPolicy,
+    /// ZEB-1031 Task 7 review M1: the highest `(old_epoch, reset_id)` this
+    /// engine has ever been told about via `void_tier3_polls_for_reset`
+    /// (community-wide, NOT per-poll — reuses `VoidedInfo`'s shape purely
+    /// for convenience). Consulted at Tier-3 PollCreate materialization
+    /// time (`apply_with_snapshot`'s Tier-3 branch, alongside the `cfg.ce`
+    /// read) so a pre-reset-epoch poll that syncs in AFTER the local
+    /// sweep already ran — via an independent anti-entropy path (dfrost
+    /// catch-up and voting-log RBSR are separate wire protocols with no
+    /// ordering guarantee between them) — still materializes already
+    /// voided, instead of permanently stalling live-and-mutable (spec §7
+    /// forbids a silent stall). `None` until this engine's first reset.
+    /// Persisted community-wide in `community_voting_persist.rs`
+    /// (`PersistedVotingLog`, not the per-poll `PollRestore` overlay) and
+    /// restored BEFORE the boot replay loop runs — unlike `poll_restore`,
+    /// which restores AFTER (it needs the polls to already exist by id).
+    pub retired_epoch_watermark: Option<VoidedInfo>,
 }
 
 /// Materialized state for a single poll.
@@ -187,6 +244,12 @@ pub enum ApplyError {
     /// poll (the tier_state is not `Tier3`). Distinct from `RetryOfPollNotFailed`
     /// which applies when the predecessor is Tier 3 but not in Failed stage.
     RetryOfPollNotTier3,
+    /// ZEB-1031 Task 7: event targeted a Tier 3 poll voided by a committee
+    /// reset (spec §7). Distinct from `IllegalTransition` (the ordinary
+    /// Failed/Finalized terminal rejections) so callers can surface a
+    /// reset-specific message and prompt a relaunch instead of a generic
+    /// "poll closed" error.
+    PollVoided,
 }
 
 /// ZEB-860 / Cluster K: mirror a Tier-3 poll's terminal `stage` into the
@@ -570,6 +633,9 @@ impl VotingLog {
                         crate::community_voting_tier3::ApplyError::PayloadDecode(_) => {
                             ApplyError::PayloadDecode
                         }
+                        crate::community_voting_tier3::ApplyError::PollVoided => {
+                            ApplyError::PollVoided
+                        }
                     });
                 }
             };
@@ -822,19 +888,42 @@ impl VotingLog {
                         })
                         .unwrap_or_default();
 
+                // ZEB-1031 Task 7 review C1: `cfg.ce` (when present) is the
+                // wire-carried, creator-signed epoch — authoritative for
+                // EVERY materialization path (this branch runs identically
+                // for local mint, peer `process_inbound`, and backfill
+                // apply), unlike the old asymmetric `set_tier3_poll_epoch`
+                // patch-after-the-fact, which had exactly one call site (the
+                // author's own local-mint pre-read) and left every other
+                // device's copy at the `0` fallback below forever. Absent
+                // `ce` (a pre-Task-7 poll, from before this field existed)
+                // is treated as epoch 0 by construction — pre-upgrade polls
+                // predate every representable reset, so "voidable by any
+                // reset at/above epoch 0" is the correct disposition, not a
+                // bug.
+                let community_epoch = cfg.ce.unwrap_or(0);
                 let tier3_meta = Tier3PollMeta {
                     poll_id,
                     proposer: event.actor,
                     poll_create_hlc: event.hlc.clone(),
                     config: cfg.clone(),
                     poll_create_event_hash,
-                    // community_epoch is set to 0 here; the engine calls
-                    // `set_tier3_poll_epoch` immediately after apply to store
-                    // the real epoch read from DfrostLogRegistry (Cluster 1 fix).
-                    community_epoch: 0,
+                    community_epoch,
                 };
-                let tier3_state =
+                let mut tier3_state =
                     Tier3PollState::new_from_create(tier3_meta, eligible_electorate_snapshot);
+                // ZEB-1031 Task 7 review M1: a poll materializing at or
+                // below the highest reset epoch this engine has already
+                // swept must not go live-and-mutable — it may be arriving
+                // late (independent anti-entropy path) after the sweep for
+                // that very reset already ran. Void it immediately rather
+                // than relying on a sweep that already happened and will
+                // never re-run for this poll.
+                if let Some(watermark) = self.retired_epoch_watermark {
+                    if community_epoch <= watermark.old_epoch {
+                        tier3_state.voided = Some(watermark);
+                    }
+                }
 
                 let meta = PollMeta {
                     poll_id,
@@ -1789,6 +1878,8 @@ mod tier3_dispatch_tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
+            ce: None,
         }
     }
 
@@ -1915,6 +2006,8 @@ mod tier3_dispatch_tests {
                         sortition_size: None,
                     },
                     retry_of: None,
+                    predecessor: None,
+                    ce: None,
                 },
                 poll_create_event_hash: [0xaa; 32],
                 community_epoch: 0,

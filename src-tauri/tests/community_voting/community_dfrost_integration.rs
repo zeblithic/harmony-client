@@ -24,7 +24,8 @@ use frost_ristretto255::{
     rand_core, Identifier,
 };
 use harmony_app::community_dfrost_catchup::{
-    decode_frame, encode_frame, CatchupBody, CatchupFrame, CatchupStatus, CATCHUP_VERSION,
+    decode_frame, encode_frame, CatchupBody, CatchupFrame, CatchupStatus, ResetChainLink,
+    CATCHUP_VERSION,
 };
 use harmony_app::community_dfrost_crypto::{
     dkg_part1_local, dkg_part2_local, dkg_part3_local, verifying_key_to_bytes,
@@ -32,19 +33,27 @@ use harmony_app::community_dfrost_crypto::{
 };
 use harmony_app::community_dfrost_log::{
     build_signed_dfrost_event, ApplyError, CommitteeState, DfrostLog, PendingCeremony,
+    ResetMarkerApplied,
 };
 use harmony_app::community_dfrost_log_engine::{
-    CatchupOutcome, DfrostLogEngine, DfrostLogEngineParams,
+    verify_reset_marker_admissible, CatchupOutcome, DfrostLogEngine, DfrostLogEngineParams,
+    DfrostLogRegistry,
 };
 use harmony_app::community_dfrost_types::{
     derive_vrf_output, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
-    RefreshRoundPayload, RepairRoundPayload, SignedCommitteeEvent, ThresholdSignPayload,
-    VrfBeaconPayload,
+    RefreshRoundPayload, RepairRoundPayload, ResetMarkerPayload, SignedCommitteeEvent,
+    ThresholdSignPayload, VrfBeaconPayload,
 };
-use harmony_app::community_membership::RecipientCiphertext;
+use harmony_app::community_membership::{
+    dfrost_reset_digest, EventId, MaterializedMembership, MemberState, MemberStatus,
+    RecipientCiphertext, ResetPhase, ResetProposalView,
+};
 use harmony_app::community_state_sync::IdentityResolver;
+use harmony_app::community_voting_core::{MemberAttrs, MembershipSnapshot};
+use harmony_app::community_voting_log::{MembershipSnapshotResolver, SnapshotResolverError};
 use harmony_app::dm_signing;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use harmony_app::{production_dkg_driver, DfrostCoreHandles, DfrostLogsMap};
 use tokio::sync::{mpsc, Mutex};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -77,6 +86,23 @@ fn hlc(wall_ms: u64, node: &str) -> Hlc {
         wall_ms,
         logical: 0,
         device_id: node.into(),
+    }
+}
+
+/// A `MemberState` for a hand-built `MaterializedMembership` test
+/// fixture — Joined, no left_at, no device-key bookkeeping needed for
+/// these tests. ZEB-1031 review I1: `verify_reset_marker_admissible`'s
+/// RS-M5 pairs the power/`nm` read with `is_joined_member`, so any
+/// fixture actor authoring a marker (or claimed as a pinned successor
+/// member checked via that leg) must have an entry here, not just in
+/// `power_levels`.
+fn joined_member_state() -> MemberState {
+    MemberState {
+        status: MemberStatus::Joined,
+        joined_at: hlc(0, "t"),
+        left_at: None,
+        enrolled_device_keys: Default::default(),
+        revoked_device_keys: Default::default(),
     }
 }
 
@@ -1958,4 +1984,2694 @@ async fn fresh_joiner_adopts_committee_state_zeb1030() {
         let dg = d_log.lock().await;
         assert!(!dg.committee_state.active, "D must stay inactive");
     }
+}
+
+// ─── Task 5: ZEB-1031 provenance / reset marker / catch-up chain ───────────
+
+/// Test `MembershipSnapshotResolver` backing `verify_reset_marker_
+/// admissible` (RS-M3/M4/M5) and the `dfrost_reset_rejected_vks` gate
+/// with a hand-built `MaterializedMembership` (a real membership-log
+/// event pipeline is Task 1/2's own test responsibility; Task 5's
+/// tests exercise what THIS task consumes, given upstream state).
+/// `snapshot_at` covers the pre-existing `di`/joiner membership gates
+/// too, so the SAME resolver instance is wired to every engine below.
+struct TestResetResolver {
+    members: Vec<OwnerAddr>,
+    membership: Mutex<MaterializedMembership>,
+}
+
+impl TestResetResolver {
+    fn new(members: Vec<OwnerAddr>, membership: MaterializedMembership) -> Self {
+        Self {
+            members,
+            membership: Mutex::new(membership),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MembershipSnapshotResolver for TestResetResolver {
+    async fn snapshot_at(
+        &self,
+        _community_id: SpaceId,
+        _hlc: &Hlc,
+    ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+        let m = self.membership.lock().await;
+        let mut members = HashMap::new();
+        for addr in &self.members {
+            let power = *m.power_levels.get(addr).unwrap_or(&0);
+            members.insert(
+                *addr,
+                MemberAttrs {
+                    power,
+                    vouching_depth: 0,
+                },
+            );
+        }
+        Ok(MembershipSnapshot { members })
+    }
+
+    async fn reset_membership_at(
+        &self,
+        _community_id: SpaceId,
+        _hlc: &Hlc,
+    ) -> Result<MaterializedMembership, SnapshotResolverError> {
+        Ok(self.membership.lock().await.clone())
+    }
+
+    async fn reset_membership_now(
+        &self,
+        _community_id: SpaceId,
+    ) -> Result<MaterializedMembership, SnapshotResolverError> {
+        Ok(self.membership.lock().await.clone())
+    }
+}
+
+/// ZEB-1031 Task 5: the full committee-reset lifecycle. An active 2-of-2
+/// committee is driven through a membership-authorized reset: a marker
+/// deactivates it, a successor DKG promotes a new joint vk, a straggler
+/// still holding the pre-reset state heals via the catch-up reset chain
+/// (ending active at the new vk with `vk_history.len() == 1`), and a
+/// fresh joiner offered ONLY the stale pre-reset quorum while the reset
+/// is Authorized is rejected (stale-committee replay, spec §6.1).
+#[tokio::test]
+async fn committee_reset_marker_successor_dkg_and_straggler_healing_zeb1031() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x71);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0x72);
+
+    let alice_x = alice_x25519();
+    let bob_x = bob_x25519();
+    let mut c = dkg_2of2_setup_for(alice_addr, bob_addr, alice_x, bob_x, Vec::new());
+    let old_vk = c.joint_vk;
+    let community_id = SpaceId([0x71; 16]);
+    // Sorted ascending: adopt_initial_quorum requires it (the reset
+    // path's ceremonies never go through dkg_2of2_setup_for's own
+    // internal member list, which is unsorted-tolerant since apply()
+    // never checks it).
+    let mut new_members = vec![alice_addr, bob_addr];
+    new_members.sort();
+    let new_threshold: u16 = 2;
+
+    // ── Membership view: alice is the power-100 admin; one reset
+    //    proposal targets the current committee, Authorized, pinning
+    //    the (same-shape, for simplicity) successor committee.
+    let reset_id: EventId = [0x80; 16];
+    let digest = dfrost_reset_digest(
+        &community_id,
+        &reset_id,
+        &old_vk,
+        1,
+        &new_members,
+        new_threshold,
+    )
+    .expect("digest");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset_id,
+        proposer: alice_addr,
+        target_vk: old_vk,
+        target_epoch: 1,
+        new_members: new_members.clone(),
+        new_threshold,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    let resolver = Arc::new(TestResetResolver::new(new_members.clone(), membership));
+
+    // ── Marker: alice (power-100) authors it, REAL Ed25519 signature
+    //    (it crosses the catch-up wire below).
+    let marker_payload = ResetMarkerPayload {
+        reset_proposal_id: reset_id,
+        reset_digest: digest,
+        old_vk,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker_event = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker");
+
+    // Admissibility (RS-M3/M4/M5) then apply — mirrors the engine's
+    // process_inbound routing for `rs` (verify_reset_marker_admissible
+    // is the sole entry point `apply_reset_marker` can't reach without
+    // it, since the successor pin comes from membership, not the wire).
+    let membership_at_marker = resolver.membership.lock().await.clone();
+    let (nm, nt) = verify_reset_marker_admissible(
+        &marker_payload,
+        &alice_addr,
+        &community_id,
+        &membership_at_marker,
+    )
+    .expect("marker admissible");
+    let applied = c
+        .engine_a
+        .apply_reset_marker(&marker_event, &community_id, nm, nt)
+        .expect("marker applies");
+    assert!(
+        matches!(applied, ResetMarkerApplied::Applied { old_epoch: 1, .. }),
+        "expected Applied at old_epoch 1, got {applied:?}"
+    );
+    assert!(!c.engine_a.committee_state.active, "committee deactivates");
+    assert_eq!(c.engine_a.committee_state.vk_history.len(), 1);
+    assert!(c.engine_a.committee_state.pending_reset.is_some());
+
+    // ── Successor DKG (epoch 2): fabricated verifying shares — apply()
+    //    never cross-checks a dk payload against real FROST material
+    //    (see dkg_2of2_setup_for's doc); only the reset/adoption
+    //    bookkeeping matters here.
+    let successor_ceremony_id: [u8; 32] = [0x81; 32];
+    c.engine_a.committee_state.pending_dkg = Some(PendingCeremony {
+        ceremony_id: successor_ceremony_id,
+        members: new_members.clone(),
+        threshold: new_threshold,
+        max_signers: 2,
+        proposed_epoch: 2,
+        ..Default::default()
+    });
+    let new_vk = [0x82; 32];
+    let successor_dk_payload = DkgCompletePayload {
+        ceremony_id: successor_ceremony_id,
+        joint_verifying_key: new_vk,
+        verifying_shares: vec![
+            MemberVerifyingShare {
+                member: alice_addr,
+                verifying_share: [0x83; 32],
+            },
+            MemberVerifyingShare {
+                member: bob_addr,
+                verifying_share: [0x84; 32],
+            },
+        ],
+        epoch: 2,
+        members: new_members.clone(),
+        threshold: new_threshold,
+        max_signers: 2,
+        space_id: Some(community_id),
+    };
+    let dk_alice_e2 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &successor_dk_payload,
+        hlc(6_000, "alice"),
+    )
+    .expect("sign dk alice e2");
+    let dk_bob_e2 = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &successor_dk_payload,
+        hlc(6_100, "bob"),
+    )
+    .expect("sign dk bob e2");
+    c.engine_a.apply(dk_alice_e2).expect("alice dk e2 applies");
+    c.engine_a.apply(dk_bob_e2).expect("bob dk e2 applies");
+    assert!(c.engine_a.committee_state.active, "successor promotes");
+    assert_eq!(c.engine_a.committee_state.joint_verifying_key, Some(new_vk));
+    assert_eq!(c.engine_a.committee_state.current_epoch, 2);
+    assert!(
+        c.engine_a.committee_state.pending_reset.is_none(),
+        "promotion clears the pin"
+    );
+
+    // ── Straggler: engine_b is untouched — still active at epoch 1 /
+    //    old_vk. Wrap the promoted responder (engine_a) and the
+    //    straggler (engine_b) in real DfrostLogEngines and drive one
+    //    catch-up round.
+    let responder_log = Arc::new(Mutex::new(c.engine_a));
+    let straggler_log = Arc::new(Mutex::new(c.engine_b));
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+
+    let (r_pub_tx, _r_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_r_sub_tx, r_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let responder_engine =
+        DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: responder_log.clone(),
+            publisher_tx: r_pub_tx,
+            subscriber_rx: r_sub_rx,
+            app_handle: None,
+            self_addr: alice_addr,
+            self_x25519_priv: alice_x.0,
+            identity_resolver: identity_resolver.clone(),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+    let (s_pub_tx, _s_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_s_sub_tx, s_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler_engine =
+        DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: straggler_log.clone(),
+            publisher_tx: s_pub_tx,
+            subscriber_rx: s_sub_rx,
+            app_handle: None,
+            self_addr: bob_addr,
+            self_x25519_priv: bob_x.0,
+            identity_resolver: identity_resolver.clone(),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+    let req = straggler_engine.catchup_build_request().await;
+    assert_eq!(req.epoch, 1);
+    assert!(req.active);
+    let frames = responder_engine
+        .catchup_respond(req)
+        .await
+        .expect("responder serves the reset chain");
+    let outcome = straggler_engine.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(
+            outcome,
+            CatchupOutcome::AdoptedResetChain { epoch: 2, links: 1 }
+        ),
+        "expected AdoptedResetChain{{epoch:2, links:1}}, got {outcome:?}"
+    );
+    {
+        let sg = straggler_log.lock().await;
+        assert!(sg.committee_state.active, "straggler ends active");
+        assert_eq!(
+            sg.committee_state.joint_verifying_key,
+            Some(new_vk),
+            "straggler adopts the new vk"
+        );
+        assert_eq!(
+            sg.committee_state.vk_history.len(),
+            1,
+            "straggler recorded exactly one retired committee"
+        );
+        assert_eq!(sg.committee_state.current_epoch, 2);
+    }
+
+    // ── Fresh joiner D offered ONLY the stale pre-reset quorum while
+    //    the reset is Authorized → rejected (stale-committee replay,
+    //    spec §6.1), never adopted.
+    let stale_dk_payload = DkgCompletePayload {
+        ceremony_id: CEREMONY_ID,
+        joint_verifying_key: old_vk,
+        verifying_shares: vec![
+            MemberVerifyingShare {
+                member: alice_addr,
+                verifying_share: [0x01; 32],
+            },
+            MemberVerifyingShare {
+                member: bob_addr,
+                verifying_share: [0x02; 32],
+            },
+        ],
+        epoch: 1,
+        members: new_members.clone(),
+        threshold: 2,
+        max_signers: 2,
+        space_id: Some(community_id),
+    };
+    let stale_dk_alice = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &stale_dk_payload,
+        hlc(3_500, "alice"),
+    )
+    .expect("sign stale dk alice");
+    let stale_dk_bob = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &stale_dk_payload,
+        hlc(3_600, "bob"),
+    )
+    .expect("sign stale dk bob");
+    let stale_responder_id: [u8; 8] = [0x55; 8];
+    let mut stale_alice_buf = Vec::new();
+    ciborium::ser::into_writer(&stale_dk_alice, &mut stale_alice_buf).expect("encode stale dk a");
+    let mut stale_bob_buf = Vec::new();
+    ciborium::ser::into_writer(&stale_dk_bob, &mut stale_bob_buf).expect("encode stale dk b");
+    let stale_frames = vec![
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: stale_responder_id,
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 1,
+                active: true,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: stale_responder_id,
+            body: CatchupBody::DkEvidence(stale_alice_buf),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: stale_responder_id,
+            body: CatchupBody::DkEvidence(stale_bob_buf),
+        },
+    ];
+
+    let d_log = Arc::new(Mutex::new(DfrostLog::new()));
+    let (d_pub_tx, _d_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_d_sub_tx, d_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let d_engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id,
+        dfrost_log: d_log.clone(),
+        publisher_tx: d_pub_tx,
+        subscriber_rx: d_sub_rx,
+        app_handle: None,
+        self_addr: OwnerAddr([0xD0; 16]),
+        self_x25519_priv: [0u8; 32],
+        identity_resolver,
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(resolver.clone()),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let outcome_d = d_engine.catchup_ingest(wire_cross(stale_frames)).await;
+    assert_eq!(
+        outcome_d,
+        CatchupOutcome::NothingUsable,
+        "stale pre-reset quorum must be rejected while the reset is Authorized"
+    );
+    {
+        let dg = d_log.lock().await;
+        assert!(!dg.committee_state.active, "D must stay inactive");
+    }
+}
+
+// ─── Task 5 review round 1: C1 (skew gate), C2 (multi-reset chain) ─────────
+
+/// Poll `log` until `predicate` holds or 2s elapse — the same pattern
+/// `community_dfrost_log_engine.rs`'s own test module uses for the
+/// receive-loop-driven (background-task) live ingest path.
+async fn wait_for_dfrost_log<F>(label: &str, log: &Arc<Mutex<DfrostLog>>, mut predicate: F)
+where
+    F: FnMut(&DfrostLog) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        {
+            let guard = log.lock().await;
+            if predicate(&guard) {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("wait_for_dfrost_log({label}) timed out after 2s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+fn now_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64
+}
+
+/// A single active committee (alice/bob, 2-of-2) plus a matching
+/// Authorized reset proposal targeting it — the minimal fixture shared
+/// by the C1 skew-gate tests. `marker_wall_ms` lets each test pick a
+/// clearly-future or clearly-in-tolerance envelope HLC without hunting
+/// for the exact single-ms boundary (real-wall-clock tests need margin
+/// against test/engine clock-read drift).
+struct SkewFixture {
+    community_id: SpaceId,
+    resolver: Arc<TestResetResolver>,
+    identity_resolver: Arc<dyn IdentityResolver + Send + Sync>,
+    alice_addr: OwnerAddr,
+    alice_x_priv: [u8; 32],
+    bob_sk: ed25519_dalek::SigningKey,
+    bob_addr: OwnerAddr,
+    old_vk: [u8; 32],
+    marker: SignedCommitteeEvent,
+    active_log: DfrostLog,
+}
+
+fn build_skew_fixture(marker_wall_ms: u64) -> SkewFixture {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x81);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0x82);
+    let alice_x = alice_x25519();
+    let bob_x = bob_x25519();
+    let c = dkg_2of2_setup_for(alice_addr, bob_addr, alice_x, bob_x, Vec::new());
+    let old_vk = c.joint_vk;
+    let community_id = SpaceId([0x81; 16]);
+    let mut new_members = vec![alice_addr, bob_addr];
+    new_members.sort();
+
+    let reset_id: EventId = [0x90; 16];
+    let digest =
+        dfrost_reset_digest(&community_id, &reset_id, &old_vk, 1, &new_members, 2).expect("digest");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset_id,
+        proposer: alice_addr,
+        target_vk: old_vk,
+        target_epoch: 1,
+        new_members: new_members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    let resolver = Arc::new(TestResetResolver::new(new_members, membership));
+
+    let marker_payload = ResetMarkerPayload {
+        reset_proposal_id: reset_id,
+        reset_digest: digest,
+        old_vk,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker_payload,
+        hlc(marker_wall_ms, "alice"),
+    )
+    .expect("sign marker");
+
+    SkewFixture {
+        community_id,
+        resolver,
+        identity_resolver: resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]),
+        alice_addr,
+        alice_x_priv: alice_x.0,
+        bob_sk,
+        bob_addr,
+        old_vk,
+        marker,
+        active_log: c.engine_a,
+    }
+}
+
+/// ZEB-1031 review C1: a marker whose envelope HLC is stamped well
+/// past `now + MAX_FORWARD_SKEW_MS` must be dropped by the LIVE
+/// ingest path (`process_inbound`'s subscriber-channel route) — never
+/// applied, regardless of otherwise-genuine RS-M3/M4/M5 admissibility.
+/// Without this gate, a marker author skips the veto window + 48h
+/// finality margin entirely (spec §10's named threat).
+#[tokio::test]
+async fn reset_marker_forward_skewed_rejected_on_live_ingest_zeb1031() {
+    let far_future = now_wall_ms() + harmony_app::clock_trust::MAX_FORWARD_SKEW_MS + 60_000;
+    let fx = build_skew_fixture(far_future);
+
+    // Seed an UNRELATED pending DKG ceremony so a real, applyable
+    // sentinel event exists to prove the receive loop drained past the
+    // (dropped, never reaching apply) marker packet — FIFO mpsc, no
+    // fixed sleep needed.
+    let mut active_log = fx.active_log;
+    let sentinel_ceremony_id: [u8; 32] = [0x77; 32];
+    active_log.committee_state.pending_dkg = Some(PendingCeremony {
+        ceremony_id: sentinel_ceremony_id,
+        members: vec![fx.alice_addr, fx.bob_addr],
+        threshold: 2,
+        max_signers: 2,
+        proposed_epoch: 999,
+        ..Default::default()
+    });
+
+    let log = Arc::new(Mutex::new(active_log));
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let _engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: log.clone(),
+        publisher_tx: pub_tx,
+        subscriber_rx: sub_rx,
+        app_handle: None,
+        self_addr: fx.alice_addr,
+        self_x25519_priv: fx.alice_x_priv,
+        identity_resolver: fx.identity_resolver,
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let mut packet = Vec::new();
+    ciborium::ser::into_writer(&fx.marker, &mut packet).expect("encode marker packet");
+    sub_tx.send(packet).await.expect("send marker inbound");
+
+    // Real Ed25519 signature (this event crosses `process_inbound`'s
+    // `verify_signed_committee_event` gate on the wire, unlike the
+    // synthetic-sig `build_dr_event` helper used by tests that apply
+    // directly to a `DfrostLog`).
+    let sentinel = build_signed_dfrost_event(
+        &fx.bob_sk,
+        fx.bob_addr,
+        DfrostEventKind::DkgRound,
+        &DkgRoundPayload {
+            ceremony_id: sentinel_ceremony_id,
+            round_num: 1,
+            round1_package: Some(vec![0xAA]),
+            recipient_ciphertexts: None,
+        },
+        hlc(50_000, "bob"),
+    )
+    .expect("sign sentinel");
+    let mut sentinel_packet = Vec::new();
+    ciborium::ser::into_writer(&sentinel, &mut sentinel_packet).expect("encode sentinel");
+    sub_tx
+        .send(sentinel_packet)
+        .await
+        .expect("send sentinel inbound");
+
+    wait_for_dfrost_log("skewed marker sentinel drains", &log, |l| {
+        l.committee_state
+            .pending_dkg
+            .as_ref()
+            .is_some_and(|p| p.round1_packages.contains_key(&fx.bob_addr))
+    })
+    .await;
+
+    let g = log.lock().await;
+    assert!(
+        g.committee_state.active,
+        "forward-skewed marker must not deactivate the committee"
+    );
+    assert_eq!(g.committee_state.joint_verifying_key, Some(fx.old_vk));
+    assert!(
+        g.committee_state.vk_history.is_empty(),
+        "forward-skewed marker must not be recorded"
+    );
+}
+
+/// ZEB-1031 review C1: the same skew gate on the catch-up reset-chain
+/// APPLY path (`apply_reset_chain`) — a future-stamped marker inside a
+/// served `ResetChainLink` must not apply either.
+#[tokio::test]
+async fn reset_chain_link_forward_skewed_marker_rejected_zeb1031() {
+    let far_future = now_wall_ms() + harmony_app::clock_trust::MAX_FORWARD_SKEW_MS + 60_000;
+    let fx = build_skew_fixture(far_future);
+
+    let link_bytes = {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &vec![ResetChainLink {
+                marker: fx.marker.clone(),
+                dk_events: Vec::new(),
+            }],
+            &mut buf,
+        )
+        .expect("encode reset chain");
+        buf
+    };
+    let frames = vec![
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x11; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 1,
+                active: true,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x11; 8],
+            body: CatchupBody::ResetChain(link_bytes),
+        },
+    ];
+
+    let straggler_log = Arc::new(Mutex::new(fx.active_log));
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: straggler_log.clone(),
+        publisher_tx: pub_tx,
+        subscriber_rx: sub_rx,
+        app_handle: None,
+        self_addr: fx.alice_addr,
+        self_x25519_priv: fx.alice_x_priv,
+        identity_resolver: fx.identity_resolver,
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let outcome = straggler.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        !matches!(outcome, CatchupOutcome::AdoptedResetChain { .. }),
+        "forward-skewed chain-link marker must not apply, got {outcome:?}"
+    );
+    let g = straggler_log.lock().await;
+    assert!(g.committee_state.active, "committee stays untouched");
+    assert!(g.committee_state.vk_history.is_empty());
+}
+
+/// ZEB-1031 review C1: a marker comfortably WITHIN the skew tolerance
+/// (well short of `now + MAX_FORWARD_SKEW_MS`) is admissible and
+/// applies normally through the same chain-apply path.
+#[tokio::test]
+async fn reset_chain_link_in_tolerance_marker_accepted_zeb1031() {
+    let near_future = now_wall_ms() + (harmony_app::clock_trust::MAX_FORWARD_SKEW_MS / 2);
+    let fx = build_skew_fixture(near_future);
+
+    let link_bytes = {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &vec![ResetChainLink {
+                marker: fx.marker.clone(),
+                dk_events: Vec::new(),
+            }],
+            &mut buf,
+        )
+        .expect("encode reset chain");
+        buf
+    };
+    let frames = vec![
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x12; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 1,
+                active: true,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x12; 8],
+            body: CatchupBody::ResetChain(link_bytes),
+        },
+    ];
+
+    let straggler_log = Arc::new(Mutex::new(fx.active_log));
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: straggler_log.clone(),
+        publisher_tx: pub_tx,
+        subscriber_rx: sub_rx,
+        app_handle: None,
+        self_addr: fx.alice_addr,
+        self_x25519_priv: fx.alice_x_priv,
+        identity_resolver: fx.identity_resolver,
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let outcome = straggler.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedResetChain { links: 1, .. }),
+        "in-tolerance marker must apply, got {outcome:?}"
+    );
+    let g = straggler_log.lock().await;
+    assert!(
+        !g.committee_state.active,
+        "marker deactivated the committee"
+    );
+    assert_eq!(g.committee_state.vk_history.len(), 1);
+}
+
+// ─── Task 5 review round 1: C2 mandatory multi-reset chain tests ───────────
+
+/// Two committee resets deep: vk1@epoch1 → (reset1) → vk2@epoch2 →
+/// (reset2) → vk3@epoch3. `promoted_log` has walked the whole chain
+/// (both markers + both successor DKGs, real Ed25519 throughout);
+/// `straggler_log` is untouched at vk1/epoch1 — the SAME `dkg_2of2_
+/// setup_for` ceremony's other engine, never advanced.
+struct TwoResetFixture {
+    community_id: SpaceId,
+    resolver: Arc<TestResetResolver>,
+    identity_resolver: Arc<dyn IdentityResolver + Send + Sync>,
+    alice_sk: ed25519_dalek::SigningKey,
+    alice_addr: OwnerAddr,
+    alice_x_priv: [u8; 32],
+    bob_x_priv: [u8; 32],
+    bob_addr: OwnerAddr,
+    vk3: [u8; 32],
+    marker1: SignedCommitteeEvent,
+    marker2: SignedCommitteeEvent,
+    dk_e2: Vec<SignedCommitteeEvent>,
+    straggler_log: DfrostLog,
+    promoted_log: DfrostLog,
+}
+
+fn build_two_reset_fixture() -> TwoResetFixture {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x91);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0x92);
+    let alice_x = alice_x25519();
+    let bob_x = bob_x25519();
+    let mut c = dkg_2of2_setup_for(alice_addr, bob_addr, alice_x, bob_x, Vec::new());
+    let vk1 = c.joint_vk;
+    let community_id = SpaceId([0x91; 16]);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+
+    // ── Reset 1: vk1@epoch1 → vk2@epoch2 ────────────────────────────
+    let reset1_id: EventId = [0xA1; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+    let marker1_payload = ResetMarkerPayload {
+        reset_proposal_id: reset1_id,
+        reset_digest: digest1,
+        old_vk: vk1,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker1 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker1_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker1");
+    let applied1 = c
+        .engine_a
+        .apply_reset_marker(&marker1, &community_id, members.clone(), 2)
+        .expect("marker1 applies");
+    assert!(matches!(applied1, ResetMarkerApplied::Applied { .. }));
+
+    let vk2 = [0xB2; 32];
+    let ceremony2: [u8; 32] = [0xC2; 32];
+    c.engine_a.committee_state.pending_dkg = Some(PendingCeremony {
+        ceremony_id: ceremony2,
+        members: members.clone(),
+        threshold: 2,
+        max_signers: 2,
+        proposed_epoch: 2,
+        ..Default::default()
+    });
+    let dk_payload2 = DkgCompletePayload {
+        ceremony_id: ceremony2,
+        joint_verifying_key: vk2,
+        verifying_shares: vec![
+            MemberVerifyingShare {
+                member: alice_addr,
+                verifying_share: [0xB3; 32],
+            },
+            MemberVerifyingShare {
+                member: bob_addr,
+                verifying_share: [0xB4; 32],
+            },
+        ],
+        epoch: 2,
+        members: members.clone(),
+        threshold: 2,
+        max_signers: 2,
+        space_id: Some(community_id),
+    };
+    let dk_alice_e2 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload2,
+        hlc(6_000, "alice"),
+    )
+    .expect("sign dk alice e2");
+    let dk_bob_e2 = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload2,
+        hlc(6_100, "bob"),
+    )
+    .expect("sign dk bob e2");
+    c.engine_a
+        .apply(dk_alice_e2.clone())
+        .expect("apply dk alice e2");
+    c.engine_a
+        .apply(dk_bob_e2.clone())
+        .expect("apply dk bob e2");
+    assert!(c.engine_a.committee_state.active);
+    assert_eq!(c.engine_a.committee_state.joint_verifying_key, Some(vk2));
+
+    // ── Reset 2: vk2@epoch2 → vk3@epoch3 ────────────────────────────
+    let reset2_id: EventId = [0xA2; 16];
+    let digest2 =
+        dfrost_reset_digest(&community_id, &reset2_id, &vk2, 2, &members, 2).expect("digest2");
+    let marker2_payload = ResetMarkerPayload {
+        reset_proposal_id: reset2_id,
+        reset_digest: digest2,
+        old_vk: vk2,
+        old_epoch: 2,
+        space_id: community_id,
+    };
+    let marker2 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker2_payload,
+        hlc(7_000, "alice"),
+    )
+    .expect("sign marker2");
+    let applied2 = c
+        .engine_a
+        .apply_reset_marker(&marker2, &community_id, members.clone(), 2)
+        .expect("marker2 applies");
+    assert!(matches!(applied2, ResetMarkerApplied::Applied { .. }));
+
+    let vk3 = [0xD2; 32];
+    let ceremony3: [u8; 32] = [0xE2; 32];
+    c.engine_a.committee_state.pending_dkg = Some(PendingCeremony {
+        ceremony_id: ceremony3,
+        members: members.clone(),
+        threshold: 2,
+        max_signers: 2,
+        proposed_epoch: 3,
+        ..Default::default()
+    });
+    let dk_payload3 = DkgCompletePayload {
+        ceremony_id: ceremony3,
+        joint_verifying_key: vk3,
+        verifying_shares: vec![
+            MemberVerifyingShare {
+                member: alice_addr,
+                verifying_share: [0xD3; 32],
+            },
+            MemberVerifyingShare {
+                member: bob_addr,
+                verifying_share: [0xD4; 32],
+            },
+        ],
+        epoch: 3,
+        members: members.clone(),
+        threshold: 2,
+        max_signers: 2,
+        space_id: Some(community_id),
+    };
+    let dk_alice_e3 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload3,
+        hlc(8_000, "alice"),
+    )
+    .expect("sign dk alice e3");
+    let dk_bob_e3 = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &dk_payload3,
+        hlc(8_100, "bob"),
+    )
+    .expect("sign dk bob e3");
+    c.engine_a
+        .apply(dk_alice_e3.clone())
+        .expect("apply dk alice e3");
+    c.engine_a
+        .apply(dk_bob_e3.clone())
+        .expect("apply dk bob e3");
+    assert!(c.engine_a.committee_state.active);
+    assert_eq!(c.engine_a.committee_state.joint_verifying_key, Some(vk3));
+    assert_eq!(c.engine_a.committee_state.vk_history.len(), 2);
+
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset1_id,
+        proposer: alice_addr,
+        target_vk: vk1,
+        target_epoch: 1,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset2_id,
+        proposer: alice_addr,
+        target_vk: vk2,
+        target_epoch: 2,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 6_500,
+        deadline_ms: Some(9_500),
+        authorized_at_ms: Some(9_500),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    let resolver = Arc::new(TestResetResolver::new(members, membership));
+
+    TwoResetFixture {
+        community_id,
+        resolver,
+        identity_resolver: resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]),
+        alice_sk,
+        alice_addr,
+        alice_x_priv: alice_x.0,
+        bob_x_priv: bob_x.0,
+        bob_addr,
+        vk3,
+        marker1,
+        marker2,
+        dk_e2: vec![dk_alice_e2, dk_bob_e2],
+        straggler_log: c.engine_b,
+        promoted_log: c.engine_a,
+    }
+}
+
+/// ZEB-1031 review C2 (mandatory, spec §11 "straggler across one and
+/// two resets"): a straggler stuck at the VERY FIRST pre-reset state
+/// walks a two-reset chain end-to-end in ONE catch-up round, ending
+/// active at the final vk with `vk_history.len() == 2`.
+#[tokio::test]
+async fn straggler_heals_two_reset_chain_end_to_end_zeb1031() {
+    let fx = build_two_reset_fixture();
+
+    let straggler_log = Arc::new(Mutex::new(fx.straggler_log));
+    let promoted_log = Arc::new(Mutex::new(fx.promoted_log));
+
+    let (r_pub_tx, _r_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_r_sub_tx, r_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let responder = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: promoted_log.clone(),
+        publisher_tx: r_pub_tx,
+        subscriber_rx: r_sub_rx,
+        app_handle: None,
+        self_addr: fx.alice_addr,
+        self_x25519_priv: fx.alice_x_priv,
+        identity_resolver: fx.identity_resolver.clone(),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver.clone()),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let (s_pub_tx, _s_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_s_sub_tx, s_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: straggler_log.clone(),
+        publisher_tx: s_pub_tx,
+        subscriber_rx: s_sub_rx,
+        app_handle: None,
+        self_addr: fx.bob_addr,
+        self_x25519_priv: fx.bob_x_priv,
+        identity_resolver: fx.identity_resolver,
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let req = straggler.catchup_build_request().await;
+    assert_eq!(req.epoch, 1);
+    assert!(req.active);
+    let frames = responder
+        .catchup_respond(req)
+        .await
+        .expect("responder serves the 2-link chain");
+    let outcome = straggler.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedResetChain { links: 2, .. }),
+        "expected a 2-link chain adoption in one round, got {outcome:?}"
+    );
+    let g = straggler_log.lock().await;
+    assert!(g.committee_state.active);
+    assert_eq!(g.committee_state.joint_verifying_key, Some(fx.vk3));
+    assert_eq!(g.committee_state.vk_history.len(), 2);
+    assert_eq!(g.committee_state.current_epoch, 3);
+}
+
+/// ZEB-1031 review C2 (mandatory): a chain link whose successor quorum
+/// stalls (inadmissible shape) must not lose the progress already made
+/// — both markers apply (`vk_history.len() == 2`, no truncation), and
+/// the node — now `!active` mid-chain — heals the remainder on a LATER
+/// round via the SAME reset-chain-first routing (review C2a: reachable
+/// regardless of the local active flag).
+#[tokio::test]
+async fn reset_chain_mid_link_failure_preserves_progress_and_retries_zeb1031() {
+    let fx = build_two_reset_fixture();
+
+    let straggler_log = Arc::new(Mutex::new(fx.straggler_log));
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: straggler_log.clone(),
+        publisher_tx: pub_tx,
+        subscriber_rx: sub_rx,
+        app_handle: None,
+        self_addr: fx.bob_addr,
+        self_x25519_priv: fx.bob_x_priv,
+        identity_resolver: fx.identity_resolver.clone(),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver.clone()),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    // Round 1: link1 genuine; link2's dk_events CORRUPTED — a shape
+    // that does not match the pin2 `adopt_initial_quorum` enforces
+    // ([alice] instead of [alice, bob]).
+    let corrupt_payload = DkgCompletePayload {
+        ceremony_id: [0xFF; 32],
+        joint_verifying_key: fx.vk3,
+        verifying_shares: vec![MemberVerifyingShare {
+            member: fx.alice_addr,
+            verifying_share: [0x00; 32],
+        }],
+        epoch: 3,
+        members: vec![fx.alice_addr],
+        threshold: 1,
+        max_signers: 1,
+        space_id: Some(fx.community_id),
+    };
+    let corrupt_dk = build_signed_dfrost_event(
+        &fx.alice_sk,
+        fx.alice_addr,
+        DfrostEventKind::DkgComplete,
+        &corrupt_payload,
+        hlc(8_000, "alice"),
+    )
+    .expect("sign corrupt dk");
+
+    let round1_links = vec![
+        ResetChainLink {
+            marker: fx.marker1.clone(),
+            dk_events: fx.dk_e2.clone(),
+        },
+        ResetChainLink {
+            marker: fx.marker2.clone(),
+            dk_events: vec![corrupt_dk],
+        },
+    ];
+    let mut round1_bytes = Vec::new();
+    ciborium::ser::into_writer(&round1_links, &mut round1_bytes).expect("encode round1 chain");
+    let round1_frames = vec![
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x21; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 3,
+                active: true,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x21; 8],
+            body: CatchupBody::ResetChain(round1_bytes),
+        },
+    ];
+
+    let outcome1 = straggler.catchup_ingest(wire_cross(round1_frames)).await;
+    assert!(
+        matches!(outcome1, CatchupOutcome::AdoptedResetChain { links: 2, .. }),
+        "both markers apply even though link2's quorum stalls, got {outcome1:?}"
+    );
+    {
+        let g = straggler_log.lock().await;
+        assert!(
+            !g.committee_state.active,
+            "stuck mid-chain: link2's quorum never adopted"
+        );
+        assert_eq!(
+            g.committee_state.vk_history.len(),
+            2,
+            "both markers persisted — no truncation of earlier progress"
+        );
+        assert!(
+            g.committee_state.pending_reset.is_some(),
+            "pin2 still set — ready to retry"
+        );
+        assert_eq!(g.committee_state.current_epoch, 2);
+    }
+
+    // Round 2: a genuine, fully-promoted responder serves the SAME
+    // straggler again — select_reset_chain naturally resumes at entry2
+    // only, since the straggler's own request epoch is now oe2 = 2.
+    let promoted_log = Arc::new(Mutex::new(fx.promoted_log));
+    let (r_pub_tx, _r_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_r_sub_tx, r_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let responder = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: promoted_log.clone(),
+        publisher_tx: r_pub_tx,
+        subscriber_rx: r_sub_rx,
+        app_handle: None,
+        self_addr: fx.alice_addr,
+        self_x25519_priv: fx.alice_x_priv,
+        identity_resolver: fx.identity_resolver,
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    let req2 = straggler.catchup_build_request().await;
+    assert_eq!(req2.epoch, 2, "straggler resumes from its stuck epoch");
+    assert!(!req2.active);
+    let frames2 = responder
+        .catchup_respond(req2)
+        .await
+        .expect("responder serves the remaining link");
+    let outcome2 = straggler.catchup_ingest(wire_cross(frames2)).await;
+    // Review NB1: round 2 re-serves marker2 (still <= the straggler's
+    // resumed request epoch), which the straggler already applied in
+    // round 1 — that re-delivery is RS-M6's `AlreadyMoved` no-op and no
+    // longer counts toward `links` (only a genuine `Applied` does). The
+    // real progress this round is the quorum adoption, reflected in
+    // `epoch` — assert on that and on state, not the link count.
+    assert!(
+        matches!(
+            outcome2,
+            CatchupOutcome::AdoptedResetChain { epoch: 3, links: 0 }
+        ),
+        "round 2 completes the remaining quorum via an AlreadyMoved marker \
+         re-delivery + fresh dk adoption, got {outcome2:?}"
+    );
+    let g = straggler_log.lock().await;
+    assert!(g.committee_state.active, "fully healed after round 2");
+    assert_eq!(g.committee_state.joint_verifying_key, Some(fx.vk3));
+    assert_eq!(
+        g.committee_state.vk_history.len(),
+        2,
+        "still exactly 2 — no duplicate marker recorded"
+    );
+    assert_eq!(g.committee_state.current_epoch, 3);
+}
+
+// ─── Task 5 review round 2 (NB1): AlreadyMoved must not count as progress ──
+
+/// ZEB-1031 review round 2 (NB1): `apply_reset_chain` must NOT report
+/// progress — and must NOT short-circuit `catchup_ingest`'s reset-chain-try
+/// loop (review C2a) — for a group whose only chain link is an
+/// `AlreadyMoved` (RS-M6) re-delivery with an empty `dk_events` list.
+/// `select_reset_chain`'s own doc calls this a normal serve (a responder
+/// that hasn't itself finished the successor DKG yet), so it happens on
+/// every round a straggler talks to a lagging responder. Before the fix,
+/// such a group unconditionally returned `Some(AdoptedResetChain{links:1,..})`,
+/// and `catchup_ingest`'s hoisted loop returns on the FIRST group that
+/// yields `Some` — discarding every OTHER group in the same round,
+/// including one carrying the genuine successor dk evidence this straggler
+/// actually needs. Ordering decides which group goes first, so a single
+/// stale-but-honest responder (or a hostile one, deliberately) could starve
+/// healing indefinitely just by sorting ahead of the group with real
+/// evidence.
+#[tokio::test]
+async fn apply_reset_chain_no_progress_falls_through_to_other_groups_dk_evidence_zeb1031() {
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0x73);
+    let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0x74);
+    let alice_x = alice_x25519();
+    let bob_x = bob_x25519();
+    let mut c = dkg_2of2_setup_for(alice_addr, bob_addr, alice_x, bob_x, Vec::new());
+    let old_vk = c.joint_vk;
+    let community_id = SpaceId([0x73; 16]);
+    let mut new_members = vec![alice_addr, bob_addr];
+    new_members.sort();
+    let new_threshold: u16 = 2;
+
+    let reset_id: EventId = [0x93; 16];
+    let digest = dfrost_reset_digest(
+        &community_id,
+        &reset_id,
+        &old_vk,
+        1,
+        &new_members,
+        new_threshold,
+    )
+    .expect("digest");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset_id,
+        proposer: alice_addr,
+        target_vk: old_vk,
+        target_epoch: 1,
+        new_members: new_members.clone(),
+        new_threshold,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    let resolver = Arc::new(TestResetResolver::new(new_members.clone(), membership));
+
+    let marker_payload = ResetMarkerPayload {
+        reset_proposal_id: reset_id,
+        reset_digest: digest,
+        old_vk,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker_event = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker");
+
+    let membership_at_marker = resolver.membership.lock().await.clone();
+    let (nm, nt) = verify_reset_marker_admissible(
+        &marker_payload,
+        &alice_addr,
+        &community_id,
+        &membership_at_marker,
+    )
+    .expect("marker admissible");
+
+    // The straggler already applied this marker DIRECTLY — mirrors a
+    // node that made it through link 1 on a PRIOR catch-up round. This
+    // is what makes the SAME marker's re-delivery below an `AlreadyMoved`
+    // no-op rather than a fresh `Applied`.
+    let applied_b = c
+        .engine_b
+        .apply_reset_marker(&marker_event, &community_id, nm, nt)
+        .expect("marker applies to straggler");
+    assert!(
+        matches!(applied_b, ResetMarkerApplied::Applied { .. }),
+        "precondition: straggler must have genuinely applied it once already"
+    );
+    assert!(!c.engine_b.committee_state.active);
+    assert!(c.engine_b.committee_state.pending_reset.is_some());
+
+    // Successor DKG (epoch 2) — the genuine evidence group B will carry.
+    let successor_ceremony_id: [u8; 32] = [0x94; 32];
+    let new_vk = [0x95; 32];
+    let successor_dk_payload = DkgCompletePayload {
+        ceremony_id: successor_ceremony_id,
+        joint_verifying_key: new_vk,
+        verifying_shares: vec![
+            MemberVerifyingShare {
+                member: alice_addr,
+                verifying_share: [0x96; 32],
+            },
+            MemberVerifyingShare {
+                member: bob_addr,
+                verifying_share: [0x97; 32],
+            },
+        ],
+        epoch: 2,
+        members: new_members.clone(),
+        threshold: new_threshold,
+        max_signers: 2,
+        space_id: Some(community_id),
+    };
+    let dk_alice_e2 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::DkgComplete,
+        &successor_dk_payload,
+        hlc(6_000, "alice"),
+    )
+    .expect("sign dk alice e2");
+    let dk_bob_e2 = build_signed_dfrost_event(
+        &bob_sk,
+        bob_addr,
+        DfrostEventKind::DkgComplete,
+        &successor_dk_payload,
+        hlc(6_100, "bob"),
+    )
+    .expect("sign dk bob e2");
+
+    let straggler_log = Arc::new(Mutex::new(c.engine_b));
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+    let (s_pub_tx, _s_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_s_sub_tx, s_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler_engine =
+        DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: straggler_log.clone(),
+            publisher_tx: s_pub_tx,
+            subscriber_rx: s_sub_rx,
+            app_handle: None,
+            self_addr: bob_addr,
+            self_x25519_priv: bob_x.0,
+            identity_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+    // Hand-built round, group A ordered FIRST so a starvation bug fires
+    // deterministically: group A serves ONLY the already-applied marker
+    // with an EMPTY `dk_events` — exactly `select_reset_chain`'s own
+    // documented normal case for a responder that hasn't itself finished
+    // the successor DKG yet. Group B is a SEPARATE, ordinary (non-chain)
+    // responder carrying the genuine successor dk evidence.
+    let group_a_link = ResetChainLink {
+        marker: marker_event.clone(),
+        dk_events: Vec::new(),
+    };
+    let mut group_a_chain_bytes = Vec::new();
+    ciborium::ser::into_writer(&vec![group_a_link], &mut group_a_chain_bytes)
+        .expect("encode group A chain");
+
+    let mut dk_alice_buf = Vec::new();
+    ciborium::ser::into_writer(&dk_alice_e2, &mut dk_alice_buf).expect("encode dk alice e2");
+    let mut dk_bob_buf = Vec::new();
+    ciborium::ser::into_writer(&dk_bob_e2, &mut dk_bob_buf).expect("encode dk bob e2");
+
+    let frames = vec![
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x31; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 1,
+                active: false,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x31; 8],
+            body: CatchupBody::ResetChain(group_a_chain_bytes),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x32; 8],
+            body: CatchupBody::Status(CatchupStatus {
+                epoch: 2,
+                active: true,
+            }),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x32; 8],
+            body: CatchupBody::DkEvidence(dk_alice_buf),
+        },
+        CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x32; 8],
+            body: CatchupBody::DkEvidence(dk_bob_buf),
+        },
+    ];
+
+    let outcome = straggler_engine.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedInitial { epoch: 2, .. }),
+        "group A's no-progress AlreadyMoved link must fall through to group B's \
+         dk evidence via the ordinary joiner path, got {outcome:?}"
+    );
+    let g = straggler_log.lock().await;
+    assert!(
+        g.committee_state.active,
+        "straggler heals via group B despite group A yielding nothing"
+    );
+    assert_eq!(g.committee_state.joint_verifying_key, Some(new_vk));
+    assert_eq!(g.committee_state.current_epoch, 2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ZEB-1031 Task 7: poll voiding on committee reset + prompted relaunch.
+// See docs/superpowers/specs/2026-08-30-zeb1031-dfrost-committee-reset-design.md §7.
+//
+// Both tests below drive a reset marker through a REAL `DfrostLogEngine`
+// (never hand-calling `VotingLogEngine::void_tier3_polls_for_reset`
+// directly) so the Weak-hook dispatch wiring
+// (`DfrostLogRegistry::dispatch_reset_marker_callbacks` →
+// `VotingLogEngine::on_dfrost_reset_marker`) is exercised end-to-end at
+// BOTH apply sites: live ingest (`process_inbound`) here, and catch-up
+// chain adoption (`apply_reset_chain`) in the second test.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Minimal `DfrostLog` with an ACTIVE 2-member committee at `epoch`, no real
+/// DKG run — `verify_reset_marker_admissible` (RS-M3/M4/M5) only checks
+/// digest/membership-evidence equality, not FROST zero-knowledge proofs, so
+/// an arbitrary `vk` byte pattern is sufficient (mirrors the shape
+/// `engine_orchestration_emits_kd_ts_after_kd_cl_se_mode` builds directly
+/// for the same reason).
+fn active_committee_dfrost_log(members: &[OwnerAddr], vk: [u8; 32], epoch: u64) -> DfrostLog {
+    let mut log = DfrostLog::new();
+    log.committee_state = CommitteeState {
+        active: true,
+        current_epoch: epoch,
+        joint_verifying_key: Some(vk),
+        verifying_shares: BTreeMap::new(),
+        members: members.to_vec(),
+        threshold: 2,
+        max_signers: members.len() as u16,
+        identifier_map: CommitteeState::build_identifier_map(members),
+        pending_dkg: None,
+        pending_sign: BTreeMap::new(),
+        pending_refresh: None,
+        pending_repair: None,
+        vk_history: Vec::new(),
+        pending_reset: None,
+    };
+    log
+}
+
+/// Seed a minimal open Tier-3 (se-mode) poll at `community_epoch` directly
+/// into `voting_log`, bypassing `publish_event` — same "insert the
+/// synthesized PollState" idiom `engine_orchestration_emits_kd_ts_after_kd_cl_se_mode`
+/// uses. The void mechanism doesn't touch ballots/crypto, so no committee
+/// oracle or ratification state is needed.
+fn seed_open_se_poll(
+    voting_log: &mut harmony_app::community_voting_log::VotingLog,
+    poll_id: harmony_app::community_voting_core::PollId,
+    creator: OwnerAddr,
+    community_id: SpaceId,
+    community_epoch: u64,
+) {
+    use harmony_app::community_voting_core::{
+        Eligibility, Lifecycle, PollMeta, Tier, Tier3PollConfigPayload,
+    };
+    use harmony_app::community_voting_log::{PollState, TierState};
+    use harmony_app::community_voting_tier3::{Tier3PollMeta, Tier3PollState};
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "ZEB-1031 Task 7 void smoke".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 10,
+        drafting_window_seconds: 10,
+        ratification_window_seconds: 10,
+        privacy_mode: "se".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: None,
+        ce: None,
+    };
+    let create_hlc = hlc(0, "seed");
+    let meta = Tier3PollMeta {
+        poll_id,
+        proposer: creator,
+        poll_create_hlc: create_hlc.clone(),
+        config: config.clone(),
+        poll_create_event_hash: poll_id.0,
+        community_epoch,
+    };
+    let t3 = Tier3PollState::new_from_create(meta, vec![creator]);
+    let poll_state = PollState {
+        meta: PollMeta {
+            poll_id,
+            community_id,
+            creator,
+            tier: Tier::Sortition,
+            eligibility: config.eligibility,
+            lifecycle: Lifecycle::Open,
+            created_at: create_hlc.clone(),
+            opens_at: create_hlc.clone(),
+            closes_at: Hlc {
+                wall_ms: create_hlc.wall_ms + 30_000,
+                logical: 0,
+                device_id: create_hlc.device_id.clone(),
+            },
+            extends_at: None,
+            channel_id: None,
+            finalized_at_ms: None,
+        },
+        events: vec![],
+        tier_state: TierState::Tier3(Box::new(t3)),
+        tier1_cfg: None,
+        tier1_snapshot: None,
+    };
+    voting_log.polls.insert(poll_id, poll_state);
+}
+
+/// Poll `voting_log` until `predicate` holds or 2s elapse — mirrors
+/// `wait_for_dfrost_log` above for the voting side (the reset-marker
+/// callback dispatch runs in a spawned task, so voiding lands
+/// asynchronously relative to the inbound packet send).
+async fn wait_for_voting_log<F>(
+    label: &str,
+    voting_log: &Arc<Mutex<harmony_app::community_voting_log::VotingLog>>,
+    mut predicate: F,
+) where
+    F: FnMut(&harmony_app::community_voting_log::VotingLog) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        {
+            let guard = voting_log.lock().await;
+            if predicate(&guard) {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("wait_for_voting_log({label}) timed out after 2s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// ZEB-1031 Task 7 (spec §7): a reset marker applied through the dfrost
+/// engine's LIVE-INGEST path (`process_inbound`, never hand-calling
+/// `void_tier3_polls_for_reset`) voids every open Tier-3 poll whose
+/// `community_epoch <= old_epoch`, tagging it with the marker's
+/// `(reset_id, old_epoch)`; a poll minted at a later epoch is untouched.
+/// A voided poll then rejects every further mutation — including one
+/// whose payload wouldn't even decode — with the SAME `PollVoided` error
+/// win before payload decode is ever attempted. Re-voiding is a no-op.
+#[tokio::test]
+async fn live_ingest_reset_marker_voids_open_tier3_polls_zeb1031() {
+    use harmony_app::community_voting_core::PollId;
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xB1);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xB2);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xB1; 16]);
+    let vk1: [u8; 32] = [0xC1; 32];
+
+    // ── Dfrost side: an active epoch-1 committee, wired for live ingest ──
+    let dfrost_log = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+
+    let reset1_id: EventId = [0xD1; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+    let marker1_payload = ResetMarkerPayload {
+        reset_proposal_id: reset1_id,
+        reset_digest: digest1,
+        old_vk: vk1,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker1 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker1_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker1");
+
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset1_id,
+        proposer: alice_addr,
+        target_vk: vk1,
+        target_epoch: 1,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    let resolver = Arc::new(TestResetResolver::new(members.clone(), membership));
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+
+    let dfrost_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    // Keep the subscriber sender so the test can feed `marker1` in as a
+    // live inbound packet — mirrors a peer node's Zenoh delivery.
+    let (dtx, drx) = mpsc::channel::<Vec<u8>>(4);
+    let (_dpub_tx, _dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+    DfrostLogRegistry::register(
+        &dfrost_reg,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: dfrost_log.clone(),
+            publisher_tx: _dpub_tx,
+            subscriber_rx: drx,
+            app_handle: None,
+            self_addr: bob_addr,
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: identity_resolver.clone(),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // ── Voting side: seed one poll at epoch 1 (will be voided) and one
+    //    at epoch 2 (created post-reset — must stay untouched). ──
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    let poll1_id = PollId([0x01; 32]);
+    let poll2_id = PollId([0x02; 32]);
+    {
+        let mut log = voting_log.lock().await;
+        seed_open_se_poll(&mut log, poll1_id, alice_addr, community_id, 1);
+        seed_open_se_poll(&mut log, poll2_id, alice_addr, community_id, 2);
+    }
+
+    let (v_pub_tx, _v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-t7-live".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: Arc::clone(&voting_log),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_cid, _seed, _epoch| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, dfrost_reg.clone(), requester).await;
+
+    // ── Feed marker1 in as a live inbound packet (never hand-calling
+    //    void_tier3_polls_for_reset) ──
+    let mut packet = Vec::new();
+    ciborium::into_writer(&marker1, &mut packet).expect("encode marker1");
+    dtx.send(packet)
+        .await
+        .expect("dfrost subscriber channel open");
+
+    // The reset-marker callback dispatch spawns the void handler
+    // asynchronously — poll until it lands.
+    wait_for_voting_log("poll1 voided", &voting_log, |log| {
+        log.polls
+            .get(&poll1_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .and_then(|t3| t3.voided)
+            .is_some()
+    })
+    .await;
+
+    {
+        let log = voting_log.lock().await;
+        let t3_1 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+        let voided = t3_1.voided.expect("poll1 voided");
+        assert_eq!(
+            voided.reset_id, reset1_id,
+            "voided.reset_id must echo the marker's ri"
+        );
+        assert_eq!(
+            voided.old_epoch, 1,
+            "voided.old_epoch must echo the marker's oe"
+        );
+
+        let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+        assert!(
+            t3_2.voided.is_none(),
+            "poll at epoch 2 (post-reset) must stay untouched by a marker retiring epoch 1"
+        );
+    }
+
+    // ── Mutation on the voided poll is rejected — with PollVoided, not a
+    //    payload-decode error, confirming the check runs before decode. ──
+    {
+        use harmony_app::community_voting_core::{PollEventKindCode, SignedVotingEvent, Tier};
+        let mut log = voting_log.lock().await;
+        let t3 = log
+            .polls
+            .get_mut(&poll1_id)
+            .unwrap()
+            .tier_state
+            .as_tier3_mut()
+            .unwrap();
+        let garbage_ballot = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::RatificationBallot,
+            hlc: hlc(6_000, "someone"),
+            actor: bob_addr,
+            payload: vec![], // deliberately undecodable — voided must win first
+            sig: vec![0u8; 64],
+        };
+        let err = t3
+            .apply_event(&garbage_ballot)
+            .expect_err("ballot on a voided poll must be rejected");
+        assert!(
+            matches!(
+                err,
+                harmony_app::community_voting_tier3::ApplyError::PollVoided
+            ),
+            "expected PollVoided, got {err:?}"
+        );
+    }
+
+    // ── Re-voiding is idempotent: 0 additional. ──
+    let revoided = voting_engine.void_tier3_polls_for_reset(1, reset1_id).await;
+    assert_eq!(
+        revoided, 0,
+        "re-running void for the same reset must be a no-op"
+    );
+}
+
+/// ZEB-1031 Task 8 review I1: the reset-marker callback dispatch must ALSO
+/// fire on the LOCAL-AUTHOR path (`dfrost_author_reset_marker_core`, via
+/// the manual `author_dfrost_reset_marker` IPC or the orchestrator's
+/// `maybe_auto_drive_reset`) — not only on inbound ingest / catch-up
+/// adoption. Before the I1 fix, the authoring node's own open Tier-3 polls
+/// stayed open (never voided) and its `retired_epoch_watermark` never
+/// advanced, because `publish_event` records into the replay tracker
+/// BEFORE sending specifically so self-loopback is dropped at
+/// `process_inbound`'s dedup step — the author never re-ingests its own
+/// marker, so the ingest-side dispatch alone can never reach it.
+///
+/// Same fixture shape as `live_ingest_reset_marker_voids_open_tier3_polls_zeb1031`
+/// (one poll at epoch 1 — must void; one at epoch 2 — must stay untouched),
+/// but instead of feeding `marker1` in as an inbound packet, this authors
+/// it directly through the production `DkgDriver::author_reset_marker`
+/// path (`production_dkg_driver` over `DfrostCoreHandles`, sharing the SAME
+/// `dfrost_log`/`dfrost_reg` the voting engine's callback is subscribed to)
+/// — no second node, no inbound packet, involved.
+#[tokio::test]
+async fn local_author_reset_marker_voids_open_tier3_polls_zeb1031() {
+    use harmony_app::community_voting_core::PollId;
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, _alice_pub64) = fixture_identity(0xB3);
+    let (_bob_sk, bob_addr, _bob_pub64) = fixture_identity(0xB4);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xB3; 16]);
+    let vk1: [u8; 32] = [0xC3; 32];
+
+    // ── Dfrost side: an active epoch-1 committee. Alice (the authoring
+    //    node) holds this same log. ──
+    let dfrost_log = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+
+    let reset1_id: EventId = [0xD3; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+
+    let dfrost_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let (dpub_tx, mut dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+    tokio::spawn(async move { while dpub_rx.recv().await.is_some() {} });
+    let (_dsub_tx, dsub_rx) = mpsc::channel::<Vec<u8>>(4);
+    DfrostLogRegistry::register(
+        &dfrost_reg,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: dfrost_log.clone(),
+            publisher_tx: dpub_tx,
+            subscriber_rx: dsub_rx,
+            app_handle: None,
+            self_addr: alice_addr,
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver_with(&[]),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // ── Voting side: seed one poll at epoch 1 (will be voided) and one
+    //    at epoch 2 (created post-reset — must stay untouched). ──
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    let poll1_id = PollId([0x03; 32]);
+    let poll2_id = PollId([0x04; 32]);
+    {
+        let mut log = voting_log.lock().await;
+        seed_open_se_poll(&mut log, poll1_id, alice_addr, community_id, 1);
+        seed_open_se_poll(&mut log, poll2_id, alice_addr, community_id, 2);
+    }
+
+    let (v_pub_tx, mut v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    tokio::spawn(async move { while v_pub_rx.recv().await.is_some() {} });
+    let (_v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-t8-author".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: Arc::clone(&voting_log),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_cid, _seed, _epoch| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, dfrost_reg.clone(), requester).await;
+
+    // ── Author marker1 LOCALLY via the production driver — the exact
+    //    path `maybe_auto_drive_reset` / `author_dfrost_reset_marker`
+    //    take, never touching the inbound/catch-up ingest paths. ──
+    let mut dfrost_logs_map = HashMap::new();
+    dfrost_logs_map.insert(community_id, dfrost_log.clone());
+    let handles = DfrostCoreHandles::<tauri::test::MockRuntime>::for_tests(
+        Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-zeb1031-t8-author".to_string(),
+        ))),
+        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        "dev-zeb1031-t8-author".to_string(),
+        alice_addr,
+        Arc::new(alice_sk),
+        Arc::new(Mutex::new(dfrost_logs_map)) as DfrostLogsMap,
+        None,
+        Some(dfrost_reg.clone()),
+    );
+    let driver = production_dkg_driver::<tauri::test::MockRuntime>(handles, None);
+    driver
+        .author_reset_marker(community_id, reset1_id, digest1, vk1, 1, members.clone(), 2)
+        .await
+        .expect("author_reset_marker succeeds");
+
+    // The reset-marker callback dispatch spawns the void handler
+    // asynchronously — poll until it lands, exactly like the ingest-path
+    // sibling test above.
+    wait_for_voting_log("poll1 voided (authoring node)", &voting_log, |log| {
+        log.polls
+            .get(&poll1_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .and_then(|t3| t3.voided)
+            .is_some()
+    })
+    .await;
+
+    let log = voting_log.lock().await;
+    let t3_1 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+    let voided = t3_1.voided.expect("poll1 voided");
+    assert_eq!(
+        voided.reset_id, reset1_id,
+        "voided.reset_id must echo the marker's ri"
+    );
+    assert_eq!(
+        voided.old_epoch, 1,
+        "voided.old_epoch must echo the marker's oe"
+    );
+
+    let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+    assert!(
+        t3_2.voided.is_none(),
+        "poll at epoch 2 (post-reset) must stay untouched by a marker retiring epoch 1"
+    );
+}
+
+/// ZEB-1031 Task 7 (spec §7): the SAME void hook fires from the catch-up
+/// CHAIN-ADOPTION apply site (`apply_reset_chain`) — a straggler healing
+/// through a multi-reset chain voids its stale Tier-3 polls exactly like a
+/// live node. Builds on Task 5's `TwoResetFixture` (already a proven,
+/// working two-reset chain) rather than re-deriving one.
+#[tokio::test]
+async fn chain_adoption_reset_marker_voids_open_tier3_polls_zeb1031() {
+    use harmony_app::community_voting_core::PollId;
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let fx = build_two_reset_fixture();
+
+    let straggler_log = Arc::new(Mutex::new(fx.straggler_log));
+    let promoted_log = Arc::new(Mutex::new(fx.promoted_log));
+
+    // Responder side (already-promoted, holds the 2-link chain).
+    let (r_pub_tx, _r_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_r_sub_tx, r_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let responder = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: promoted_log.clone(),
+        publisher_tx: r_pub_tx,
+        subscriber_rx: r_sub_rx,
+        app_handle: None,
+        self_addr: fx.alice_addr,
+        self_x25519_priv: fx.alice_x_priv,
+        identity_resolver: fx.identity_resolver.clone(),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver.clone()),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    // Straggler side — registered in a REAL DfrostLogRegistry so
+    // `apply_reset_chain`'s own `registry_weak` (not a fn param, unlike
+    // the live-ingest path) can dispatch the void callback.
+    let straggler_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let (s_pub_tx, _s_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_s_sub_tx, s_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler = DfrostLogRegistry::register(
+        &straggler_reg,
+        DfrostLogEngineParams {
+            community_id: fx.community_id,
+            dfrost_log: straggler_log.clone(),
+            publisher_tx: s_pub_tx,
+            subscriber_rx: s_sub_rx,
+            app_handle: None,
+            self_addr: fx.bob_addr,
+            self_x25519_priv: fx.bob_x_priv,
+            identity_resolver: fx.identity_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(fx.resolver),
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // Voting engine on the straggler's registry: one poll at epoch 1
+    // (pre-BOTH resets — must void on marker1) and one at epoch 3
+    // (the chain's final epoch, i.e. created post-reset — untouched).
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    let poll1_id = PollId([0x11; 32]);
+    let poll3_id = PollId([0x33; 32]);
+    {
+        let mut log = voting_log.lock().await;
+        seed_open_se_poll(&mut log, poll1_id, fx.alice_addr, fx.community_id, 1);
+        seed_open_se_poll(&mut log, poll3_id, fx.alice_addr, fx.community_id, 3);
+    }
+    let (v_pub_tx, _v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-t7-chain".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id: fx.community_id,
+        voting_log: Arc::clone(&voting_log),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_cid, _seed, _epoch| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, straggler_reg.clone(), requester).await;
+
+    // Drive the SAME catch-up round the Task 5 test does.
+    let req = straggler.catchup_build_request().await;
+    let frames = responder
+        .catchup_respond(req)
+        .await
+        .expect("responder serves the 2-link chain");
+    let outcome = straggler.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedResetChain { links: 2, .. }),
+        "expected a 2-link chain adoption, got {outcome:?}"
+    );
+
+    wait_for_voting_log("poll1 voided via chain adoption", &voting_log, |log| {
+        log.polls
+            .get(&poll1_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .and_then(|t3| t3.voided)
+            .is_some()
+    })
+    .await;
+
+    let log = voting_log.lock().await;
+    let t3_1 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+    assert_eq!(t3_1.voided.expect("poll1 voided").old_epoch, 1);
+    let t3_3 = log.polls[&poll3_id].tier_state.as_tier3().unwrap();
+    assert!(
+        t3_3.voided.is_none(),
+        "poll at the chain's final epoch (3) must stay untouched"
+    );
+}
+
+/// ZEB-1031 Task 7 review C1 (MANDATORY regression): drives the void sweep
+/// against a poll materialized through the REAL peer path — never
+/// hand-seeded, never dual-applied. Author (alice) mints a Tier-3
+/// PollCreate on engine A at community epoch 1; peer (bob) engine B
+/// materializes it via `process_inbound` deriving `community_epoch` from
+/// the wire-carried `cfg.ce` (NOT a local `set_tier3_poll_epoch` patch,
+/// which never runs for peer-ingested creates). A reset marker for
+/// `old_epoch = 1` applied on B's dfrost side via LIVE INGEST then voids
+/// B's peer-materialized copy of the poll — proving `community_epoch` is
+/// no longer a creator-local cache that only the author ever sees
+/// correctly. A second, post-reset poll at epoch 2 (same author→peer
+/// path) survives B's sweep untouched.
+#[tokio::test]
+async fn peer_materialized_poll_voids_via_wire_carried_epoch_zeb1031() {
+    use harmony_app::community_voting_core::{
+        build_signed_poll_create_tier3, derive_poll_id, Eligibility, MemberAttrs,
+        Tier3PollConfigPayload, VotingIdentityResolver,
+    };
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xF1);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xF2);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xF1; 16]);
+    let vk1: [u8; 32] = [0xA9; 32];
+
+    // ── Membership evidence for B's reset-marker admissibility (RS-M3/4/5) ──
+    let reset1_id: EventId = [0xB9; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset1_id,
+        proposer: alice_addr,
+        target_vk: vk1,
+        target_epoch: 1,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+
+    // ── A's dfrost side (epoch 1) — so A can embed `ce` before signing ──
+    let dfrost_log_a = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+    let dfrost_reg_a = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    {
+        let (a_dpub_tx, _a_dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_a_dsub_tx, a_dsub_rx) = mpsc::channel::<Vec<u8>>(4);
+        DfrostLogRegistry::register(
+            &dfrost_reg_a,
+            DfrostLogEngineParams {
+                community_id,
+                dfrost_log: dfrost_log_a.clone(),
+                publisher_tx: a_dpub_tx,
+                subscriber_rx: a_dsub_rx,
+                app_handle: None,
+                self_addr: alice_addr,
+                self_x25519_priv: [0u8; 32],
+                identity_resolver: identity_resolver.clone(),
+                registry_weak: None,
+                driver: None,
+                membership_resolver: None,
+                orchestrator_config: Default::default(),
+                persist: None,
+            },
+        )
+        .await;
+    }
+
+    // ── B's dfrost side (epoch 1, same vk) — for applying the live reset marker ──
+    let dfrost_log_b = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+    let dfrost_reg_b = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let resolver_b = Arc::new(TestResetResolver::new(members.clone(), membership));
+    let (b_dtx, b_drx) = mpsc::channel::<Vec<u8>>(4);
+    {
+        let (b_dpub_tx, _b_dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+        DfrostLogRegistry::register(
+            &dfrost_reg_b,
+            DfrostLogEngineParams {
+                community_id,
+                dfrost_log: dfrost_log_b.clone(),
+                publisher_tx: b_dpub_tx,
+                subscriber_rx: b_drx,
+                app_handle: None,
+                self_addr: bob_addr,
+                self_x25519_priv: [0u8; 32],
+                identity_resolver: identity_resolver.clone(),
+                registry_weak: None,
+                driver: None,
+                membership_resolver: Some(resolver_b.clone()),
+                orchestrator_config: Default::default(),
+                persist: None,
+            },
+        )
+        .await;
+    }
+
+    // ── Voting engines A (author) and B (peer), bridged directly (real
+    //    packet delivery — mirrors a Zenoh pub/sub hop) ──
+    let voting_log_a = Arc::new(Mutex::new(VotingLog::new()));
+    let voting_log_b = Arc::new(Mutex::new(VotingLog::new()));
+
+    struct BridgeIdentity(Arc<dyn IdentityResolver + Send + Sync>);
+    #[async_trait::async_trait]
+    impl VotingIdentityResolver for BridgeIdentity {
+        async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
+            self.0.resolve(owner).await
+        }
+    }
+    struct BridgeMembership(MembershipSnapshot);
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for BridgeMembership {
+        async fn snapshot_at(
+            &self,
+            _community_id: SpaceId,
+            _hlc: &Hlc,
+        ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+            Ok(self.0.clone())
+        }
+    }
+    let voting_snapshot = MembershipSnapshot {
+        members: [
+            (
+                alice_addr,
+                MemberAttrs {
+                    power: 100,
+                    vouching_depth: 0,
+                },
+            ),
+            (
+                bob_addr,
+                MemberAttrs {
+                    power: 1,
+                    vouching_depth: 0,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let voting_identity_resolver = Arc::new(BridgeIdentity(identity_resolver.clone()));
+    let voting_membership_resolver = Arc::new(BridgeMembership(voting_snapshot.clone()));
+
+    let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (_a_sub_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let device_id_a = "dev-zeb1031-c1-a".to_string();
+    let hlc_tracker_a = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id_a.clone(),
+    )));
+    let engine_a = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: voting_log_a.clone(),
+        publisher_tx: a_pub_tx,
+        subscriber_rx: a_sub_rx,
+        hlc_tracker: Some(hlc_tracker_a),
+        device_id: Some(device_id_a),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester_a: BeaconRequester =
+        Arc::new(move |_c, _s, _e| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&engine_a, dfrost_reg_a.clone(), requester_a).await;
+
+    let (b_pub_tx, _b_pub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(16);
+    let device_id_b = "dev-zeb1031-c1-b".to_string();
+    let hlc_tracker_b = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id_b.clone(),
+    )));
+    let engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: voting_log_b.clone(),
+        publisher_tx: b_pub_tx,
+        subscriber_rx: b_sub_rx,
+        hlc_tracker: Some(hlc_tracker_b),
+        device_id: Some(device_id_b),
+        app_handle: None,
+        identity_resolver: Some(voting_identity_resolver),
+        membership_resolver: Some(voting_membership_resolver),
+    })
+    .await;
+    let requester_b: BeaconRequester =
+        Arc::new(move |_c, _s, _e| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&engine_b, dfrost_reg_b.clone(), requester_b).await;
+
+    // Bridge A's publisher output into B's subscriber input — real peer
+    // delivery, never a direct dual-apply.
+    tokio::spawn(async move {
+        while let Some(packet) = a_pub_rx.recv().await {
+            let _ = b_sub_tx.send(packet).await;
+        }
+    });
+
+    // ── A mints a REAL Tier-3 PollCreate at epoch 1 ──
+    let epoch1 = dfrost_reg_a
+        .get(community_id)
+        .await
+        .expect("A's dfrost engine")
+        .latest_committee_epoch()
+        .await
+        .expect("A's committee active");
+    assert_eq!(epoch1, 1);
+    let cfg1 = Tier3PollConfigPayload {
+        proposal_text: "pre-reset poll".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: None,
+        ce: Some(epoch1),
+    };
+    let event1 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg1, hlc(1_000, "alice"))
+        .expect("sign poll1");
+    let poll1_id = derive_poll_id(
+        &community_id,
+        &event1.signing_bytes().expect("signing bytes"),
+    );
+    engine_a
+        .publish_event(event1, Some(voting_snapshot.clone()))
+        .await
+        .expect("A publishes poll1");
+
+    // ── B materializes poll1 via process_inbound — the real peer path ──
+    wait_for_voting_log("B materializes poll1", &voting_log_b, |log| {
+        log.polls.contains_key(&poll1_id)
+    })
+    .await;
+    {
+        let log = voting_log_b.lock().await;
+        let t3 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3.meta.community_epoch, 1,
+            "B must derive community_epoch from the wire-carried ce, not a \
+             local set_tier3_poll_epoch patch (which never runs for \
+             peer-ingested creates)"
+        );
+        assert!(t3.voided.is_none());
+    }
+
+    // ── Apply the reset marker for old_epoch=1 on B's dfrost side, LIVE
+    //    INGEST (never hand-calling void_tier3_polls_for_reset) ──
+    let marker1_payload = ResetMarkerPayload {
+        reset_proposal_id: reset1_id,
+        reset_digest: digest1,
+        old_vk: vk1,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker1 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker1_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker1");
+    let mut packet = Vec::new();
+    ciborium::into_writer(&marker1, &mut packet).expect("encode marker1");
+    b_dtx
+        .send(packet)
+        .await
+        .expect("B's dfrost subscriber open");
+
+    // ── B's PEER-MATERIALIZED poll1 (never hand-seeded) gets voided ──
+    wait_for_voting_log(
+        "poll1 voided on B via wire-carried epoch",
+        &voting_log_b,
+        |log| {
+            log.polls
+                .get(&poll1_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .and_then(|t3| t3.voided)
+                .is_some()
+        },
+    )
+    .await;
+
+    // ── A mints a SECOND, post-reset poll at epoch 2 (successor committee) ──
+    {
+        let mut log = dfrost_log_a.lock().await;
+        log.committee_state.current_epoch = 2;
+    }
+    let epoch2 = dfrost_reg_a
+        .get(community_id)
+        .await
+        .expect("A's dfrost engine")
+        .latest_committee_epoch()
+        .await
+        .expect("A's committee active");
+    assert_eq!(epoch2, 2);
+    let cfg2 = Tier3PollConfigPayload {
+        proposal_text: "post-reset poll".into(),
+        ce: Some(epoch2),
+        ..cfg1
+    };
+    let event2 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg2, hlc(6_000, "alice"))
+        .expect("sign poll2");
+    let poll2_id = derive_poll_id(
+        &community_id,
+        &event2.signing_bytes().expect("signing bytes"),
+    );
+    engine_a
+        .publish_event(event2, Some(voting_snapshot))
+        .await
+        .expect("A publishes poll2");
+
+    // ── B materializes poll2 via process_inbound and it survives the
+    //    (already-run) sweep untouched ──
+    wait_for_voting_log("B materializes poll2", &voting_log_b, |log| {
+        log.polls.contains_key(&poll2_id)
+    })
+    .await;
+    let log = voting_log_b.lock().await;
+    let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+    assert_eq!(t3_2.meta.community_epoch, 2);
+    assert!(
+        t3_2.voided.is_none(),
+        "post-reset poll (peer-materialized via B's own process_inbound) \
+         must survive B's earlier sweep"
+    );
+}
+
+/// ZEB-1031 Task 7 review M1 (folded-in, spec §7 no-silent-stall
+/// guarantee): a pre-reset-epoch poll whose `kd=cr` event syncs in AFTER
+/// the local void sweep already ran (independent anti-entropy — dfrost
+/// catch-up and voting-log RBSR are separate wire protocols with no
+/// ordering guarantee between them) must arrive ALREADY VOIDED, not live.
+/// Order: sweep runs first (marker applied while the voting log is still
+/// empty — the retired-epoch watermark is set with zero polls to void),
+/// THEN the pre-reset poll's `kd=cr` syncs in via the real inbound path
+/// (never hand-seeded). A post-reset poll delivered the same way is
+/// unaffected.
+#[tokio::test]
+async fn late_syncing_pre_reset_poll_arrives_already_voided_via_watermark_zeb1031() {
+    use harmony_app::community_voting_core::{
+        build_signed_poll_create_tier3, derive_poll_id, Eligibility, Tier3PollConfigPayload,
+    };
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xD1);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xD2);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xD1; 16]);
+    let vk1: [u8; 32] = [0xE9; 32];
+
+    let reset1_id: EventId = [0xC9; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset1_id,
+        proposer: alice_addr,
+        target_vk: vk1,
+        target_epoch: 1,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+        effective_quorum: None,
+    });
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+    let resolver = Arc::new(TestResetResolver::new(members.clone(), membership));
+
+    // ── B's dfrost side (epoch 1) — wired for live-ingest marker apply ──
+    let dfrost_log = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+    let dfrost_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let (dtx, drx) = mpsc::channel::<Vec<u8>>(4);
+    let (dpub_tx, _dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+    DfrostLogRegistry::register(
+        &dfrost_reg,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: dfrost_log.clone(),
+            publisher_tx: dpub_tx,
+            subscriber_rx: drx,
+            app_handle: None,
+            self_addr: bob_addr,
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: identity_resolver.clone(),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // ── B's voting engine — EMPTY at the moment the sweep runs ──
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    // `verify_voting_event` (the inbound sig-verify gate) needs a REAL
+    // resolver — alice's pub64 must resolve for her signed kd=cr events
+    // to verify, or process_inbound silently drops them and this test's
+    // "arrives via the real inbound path" premise never fires.
+    struct BridgeVotingIdentity(Arc<dyn IdentityResolver + Send + Sync>);
+    #[async_trait::async_trait]
+    impl harmony_app::community_voting_core::VotingIdentityResolver for BridgeVotingIdentity {
+        async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
+            self.0.resolve(owner).await
+        }
+    }
+    struct BridgeMembership(Arc<TestResetResolver>);
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for BridgeMembership {
+        async fn snapshot_at(
+            &self,
+            community_id: SpaceId,
+            hlc: &Hlc,
+        ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+            self.0.snapshot_at(community_id, hlc).await
+        }
+    }
+    let (v_pub_tx, _v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-m1".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: voting_log.clone(),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: Some(Arc::new(BridgeVotingIdentity(identity_resolver.clone()))),
+        membership_resolver: Some(Arc::new(BridgeMembership(resolver))),
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_c, _s, _e| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, dfrost_reg, requester).await;
+
+    // ── Sweep runs FIRST: apply the reset marker while the voting log is
+    //    still empty (zero polls to void — only the watermark advances) ──
+    let marker1_payload = ResetMarkerPayload {
+        reset_proposal_id: reset1_id,
+        reset_digest: digest1,
+        old_vk: vk1,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker1 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker1_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker1");
+    let mut packet = Vec::new();
+    ciborium::into_writer(&marker1, &mut packet).expect("encode marker1");
+    dtx.send(packet).await.expect("dfrost subscriber open");
+
+    // Wait for the sweep's async dispatch to land — no polls exist yet to
+    // observe voiding on, so poll the watermark directly instead.
+    wait_for_voting_log(
+        "watermark advances from the empty-log sweep",
+        &voting_log,
+        |log| log.retired_epoch_watermark.is_some(),
+    )
+    .await;
+    {
+        let log = voting_log.lock().await;
+        let watermark = log.retired_epoch_watermark.expect("watermark set");
+        assert_eq!(watermark.reset_id, reset1_id);
+        assert_eq!(watermark.old_epoch, 1);
+        assert!(
+            log.polls.is_empty(),
+            "the sweep ran against an empty log — nothing to void yet"
+        );
+    }
+
+    // ── NOW the pre-reset poll's kd=cr syncs in — real inbound delivery,
+    //    never hand-seeded, never a dual-apply ──
+    let cfg1 = Tier3PollConfigPayload {
+        proposal_text: "late-syncing pre-reset poll".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: None,
+        ce: Some(1),
+    };
+    let event1 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg1, hlc(1_000, "alice"))
+        .expect("sign poll1");
+    let poll1_id = derive_poll_id(
+        &community_id,
+        &event1.signing_bytes().expect("signing bytes"),
+    );
+    let mut packet1 = Vec::new();
+    ciborium::into_writer(&event1, &mut packet1).expect("encode poll1");
+    v_sub_tx
+        .send(packet1)
+        .await
+        .expect("voting subscriber open");
+
+    wait_for_voting_log(
+        "B materializes the late pre-reset poll",
+        &voting_log,
+        |log| log.polls.contains_key(&poll1_id),
+    )
+    .await;
+    {
+        let log = voting_log.lock().await;
+        let t3 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+        let voided = t3.voided.expect(
+            "a pre-reset-epoch poll syncing in AFTER the sweep must materialize \
+             already voided via the retired-epoch watermark, not live",
+        );
+        assert_eq!(voided.reset_id, reset1_id);
+        assert_eq!(voided.old_epoch, 1);
+    }
+
+    // ── A post-reset poll delivered the same way is unaffected ──
+    let cfg2 = Tier3PollConfigPayload {
+        proposal_text: "post-reset poll, late sync".into(),
+        ce: Some(2),
+        ..cfg1
+    };
+    let event2 = build_signed_poll_create_tier3(&alice_sk, alice_addr, &cfg2, hlc(6_000, "alice"))
+        .expect("sign poll2");
+    let poll2_id = derive_poll_id(
+        &community_id,
+        &event2.signing_bytes().expect("signing bytes"),
+    );
+    let mut packet2 = Vec::new();
+    ciborium::into_writer(&event2, &mut packet2).expect("encode poll2");
+    v_sub_tx
+        .send(packet2)
+        .await
+        .expect("voting subscriber open");
+
+    wait_for_voting_log("B materializes the post-reset poll", &voting_log, |log| {
+        log.polls.contains_key(&poll2_id)
+    })
+    .await;
+    let log = voting_log.lock().await;
+    let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+    assert!(
+        t3_2.voided.is_none(),
+        "a post-reset poll must NOT be voided by a watermark from an earlier reset"
+    );
 }
