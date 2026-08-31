@@ -55,6 +55,26 @@ export interface ProposeDfrostResetResult {
   proposalEventId: string;
 }
 
+/** ZEB-1042 — result of `get_dfrost_committee_summary`: the community's
+ *  active D-FROST committee identity. Prefills the propose form's
+ *  target vk/epoch and backs the panel's "Current committee" block.
+ *  Mirrors the Rust `DfrostCommitteeSummaryDto` (serde camelCase). */
+export interface DfrostCommitteeSummaryDto {
+  /** False until the first DKG completion (`dk`) finalises a committee. */
+  active: boolean;
+  currentEpoch: number;
+  /** Compressed joint verifying key, hex. Null until the first DKG —
+   *  the propose form falls back to manual entry then. */
+  jointVk: string | null;
+  /** Committee member OwnerAddrs, hex, canonical order. */
+  memberAddrs: string[];
+  threshold: number;
+  maxSigners: number;
+  /** True while an applied reset marker pins a successor committee whose
+   *  DKG promotion has not landed yet — a reset is already in flight. */
+  pendingReset: boolean;
+}
+
 export interface CosignDfrostResetResult {
   signersAfter: number;
   phase: ResetPhase;
