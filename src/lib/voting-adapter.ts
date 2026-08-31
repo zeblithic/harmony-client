@@ -63,6 +63,7 @@ import type {
   VotingTier3PollCreatedPayload,
   VotingTier3RatificationOpenPayload,
   VotingTier3SortitionCompletePayload,
+  VotingTier3VoidedPayload,
   Tier3PollExport,
   Tier3PollSummary,
 } from './types/voting';
@@ -140,6 +141,9 @@ export class VotingAdapter {
     (p: VotingTier3RatificationOpenPayload) => void
   > = [];
   private tier3FinalizedSubs: Array<(p: VotingTier3FinalizedPayload) => void> = [];
+  // ZEB-1031 §7/§9 — voided-poll event (out-of-band engine mutation, not
+  // a kd=* poll-event dispatch — see VotingTier3VoidedPayload doc).
+  private tier3VoidedSubs: Array<(p: VotingTier3VoidedPayload) => void> = [];
 
   // ZEB-294 — Tier 3 deliberation event subscribers.
   private tier3DeliberationStatementCreatedSubs: Array<
@@ -315,6 +319,19 @@ export class VotingAdapter {
     return () => {
       const i = this.tier3FinalizedSubs.indexOf(handler);
       if (i >= 0) this.tier3FinalizedSubs.splice(i, 1);
+    };
+  }
+
+  /** ZEB-1031 §7/§9: subscribe to a poll being voided by a D-FROST
+   *  committee reset. Fires once per poll newly voided by a single
+   *  reset sweep. */
+  subscribeTier3Voided(
+    handler: (p: VotingTier3VoidedPayload) => void,
+  ): () => void {
+    this.tier3VoidedSubs.push(handler);
+    return () => {
+      const i = this.tier3VoidedSubs.indexOf(handler);
+      if (i >= 0) this.tier3VoidedSubs.splice(i, 1);
     };
   }
 
@@ -591,6 +608,16 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenTier3Finalized);
+
+        // ZEB-1031 §7/§9 — voided-poll event.
+        const unlistenTier3Voided = await adapter.listen(
+          'voting-tier3-voided',
+          (event) => {
+            const payload = event.payload as VotingTier3VoidedPayload;
+            for (const sub of [...this.tier3VoidedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3Voided);
 
         // ZEB-294 — Tier 3 deliberation events.
         const unlistenTier3DeliberationStatementCreated = await adapter.listen(
@@ -932,6 +959,14 @@ export class VotingAdapter {
    *  PollCreate.hlc descending. Finalized polls are included. */
   async listTier3Polls(communityId: string): Promise<Tier3PollSummary[]> {
     return this.invoke<Tier3PollSummary[]>('voting_list_tier3_polls', { communityId });
+  }
+
+  /** ZEB-1031 §7/§9: relaunch a poll voided by a D-FROST committee reset.
+   *  Authors a fresh PollCreate copying the voided poll's parameters at
+   *  the current epoch, linking the predecessor. Returns the new poll's
+   *  id (hex). Backend authorizes creator-or-admin (power 100). */
+  async relaunchVoidedPoll(pollId: string): Promise<string> {
+    return this.invoke<string>('relaunch_voided_poll', { pollId });
   }
 
   private async invoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {

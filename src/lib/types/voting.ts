@@ -468,6 +468,20 @@ export interface CandidateScore {
   runoffVotes: number;
 }
 
+/** ZEB-1031 §7/§9: payload for `voting-tier3-voided` event. Fired once
+ *  per poll newly voided by a single D-FROST committee-reset sweep —
+ *  unlike every other `voting-tier3-*` event, this is NOT driven by a
+ *  `kd=*` poll event applying (voiding is out-of-band engine mutation
+ *  triggered by a reset-marker apply), so it's a dedicated event rather
+ *  than riding the existing per-kind dispatch. */
+export interface VotingTier3VoidedPayload {
+  pollId: string;
+  communityId: string;
+  /** 32-char hex EventId of the reset that voided this poll. */
+  resetId: string;
+  oldEpoch: number;
+}
+
 /** Payload for `voting-tier3-finalized` event. */
 export interface VotingTier3FinalizedPayload {
   pollId: string;
@@ -578,6 +592,16 @@ export interface RatificationCandidateExport {
   text: string;
 }
 
+/** ZEB-1031 §7/§9 — set when a D-FROST committee reset voided this poll.
+ *  Mirrors Rust `VoidedInfoDto`. */
+export interface VoidedInfoExport {
+  /** 32-char hex EventId of the reset that voided this poll. */
+  resetId: string;
+  /** The community-dfrost epoch this poll's ballots were encrypted
+   *  under — always strictly below the current (post-reset) epoch. */
+  oldEpoch: number;
+}
+
 /** ZEB-311 — full Tier 3 poll state for the UI. Returned by
  *  `adapter.getTier3Poll(pollId)`. */
 export interface Tier3PollExport {
@@ -632,6 +656,11 @@ export interface Tier3PollExport {
   /** ZEB-295 (se-mode only): committee size n at the latest committee
    *  epoch. Always 0 in pu-mode polls or when no committee is yet active. */
   encryptedTallyCommitteeSize: number;
+  /** ZEB-1031 §7/§9: set when a D-FROST committee reset voided this poll —
+   *  optional (absent = not voided) rather than required, matching the
+   *  ZEB-790 convention above for fields added after `Tier3PollExport`
+   *  first shipped, so pre-existing test fixtures don't need updating. */
+  voided?: VoidedInfoExport | null;
 }
 
 /** ZEB-311 — list-row shape. Lightweight; no candidate details. */
@@ -651,6 +680,10 @@ export interface Tier3PollSummary {
    *  without a full poll-detail fetch. Same three-tag domain as
    *  `Tier3PollExport.privacyMode`. */
   privacyMode: 'pu' | 'se' | 'rf';
+  /** ZEB-1031 §7/§9: set when a D-FROST committee reset voided this poll —
+   *  lets the list row render the 🚫 Voided badge without a full detail
+   *  fetch. Optional per the same ZEB-790 convention as above. */
+  voided?: VoidedInfoExport | null;
 }
 
 /** ZEB-295: emitted on every accepted kd=ts so the frontend can update

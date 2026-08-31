@@ -7,6 +7,7 @@ import type {
   VotingTier3DraftingOpenPayload,
   VotingTier3RatificationOpenPayload,
   VotingTier3FinalizedPayload,
+  VotingTier3VoidedPayload,
 } from '../types/voting';
 
 function makeMockAdapter(): {
@@ -139,6 +140,27 @@ describe('VotingAdapter Tier 3 IPC wrappers', () => {
       /voting_propose_draft_candidate failed: Error: snapshot missing/,
     );
   });
+
+  // ── ZEB-1031 §7/§9: voided-poll relaunch ────────────────────────────
+  it('relaunchVoidedPoll invokes relaunch_voided_poll with the camelCased pollId', async () => {
+    const { adapter, invoke } = makeMockAdapter();
+    invoke.mockResolvedValue('ff'.repeat(32));
+    const va = new VotingAdapter();
+    await va.connectAdapter(adapter);
+    const newPollId = await va.relaunchVoidedPoll('aa'.repeat(32));
+    expect(newPollId).toBe('ff'.repeat(32));
+    expect(invoke).toHaveBeenCalledWith('relaunch_voided_poll', { pollId: 'aa'.repeat(32) });
+  });
+
+  it('relaunchVoidedPoll extracts the string rejection error with command prefix', async () => {
+    const { adapter, invoke } = makeMockAdapter();
+    invoke.mockRejectedValue('poll has not been voided');
+    const va = new VotingAdapter();
+    await va.connectAdapter(adapter);
+    await expect(va.relaunchVoidedPoll('aa'.repeat(32))).rejects.toThrow(
+      /relaunch_voided_poll failed: poll has not been voided/,
+    );
+  });
 });
 
 describe('VotingAdapter Tier 3 event subscribers', () => {
@@ -228,6 +250,32 @@ describe('VotingAdapter Tier 3 event subscribers', () => {
       scoresSummary: [{ eventHash: 'cc'.repeat(32), totalScore: 10, runoffVotes: 5 }],
     });
     expect(seen[0]?.winnerText).toBe('Winner!');
+  });
+
+  // ── ZEB-1031 §7/§9: voided-poll event ─────────────────────────────
+  it('subscribeTier3Voided receives resetId + oldEpoch and honors unsubscribe', async () => {
+    const { adapter, emit } = makeMockAdapter();
+    const va = new VotingAdapter();
+    await va.connectAdapter(adapter);
+    const seen: VotingTier3VoidedPayload[] = [];
+    const unsub = va.subscribeTier3Voided((p) => seen.push(p));
+    emit('voting-tier3-voided', {
+      pollId: 'aa'.repeat(32),
+      communityId: 'bb'.repeat(16),
+      resetId: 'cc'.repeat(16),
+      oldEpoch: 3,
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.resetId).toBe('cc'.repeat(16));
+    expect(seen[0]?.oldEpoch).toBe(3);
+    unsub();
+    emit('voting-tier3-voided', {
+      pollId: 'aa'.repeat(32),
+      communityId: 'bb'.repeat(16),
+      resetId: 'cc'.repeat(16),
+      oldEpoch: 3,
+    });
+    expect(seen).toHaveLength(1);
   });
 });
 

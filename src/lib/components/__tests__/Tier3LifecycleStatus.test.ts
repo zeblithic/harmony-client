@@ -41,4 +41,26 @@ describe('Tier3LifecycleStatus', () => {
     });
     expect(getByText('Charter amended')).toBeTruthy();
   });
+
+  // ── ZEB-1031 §7/§9: voided-poll badge ───────────────────────────────
+  it('renders a Voided badge — taking priority over the stage chips — when voided is set', () => {
+    const { getByText, queryByText } = render(Tier3LifecycleStatus, {
+      props: {
+        summary: {
+          ...baseSummary,
+          stage: 'dr',
+          voided: { resetId: 'aa'.repeat(16), oldEpoch: 3 },
+        },
+      },
+    });
+    expect(getByText(/Voided/)).toBeTruthy();
+    expect(queryByText('Drafting')).toBeNull();
+  });
+
+  it('does not render the Voided badge when voided is absent', () => {
+    const { queryByText } = render(Tier3LifecycleStatus, {
+      props: { summary: { ...baseSummary, stage: 'dr' } },
+    });
+    expect(queryByText(/Voided/)).toBeNull();
+  });
 });

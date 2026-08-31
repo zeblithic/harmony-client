@@ -29,6 +29,7 @@
   } from '../types/voting';
   import { tier3StageLabel } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
+  import { POWER_THRESHOLDS } from '../types';
   import Tier3LifecycleStatus from './Tier3LifecycleStatus.svelte';
   import SortitionRevealView from './SortitionRevealView.svelte';
   import MiniPublicParticipationToggle from './MiniPublicParticipationToggle.svelte';
@@ -41,10 +42,16 @@
     communityId,
     adapter,
     myAddr,
+    myPower = 0,
   }: {
     communityId: string;
     adapter: VotingAdapter;
     myAddr: string;
+    /** ZEB-1031 §7/§9: gates the Relaunch button on a voided poll
+     *  (creator-or-admin per spec) — defaults to 0 so callers that
+     *  don't yet thread admin power through still render, just without
+     *  the admin branch of that gate. */
+    myPower?: number;
   } = $props();
 
   // Create-form state
@@ -201,6 +208,29 @@
         && d.encryptedTallyShareCount > 0;
   }
 
+  // ZEB-1031 §7/§9: relaunch a poll voided by a D-FROST committee reset.
+  // Authors a fresh PollCreate copying the voided poll's parameters at the
+  // current epoch and navigates the detail pane to it on success — the old
+  // poll's ballots are cryptographically unrecoverable (ElGamal-encrypted
+  // to the retired committee), so this is a fresh poll, not a resume.
+  let relaunching = $state(false);
+  let relaunchError = $state<string | null>(null);
+
+  async function relaunchVoided(pollId: string) {
+    if (relaunching) return;
+    relaunching = true;
+    relaunchError = null;
+    try {
+      const newPollId = await adapter.relaunchVoidedPoll(pollId);
+      await loadSummaries();
+      select(newPollId);
+    } catch (e) {
+      relaunchError = e instanceof Error ? e.message : String(e);
+    } finally {
+      relaunching = false;
+    }
+  }
+
   function retryFailed(failed: Tier3PollSummary) {
     proposalText = failed.proposalText;
     sortitionSize = failed.sortitionSize;
@@ -296,6 +326,17 @@
     unsubscribers.push(
       adapter.subscribeTier3DraftApproval((p) => {
         if (p.communityId !== communityId) return;
+        if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
+      }),
+    );
+    // ZEB-1031 §7/§9: voiding is out-of-band engine mutation (a D-FROST
+    // reset-marker apply, not a kd=* poll event), so — unlike the events
+    // above — it touches BOTH the list (the voided chip) and the detail
+    // pane (the banner), mirroring subscribeTier3Finalized's dual refetch.
+    unsubscribers.push(
+      adapter.subscribeTier3Voided((p) => {
+        if (p.communityId !== communityId) return;
+        loadSummaries();
         if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
       }),
     );
@@ -546,7 +587,32 @@
         <h4>{selectedDetail.proposalText}</h4>
         <p class="stage-label">{tier3StageLabel(selectedDetail.stage)}</p>
 
-        {#if selectedDetail.stage === 'so'}
+        {#if selectedDetail.voided}
+          <!-- ZEB-1031 §7: the poll stays at whatever stage it was voided
+               at (orthogonal to `stage`) — ballots are ElGamal-encrypted
+               to the retired committee and unrecoverable, so every
+               interactive control below is suppressed in favor of this
+               banner + a one-click relaunch (fresh poll, not a resume). -->
+          <div class="voided-banner" role="alert" data-testid="voided-banner">
+            <p class="voided-text">
+              This poll was voided by committee reset {selectedDetail.voided.resetId.slice(0, 8)}… —
+              ballots encrypted to the retired committee are unrecoverable; re-voting is honest.
+            </p>
+            {#if selectedDetail.proposer === myAddr || myPower >= POWER_THRESHOLDS.max}
+              <button
+                type="button"
+                class="relaunch-btn"
+                disabled={relaunching}
+                onclick={() => relaunchVoided(selectedDetail!.pollId)}
+              >
+                {relaunching ? 'Relaunching…' : 'Relaunch'}
+              </button>
+            {/if}
+            {#if relaunchError}
+              <p class="error">{relaunchError}</p>
+            {/if}
+          </div>
+        {:else if selectedDetail.stage === 'so'}
           <p>Awaiting sortition draw. The D-FROST committee must produce the VRF beacon before the mini-public is selected.</p>
         {:else if selectedDetail.stage === 'de' || selectedDetail.stage === 'dr' || selectedDetail.stage === 'ra' || selectedDetail.stage === 'fi'}
           <SortitionRevealView detail={selectedDetail} {myAddr} />
@@ -715,6 +781,30 @@
     color: var(--text-doc);
     font-size: 0.9rem;
   }
+  /* ZEB-1031 §7/§9: a poll voided by a D-FROST committee reset — same
+     shape as .awaiting-tally but flagged, not informational. */
+  .voided-banner {
+    margin: 0.75rem 0;
+    padding: 0.6rem 0.8rem;
+    background: color-mix(in srgb, var(--vote-against) 12%, var(--panel-bg));
+    border-left: 3px solid var(--vote-against);
+    border-radius: 3px;
+  }
+  .voided-text {
+    margin: 0 0 0.5rem;
+    color: var(--text-doc);
+    font-size: 0.9rem;
+  }
+  .relaunch-btn {
+    background: var(--accent);
+    color: var(--on-accent);
+    border: 0;
+    padding: 0.4rem 0.9rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .relaunch-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .finalized-result { margin-top: 1rem; }
   .winner-line, .runner-up-line { margin: 0.4rem 0; }
   .badge {
