@@ -35,9 +35,9 @@ pub const CATCHUP_VERSION: u8 = 1;
 /// realistic committee (mirrors `MAX_DFROST_PAYLOAD_BYTES` in
 /// `event_loop.rs`). A `ResetChain` frame (ZEB-1031 §6.3, reshaped by
 /// ZEB-1038) carries ONE reset-chain link — a marker plus its successor
-/// `dk` quorum, O(N²) bytes in committee size — served one-per-frame up
-/// to [`MAX_RESET_CHAIN_LINKS_PER_RESPONSE`] frames per response; see
-/// that constant's doc for the sizing math against this bound. Checked
+/// `dk` quorum, trimmed to O(t·N) bytes by ZEB-1045 — served
+/// one-per-frame up to [`MAX_RESET_CHAIN_LINKS_PER_RESPONSE`] frames per
+/// response; see that constant's doc for the sizing math. Checked
 /// before decode to prevent peer-controlled allocation.
 pub const MAX_DFROST_CATCHUP_FRAME_BYTES: usize = 64 * 1024;
 
@@ -89,25 +89,27 @@ pub const MAX_CATCHUP_RESPONDER_GROUPS: usize = 16;
 /// one fan-out point in this module that was unbounded before this cap.
 ///
 /// Sizing against [`MAX_DFROST_CATCHUP_FRAME_BYTES`] (64 KiB): one link
-/// is O(N²) bytes in committee size N — a marker plus one `dk` event per
-/// confirming member, and EACH `dk` payload carries the full N-entry
-/// verifying-share list (~50 bytes/entry) plus the N-entry member list,
-/// so a link weighs roughly N × (55N + 300) bytes: ~6 KiB at N=8,
-/// ~35 KiB at N=20, past the frame cap somewhere in the low 40s. That
-/// byte growth — not this count cap — is the binding constraint, which
-/// is why `catchup_respond` serves ONE link per frame (ZEB-1038),
-/// oldest-first, fit-testing each frame with [`encode_frame`] and
-/// STOPPING at the first link that cannot fit alone (markers apply in
-/// epoch order, so links past a gap are wasted verify work). The
-/// pre-ZEB-1038 shape packed the whole selection into one frame and
-/// dropped it whole on overflow — at N≈16 a 3-link chain already
-/// exceeded the cap, permanently wedging that requester/responder pair
+/// is a marker plus `dk` events whose payloads EACH carry the full
+/// N-entry verifying-share list (~50 bytes/entry) plus the N-entry
+/// member list — ~(80N + 300) bytes per event. Served untrimmed (one
+/// event per confirming member) a link weighed O(N²): past the frame
+/// cap around committee N in the low 40s, and at N≈16 a 3-link chain
+/// already exceeded the cap. The pre-ZEB-1038 shape packed the whole
+/// selection into one frame and dropped it whole on overflow,
+/// permanently wedging that requester/responder pair
 /// (`select_reset_chain` rebuilt the same oversized set every round).
-/// Residual: a single link past the frame cap (payload N in the low
-/// 40s) still cannot be served; the future lever is trimming each
-/// link's `dk` set to a threshold-quorum subset (`adopt_initial_quorum`
-/// requires only `threshold` distinct actors), which flattens a link to
-/// O(t·N) bytes.
+/// Two fixes bound this:
+///
+/// * ZEB-1038 — `catchup_respond` serves ONE link per frame,
+///   oldest-first, fit-testing each frame with [`encode_frame`] and
+///   STOPPING at the first link that cannot fit alone (markers apply in
+///   epoch order, so links past a gap are wasted verify work).
+/// * ZEB-1045 — `trim_dk_events_to_quorum` flattens each link to its
+///   payload threshold t (O(t·N) bytes, ~t × (80N + 300)), since
+///   `adopt_initial_quorum` needs only t distinct actors. The
+///   single-link bound moves from N in the low 40s to roughly N≈400 at
+///   t=2, N≈270 at t=3, N≈155 at t=5; the ZEB-1038
+///   stop-at-first-misfit remains the backstop past that.
 pub const MAX_RESET_CHAIN_LINKS_PER_RESPONSE: usize = 8;
 
 /// ZEB-1030 PR#778 round-1: margin subtracted from
@@ -380,7 +382,9 @@ fn dk_events_for_epoch(log: &DfrostLog, epoch: u64) -> Vec<SignedCommitteeEvent>
 /// "that entry forward"), attach the retained `rs` marker event for
 /// that reset plus the successor epoch's `dk` quorum (which may still
 /// be empty if this responder hasn't itself completed that successor
-/// DKG yet — the requester picks the chain back up on a later round).
+/// DKG yet — the requester picks the chain back up on a later round),
+/// trimmed to a threshold-quorum subset by
+/// [`trim_dk_events_to_quorum`] (ZEB-1045 — see its doc).
 ///
 /// ZEB-1031 review I3: capped at [`MAX_RESET_CHAIN_LINKS_PER_RESPONSE`]
 /// links, OLDEST first (the natural ascending-`old_epoch` iteration
@@ -423,10 +427,80 @@ fn select_reset_chain(log: &DfrostLog, req: &CatchupRequest) -> Vec<ResetChainLi
         let successor_epoch = entry.old_epoch.saturating_add(1);
         links.push(ResetChainLink {
             marker: marker.clone(),
-            dk_events: dk_events_for_epoch(log, successor_epoch),
+            dk_events: trim_dk_events_to_quorum(dk_events_for_epoch(log, successor_epoch)),
         });
     }
     links
+}
+
+/// ZEB-1045: trim a reset-chain link's successor-epoch `dk` set to a
+/// threshold-quorum subset. `adopt_initial_quorum` needs only
+/// `threshold` distinct actors carrying byte-identical payloads — the
+/// remaining N−t events are redundant attestations — so serving all N
+/// made a link O(N²) bytes (each of N events carries the full N-entry
+/// verifying-share list) for zero adoptability gain. Trimming flattens
+/// a link to O(t·N), moving the single-link 64KiB bound from committee
+/// N in the low 40s into the hundreds for small t (the ZEB-1038
+/// residual this closes for realistic sizes).
+///
+/// Selection is deterministic so repeated rounds serve the same subset:
+/// group by identical signed payload bytes (honest confirmers of one
+/// ceremony encode identical payloads; `adopt_initial_quorum` rejects
+/// any set whose payloads disagree, so a mixed set is unadoptable
+/// anyway — which means the pre-trim shape let ONE divergent-payload
+/// event from a misbehaving member poison the whole served set every
+/// round), take the group with the most distinct actors (ties break to
+/// the smaller payload key via `BTreeMap` order + strict `>`), and
+/// serve its first `min(threshold, len)` events in ascending actor
+/// order. Sub-threshold serving ("serve what you have, the requester
+/// retries next round") is preserved by the `min`. Bare `t` with no
+/// margin is deliberate: the requester drops a link WHOLE on any dk
+/// verify failure, so extra events can never rescue a link — they only
+/// add bytes and one more event that could fail.
+fn trim_dk_events_to_quorum(dk_events: Vec<SignedCommitteeEvent>) -> Vec<SignedCommitteeEvent> {
+    if dk_events.is_empty() {
+        return dk_events;
+    }
+    // One event per actor in ascending actor order (dk_events_for_epoch's
+    // BTreeMap order), so group size = distinct-actor count and
+    // within-group index order stays ascending-actor.
+    let selected: Vec<usize> = {
+        let mut groups: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
+        for (i, ev) in dk_events.iter().enumerate() {
+            groups.entry(ev.payload.as_slice()).or_default().push(i);
+        }
+        let (payload, idxs) = groups
+            .into_iter()
+            .reduce(|best, cand| {
+                if cand.1.len() > best.1.len() {
+                    cand
+                } else {
+                    best
+                }
+            })
+            .expect("non-empty dk_events yields at least one group");
+        let threshold = match ciborium::de::from_reader::<DkgCompletePayload, _>(payload) {
+            Ok(p) => p.threshold as usize,
+            // Defensive only: `dk_events_for_epoch` already drops events
+            // with undecodable payloads, so this arm is unreachable from
+            // the one call site — serve untrimmed rather than guess.
+            Err(_) => return dk_events,
+        };
+        idxs.into_iter().take(threshold).collect()
+    };
+    let mut kept = 0usize;
+    dk_events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, ev)| {
+            if selected.get(kept) == Some(&i) {
+                kept += 1;
+                Some(ev)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Pure responder selection. `None` ⇒ nothing to serve (inactive
@@ -915,6 +989,224 @@ mod tests {
             links[1].dk_events.len(),
             1,
             "epoch-3 dk quorum attached to link 2"
+        );
+    }
+
+    /// ZEB-1045: full-payload `dk` builder — real member/verifying-share
+    /// lists so trimmed links carry realistic O(N) payloads and can be
+    /// driven through `adopt_initial_quorum` end-to-end (which never
+    /// verifies signatures, so arbitrary sig bytes are fine here just as
+    /// they are for `select_catchup`).
+    fn zeb1045_dk_event(
+        epoch: u64,
+        actor: OwnerAddr,
+        members: &[OwnerAddr],
+        threshold: u16,
+        joint_vk: [u8; 32],
+        hlc: Hlc,
+    ) -> SignedCommitteeEvent {
+        use crate::community_dfrost_types::MemberVerifyingShare;
+        let payload = DkgCompletePayload {
+            ceremony_id: [0x45; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares: members
+                .iter()
+                .map(|m| MemberVerifyingShare {
+                    member: *m,
+                    verifying_share: [0x55; 32],
+                })
+                .collect(),
+            epoch,
+            members: members.to_vec(),
+            threshold,
+            max_signers: members.len() as u16,
+            space_id: Some(crate::owner_state_types::SpaceId([0x45; 16])),
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::ser::into_writer(&payload, &mut payload_bytes).unwrap();
+        SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc,
+            actor,
+            payload: payload_bytes,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// ZEB-1045: a link's `dk` set is trimmed to the payload's own
+    /// `threshold` — the first t events in ascending actor order — and
+    /// the trimmed set still clears `adopt_initial_quorum` (which needs
+    /// only `threshold` distinct actors, not all N).
+    #[test]
+    fn reset_chain_links_trimmed_to_threshold_quorum_zeb1045() {
+        let mut log = test_active_log(2);
+        seed_reset(&mut log, [0x01; 16], [0xAA; 32], 1);
+        let members: Vec<OwnerAddr> = (1..=7).map(test_owner).collect();
+        for (i, actor) in members.iter().enumerate() {
+            log.insert_event_for_test(zeb1045_dk_event(
+                2,
+                *actor,
+                &members,
+                3,
+                [0xAB; 32],
+                test_hlc(1100 + i as u64, 0, "dev"),
+            ));
+        }
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: None,
+        };
+        let links = select_reset_chain(&log, &req);
+        assert_eq!(links.len(), 1);
+        let dk = &links[0].dk_events;
+        assert_eq!(
+            dk.len(),
+            3,
+            "dk set trimmed to the payload threshold (got {} events)",
+            dk.len()
+        );
+        let served: Vec<OwnerAddr> = dk.iter().map(|ev| ev.actor).collect();
+        assert_eq!(
+            served,
+            vec![test_owner(1), test_owner(2), test_owner(3)],
+            "deterministic first-t subset in ascending actor order"
+        );
+        let mut adopter = DfrostLog::new();
+        let epoch = adopter
+            .adopt_initial_quorum(
+                dk,
+                &crate::owner_state_types::SpaceId([0x45; 16]),
+                &std::collections::BTreeSet::new(),
+            )
+            .expect("trimmed quorum must still be adoptable");
+        assert_eq!(epoch, 2);
+    }
+
+    /// ZEB-1045: trimming picks from the largest byte-identical-payload
+    /// group, not blindly the first t actors — one divergent-payload dk
+    /// event (which would make the whole served set unadoptable:
+    /// `adopt_initial_quorum` requires exact payload agreement) is
+    /// excluded even when its actor sorts FIRST.
+    #[test]
+    fn reset_chain_trim_excludes_divergent_payload_minority_zeb1045() {
+        let mut log = test_active_log(2);
+        seed_reset(&mut log, [0x01; 16], [0xAA; 32], 1);
+        let members: Vec<OwnerAddr> = (1..=6).map(test_owner).collect();
+        // Actor 1 (first in sort order) diverges on the claimed vk.
+        log.insert_event_for_test(zeb1045_dk_event(
+            2,
+            test_owner(1),
+            &members,
+            2,
+            [0xBB; 32],
+            test_hlc(1100, 0, "dev"),
+        ));
+        for (i, actor) in members.iter().enumerate().skip(1) {
+            log.insert_event_for_test(zeb1045_dk_event(
+                2,
+                *actor,
+                &members,
+                2,
+                [0xAA; 32],
+                test_hlc(1100 + i as u64, 0, "dev"),
+            ));
+        }
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: None,
+        };
+        let links = select_reset_chain(&log, &req);
+        assert_eq!(links.len(), 1);
+        let dk = &links[0].dk_events;
+        assert_eq!(dk.len(), 2, "trimmed to the majority group's threshold");
+        for ev in dk {
+            let p: DkgCompletePayload = ciborium::de::from_reader(&ev.payload[..]).unwrap();
+            assert_eq!(
+                p.joint_verifying_key, [0xAA; 32],
+                "served events all come from the agreeing majority group"
+            );
+        }
+        let served: Vec<OwnerAddr> = dk.iter().map(|ev| ev.actor).collect();
+        assert_eq!(
+            served,
+            vec![test_owner(2), test_owner(3)],
+            "first t of the MAJORITY group — the divergent actor 1 is passed over"
+        );
+    }
+
+    /// ZEB-1045 headline: a committee whose untrimmed link exceeds the
+    /// 64KiB frame cap (the documented ZEB-1038 residual) serves a
+    /// fitting link after the quorum trim. 120 payload members × 8 dk
+    /// actors ≈ 70KiB untrimmed; trimmed to threshold 2 ≈ 18KiB.
+    #[test]
+    fn reset_chain_large_committee_link_fits_after_trim_zeb1045() {
+        let mut log = test_active_log(2);
+        seed_reset(&mut log, [0x01; 16], [0xAA; 32], 1);
+        let members: Vec<OwnerAddr> = (1..=120).map(|i| test_owner(i as u8)).collect();
+        for (i, actor) in members.iter().take(8).enumerate() {
+            log.insert_event_for_test(zeb1045_dk_event(
+                2,
+                *actor,
+                &members,
+                2,
+                [0xAB; 32],
+                test_hlc(1100 + i as u64, 0, "dev"),
+            ));
+        }
+        // Regression precondition: the UNTRIMMED link (all 8 events)
+        // cannot be framed — this is the fixture ZEB-1038 could only
+        // stop on.
+        let untrimmed = ResetChainLink {
+            marker: log
+                .events()
+                .find(|ev| ev.kind == DfrostEventKind::ResetMarker)
+                .unwrap()
+                .clone(),
+            dk_events: log
+                .events()
+                .filter(|ev| ev.kind == DfrostEventKind::DkgComplete)
+                .cloned()
+                .collect(),
+        };
+        assert_eq!(untrimmed.dk_events.len(), 8);
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(std::slice::from_ref(&untrimmed), &mut body).unwrap();
+        let oversize = CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x45; 8],
+            body: CatchupBody::ResetChain(body),
+        };
+        assert!(
+            encode_frame(&oversize).is_err(),
+            "fixture must exceed the frame cap untrimmed"
+        );
+
+        let req = CatchupRequest {
+            version: CATCHUP_VERSION,
+            epoch: 1,
+            active: true,
+            beacon_watermark: None,
+        };
+        let links = select_reset_chain(&log, &req);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].dk_events.len(), 2, "trimmed to threshold");
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(std::slice::from_ref(&links[0]), &mut body).unwrap();
+        let trimmed = CatchupFrame {
+            version: CATCHUP_VERSION,
+            responder_id: [0x45; 8],
+            body: CatchupBody::ResetChain(body),
+        };
+        assert!(
+            encode_frame(&trimmed).is_ok(),
+            "trimmed link must fit the frame cap"
         );
     }
 
