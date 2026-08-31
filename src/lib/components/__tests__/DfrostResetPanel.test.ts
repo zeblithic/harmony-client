@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { tick as svelteTick } from 'svelte';
 import { render, waitFor, fireEvent } from '@testing-library/svelte';
 import DfrostResetPanel from '../DfrostResetPanel.svelte';
-import type { ResetProposalDto } from '../../dfrost-reset-types';
+import type { DfrostCommitteeSummaryDto, ResetProposalDto } from '../../dfrost-reset-types';
 import type { CommunityMember } from '../../types';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
@@ -45,9 +45,38 @@ function makeProposal(overrides: Partial<ResetProposalDto> = {}): ResetProposalD
   };
 }
 
-function mockResetState(proposals: ResetProposalDto[]) {
+function makeSummary(overrides: Partial<DfrostCommitteeSummaryDto> = {}): DfrostCommitteeSummaryDto {
+  return {
+    active: true,
+    currentEpoch: 3,
+    jointVk: 'aa'.repeat(32),
+    memberAddrs: [MEMBER_A, MEMBER_B],
+    threshold: 2,
+    maxSigners: 2,
+    pendingReset: false,
+    ...overrides,
+  };
+}
+
+/** Pre-DKG shape — no committee yet. The default for existing tests so
+ *  the propose form keeps its manual-entry behavior unless a test opts
+ *  into an active committee (ZEB-1042 prefill). */
+const PRE_DKG_SUMMARY = makeSummary({
+  active: false,
+  currentEpoch: 0,
+  jointVk: null,
+  memberAddrs: [],
+  threshold: 0,
+  maxSigners: 0,
+});
+
+function mockResetState(
+  proposals: ResetProposalDto[],
+  summary: DfrostCommitteeSummaryDto = PRE_DKG_SUMMARY,
+) {
   (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
     if (cmd === 'get_dfrost_reset_state') return Promise.resolve(proposals);
+    if (cmd === 'get_dfrost_committee_summary') return Promise.resolve(summary);
     return Promise.resolve(undefined);
   });
 }
@@ -349,6 +378,111 @@ describe('DfrostResetPanel', () => {
     await waitFor(() => {
       expect(queryByText('Propose a committee reset…')).toBeNull();
     });
+  });
+
+  // ── ZEB-1042: committee summary + propose-form prefill ────────────────
+
+  it('renders the current committee line from get_dfrost_committee_summary', async () => {
+    mockResetState([], makeSummary());
+    const { getByTestId } = renderPanel();
+    await waitFor(() => {
+      const line = getByTestId('dfrost-committee-summary');
+      expect(line.textContent).toContain('epoch 3');
+      expect(line.textContent).toContain('2-of-2');
+      // shortHex of 'aa'.repeat(32): first 8 + … + last 4.
+      expect(line.textContent).toContain('aaaaaaaa…aaaa');
+      expect(line.textContent).not.toContain('reset in progress');
+    });
+  });
+
+  it('flags an in-flight reset when the summary carries pendingReset', async () => {
+    mockResetState([], makeSummary({ pendingReset: true }));
+    const { getByTestId } = renderPanel();
+    await waitFor(() => {
+      expect(getByTestId('dfrost-committee-summary').textContent).toContain('reset in progress');
+    });
+  });
+
+  it('renders the no-committee line pre-DKG and leaves the target fields editable', async () => {
+    mockResetState([]); // PRE_DKG_SUMMARY default
+    const { getByTestId, getByText, container } = renderPanel();
+    await waitFor(() => {
+      expect(getByTestId('dfrost-committee-summary').textContent).toContain(
+        'No active D-FROST committee yet',
+      );
+    });
+    await fireEvent.click(getByText('Propose a committee reset…'));
+    const vkInput = container.querySelector(
+      'input[placeholder*="64-char hex"]',
+    ) as HTMLInputElement;
+    expect(vkInput.readOnly).toBe(false);
+    expect(vkInput.value).toBe('');
+  });
+
+  it('prefills and locks the target vk/epoch from an active committee, and submits the prefilled values', async () => {
+    mockResetState([], makeSummary({ currentEpoch: 7 }));
+    const { getByText, container } = renderPanel();
+    await waitFor(() => {
+      expect(getByText('Propose a committee reset…')).toBeTruthy();
+    });
+    await fireEvent.click(getByText('Propose a committee reset…'));
+
+    let vkInput: HTMLInputElement;
+    let epochInput: HTMLInputElement;
+    await waitFor(() => {
+      vkInput = container.querySelector('input[placeholder*="64-char hex"]') as HTMLInputElement;
+      epochInput = container.querySelector('input[type="number"][min="0"]') as HTMLInputElement;
+      expect(vkInput.value).toBe('aa'.repeat(32));
+      expect(epochInput.value).toBe('7');
+      expect(vkInput.readOnly).toBe(true);
+      expect(epochInput.readOnly).toBe(true);
+    });
+    expect(getByText('Target key and epoch are filled from the active committee.')).toBeTruthy();
+
+    // Successor config is still the admin's to choose — and the propose
+    // payload must carry the prefilled vk/epoch verbatim.
+    await fireEvent.click(getByText('@bob').closest('button')!);
+    await fireEvent.click(getByText('@cyn').closest('button')!);
+    await fireEvent.click(getByText('Review proposal…'));
+    await fireEvent.click(getByText('Propose reset'));
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('propose_dfrost_reset', {
+        communityId: COMMUNITY_ID,
+        targetVkHex: 'aa'.repeat(32),
+        targetEpoch: 7,
+        newMembers: [MEMBER_A, MEMBER_B],
+        newThreshold: 2,
+        vetoWindowMs: 72 * 3_600_000,
+      });
+    });
+  });
+
+  it('falls back to manual entry when the committee summary read fails', async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_dfrost_reset_state') return Promise.resolve([]);
+      if (cmd === 'get_dfrost_committee_summary')
+        return Promise.reject(new Error('caller is not a Joined member'));
+      return Promise.resolve(undefined);
+    });
+    const { getByText, container, queryByTestId } = renderPanel();
+    await waitFor(() => {
+      expect(getByText('Propose a committee reset…')).toBeTruthy();
+    });
+    // No summary → no committee line at all.
+    expect(queryByTestId('dfrost-committee-summary')).toBeNull();
+
+    await fireEvent.click(getByText('Propose a committee reset…'));
+    await waitFor(() => {
+      expect(
+        getByText(/Couldn't load the active committee \(caller is not a Joined member\)/),
+      ).toBeTruthy();
+    });
+    const vkInput = container.querySelector(
+      'input[placeholder*="64-char hex"]',
+    ) as HTMLInputElement;
+    expect(vkInput.readOnly).toBe(false);
+    await fireEvent.input(vkInput, { target: { value: 'ab'.repeat(32) } });
+    expect(vkInput.value).toBe('ab'.repeat(32));
   });
 
   it('surfaces respond_dfrost_reset errors via the Tauri error-extraction convention', async () => {

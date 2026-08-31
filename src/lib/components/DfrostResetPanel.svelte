@@ -20,21 +20,21 @@
    * section) and not fleet/device recovery. Copy below stays verbally
    * distinct from both.
    *
-   * KNOWN GAP (flagged in the Task 9 report, not fixable from the
-   * frontend): `propose_dfrost_reset` requires the CURRENT committee's
-   * `target_vk_hex` / `target_epoch`, but no IPC anywhere exposes a
-   * community's active D-FROST committee vk/epoch to the frontend today
-   * — the propose form below takes them as plain text/number inputs
-   * that an admin must already know out-of-band (e.g. from logs or the
-   * `api` CLI). The backend still validates them (RS-P mirror) and
-   * returns a readable error on mismatch, so the form is functional,
-   * just not self-service the way the rest of this panel is.
+   * ZEB-1042: `get_dfrost_committee_summary` exposes the active
+   * committee's vk/epoch/shape, closing the ZEB-1031 Task 9 gap where
+   * the propose form's `target_vk_hex` / `target_epoch` had to be typed
+   * in from out-of-band knowledge. When the summary loads with an
+   * active committee the two fields are prefilled and locked
+   * (read-only); if the read fails or no committee exists yet, the
+   * manual inputs remain as the fallback — the backend validates either
+   * way (RS-P mirror) and returns a readable error on mismatch.
    */
   import { onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import type { CommunityMember } from '../types';
   import type {
     CosignDfrostResetResult,
+    DfrostCommitteeSummaryDto,
     ProposeDfrostResetResult,
     ResetPhase,
     ResetProposalDto,
@@ -75,9 +75,14 @@
 
   let proposals = $state<ResetProposalDto[]>([]);
   let loadError = $state<string | null>(null);
+  // ZEB-1042: active-committee identity — backs the "Current committee"
+  // line and prefills/locks the propose form's target vk/epoch.
+  let committee = $state<DfrostCommitteeSummaryDto | null>(null);
+  let committeeError = $state<string | null>(null);
   let nowMs = $state(Date.now());
   let tick = $state(Date.now());
   let latestCallId = 0;
+  let latestCommitteeCallId = 0;
   let pollHandle: ReturnType<typeof setInterval> | null = null;
   let tickHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -113,14 +118,49 @@
     }
   }
 
+  /** ZEB-1042: fetch the active committee summary. On success with an
+   *  active committee, prefill the propose form's target fields — they
+   *  render read-only in that state (`prefillLocked`), so this never
+   *  clobbers manual input; when the summary is missing or pre-DKG the
+   *  fields stay editable and untouched. */
+  async function refreshCommittee() {
+    const myCallId = ++latestCommitteeCallId;
+    try {
+      const summary = await invoke<DfrostCommitteeSummaryDto>('get_dfrost_committee_summary', {
+        communityId,
+      });
+      if (myCallId !== latestCommitteeCallId) return; // stale
+      committee = summary;
+      committeeError = null;
+      if (summary.active && summary.jointVk !== null) {
+        targetVkHex = summary.jointVk;
+        targetEpoch = String(summary.currentEpoch);
+      }
+    } catch (e) {
+      if (myCallId !== latestCommitteeCallId) return;
+      committeeError = e instanceof Error ? e.message : String(e);
+      committee = null;
+    }
+  }
+
   $effect(() => {
     void communityId;
     proposals = [];
     loadError = null;
     actionError = null;
+    // Clear cross-community carryover: a prefilled vk/epoch from the
+    // previous community must never survive into this one's form.
+    committee = null;
+    committeeError = null;
+    targetVkHex = '';
+    targetEpoch = '';
     void refresh();
+    void refreshCommittee();
 
-    pollHandle = setInterval(() => void refresh(), POLL_MS);
+    pollHandle = setInterval(() => {
+      void refresh();
+      void refreshCommittee();
+    }, POLL_MS);
     tickHandle = setInterval(() => {
       tick = Date.now();
     }, TICK_MS);
@@ -244,6 +284,21 @@
       newThreshold <= selectedMembers.size,
   );
 
+  // ZEB-1042: with an active committee loaded, the target fields are
+  // authoritative — render them read-only so the admin can't submit a
+  // mistyped vk/epoch against a known committee.
+  let prefillLocked = $derived(
+    committee !== null && committee.active && committee.jointVk !== null,
+  );
+
+  function toggleProposeForm() {
+    showProposeForm = !showProposeForm;
+    // Re-fetch on open so a committee refresh (epoch bump) that landed
+    // since the last poll can't leave a stale epoch in the form. The
+    // backend's RS-P mirror still validates as the backstop.
+    if (showProposeForm) void refreshCommittee();
+  }
+
   function openProposeConfirm() {
     if (!canSubmitPropose) return;
     proposeError = null;
@@ -289,6 +344,22 @@
     and authorizes a successor committee. Any current committee member can
     veto a reset by proving the committee is still alive.
   </p>
+
+  {#if committee}
+    <p class="committee-summary" data-testid="dfrost-committee-summary">
+      {#if committee.active && committee.jointVk !== null}
+        Current committee: epoch {committee.currentEpoch},
+        {committee.threshold}-of-{committee.maxSigners},
+        key <code>{shortHex(committee.jointVk)}</code>
+        {#if committee.pendingReset}
+          <span class="reset-in-progress">— reset in progress, successor ceremony pending</span>
+        {/if}
+      {:else}
+        No active D-FROST committee yet — there is nothing to reset until the
+        first key ceremony completes.
+      {/if}
+    </p>
+  {/if}
 
   {#if loadError}
     <p class="error" role="alert">{loadError}</p>
@@ -396,7 +467,7 @@
   {/if}
 
   {#if canAdmin}
-    <button type="button" class="propose-toggle" onclick={() => (showProposeForm = !showProposeForm)}>
+    <button type="button" class="propose-toggle" onclick={toggleProposeForm}>
       {showProposeForm ? 'Cancel proposal' : 'Propose a committee reset…'}
     </button>
 
@@ -408,12 +479,24 @@
           openProposeConfirm();
         }}
       >
+        {#if prefillLocked}
+          <p class="help-text">
+            Target key and epoch are filled from the active committee.
+          </p>
+        {:else if committeeError !== null}
+          <p class="help-text">
+            Couldn't load the active committee ({committeeError}) — enter the
+            target key and epoch manually.
+          </p>
+        {/if}
         <label>
           <span>Target committee verifying key (hex)</span>
           <input
             type="text"
             bind:value={targetVkHex}
             placeholder="64-char hex — the committee being replaced"
+            readonly={prefillLocked}
+            class:prefilled={prefillLocked}
             required
           />
         </label>
@@ -426,6 +509,8 @@
             oninput={(e) => {
               targetEpoch = (e.target as HTMLInputElement).value;
             }}
+            readonly={prefillLocked}
+            class:prefilled={prefillLocked}
             required
           />
         </label>
@@ -530,6 +615,27 @@
     font-size: 0.8rem;
     color: var(--text-secondary);
     margin: 0;
+  }
+  .committee-summary {
+    font-size: 0.8rem;
+    color: var(--text-primary);
+    margin: 0;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-raised);
+  }
+  .committee-summary code {
+    font-size: 0.75rem;
+  }
+  .reset-in-progress {
+    color: var(--gov-clay-deep, var(--text-secondary));
+    font-weight: 600;
+  }
+  .propose-form input.prefilled {
+    color: var(--text-secondary);
+    background: var(--surface-raised);
+    cursor: default;
   }
   .empty {
     color: var(--text-secondary);

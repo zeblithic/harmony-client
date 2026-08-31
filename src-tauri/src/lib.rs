@@ -55769,6 +55769,130 @@ async fn get_dfrost_reset_state(
     get_dfrost_reset_state_impl(state_lock.inner(), community_id, now_ms).await
 }
 
+/// ZEB-1042: read-only projection of a community's active D-FROST
+/// committee identity (`CommitteeState`) for the frontend — closes the
+/// ZEB-1031 Task 9 gap where `propose_dfrost_reset`'s `target_vk_hex` /
+/// `target_epoch` had to be typed in by hand. Exposes only public
+/// identity: the joint verifying key is broadcast CRDT state, and
+/// per-member `verifying_shares` deliberately stay out (nothing in the
+/// panel needs them).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DfrostCommitteeSummaryDto {
+    /// `false` until the first `dk` event finalises the committee.
+    pub active: bool,
+    pub current_epoch: u64,
+    /// Compressed joint verifying key, hex. `None` until the first DKG
+    /// completion — the propose form falls back to manual entry then.
+    pub joint_vk: Option<String>,
+    /// Committee member `OwnerAddr`s, hex, canonical bytewise order.
+    pub member_addrs: Vec<String>,
+    pub threshold: u16,
+    pub max_signers: u16,
+    /// `true` while an applied reset marker pins a successor shape whose
+    /// `dk` promotion has not landed yet (`CommitteeState::pending_reset`)
+    /// — the panel shows "reset in progress" instead of offering a
+    /// second proposal against a committee already being replaced.
+    pub pending_reset: bool,
+}
+
+/// Pure projection of `CommitteeState` into the wire DTO — mirrors
+/// `compute_dfrost_reset_state`'s shape so the IPC wrapper stays a thin
+/// lock-and-project.
+pub fn compute_dfrost_committee_summary(
+    cs: &crate::community_dfrost_log::CommitteeState,
+) -> DfrostCommitteeSummaryDto {
+    DfrostCommitteeSummaryDto {
+        active: cs.active,
+        current_epoch: cs.current_epoch,
+        joint_vk: cs.joint_verifying_key.map(hex::encode),
+        member_addrs: cs.members.iter().map(|a| hex::encode(a.0)).collect(),
+        threshold: cs.threshold,
+        max_signers: cs.max_signers,
+        pending_reset: cs.pending_reset.is_some(),
+    }
+}
+
+/// ZEB-1042: read a community's active D-FROST committee vk/epoch/shape.
+/// Same read policy as `get_dfrost_reset_state` — readable by any Joined
+/// member (committee identity is public CRDT state), gated so a departed
+/// member's node can't keep serving it.
+pub(crate) async fn get_dfrost_committee_summary_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<DfrostCommitteeSummaryDto, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (registry, self_owner, dfrost_logs) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            std::sync::Arc::clone(&g.dfrost_logs),
+        )
+    };
+
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let admin_addr = engine_arc.admin_addr();
+    let caller_status = {
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        g.materialized_with_now(admin_addr, wall_now_ms)
+            .members
+            .get(&self_owner)
+            .map(|m| m.status)
+    };
+    if !matches!(
+        caller_status,
+        Some(crate::community_membership::MemberStatus::Joined)
+    ) {
+        return Err("get_dfrost_committee_summary: caller is not a Joined member".to_string());
+    }
+
+    let log_arc = {
+        let map = dfrost_logs.lock().await;
+        map.get(&space_id).cloned().ok_or_else(|| {
+            format!(
+                "no D-FROST committee log for community {} — committee not initialised",
+                hex::encode(space_id.0)
+            )
+        })?
+    };
+    let summary = {
+        let log = log_arc.lock().await;
+        compute_dfrost_committee_summary(&log.committee_state)
+    };
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn get_dfrost_committee_summary(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<DfrostCommitteeSummaryDto, String> {
+    get_dfrost_committee_summary_impl(state_lock.inner(), community_id).await
+}
+
 /// Result of `propose_dfrost_reset` — the new proposal's event id.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57809,6 +57933,77 @@ mod dfrost_reset_dto_tests {
 
         let dtos = compute_dfrost_reset_state(&materialized, proposer);
         assert_eq!(dtos[0].effective_quorum, None);
+    }
+}
+
+#[cfg(test)]
+mod dfrost_committee_summary_dto_tests {
+    use super::compute_dfrost_committee_summary;
+    use crate::community_dfrost_log::CommitteeState;
+    use crate::owner_state_types::OwnerAddr;
+
+    /// An active committee projects its public identity verbatim —
+    /// vk/epoch land in exactly the shape `propose_dfrost_reset` expects
+    /// back (hex vk, numeric epoch), members in canonical order.
+    #[test]
+    fn active_committee_projects_identity() {
+        let a = OwnerAddr([0x01; 16]);
+        let b = OwnerAddr([0x02; 16]);
+        let cs = CommitteeState {
+            active: true,
+            current_epoch: 3,
+            joint_verifying_key: Some([0xAB; 32]),
+            members: vec![a, b],
+            threshold: 2,
+            max_signers: 2,
+            pending_reset: Some(crate::community_dfrost_log::PendingReset {
+                reset_id: [0x0E; 16],
+                new_members: vec![a, b],
+                new_threshold: 2,
+            }),
+            ..CommitteeState::default()
+        };
+        let dto = compute_dfrost_committee_summary(&cs);
+        assert!(dto.active);
+        assert_eq!(dto.current_epoch, 3);
+        assert_eq!(dto.joint_vk.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(dto.member_addrs, vec!["01".repeat(16), "02".repeat(16)]);
+        assert_eq!(dto.threshold, 2);
+        assert_eq!(dto.max_signers, 2);
+        assert!(dto.pending_reset);
+    }
+
+    /// Pre-DKG state (fresh community): inactive, no vk — the panel's
+    /// prefill must fall back to manual entry on `jointVk == null`.
+    #[test]
+    fn pre_dkg_committee_has_no_vk() {
+        let dto = compute_dfrost_committee_summary(&CommitteeState::default());
+        assert!(!dto.active);
+        assert_eq!(dto.current_epoch, 0);
+        assert_eq!(dto.joint_vk, None);
+        assert!(dto.member_addrs.is_empty());
+        assert!(!dto.pending_reset);
+    }
+
+    /// Wire-shape pin: serde must emit camelCase keys (`currentEpoch`,
+    /// `jointVk`, `memberAddrs`, `maxSigners`, `pendingReset`) — the
+    /// Svelte panel destructures these names verbatim.
+    #[test]
+    fn dto_serializes_camel_case() {
+        let dto = compute_dfrost_committee_summary(&CommitteeState::default());
+        let json = serde_json::to_value(&dto).expect("serialize");
+        let obj = json.as_object().expect("object");
+        for key in [
+            "active",
+            "currentEpoch",
+            "jointVk",
+            "memberAddrs",
+            "threshold",
+            "maxSigners",
+            "pendingReset",
+        ] {
+            assert!(obj.contains_key(key), "missing wire key {key}");
+        }
     }
 }
 
@@ -81475,6 +81670,8 @@ pub fn run() {
             relaunch_voided_poll,
             // ZEB-1031 Task 8: D-FROST committee-reset ceremony IPCs (spec §9).
             get_dfrost_reset_state,
+            // ZEB-1042: committee identity read (prefills the propose form).
+            get_dfrost_committee_summary,
             propose_dfrost_reset,
             cosign_dfrost_reset,
             respond_dfrost_reset,
@@ -81717,6 +81914,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         relaunch_voided_poll,
         // ZEB-1031 Task 8: D-FROST committee-reset ceremony IPCs (spec §9).
         get_dfrost_reset_state,
+        // ZEB-1042: committee identity read (prefills the propose form).
+        get_dfrost_committee_summary,
         propose_dfrost_reset,
         cosign_dfrost_reset,
         respond_dfrost_reset,
