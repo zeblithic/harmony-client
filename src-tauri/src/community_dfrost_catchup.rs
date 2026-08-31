@@ -75,15 +75,18 @@ pub const MAX_CATCHUP_RESPONDER_GROUPS: usize = 16;
 ///
 /// Enforced on BOTH sides: the responder truncates the selection before
 /// serving (`select_reset_chain`), and the requester independently caps
-/// what it will decode+verify from one responder GROUP — across all of
-/// the group's `ResetChain` frames combined (`catchup_decode_and_verify`;
-/// group-total since ZEB-1038, because per-link frames made multi-frame
-/// chains the legitimate serving shape and a per-frame cap would multiply
-/// the verify-work bound by the frame count) — the same defence-in-depth
-/// posture as `MAX_CATCHUP_RESPONDER_GROUPS`/`MAX_CATCHUP_BEACONS_PER_
-/// ROUND`, whose docs reason about exactly this per-link
-/// `Ed25519::verify_strict` cost; a `ResetChain` frame is the one
-/// fan-out point in this module that was unbounded before this cap.
+/// the links it will ATTEMPT to verify from one responder GROUP — across
+/// all of the group's `ResetChain` frames combined, charged BEFORE
+/// verification (`catchup_decode_and_verify`; group-total since
+/// ZEB-1038, because per-link frames made multi-frame chains the
+/// legitimate serving shape and a per-frame cap would multiply the
+/// verify-work bound by the frame count; attempt-counted rather than
+/// accepted-counted, because invalid links never enter the accepted set
+/// and would otherwise refresh the budget frame after frame) — the same
+/// defence-in-depth posture as `MAX_CATCHUP_RESPONDER_GROUPS`/
+/// `MAX_CATCHUP_BEACONS_PER_ROUND`, whose docs reason about exactly this
+/// per-link `Ed25519::verify_strict` cost; a `ResetChain` frame is the
+/// one fan-out point in this module that was unbounded before this cap.
 ///
 /// Sizing against [`MAX_DFROST_CATCHUP_FRAME_BYTES`] (64 KiB): one link
 /// is O(N²) bytes in committee size N — a marker plus one `dk` event per

@@ -3953,6 +3953,15 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         let mut dk_events = Vec::new();
         let mut beacons = Vec::new();
         let mut reset_chain = Vec::new();
+        // ZEB-1038 (review round 1, CodeRabbit + CodeAnt convergent
+        // finding): the group-total link budget counts ATTEMPTED links —
+        // charged before verification — not accepted ones. Deriving the
+        // budget from `reset_chain.len()` (accepted only) let a hostile
+        // responder send frame after frame of invalid-signature links:
+        // none ever grew `reset_chain`, so every frame saw a fresh
+        // budget and the Ed25519 verify work was bounded only by the
+        // 16 MiB round cap instead of by this constant.
+        let mut reset_chain_attempted = 0usize;
         for frame in frames {
             let (bytes, want_kind, bucket): (Vec<u8>, DfrostEventKind, &str) = match frame.body {
                 CatchupBody::Status(_) => continue,
@@ -3983,12 +3992,16 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                     // chains the legitimate serving shape, so a
                     // per-frame `take` would let a hostile responder
                     // pack every frame full and multiply the verify
-                    // work this cap exists to bound. `budget` charges
-                    // links already accepted from earlier frames of
-                    // the same group.
+                    // work this cap exists to bound. The budget charges
+                    // links ATTEMPTED (counted before verification, see
+                    // `reset_chain_attempted`'s declaration comment) —
+                    // an invalid link consumes budget exactly like an
+                    // accepted one, so a group serving garbage burns
+                    // through its 8 attempts and is done, instead of
+                    // getting a fresh budget per frame.
                     let received = links.len();
                     let budget =
-                        MAX_RESET_CHAIN_LINKS_PER_RESPONSE.saturating_sub(reset_chain.len());
+                        MAX_RESET_CHAIN_LINKS_PER_RESPONSE.saturating_sub(reset_chain_attempted);
                     if received > budget {
                         tracing::warn!(
                             received,
@@ -3999,6 +4012,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                         );
                     }
                     for link in links.into_iter().take(budget) {
+                        reset_chain_attempted += 1;
                         let Some(marker) = self
                             .verify_catchup_event(link.marker, DfrostEventKind::ResetMarker, "rs")
                             .await
@@ -11338,6 +11352,100 @@ mod tests {
             reset_chain.len(),
             MAX_RESET_CHAIN_LINKS_PER_RESPONSE,
             "group-total cap bounds links across ALL frames of the group"
+        );
+    }
+
+    /// ZEB-1038 review round 1 (CodeRabbit + CodeAnt convergent
+    /// finding): the group-total budget counts ATTEMPTED links, charged
+    /// before verification — invalid-signature links consume it exactly
+    /// like accepted ones. Two frames of garbage links exhaust the
+    /// budget, so a third frame of perfectly VALID links gets zero
+    /// verify attempts: without attempt-counting, invalid links never
+    /// grew the accepted set and every frame saw a fresh budget,
+    /// re-bounding the Ed25519 work by the 16 MiB round cap instead of
+    /// this constant.
+    #[tokio::test]
+    async fn reset_chain_attempted_links_consume_group_budget_zeb1038() {
+        let (sk, marker_actor, marker_pub64) = fixture_identity(0xE4);
+        let make_marker = |sig_garbage: bool| {
+            let mut marker = crate::community_dfrost_log::build_signed_dfrost_event(
+                &sk,
+                marker_actor,
+                DfrostEventKind::ResetMarker,
+                &ResetMarkerPayload {
+                    reset_proposal_id: [0x0B; 16],
+                    reset_digest: [0u8; 32],
+                    old_vk: [0x0B; 32],
+                    old_epoch: 1,
+                    space_id: SpaceId([0xD8; 16]),
+                },
+                Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "zeb1038-admin".into(),
+                },
+            )
+            .expect("build rs marker");
+            if sig_garbage {
+                marker.sig = vec![0u8; 64];
+            }
+            marker
+        };
+        let bad_link = ResetChainLink {
+            marker: make_marker(true),
+            dk_events: Vec::new(),
+        };
+        let good_link = ResetChainLink {
+            marker: make_marker(false),
+            dk_events: Vec::new(),
+        };
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(marker_actor, marker_pub64);
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: SpaceId([0xD8; 16]),
+            dfrost_log: Arc::new(tokio::sync::Mutex::new(
+                crate::community_dfrost_log::DfrostLog::new(),
+            )),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0xDA; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: Arc::new(StaticResolver(resolver_map)),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        let chain_frame = |links: &Vec<ResetChainLink>| {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(links, &mut buf).unwrap();
+            CatchupFrame {
+                version: CATCHUP_VERSION,
+                responder_id: [0x78; 8],
+                body: CatchupBody::ResetChain(buf),
+            }
+        };
+        // Frames 1-2: 4 invalid links each — 8 attempts, the whole
+        // budget. Frame 3: 4 VALID links — must get zero attempts.
+        let frames = vec![
+            chain_frame(&vec![bad_link.clone(); 4]),
+            chain_frame(&vec![bad_link.clone(); 4]),
+            chain_frame(&vec![good_link.clone(); 4]),
+        ];
+
+        let (_dk, _vb, reset_chain) = engine.catchup_decode_and_verify(frames).await;
+        assert!(
+            reset_chain.is_empty(),
+            "invalid links must consume the attempt budget — the valid \
+             third frame arrives after exhaustion (got {} accepted)",
+            reset_chain.len()
         );
     }
 }
