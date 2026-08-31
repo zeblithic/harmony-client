@@ -883,6 +883,27 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 }
             })
             .await;
+
+        // ZEB-1031 Task 7: subscribe to dfrost committee-reset-marker
+        // applies (spec §7). Same Weak-capture pattern as the beacon
+        // subscription above — no reference cycle. Fires from BOTH dfrost
+        // apply sites (live ingest + catch-up chain adoption), so a
+        // straggler healing through the reset chain voids its stale
+        // Tier-3 polls exactly like a live node.
+        let engine_weak_reset = Arc::downgrade(this);
+        registry
+            .subscribe_reset_markers(move |old_epoch, reset_id, community_id| {
+                if let Some(engine) = engine_weak_reset.upgrade() {
+                    let community_id = *community_id;
+                    // Callback is synchronous; spawn the async void handler.
+                    tokio::spawn(async move {
+                        engine
+                            .on_dfrost_reset_marker(old_epoch, reset_id, community_id)
+                            .await;
+                    });
+                }
+            })
+            .await;
     }
 
     /// Handle a VRF beacon arrival from DfrostLog.
@@ -947,6 +968,177 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             )
             .await;
         }
+    }
+
+    /// Handle a committee-reset-marker arrival from DfrostLog (ZEB-1031
+    /// Task 7, spec §7).
+    ///
+    /// Spawned by the dfrost reset-marker callback (see
+    /// `install_dfrost_handle`) whenever EITHER dfrost apply site — live
+    /// ingest or catch-up chain adoption — successfully applies an `rs`
+    /// marker for ANY community; filters to this engine's own community
+    /// the same way `on_dfrost_beacon` does.
+    async fn on_dfrost_reset_marker(
+        self: &Arc<Self>,
+        old_epoch: u64,
+        reset_id: crate::community_membership::EventId,
+        community_id: SpaceId,
+    ) {
+        if community_id != self.community_id {
+            return;
+        }
+        let voided = self.void_tier3_polls_for_reset(old_epoch, reset_id).await;
+        if voided > 0 {
+            tracing::info!(
+                community_id = ?self.community_id,
+                old_epoch,
+                voided,
+                "voting engine: voided open Tier-3 polls on committee reset"
+            );
+        }
+    }
+
+    /// ZEB-1031 Task 7: void every OPEN Tier-3 poll whose `community_epoch`
+    /// predates (or equals) a retired committee's `old_epoch` (spec §7).
+    /// "Open" excludes polls already in a terminal `Stage` (`Finalized`/
+    /// `Failed`) — those can no longer accept mutations regardless, and
+    /// voiding one would be a meaningless annotation on completed
+    /// history. Idempotent: an already-voided poll is skipped and does
+    /// not count toward the returned total, so re-running for the same
+    /// `(old_epoch, reset_id)` (or a later reset chained on top) is safe.
+    ///
+    /// `pub` (not `pub(crate)`) so integration tests — a separate crate
+    /// from `harmony-app`'s perspective — can call it directly to assert
+    /// idempotency without re-driving a full dfrost apply.
+    ///
+    /// Returns the number of polls newly voided by this call.
+    pub async fn void_tier3_polls_for_reset(
+        &self,
+        old_epoch: u64,
+        reset_id: crate::community_membership::EventId,
+    ) -> usize {
+        use crate::community_voting_tier3::{Stage, VoidedInfo};
+
+        let mut voided_count = 0usize;
+        {
+            let mut log = self.voting_log.lock().await;
+            for state in log.polls.values_mut() {
+                let Some(t3) = state.tier_state.as_tier3_mut() else {
+                    continue;
+                };
+                if t3.voided.is_some() {
+                    continue; // idempotent: already voided
+                }
+                if matches!(t3.stage, Stage::Finalized | Stage::Failed) {
+                    continue; // not "open" — nothing left to void
+                }
+                if t3.meta.community_epoch > old_epoch {
+                    continue; // minted at/after the successor epoch
+                }
+                t3.voided = Some(VoidedInfo {
+                    reset_id,
+                    old_epoch,
+                });
+                voided_count += 1;
+            }
+        }
+        if voided_count > 0 {
+            self.persist_now().await;
+        }
+        voided_count
+    }
+
+    /// ZEB-1031 Task 7: relaunch a Tier-3 poll voided by a committee reset
+    /// (spec §7). Authors a fresh `kd=cr` PollCreate copying the voided
+    /// poll's parameters, carrying `predecessor: Some(old_poll_id)`, and
+    /// publishes it through the SAME local-mint dispatch every other
+    /// Tier-3 PollCreate uses (`publish_event`) — so it inherits the
+    /// CURRENT-epoch pre-read, the D-FROST-readiness gate, persistence,
+    /// and the beacon-request trigger for free, unmodified.
+    ///
+    /// Authorization: `caller` must be the voided poll's original creator,
+    /// or `caller_is_power_100` must be `true` — resolved by the caller
+    /// (the IPC layer) from a fresh membership snapshot, since this engine
+    /// has no general-purpose "is this addr an admin" query of its own.
+    ///
+    /// A free function (not a `#[tauri::command]`) deliberately: testable
+    /// directly against an engine + seeded `voting_log`, without wiring a
+    /// full `NodeState` (mirrors this codebase's established "Path C"
+    /// engine-layer testing convention — see
+    /// `community_voting_tier3_ipc_integration.rs`'s module doc).
+    ///
+    /// Returns the new poll's `PollId`.
+    pub async fn relaunch_voided_poll(
+        self: &Arc<Self>,
+        old_poll_id: PollId,
+        caller: OwnerAddr,
+        caller_is_power_100: bool,
+        signing_key: &ed25519_dalek::SigningKey,
+        hlc: Hlc,
+        snapshot: Option<crate::community_voting_core::MembershipSnapshot>,
+    ) -> Result<PollId, String> {
+        // Read the voided poll's config + creator. Held only for the
+        // read — dropped before any await below.
+        let (mut cfg, creator) = {
+            let log = self.voting_log.lock().await;
+            let state = log.polls.get(&old_poll_id).ok_or_else(|| {
+                format!(
+                    "relaunch_voided_poll: poll {} not found",
+                    hex::encode(old_poll_id.0)
+                )
+            })?;
+            let t3 = state.tier_state.as_tier3().ok_or_else(|| {
+                format!(
+                    "relaunch_voided_poll: poll {} is not a Tier 3 poll",
+                    hex::encode(old_poll_id.0)
+                )
+            })?;
+            if t3.voided.is_none() {
+                return Err(format!(
+                    "relaunch_voided_poll: poll {} has not been voided by a committee reset",
+                    hex::encode(old_poll_id.0)
+                ));
+            }
+            (t3.meta.config.clone(), state.meta.creator)
+        };
+
+        if caller != creator && !caller_is_power_100 {
+            return Err(format!(
+                "relaunch_voided_poll: caller {} is neither the original creator {} nor power-100",
+                hex::encode(caller.0),
+                hex::encode(creator.0)
+            ));
+        }
+
+        // Copy the voided poll's parameters, pointing the new poll back
+        // at it. Everything else (proposal text, windows, eligibility,
+        // privacy_mode, incentive_mode) rides through unchanged.
+        cfg.predecessor = Some(old_poll_id);
+        crate::community_voting_tier3::validate_tier3_poll_config(&cfg)
+            .map_err(|e| format!("relaunch_voided_poll: invalid config: {e:?}"))?;
+
+        let event = crate::community_voting_core::build_signed_poll_create_tier3(
+            signing_key,
+            caller,
+            &cfg,
+            hlc,
+        )
+        .map_err(|e| format!("relaunch_voided_poll: build_signed: {e:?}"))?;
+
+        // Compute the new PollId BEFORE publish (same derivation
+        // `voting_create_tier3_proposal` uses) so we can return it
+        // without a re-read.
+        let signing_bytes = event
+            .signing_bytes()
+            .map_err(|e| format!("relaunch_voided_poll: signing_bytes: {e:?}"))?;
+        let new_poll_id =
+            crate::community_voting_core::derive_poll_id(&self.community_id, &signing_bytes);
+
+        self.publish_event(event, snapshot)
+            .await
+            .map_err(|e| format!("relaunch_voided_poll: publish: {e}"))?;
+
+        Ok(new_poll_id)
     }
 
     /// Compute Fisher-Yates sortition and publish a kd=ss SortitionSelection event.
@@ -4957,6 +5149,7 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut payload = Vec::new();
         ciborium::into_writer(&config, &mut payload).expect("encode tier3 cfg");
@@ -7212,6 +7405,7 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -8003,6 +8197,7 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -8196,6 +8391,7 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -8390,6 +8586,7 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
@@ -9115,6 +9312,7 @@ mod tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut cfg_payload = Vec::new();
         ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");

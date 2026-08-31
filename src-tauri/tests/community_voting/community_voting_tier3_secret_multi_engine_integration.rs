@@ -172,6 +172,7 @@ fn config_with_privacy(privacy_mode: &str) -> Tier3PollConfigPayload {
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
     }
 }
 

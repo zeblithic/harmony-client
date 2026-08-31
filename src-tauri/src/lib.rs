@@ -57844,6 +57844,9 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
             sortition_size: Some(sortition_size),
         },
         retry_of: retry_of_pid,
+        // ZEB-1031 Task 7: ordinary proposal creation is never a
+        // relaunch — only `relaunch_voided_poll_impl` sets `predecessor`.
+        predecessor: None,
     };
     crate::community_voting_tier3::validate_tier3_poll_config(&cfg)
         .map_err(|e| format!("voting_create_tier3_proposal: invalid config: {e:?}"))?;
@@ -58034,6 +58037,111 @@ async fn voting_resolve_community_for_poll(
         "poll {} not found in any loaded community",
         hex::encode(pid.0)
     ))
+}
+
+// ─── ZEB-1031 Task 7 — voided-poll relaunch ────────────────────────────────
+
+/// Tauri IPC: relaunch a Tier-3 poll voided by a committee reset (spec §7).
+/// Authors a fresh Tier-3 `kd=cr` PollCreate copying the voided poll's
+/// parameters, carrying `predecessor: Some(voided_poll_id)`. The new poll
+/// is stamped at the CURRENT D-FROST epoch by the existing PollCreate
+/// pre-read inside `VotingLogEngine::publish_event` (untouched by this
+/// task — relaunch reuses the same local-mint dispatch every other Tier-3
+/// PollCreate goes through, so it inherits that epoch stamp, the
+/// D-FROST-readiness gate, persistence, and the beacon-request trigger for
+/// free). Returns the new poll's id as a hex string.
+///
+/// Authorization: caller must be the voided poll's original creator, or
+/// hold power-100 (admin) in the community. Returns an error if the poll
+/// is not found, not Tier 3, or not voided.
+#[tauri::command]
+async fn voting_relaunch_voided_poll(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    poll_id: String,
+) -> Result<String, String> {
+    relaunch_voided_poll_raw(state_lock.inner(), poll_id).await
+}
+
+/// ZEB-1031 Task 7: decoupled implementation of `voting_relaunch_voided_poll`
+/// for integration testing. Mirrors `voting_get_tier3_poll_impl`'s test-only
+/// shim pattern — integration tests drive this directly with a raw
+/// `&Mutex<NodeState>` rather than a `tauri::State<'_, ...>`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn relaunch_voided_poll_impl(
+    state_lock: &Mutex<NodeState>,
+    poll_id: String,
+) -> Result<String, String> {
+    relaunch_voided_poll_raw(state_lock, poll_id).await
+}
+
+async fn relaunch_voided_poll_raw(
+    state_lock: &Mutex<NodeState>,
+    poll_id: String,
+) -> Result<String, String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("relaunch_voided_poll: invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "relaunch_voided_poll: poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let old_poll_id = crate::community_voting_core::PollId(pid_bytes);
+
+    // ZEB-317: single-lock NodeState capture via the shared helper.
+    let handles = VotingEngineNodeHandles::extract(state_lock)?;
+
+    let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &old_poll_id).await?;
+
+    // Authorization input: does the caller hold power-100? The engine
+    // method decides creator-or-power-100 itself once it has read the
+    // voided poll's recorded creator.
+    let snapshot = voting_build_snapshot_for_community(
+        handles.crdt_state.clone(),
+        handles.community_registry.clone(),
+        space_id,
+    )
+    .await?;
+    let caller_is_power_100 = snapshot
+        .members
+        .get(&handles.self_owner)
+        .map(|m| m.power >= 100)
+        .unwrap_or(false);
+
+    // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this
+    // community (idempotent — the poll already exists, so this is
+    // normally a fast-path no-op).
+    let engine_arc = handles.ensure_engine(space_id).await?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &handles.hlc_tracker,
+        &handles.adopt_floor,
+        &handles.device_id,
+        wall_now_ms,
+    )
+    .await;
+
+    // Clone the signing key out (cheap — `Arc<SigningKey>`) instead of
+    // holding the outbox lock across the publish below, matching the
+    // narrow-scope convention every other Tier-3 sign+publish IPC uses.
+    let signing_key = {
+        let outbox_g = handles.dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+
+    let new_poll_id = engine_arc
+        .relaunch_voided_poll(
+            old_poll_id,
+            handles.self_owner,
+            caller_is_power_100,
+            &signing_key,
+            hlc,
+            Some(snapshot),
+        )
+        .await?;
+
+    Ok(hex::encode(new_poll_id.0))
 }
 
 /// Tauri IPC: submit a deliberation statement (kd=ds) for a Tier 3 poll.
@@ -59299,6 +59407,17 @@ async fn reconcile_voting_from_state(
         if let Some(epoch) = restore.tier3_community_epoch {
             log.set_tier3_poll_epoch(&pid, epoch);
         }
+        // ZEB-1031 Task 7: restore `voided` (set by the engine's
+        // `void_tier3_polls_for_reset`, not by any event — replay alone
+        // would resurrect a reset-voided poll as live-and-mutable).
+        // Mirrors the Tier-2 timing overlay's inline-match style above.
+        if let Some(voided) = restore.voided {
+            if let Some(state) = log.polls.get_mut(&pid) {
+                if let crate::community_voting_log::TierState::Tier3(t3) = &mut state.tier_state {
+                    t3.voided = Some(voided);
+                }
+            }
+        }
     }
     tracing::info!(
         ?community_id,
@@ -59583,6 +59702,7 @@ mod zeb718_voting_reconcile_tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut payload = Vec::new();
         ciborium::into_writer(&cfg, &mut payload).expect("encode tier3 cfg");
@@ -79857,6 +79977,8 @@ pub fn run() {
             voting_approve_draft_candidate,
             voting_decline_sortition,
             voting_cast_ratification_ballot,
+            // ZEB-1031 Task 7: relaunch a poll voided by a committee reset.
+            voting_relaunch_voided_poll,
             // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
             voting_create_tier2_proposal,
             voting_signal_tier2,
@@ -80091,6 +80213,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_approve_draft_candidate,
         voting_decline_sortition,
         voting_cast_ratification_ballot,
+        // ZEB-1031 Task 7: relaunch a poll voided by a committee reset.
+        voting_relaunch_voided_poll,
         // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
         voting_create_tier2_proposal,
         voting_signal_tier2,

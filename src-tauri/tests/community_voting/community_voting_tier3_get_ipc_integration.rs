@@ -330,6 +330,7 @@ impl Tier3TestHarness {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let hlc_create = hlc_at(1_000_000);
         let event_create = build_signed_poll_create_tier3(
@@ -461,6 +462,7 @@ impl Tier3TestHarness {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let hlc_create = hlc_at(2_000_000);
         let event_create = build_signed_poll_create_tier3(
@@ -642,6 +644,7 @@ fn tier3_config() -> Tier3PollConfigPayload {
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
     }
 }
 
@@ -916,6 +919,7 @@ async fn build_decline_promotion_log() -> (
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
     };
     let hlc_create = hlc_at(3_000_000);
     let cr_event =

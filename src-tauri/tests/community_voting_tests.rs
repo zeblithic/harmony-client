@@ -54,6 +54,8 @@ mod community_voting_tier3_granular_events_integration;
 mod community_voting_tier3_integration;
 #[path = "community_voting/community_voting_tier3_ipc_integration.rs"]
 mod community_voting_tier3_ipc_integration;
+#[path = "community_voting/community_voting_tier3_reset_void_integration.rs"]
+mod community_voting_tier3_reset_void_integration;
 #[path = "community_voting/community_voting_tier3_secret_ipc_integration.rs"]
 mod community_voting_tier3_secret_ipc_integration;
 #[path = "community_voting/community_voting_tier3_secret_kd_ts_emission_integration.rs"]

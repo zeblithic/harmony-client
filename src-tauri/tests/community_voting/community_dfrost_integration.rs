@@ -37,6 +37,7 @@ use harmony_app::community_dfrost_log::{
 };
 use harmony_app::community_dfrost_log_engine::{
     verify_reset_marker_admissible, CatchupOutcome, DfrostLogEngine, DfrostLogEngineParams,
+    DfrostLogRegistry,
 };
 use harmony_app::community_dfrost_types::{
     derive_vrf_output, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
@@ -3439,4 +3440,479 @@ async fn apply_reset_chain_no_progress_falls_through_to_other_groups_dk_evidence
     );
     assert_eq!(g.committee_state.joint_verifying_key, Some(new_vk));
     assert_eq!(g.committee_state.current_epoch, 2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ZEB-1031 Task 7: poll voiding on committee reset + prompted relaunch.
+// See docs/superpowers/specs/2026-08-30-zeb1031-dfrost-committee-reset-design.md §7.
+//
+// Both tests below drive a reset marker through a REAL `DfrostLogEngine`
+// (never hand-calling `VotingLogEngine::void_tier3_polls_for_reset`
+// directly) so the Weak-hook dispatch wiring
+// (`DfrostLogRegistry::dispatch_reset_marker_callbacks` →
+// `VotingLogEngine::on_dfrost_reset_marker`) is exercised end-to-end at
+// BOTH apply sites: live ingest (`process_inbound`) here, and catch-up
+// chain adoption (`apply_reset_chain`) in the second test.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Minimal `DfrostLog` with an ACTIVE 2-member committee at `epoch`, no real
+/// DKG run — `verify_reset_marker_admissible` (RS-M3/M4/M5) only checks
+/// digest/membership-evidence equality, not FROST zero-knowledge proofs, so
+/// an arbitrary `vk` byte pattern is sufficient (mirrors the shape
+/// `engine_orchestration_emits_kd_ts_after_kd_cl_se_mode` builds directly
+/// for the same reason).
+fn active_committee_dfrost_log(members: &[OwnerAddr], vk: [u8; 32], epoch: u64) -> DfrostLog {
+    let mut log = DfrostLog::new();
+    log.committee_state = CommitteeState {
+        active: true,
+        current_epoch: epoch,
+        joint_verifying_key: Some(vk),
+        verifying_shares: BTreeMap::new(),
+        members: members.to_vec(),
+        threshold: 2,
+        max_signers: members.len() as u16,
+        identifier_map: CommitteeState::build_identifier_map(members),
+        pending_dkg: None,
+        pending_sign: BTreeMap::new(),
+        pending_refresh: None,
+        pending_repair: None,
+        vk_history: Vec::new(),
+        pending_reset: None,
+    };
+    log
+}
+
+/// Seed a minimal open Tier-3 (se-mode) poll at `community_epoch` directly
+/// into `voting_log`, bypassing `publish_event` — same "insert the
+/// synthesized PollState" idiom `engine_orchestration_emits_kd_ts_after_kd_cl_se_mode`
+/// uses. The void mechanism doesn't touch ballots/crypto, so no committee
+/// oracle or ratification state is needed.
+fn seed_open_se_poll(
+    voting_log: &mut harmony_app::community_voting_log::VotingLog,
+    poll_id: harmony_app::community_voting_core::PollId,
+    creator: OwnerAddr,
+    community_id: SpaceId,
+    community_epoch: u64,
+) {
+    use harmony_app::community_voting_core::{
+        Eligibility, Lifecycle, PollMeta, Tier, Tier3PollConfigPayload,
+    };
+    use harmony_app::community_voting_log::{PollState, TierState};
+    use harmony_app::community_voting_tier3::{Tier3PollMeta, Tier3PollState};
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "ZEB-1031 Task 7 void smoke".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 10,
+        drafting_window_seconds: 10,
+        ratification_window_seconds: 10,
+        privacy_mode: "se".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: None,
+    };
+    let create_hlc = hlc(0, "seed");
+    let meta = Tier3PollMeta {
+        poll_id,
+        proposer: creator,
+        poll_create_hlc: create_hlc.clone(),
+        config: config.clone(),
+        poll_create_event_hash: poll_id.0,
+        community_epoch,
+    };
+    let t3 = Tier3PollState::new_from_create(meta, vec![creator]);
+    let poll_state = PollState {
+        meta: PollMeta {
+            poll_id,
+            community_id,
+            creator,
+            tier: Tier::Sortition,
+            eligibility: config.eligibility,
+            lifecycle: Lifecycle::Open,
+            created_at: create_hlc.clone(),
+            opens_at: create_hlc.clone(),
+            closes_at: Hlc {
+                wall_ms: create_hlc.wall_ms + 30_000,
+                logical: 0,
+                device_id: create_hlc.device_id.clone(),
+            },
+            extends_at: None,
+            channel_id: None,
+            finalized_at_ms: None,
+        },
+        events: vec![],
+        tier_state: TierState::Tier3(Box::new(t3)),
+        tier1_cfg: None,
+        tier1_snapshot: None,
+    };
+    voting_log.polls.insert(poll_id, poll_state);
+}
+
+/// Poll `voting_log` until `predicate` holds or 2s elapse — mirrors
+/// `wait_for_dfrost_log` above for the voting side (the reset-marker
+/// callback dispatch runs in a spawned task, so voiding lands
+/// asynchronously relative to the inbound packet send).
+async fn wait_for_voting_log<F>(
+    label: &str,
+    voting_log: &Arc<Mutex<harmony_app::community_voting_log::VotingLog>>,
+    mut predicate: F,
+) where
+    F: FnMut(&harmony_app::community_voting_log::VotingLog) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        {
+            let guard = voting_log.lock().await;
+            if predicate(&guard) {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("wait_for_voting_log({label}) timed out after 2s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// ZEB-1031 Task 7 (spec §7): a reset marker applied through the dfrost
+/// engine's LIVE-INGEST path (`process_inbound`, never hand-calling
+/// `void_tier3_polls_for_reset`) voids every open Tier-3 poll whose
+/// `community_epoch <= old_epoch`, tagging it with the marker's
+/// `(reset_id, old_epoch)`; a poll minted at a later epoch is untouched.
+/// A voided poll then rejects every further mutation — including one
+/// whose payload wouldn't even decode — with the SAME `PollVoided` error
+/// win before payload decode is ever attempted. Re-voiding is a no-op.
+#[tokio::test]
+async fn live_ingest_reset_marker_voids_open_tier3_polls_zeb1031() {
+    use harmony_app::community_voting_core::PollId;
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xB1);
+    let (_bob_sk, bob_addr, bob_pub64) = fixture_identity(0xB2);
+    let mut members = vec![alice_addr, bob_addr];
+    members.sort();
+    let community_id = SpaceId([0xB1; 16]);
+    let vk1: [u8; 32] = [0xC1; 32];
+
+    // ── Dfrost side: an active epoch-1 committee, wired for live ingest ──
+    let dfrost_log = Arc::new(Mutex::new(active_committee_dfrost_log(&members, vk1, 1)));
+
+    let reset1_id: EventId = [0xD1; 16];
+    let digest1 =
+        dfrost_reset_digest(&community_id, &reset1_id, &vk1, 1, &members, 2).expect("digest1");
+    let marker1_payload = ResetMarkerPayload {
+        reset_proposal_id: reset1_id,
+        reset_digest: digest1,
+        old_vk: vk1,
+        old_epoch: 1,
+        space_id: community_id,
+    };
+    let marker1 = build_signed_dfrost_event(
+        &alice_sk,
+        alice_addr,
+        DfrostEventKind::ResetMarker,
+        &marker1_payload,
+        hlc(5_000, "alice"),
+    )
+    .expect("sign marker1");
+
+    let mut membership = MaterializedMembership::default();
+    membership.power_levels.insert(alice_addr, 100);
+    membership.members.insert(alice_addr, joined_member_state());
+    membership.members.insert(bob_addr, joined_member_state());
+    membership.reset_proposals.push(ResetProposalView {
+        id: reset1_id,
+        proposer: alice_addr,
+        target_vk: vk1,
+        target_epoch: 1,
+        new_members: members.clone(),
+        new_threshold: 2,
+        veto_window_ms: 86_400_000,
+        signers: [alice_addr].into_iter().collect(),
+        proposed_at_wall_ms: 1_000,
+        deadline_ms: Some(9_000),
+        authorized_at_ms: Some(9_000),
+        endorsed: false,
+        phase: ResetPhase::Authorized,
+        consumed_new_vk: None,
+        consumption_superseded: false,
+    });
+    let resolver = Arc::new(TestResetResolver::new(members.clone(), membership));
+    let identity_resolver = resolver_with(&[(alice_addr, alice_pub64), (bob_addr, bob_pub64)]);
+
+    let dfrost_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    // Keep the subscriber sender so the test can feed `marker1` in as a
+    // live inbound packet — mirrors a peer node's Zenoh delivery.
+    let (dtx, drx) = mpsc::channel::<Vec<u8>>(4);
+    let (_dpub_tx, _dpub_rx) = mpsc::channel::<Vec<u8>>(4);
+    DfrostLogRegistry::register(
+        &dfrost_reg,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: dfrost_log.clone(),
+            publisher_tx: _dpub_tx,
+            subscriber_rx: drx,
+            app_handle: None,
+            self_addr: bob_addr,
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: identity_resolver.clone(),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(resolver.clone()),
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // ── Voting side: seed one poll at epoch 1 (will be voided) and one
+    //    at epoch 2 (created post-reset — must stay untouched). ──
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    let poll1_id = PollId([0x01; 32]);
+    let poll2_id = PollId([0x02; 32]);
+    {
+        let mut log = voting_log.lock().await;
+        seed_open_se_poll(&mut log, poll1_id, alice_addr, community_id, 1);
+        seed_open_se_poll(&mut log, poll2_id, alice_addr, community_id, 2);
+    }
+
+    let (v_pub_tx, _v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-t7-live".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id,
+        voting_log: Arc::clone(&voting_log),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_cid, _seed, _epoch| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, dfrost_reg.clone(), requester).await;
+
+    // ── Feed marker1 in as a live inbound packet (never hand-calling
+    //    void_tier3_polls_for_reset) ──
+    let mut packet = Vec::new();
+    ciborium::into_writer(&marker1, &mut packet).expect("encode marker1");
+    dtx.send(packet)
+        .await
+        .expect("dfrost subscriber channel open");
+
+    // The reset-marker callback dispatch spawns the void handler
+    // asynchronously — poll until it lands.
+    wait_for_voting_log("poll1 voided", &voting_log, |log| {
+        log.polls
+            .get(&poll1_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .and_then(|t3| t3.voided)
+            .is_some()
+    })
+    .await;
+
+    {
+        let log = voting_log.lock().await;
+        let t3_1 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+        let voided = t3_1.voided.expect("poll1 voided");
+        assert_eq!(
+            voided.reset_id, reset1_id,
+            "voided.reset_id must echo the marker's ri"
+        );
+        assert_eq!(
+            voided.old_epoch, 1,
+            "voided.old_epoch must echo the marker's oe"
+        );
+
+        let t3_2 = log.polls[&poll2_id].tier_state.as_tier3().unwrap();
+        assert!(
+            t3_2.voided.is_none(),
+            "poll at epoch 2 (post-reset) must stay untouched by a marker retiring epoch 1"
+        );
+    }
+
+    // ── Mutation on the voided poll is rejected — with PollVoided, not a
+    //    payload-decode error, confirming the check runs before decode. ──
+    {
+        use harmony_app::community_voting_core::{PollEventKindCode, SignedVotingEvent, Tier};
+        let mut log = voting_log.lock().await;
+        let t3 = log
+            .polls
+            .get_mut(&poll1_id)
+            .unwrap()
+            .tier_state
+            .as_tier3_mut()
+            .unwrap();
+        let garbage_ballot = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::RatificationBallot,
+            hlc: hlc(6_000, "someone"),
+            actor: bob_addr,
+            payload: vec![], // deliberately undecodable — voided must win first
+            sig: vec![0u8; 64],
+        };
+        let err = t3
+            .apply_event(&garbage_ballot)
+            .expect_err("ballot on a voided poll must be rejected");
+        assert!(
+            matches!(
+                err,
+                harmony_app::community_voting_tier3::ApplyError::PollVoided
+            ),
+            "expected PollVoided, got {err:?}"
+        );
+    }
+
+    // ── Re-voiding is idempotent: 0 additional. ──
+    let revoided = voting_engine.void_tier3_polls_for_reset(1, reset1_id).await;
+    assert_eq!(
+        revoided, 0,
+        "re-running void for the same reset must be a no-op"
+    );
+}
+
+/// ZEB-1031 Task 7 (spec §7): the SAME void hook fires from the catch-up
+/// CHAIN-ADOPTION apply site (`apply_reset_chain`) — a straggler healing
+/// through a multi-reset chain voids its stale Tier-3 polls exactly like a
+/// live node. Builds on Task 5's `TwoResetFixture` (already a proven,
+/// working two-reset chain) rather than re-deriving one.
+#[tokio::test]
+async fn chain_adoption_reset_marker_voids_open_tier3_polls_zeb1031() {
+    use harmony_app::community_voting_core::PollId;
+    use harmony_app::community_voting_log::VotingLog;
+    use harmony_app::community_voting_log_engine::{
+        BeaconRequester, VotingLogEngine, VotingLogEngineParams,
+    };
+
+    let fx = build_two_reset_fixture();
+
+    let straggler_log = Arc::new(Mutex::new(fx.straggler_log));
+    let promoted_log = Arc::new(Mutex::new(fx.promoted_log));
+
+    // Responder side (already-promoted, holds the 2-link chain).
+    let (r_pub_tx, _r_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_r_sub_tx, r_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let responder = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+        community_id: fx.community_id,
+        dfrost_log: promoted_log.clone(),
+        publisher_tx: r_pub_tx,
+        subscriber_rx: r_sub_rx,
+        app_handle: None,
+        self_addr: fx.alice_addr,
+        self_x25519_priv: fx.alice_x_priv,
+        identity_resolver: fx.identity_resolver.clone(),
+        registry_weak: None,
+        driver: None,
+        membership_resolver: Some(fx.resolver.clone()),
+        orchestrator_config: Default::default(),
+        persist: None,
+    })
+    .await;
+
+    // Straggler side — registered in a REAL DfrostLogRegistry so
+    // `apply_reset_chain`'s own `registry_weak` (not a fn param, unlike
+    // the live-ingest path) can dispatch the void callback.
+    let straggler_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+    let (s_pub_tx, _s_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_s_sub_tx, s_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let straggler = DfrostLogRegistry::register(
+        &straggler_reg,
+        DfrostLogEngineParams {
+            community_id: fx.community_id,
+            dfrost_log: straggler_log.clone(),
+            publisher_tx: s_pub_tx,
+            subscriber_rx: s_sub_rx,
+            app_handle: None,
+            self_addr: fx.bob_addr,
+            self_x25519_priv: fx.bob_x_priv,
+            identity_resolver: fx.identity_resolver,
+            registry_weak: None,
+            driver: None,
+            membership_resolver: Some(fx.resolver),
+            orchestrator_config: Default::default(),
+            persist: None,
+        },
+    )
+    .await;
+
+    // Voting engine on the straggler's registry: one poll at epoch 1
+    // (pre-BOTH resets — must void on marker1) and one at epoch 3
+    // (the chain's final epoch, i.e. created post-reset — untouched).
+    let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+    let poll1_id = PollId([0x11; 32]);
+    let poll3_id = PollId([0x33; 32]);
+    {
+        let mut log = voting_log.lock().await;
+        seed_open_se_poll(&mut log, poll1_id, fx.alice_addr, fx.community_id, 1);
+        seed_open_se_poll(&mut log, poll3_id, fx.alice_addr, fx.community_id, 3);
+    }
+    let (v_pub_tx, _v_pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_v_sub_tx, v_sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let device_id = "dev-zeb1031-t7-chain".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
+    let voting_engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        community_id: fx.community_id,
+        voting_log: Arc::clone(&voting_log),
+        publisher_tx: v_pub_tx,
+        subscriber_rx: v_sub_rx,
+        hlc_tracker: Some(hlc_tracker),
+        device_id: Some(device_id),
+        app_handle: None,
+        identity_resolver: None,
+        membership_resolver: None,
+    })
+    .await;
+    let requester: BeaconRequester =
+        Arc::new(move |_cid, _seed, _epoch| Box::pin(async { Ok("noop".to_string()) }));
+    VotingLogEngine::install_dfrost_handle(&voting_engine, straggler_reg.clone(), requester).await;
+
+    // Drive the SAME catch-up round the Task 5 test does.
+    let req = straggler.catchup_build_request().await;
+    let frames = responder
+        .catchup_respond(req)
+        .await
+        .expect("responder serves the 2-link chain");
+    let outcome = straggler.catchup_ingest(wire_cross(frames)).await;
+    assert!(
+        matches!(outcome, CatchupOutcome::AdoptedResetChain { links: 2, .. }),
+        "expected a 2-link chain adoption, got {outcome:?}"
+    );
+
+    wait_for_voting_log("poll1 voided via chain adoption", &voting_log, |log| {
+        log.polls
+            .get(&poll1_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .and_then(|t3| t3.voided)
+            .is_some()
+    })
+    .await;
+
+    let log = voting_log.lock().await;
+    let t3_1 = log.polls[&poll1_id].tier_state.as_tier3().unwrap();
+    assert_eq!(t3_1.voided.expect("poll1 voided").old_epoch, 1);
+    let t3_3 = log.polls[&poll3_id].tier_state.as_tier3().unwrap();
+    assert!(
+        t3_3.voided.is_none(),
+        "poll at the chain's final epoch (3) must stay untouched"
+    );
 }

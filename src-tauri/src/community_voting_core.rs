@@ -405,6 +405,14 @@ pub struct Tier3PollConfigPayload {
     pub eligibility: Eligibility,
     #[serde(rename = "ro", skip_serializing_if = "Option::is_none", default)]
     pub retry_of: Option<PollId>,
+    /// ZEB-1031 Task 7: `Some(old_poll_id)` when this poll is a relaunch
+    /// of a poll voided by a committee reset (spec §7). Omitted on
+    /// ordinary polls — optional-key evolution, legacy byte-identical
+    /// (mirrors `retry_of`'s addition). Distinct from `retry_of`: a
+    /// retry follows a *failed sortition*; a predecessor follows a
+    /// *committee reset* voiding an otherwise-live poll.
+    #[serde(rename = "pv", skip_serializing_if = "Option::is_none", default)]
+    pub predecessor: Option<PollId>,
 }
 
 #[cfg(test)]
@@ -593,6 +601,7 @@ mod tier3_payload_tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&payload, &mut encoded).expect("encode");
@@ -626,6 +635,7 @@ mod tier3_payload_tests {
                 sortition_size: None,
             },
             retry_of: Some(prev_poll),
+            predecessor: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&payload, &mut encoded).expect("encode");
@@ -2144,6 +2154,7 @@ mod build_tests {
                 sortition_size: Some(20),
             },
             retry_of: None,
+            predecessor: None,
         };
         let hlc = Hlc {
             wall_ms: 1,

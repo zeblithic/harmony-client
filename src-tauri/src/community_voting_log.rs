@@ -228,6 +228,12 @@ pub enum ApplyError {
     /// poll (the tier_state is not `Tier3`). Distinct from `RetryOfPollNotFailed`
     /// which applies when the predecessor is Tier 3 but not in Failed stage.
     RetryOfPollNotTier3,
+    /// ZEB-1031 Task 7: event targeted a Tier 3 poll voided by a committee
+    /// reset (spec §7). Distinct from `IllegalTransition` (the ordinary
+    /// Failed/Finalized terminal rejections) so callers can surface a
+    /// reset-specific message and prompt a relaunch instead of a generic
+    /// "poll closed" error.
+    PollVoided,
 }
 
 /// ZEB-860 / Cluster K: mirror a Tier-3 poll's terminal `stage` into the
@@ -610,6 +616,9 @@ impl VotingLog {
                         }
                         crate::community_voting_tier3::ApplyError::PayloadDecode(_) => {
                             ApplyError::PayloadDecode
+                        }
+                        crate::community_voting_tier3::ApplyError::PollVoided => {
+                            ApplyError::PollVoided
                         }
                     });
                 }
@@ -1830,6 +1839,7 @@ mod tier3_dispatch_tests {
                 sortition_size: None,
             },
             retry_of: None,
+            predecessor: None,
         }
     }
 
@@ -1956,6 +1966,7 @@ mod tier3_dispatch_tests {
                         sortition_size: None,
                     },
                     retry_of: None,
+                    predecessor: None,
                 },
                 poll_create_event_hash: [0xaa; 32],
                 community_epoch: 0,

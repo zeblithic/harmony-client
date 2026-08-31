@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::community_voting_conviction::CommunityVotingPolicy;
 use crate::community_voting_core::{PollId, PollMeta, SignedVotingEvent};
 use crate::community_voting_log::{TierState, VotingLog};
+use crate::community_voting_tier3::VoidedInfo;
 use crate::owner_state_types::SpaceId;
 
 /// Current on-disk schema version. Bump on any breaking layout change;
@@ -61,6 +62,15 @@ pub struct PollRestore {
     /// means "no Tier-3 epoch overlay", identical to prior behaviour.
     #[serde(default)]
     pub tier3_community_epoch: Option<u64>,
+    /// ZEB-1031 Task 7: `Tier3PollState.voided`, set out-of-band by
+    /// `VotingLogEngine::void_tier3_polls_for_reset` (not by any event —
+    /// replay alone never voids a poll). Without this overlay a restart
+    /// would resurrect a reset-voided poll as live-and-mutable again.
+    /// `#[serde(default)]` for the same pre-field-existence decode reason
+    /// as `tier3_community_epoch`. `None` for non-Tier-3 polls and for
+    /// Tier-3 polls never voided.
+    #[serde(default)]
+    pub voided: Option<VoidedInfo>,
 }
 
 /// The persisted record. `version` + `community_id` ride inside the
@@ -125,12 +135,14 @@ pub fn snapshot_for_persist(log: &VotingLog, community_id: &SpaceId) -> VotingLo
                 .tier_state
                 .as_tier3()
                 .map(|t3| t3.meta.community_epoch);
+            let voided = state.tier_state.as_tier3().and_then(|t3| t3.voided);
             (
                 *pid,
                 PollRestore {
                     meta: state.meta.clone(),
                     tier2_timing,
                     tier3_community_epoch,
+                    voided,
                 },
             )
         })

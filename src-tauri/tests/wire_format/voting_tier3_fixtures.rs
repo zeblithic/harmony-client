@@ -112,6 +112,7 @@ fn fixture_tier3_poll_create_payload() {
             sortition_size: None,
         },
         retry_of: None,
+        predecessor: None,
     };
     round_trip_or_regen("tier3_poll_create.cbor", &pd);
     let mut bytes = Vec::new();
@@ -136,6 +137,7 @@ fn fixture_tier3_poll_create_with_retry_of() {
             sortition_size: None,
         },
         retry_of: Some(PollId([0xab; 32])),
+        predecessor: None,
     };
     round_trip_or_regen("tier3_poll_create_retry.cbor", &pd);
     let mut bytes = Vec::new();
@@ -145,6 +147,39 @@ fn fixture_tier3_poll_create_with_retry_of() {
     assert_two_char_keys(
         &bytes,
         &["pt", "ss", "dw", "fw", "rw", "pm", "im", "el", "ro"],
+    );
+}
+
+/// ZEB-1031 Task 7: relaunch-of-a-voided-poll form — `predecessor` ("pv")
+/// present. A NEW pin (never edits the two above): optional-key evolution
+/// must leave the `retry_of`-less/`predecessor`-less encodings byte-
+/// identical, which the two fixtures above (both now carrying an explicit
+/// `predecessor: None`, still absent from the wire) already prove.
+#[test]
+fn fixture_tier3_poll_create_with_predecessor() {
+    let pd = Tier3PollConfigPayload {
+        proposal_text: "Relaunch: Amend §3 (post-reset)".into(),
+        sortition_size: 50,
+        deliberation_window_seconds: 604_800,
+        drafting_window_seconds: 604_800,
+        ratification_window_seconds: 604_800,
+        privacy_mode: "se".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+        predecessor: Some(PollId([0xcd; 32])),
+    };
+    round_trip_or_regen("tier3_poll_create_predecessor.cbor", &pd);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
+    // "pv" key is present when predecessor is Some; all keys must be 2-char.
+    assert_two_char_keys(
+        &bytes,
+        &["pt", "ss", "dw", "fw", "rw", "pm", "im", "el", "pv"],
     );
 }
 

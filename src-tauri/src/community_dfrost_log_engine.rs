@@ -789,6 +789,16 @@ pub struct DfrostLogEngine<R: tauri::Runtime> {
     // channel round-trip into the receive loop.
     identity_resolver: Arc<dyn IdentityResolver + Send + Sync>,
     orchestrator: Arc<OrchestratorHandle>,
+    /// ZEB-1031 Task 7: `Weak` back-reference to the owning registry, so
+    /// `apply_reset_chain` (a `DfrostLogEngine` method, NOT the receive
+    /// loop) can dispatch reset-marker callbacks too — the catch-up
+    /// chain-adoption path needs the same void-hook as live ingest
+    /// (`process_inbound`, which already receives its own `registry_weak`
+    /// as a fn param). `None` in tests that construct engines directly
+    /// (no registry). Populated by `DfrostLogRegistry::register`/
+    /// `register_if_vacant` via `params.registry_weak`, same as the
+    /// receive-loop's copy.
+    registry_weak: Option<std::sync::Weak<DfrostLogRegistry<R>>>,
     // JoinHandle for the receive task. Aborted explicitly in `Drop` below —
     // Tokio JoinHandles otherwise detach on drop, leaking the spawned task
     // even after the engine's `Arc` reference count reaches zero. The
@@ -1697,6 +1707,43 @@ async fn process_inbound<R: tauri::Runtime>(
                         community_id = %hex::encode(community_id.0),
                         error = %e,
                         "dfrost inbound: RepairShare payload decode failed post-apply",
+                    );
+                }
+            }
+        }
+        DfrostEventKind::ResetMarker => {
+            // ZEB-1031 Task 7: notify the voting engine (via the Weak-hook
+            // registry callback, mirroring the VrfBeacon dispatch above)
+            // so it can void every open Tier-3 poll whose committee epoch
+            // predates this reset (spec §7). Re-decodes the payload here
+            // rather than threading `apply_result`'s `ResetMarkerApplied`
+            // through — same idiom as the VrfBeacon/DkgRound/
+            // ProactiveRefresh/RepairShare arms above, all of which
+            // re-decode post-apply instead of carrying the apply return
+            // value across this match. Dispatched unconditionally on a
+            // successful apply (Applied OR the RS-M6 AlreadyMoved
+            // re-delivery case) — `void_tier3_polls_for_reset` is
+            // idempotent, so a redundant dispatch on re-delivery is
+            // harmless.
+            match ciborium::de::from_reader::<ResetMarkerPayload, _>(&event.payload[..]) {
+                Ok(payload) => {
+                    if let Some(weak) = registry_weak {
+                        if let Some(registry) = weak.upgrade() {
+                            registry
+                                .dispatch_reset_marker_callbacks(
+                                    payload.old_epoch,
+                                    payload.reset_proposal_id,
+                                    &community_id,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        error = %e,
+                        "dfrost inbound: ResetMarker payload decode failed post-apply",
                     );
                 }
             }
@@ -3129,7 +3176,10 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         // (see the field doc) — `resolver_for_loop` above is consumed by
         // the receive task closure below.
         let identity_resolver_for_engine = params.identity_resolver.clone();
-        let registry_weak_for_loop = params.registry_weak;
+        // ZEB-1031 Task 7: cloned (not moved) so a second copy survives on
+        // the engine struct itself for `apply_reset_chain` — same pattern
+        // as `identity_resolver_for_engine`/`orchestrator_for_engine` above.
+        let registry_weak_for_loop = params.registry_weak.clone();
         let mut rx = params.subscriber_rx;
 
         // ZEB-1022: one orchestration context shared by the receive loop
@@ -3216,6 +3266,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             publisher_tx: params.publisher_tx,
             identity_resolver: identity_resolver_for_engine,
             orchestrator: orchestrator_for_engine,
+            registry_weak: params.registry_weak,
             receive_handle,
             tick_handle,
             persist: params.persist,
@@ -3797,6 +3848,26 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// `pending_reset` pin inside `adopt_initial_quorum`; the terminal
     /// gate is what protects the chain's END state against adopting a
     /// since-superseded vk.
+    /// ZEB-1031 Task 7: dispatch the reset-marker void callback for a
+    /// reset-chain link, via this engine's own `registry_weak` (unlike
+    /// `process_inbound`'s live-ingest arm, `apply_reset_chain` is a
+    /// `DfrostLogEngine` method with no `registry_weak` fn param to
+    /// borrow — hence the field added to the struct for this call site).
+    /// No-op when no registry is wired (test engines built directly).
+    async fn dispatch_reset_chain_link_void(&self, payload: &ResetMarkerPayload) {
+        if let Some(weak) = self.registry_weak.as_ref() {
+            if let Some(registry) = weak.upgrade() {
+                registry
+                    .dispatch_reset_marker_callbacks(
+                        payload.old_epoch,
+                        payload.reset_proposal_id,
+                        &self.community_id,
+                    )
+                    .await;
+            }
+        }
+    }
+
     async fn apply_reset_chain(&self, links: &[ResetChainLink]) -> Option<CatchupOutcome> {
         let mut markers_applied = 0usize;
         let mut last_epoch: Option<u64> = None;
@@ -3891,10 +3962,24 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                     markers_applied += 1;
                     let mut t = self.tracker.lock().await;
                     t.record(&link.marker);
+                    self.dispatch_reset_chain_link_void(&payload).await;
                 }
                 Ok(ResetMarkerApplied::AlreadyMoved) => {
                     let mut t = self.tracker.lock().await;
                     t.record(&link.marker);
+                    // ZEB-1031 Task 7: dispatch here too (not just on a
+                    // genuine `Applied`) — a straggler healing through
+                    // this reset chain must void its stale Tier-3 polls
+                    // exactly like a live node, and voiding is idempotent
+                    // (`void_tier3_polls_for_reset` skips already-voided
+                    // polls), so a redundant dispatch on a re-served /
+                    // previously-applied link is harmless. Without this,
+                    // a node whose FIRST application of this marker ran
+                    // before the registry was wired (or crashed before
+                    // the earlier dispatch completed) would never void
+                    // on a later round, since every later round sees only
+                    // `AlreadyMoved`.
+                    self.dispatch_reset_chain_link_void(&payload).await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -4281,6 +4366,17 @@ impl<R: tauri::Runtime> Drop for DfrostLogEngine<R> {
 /// apply). Callbacks must be fast/non-blocking; heavy work must be spawned.
 pub(crate) type BeaconCallback = Arc<dyn Fn(&VrfBeaconPayload, &SpaceId) + Send + Sync + 'static>;
 
+/// ZEB-1031 Task 7: callback type for committee-reset-marker apply
+/// notifications — `(old_epoch, reset_id, community_id)`, echoing
+/// `ResetMarkerApplied::Applied`'s fields (spec §7). Called synchronously
+/// from `dispatch_reset_marker_callbacks`, which fires from BOTH dfrost
+/// apply sites: the live-ingest path (`process_inbound`) and the
+/// catch-up chain-adoption path (`apply_reset_chain`) — a straggler
+/// healing through the reset chain must void its stale polls exactly
+/// like a live node. Mirrors `BeaconCallback`.
+pub(crate) type ResetMarkerCallback =
+    Arc<dyn Fn(u64, crate::community_membership::EventId, &SpaceId) + Send + Sync + 'static>;
+
 // ── Registry ────────────────────────────────────────────────────────────────
 
 /// Per-`SpaceId` map of running `DfrostLogEngine<R>` instances. Mirrors
@@ -4292,6 +4388,10 @@ pub struct DfrostLogRegistry<R: tauri::Runtime> {
     /// Callbacks invoked by `dispatch_beacon_callbacks` when a VRF beacon
     /// is successfully applied by any engine. Populated via `subscribe_beacons`.
     beacon_callbacks: Mutex<Vec<BeaconCallback>>,
+    /// ZEB-1031 Task 7: callbacks invoked by `dispatch_reset_marker_callbacks`
+    /// when a committee-reset marker is successfully applied by any engine.
+    /// Populated via `subscribe_reset_markers`.
+    reset_marker_callbacks: Mutex<Vec<ResetMarkerCallback>>,
 }
 
 impl<R: tauri::Runtime> DfrostLogRegistry<R> {
@@ -4299,6 +4399,7 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
         Self {
             engines: Mutex::new(HashMap::new()),
             beacon_callbacks: Mutex::new(Vec::new()),
+            reset_marker_callbacks: Mutex::new(Vec::new()),
         }
     }
 
@@ -4324,6 +4425,37 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
         let callbacks = self.beacon_callbacks.lock().await.clone();
         for cb in callbacks.iter() {
             cb(payload, community_id);
+        }
+    }
+
+    /// ZEB-1031 Task 7: register a callback to be invoked whenever a
+    /// committee-reset marker (`rs`) is successfully applied by any engine
+    /// in this registry. Mirrors `subscribe_beacons` — callbacks run
+    /// synchronously in the dfrost apply path (receive loop or catch-up
+    /// task) and must be cheap; heavy work (voiding polls, persisting)
+    /// must be spawned.
+    pub async fn subscribe_reset_markers<F>(&self, callback: F)
+    where
+        F: Fn(u64, crate::community_membership::EventId, &SpaceId) + Send + Sync + 'static,
+    {
+        self.reset_marker_callbacks
+            .lock()
+            .await
+            .push(Arc::new(callback));
+    }
+
+    /// Invoke all registered reset-marker callbacks. Called by engines
+    /// after a successful `ResetMarker` apply (both the live-ingest and
+    /// catch-up chain-adoption sites). Safe to call with zero callbacks.
+    pub(crate) async fn dispatch_reset_marker_callbacks(
+        &self,
+        old_epoch: u64,
+        reset_id: crate::community_membership::EventId,
+        community_id: &SpaceId,
+    ) {
+        let callbacks = self.reset_marker_callbacks.lock().await.clone();
+        for cb in callbacks.iter() {
+            cb(old_epoch, reset_id, community_id);
         }
     }
 
