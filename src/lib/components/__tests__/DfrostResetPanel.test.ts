@@ -522,6 +522,46 @@ describe('DfrostResetPanel', () => {
     }
   });
 
+  it('blocks Review until the open-time committee refresh settles', async () => {
+    // CodeRabbit (round 2): opening the form kicks an async summary
+    // refresh; until it settles, the fields still hold last-poll values
+    // — and the round-1 confirm-freeze would pin them if the admin
+    // raced into the modal. Review must stay disabled while the refresh
+    // is in flight, then enable with the FRESH values.
+    let resolveHeld: ((s: DfrostCommitteeSummaryDto) => void) | undefined;
+    let summaryCalls = 0;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'get_dfrost_reset_state') return Promise.resolve([]);
+      if (cmd === 'get_dfrost_committee_summary') {
+        summaryCalls += 1;
+        if (summaryCalls === 1) return Promise.resolve(makeSummary({ currentEpoch: 7 }));
+        // The form-open refresh: held until the test releases it.
+        return new Promise<DfrostCommitteeSummaryDto>((res) => {
+          resolveHeld = res;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+    const { getByText, container } = renderPanel();
+    await waitFor(() => {
+      expect(getByText('Propose a committee reset…')).toBeTruthy();
+    });
+    await fireEvent.click(getByText('Propose a committee reset…'));
+
+    // Fill everything else in while the open-time refresh hangs.
+    await fireEvent.click(getByText('@bob').closest('button')!);
+    await fireEvent.click(getByText('@cyn').closest('button')!);
+    const submitButton = getByText('Review proposal…') as HTMLButtonElement;
+    expect(submitButton.disabled).toBe(true); // refresh in flight — gated
+
+    resolveHeld!(makeSummary({ currentEpoch: 8 }));
+    const epochInput = container.querySelector('input[type="number"][min="0"]') as HTMLInputElement;
+    await waitFor(() => {
+      expect(epochInput.value).toBe('8'); // fresh values landed
+      expect(submitButton.disabled).toBe(false);
+    });
+  });
+
   it('falls back to manual entry when the committee summary read fails', async () => {
     (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
       if (cmd === 'get_dfrost_reset_state') return Promise.resolve([]);

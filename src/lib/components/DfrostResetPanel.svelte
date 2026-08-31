@@ -29,7 +29,7 @@
    * manual inputs remain as the fallback — the backend validates either
    * way (RS-P mirror) and returns a readable error on mismatch.
    */
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import type { CommunityMember } from '../types';
   import type {
@@ -83,6 +83,12 @@
   let tick = $state(Date.now());
   let latestCallId = 0;
   let latestCommitteeCallId = 0;
+  // CodeRabbit (round 2): count of in-flight summary reads. While > 0
+  // the propose submit is gated — freshness is guaranteed at Review
+  // time, and the round-1 freeze then pins those values through the
+  // confirm modal. A counter (not a boolean) so an overlapping poll and
+  // form-open refresh can't clear each other's pending state.
+  let committeeRefreshInFlight = $state(0);
   let pollHandle: ReturnType<typeof setInterval> | null = null;
   let tickHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -125,6 +131,10 @@
    *  fields stay editable and untouched. */
   async function refreshCommittee() {
     const myCallId = ++latestCommitteeCallId;
+    // untrack: this runs synchronously inside the mount $effect, and a
+    // bare `+= 1` would subscribe that effect to the counter it writes
+    // (read-modify-write) — an instant self-invalidation loop.
+    untrack(() => (committeeRefreshInFlight += 1));
     try {
       const summary = await invoke<DfrostCommitteeSummaryDto>('get_dfrost_committee_summary', {
         communityId,
@@ -145,6 +155,8 @@
       if (myCallId !== latestCommitteeCallId) return;
       committeeError = e instanceof Error ? e.message : String(e);
       committee = null;
+    } finally {
+      untrack(() => (committeeRefreshInFlight -= 1));
     }
   }
 
@@ -283,6 +295,7 @@
   let canSubmitPropose = $derived(
     !proposing &&
       !noResettableCommittee &&
+      committeeRefreshInFlight === 0 &&
       targetVkHex.trim().length > 0 &&
       targetEpoch.trim().length > 0 &&
       selectedMembers.size >= 2 &&
