@@ -33,10 +33,11 @@ pub const CATCHUP_VERSION: u8 = 1;
 /// A `Status`/`DkEvidence`/`Beacon` frame carries at most one
 /// `SignedCommitteeEvent` — small CBOR, well under this bound for any
 /// realistic committee (mirrors `MAX_DFROST_PAYLOAD_BYTES` in
-/// `event_loop.rs`). A `ResetChain` frame (ZEB-1031 §6.3) is the
-/// exception: it carries up to [`MAX_RESET_CHAIN_LINKS_PER_RESPONSE`]
-/// links, each a marker plus a handful of `dk` events — see that
-/// constant's doc for the sizing math against this bound. Checked
+/// `event_loop.rs`). A `ResetChain` frame (ZEB-1031 §6.3, reshaped by
+/// ZEB-1038) carries ONE reset-chain link — a marker plus its successor
+/// `dk` quorum, O(N²) bytes in committee size — served one-per-frame up
+/// to [`MAX_RESET_CHAIN_LINKS_PER_RESPONSE`] frames per response; see
+/// that constant's doc for the sizing math against this bound. Checked
 /// before decode to prevent peer-controlled allocation.
 pub const MAX_DFROST_CATCHUP_FRAME_BYTES: usize = 64 * 1024;
 
@@ -72,26 +73,38 @@ pub const MAX_CATCHUP_RESPONDER_GROUPS: usize = 16;
 /// round, resuming the walk with no separate cursor needed (the house
 /// pattern behind the 300s catch-up cadence generally).
 ///
-/// Enforced on BOTH sides: the responder truncates before encoding
-/// (`select_reset_chain`), and the requester independently caps what
-/// it will decode+verify from one frame (`catchup_decode_and_verify`)
-/// — the same defence-in-depth posture as `MAX_CATCHUP_RESPONDER_GROUPS`/
-/// `MAX_CATCHUP_BEACONS_PER_ROUND`, whose docs reason about exactly this
-/// per-frame `Ed25519::verify_strict` cost; a `ResetChain` frame is the
-/// one fan-out point in this module that was unbounded before this cap.
+/// Enforced on BOTH sides: the responder truncates the selection before
+/// serving (`select_reset_chain`), and the requester independently caps
+/// what it will decode+verify from one responder GROUP — across all of
+/// the group's `ResetChain` frames combined (`catchup_decode_and_verify`;
+/// group-total since ZEB-1038, because per-link frames made multi-frame
+/// chains the legitimate serving shape and a per-frame cap would multiply
+/// the verify-work bound by the frame count) — the same defence-in-depth
+/// posture as `MAX_CATCHUP_RESPONDER_GROUPS`/`MAX_CATCHUP_BEACONS_PER_
+/// ROUND`, whose docs reason about exactly this per-link
+/// `Ed25519::verify_strict` cost; a `ResetChain` frame is the one
+/// fan-out point in this module that was unbounded before this cap.
 ///
-/// Sizing against [`MAX_DFROST_CATCHUP_FRAME_BYTES`] (64 KiB): a
-/// `SignedCommitteeEvent` (marker or `dk`) is on the order of a few
-/// hundred bytes to low kilobytes (a 64-byte sig, a 16-byte actor, an
-/// HLC, and a small CBOR payload — a `dk`'s per-member verifying-share
-/// list is the variable part, scaling with committee size). One link is
-/// a marker plus one `dk` event per confirming member, so this cap
-/// keeps a realistic-committee chain comfortably inside the frame
-/// bound while still being a real, documented ceiling — not the sole
-/// backstop: `catchup_respond` still checks the ENCODED length and
-/// drops the whole frame (never serves a truncated one) if a given
-/// round's capped link set still exceeds it (an unusually large
-/// committee, say).
+/// Sizing against [`MAX_DFROST_CATCHUP_FRAME_BYTES`] (64 KiB): one link
+/// is O(N²) bytes in committee size N — a marker plus one `dk` event per
+/// confirming member, and EACH `dk` payload carries the full N-entry
+/// verifying-share list (~50 bytes/entry) plus the N-entry member list,
+/// so a link weighs roughly N × (55N + 300) bytes: ~6 KiB at N=8,
+/// ~35 KiB at N=20, past the frame cap somewhere in the low 40s. That
+/// byte growth — not this count cap — is the binding constraint, which
+/// is why `catchup_respond` serves ONE link per frame (ZEB-1038),
+/// oldest-first, fit-testing each frame with [`encode_frame`] and
+/// STOPPING at the first link that cannot fit alone (markers apply in
+/// epoch order, so links past a gap are wasted verify work). The
+/// pre-ZEB-1038 shape packed the whole selection into one frame and
+/// dropped it whole on overflow — at N≈16 a 3-link chain already
+/// exceeded the cap, permanently wedging that requester/responder pair
+/// (`select_reset_chain` rebuilt the same oversized set every round).
+/// Residual: a single link past the frame cap (payload N in the low
+/// 40s) still cannot be served; the future lever is trimming each
+/// link's `dk` set to a threshold-quorum subset (`adopt_initial_quorum`
+/// requires only `threshold` distinct actors), which flattens a link to
+/// O(t·N) bytes.
 pub const MAX_RESET_CHAIN_LINKS_PER_RESPONSE: usize = 8;
 
 /// ZEB-1030 PR#778 round-1: margin subtracted from

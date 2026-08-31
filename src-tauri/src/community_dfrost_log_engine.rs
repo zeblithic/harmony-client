@@ -3819,32 +3819,60 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                 body: CatchupBody::Beacon(buf),
             });
         }
-        // ZEB-1031 §6.3: reset-chain healing links — one frame per link
-        // (marker + successor dk quorum ciborium-encoded together),
-        // NEW variant so a legacy responder/requester pair that never
-        // has one to serve (empty `sel.reset_chain`) emits byte-
-        // identical frames to before.
-        if !sel.reset_chain.is_empty() {
+        // ZEB-1031 §6.3 / ZEB-1038: reset-chain healing links — ONE link
+        // per `ResetChain` frame (matching this module's one-event-per-
+        // frame idiom for `dk`/`vb`), oldest-first, each candidate frame
+        // fit-tested with `encode_frame` — the definitive wire gate
+        // (`dfrost_catchup_seal_reply` re-runs the same check before
+        // sealing, so a frame accepted here cannot be dropped there).
+        //
+        // ZEB-1038: the pre-fix shape encoded ALL selected links into a
+        // single frame, which made the link-COUNT cap the wrong bound —
+        // one link is O(N²) bytes (one `dk` event per confirming member,
+        // each carrying N verifying shares), so at committee size ≈16
+        // three links already exceeded the 64KiB frame and the WHOLE
+        // chain was dropped; `select_reset_chain` then rebuilt the same
+        // oversized set every round, so that requester/responder pair
+        // never healed. Per-link frames heal up to the full link cap per
+        // round at any committee size where a single link fits.
+        //
+        // STOP at the first link that does not fit alone — never skip:
+        // markers must apply in ascending epoch order (`apply_reset_
+        // chain` walks the chain in order and a gap's successor marker
+        // fails RS-M2 admissibility against pre-gap state), so links
+        // past a misfit are wasted verify work for the requester. The
+        // residual is a committee so large ONE link exceeds the frame
+        // (payload N in the low 40s — see
+        // `MAX_RESET_CHAIN_LINKS_PER_RESPONSE`'s sizing doc; trimming
+        // links to a threshold-quorum dk subset is the future lever).
+        for (idx, link) in sel.reset_chain.iter().enumerate() {
             let mut buf = Vec::new();
-            if let Err(e) = ciborium::ser::into_writer(&sel.reset_chain, &mut buf) {
+            if let Err(e) = ciborium::ser::into_writer(std::slice::from_ref(link), &mut buf) {
                 tracing::warn!(
                     error = %e,
-                    links = sel.reset_chain.len(),
-                    "dfrost catchup respond: reset chain encode failed — skipped",
+                    served = idx,
+                    "dfrost catchup respond: reset chain link encode failed — chain serving \
+                     stopped",
                 );
-            } else if buf.len() > MAX_DFROST_CATCHUP_FRAME_BYTES {
-                tracing::warn!(
-                    len = buf.len(),
-                    cap = MAX_DFROST_CATCHUP_FRAME_BYTES,
-                    "dfrost catchup respond: reset chain exceeds frame cap — skipped",
-                );
-            } else {
-                frames.push(CatchupFrame {
-                    version: CATCHUP_VERSION,
-                    responder_id,
-                    body: CatchupBody::ResetChain(buf),
-                });
+                break;
             }
+            let frame = CatchupFrame {
+                version: CATCHUP_VERSION,
+                responder_id,
+                body: CatchupBody::ResetChain(buf),
+            };
+            if let Err(e) = crate::community_dfrost_catchup::encode_frame(&frame) {
+                tracing::warn!(
+                    error = %e,
+                    served = idx,
+                    remaining = sel.reset_chain.len() - idx,
+                    "dfrost catchup respond: single reset-chain link exceeds the frame cap — \
+                     chain serving stopped (ZEB-1038 residual: committee too large for one \
+                     link per frame)",
+                );
+                break;
+            }
+            frames.push(frame);
         }
         Some(frames)
     }
@@ -3948,16 +3976,29 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
                     // RESPONDER_GROUPS`/`MAX_CATCHUP_BEACONS_PER_ROUND`
                     // (each non-status link sub-event pays an
                     // `Ed25519::verify_strict`).
+                    //
+                    // ZEB-1038: the cap is GROUP-TOTAL (across every
+                    // `ResetChain` frame this responder group sent),
+                    // not per-frame. Per-link frames made multi-frame
+                    // chains the legitimate serving shape, so a
+                    // per-frame `take` would let a hostile responder
+                    // pack every frame full and multiply the verify
+                    // work this cap exists to bound. `budget` charges
+                    // links already accepted from earlier frames of
+                    // the same group.
                     let received = links.len();
-                    if received > MAX_RESET_CHAIN_LINKS_PER_RESPONSE {
+                    let budget =
+                        MAX_RESET_CHAIN_LINKS_PER_RESPONSE.saturating_sub(reset_chain.len());
+                    if received > budget {
                         tracing::warn!(
                             received,
+                            budget,
                             cap = MAX_RESET_CHAIN_LINKS_PER_RESPONSE,
-                            "dfrost catchup ingest: reset chain exceeds the per-frame link cap \
-                             — excess links dropped",
+                            "dfrost catchup ingest: reset chain links exceed the group-total \
+                             link cap — excess links dropped",
                         );
                     }
-                    for link in links.into_iter().take(MAX_RESET_CHAIN_LINKS_PER_RESPONSE) {
+                    for link in links.into_iter().take(budget) {
                         let Some(marker) = self
                             .verify_catchup_event(link.marker, DfrostEventKind::ResetMarker, "rs")
                             .await
@@ -4902,6 +4943,10 @@ impl<R: tauri::Runtime> Default for DfrostLogRegistry<R> {
 
 #[cfg(test)]
 mod tests {
+    use crate::community_dfrost_catchup::{
+        CatchupBody, CatchupFrame, CatchupRequest, ResetChainLink, CATCHUP_VERSION,
+        MAX_DFROST_CATCHUP_FRAME_BYTES, MAX_RESET_CHAIN_LINKS_PER_RESPONSE,
+    };
     use crate::community_dfrost_log_engine::{
         verify_reset_marker_admissible, CatchupOutcome, DfrostLogEngine, DfrostLogEngineParams,
         DfrostReplayTracker,
@@ -10962,6 +11007,337 @@ mod tests {
         assert_eq!(
             d_guard.committee_state.joint_verifying_key,
             Some(fixture_h.joint_vk)
+        );
+    }
+
+    // ─── ZEB-1038: reset-chain per-link frames + group-total link cap ───
+
+    /// Build a signed dk event for `actor` claiming a committee of
+    /// `payload_members` members at `epoch` — the payload's
+    /// verifying-shares list is what makes a reset-chain link O(N²)
+    /// bytes, so tests scale `payload_members` to drive frame overflow.
+    fn zeb1038_dk_event(
+        sk: &ed25519_dalek::SigningKey,
+        actor: OwnerAddr,
+        epoch: u64,
+        payload_members: &[OwnerAddr],
+        wall_ms: u64,
+    ) -> SignedCommitteeEvent {
+        use crate::community_dfrost_types::{DkgCompletePayload, MemberVerifyingShare};
+        let payload = DkgCompletePayload {
+            ceremony_id: [epoch as u8; 32],
+            joint_verifying_key: [0xE0u8.wrapping_add(epoch as u8); 32],
+            verifying_shares: payload_members
+                .iter()
+                .map(|m| MemberVerifyingShare {
+                    member: *m,
+                    verifying_share: [0x55; 32],
+                })
+                .collect(),
+            epoch,
+            members: payload_members.to_vec(),
+            threshold: 2,
+            max_signers: payload_members.len() as u16,
+            space_id: Some(SpaceId([0xD8; 16])),
+        };
+        crate::community_dfrost_log::build_signed_dfrost_event(
+            sk,
+            actor,
+            DfrostEventKind::DkgComplete,
+            &payload,
+            Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "zeb1038-dev".into(),
+            },
+        )
+        .expect("build dk event")
+    }
+
+    /// Seed one reset-lineage entry into `log`: the `vk_history` row, its
+    /// retained `rs` marker, and `dk_actors` successor-epoch dk events
+    /// whose payloads each claim a `payload_members`-sized committee.
+    fn zeb1038_seed_reset(
+        log: &mut crate::community_dfrost_log::DfrostLog,
+        sk: &ed25519_dalek::SigningKey,
+        marker_actor: OwnerAddr,
+        old_epoch: u64,
+        dk_actors: &[OwnerAddr],
+        payload_members: &[OwnerAddr],
+    ) {
+        let reset_id: EventId = [old_epoch as u8; 16];
+        let marker_hlc = Hlc {
+            wall_ms: old_epoch * 1000,
+            logical: 0,
+            device_id: "zeb1038-admin".into(),
+        };
+        let marker = crate::community_dfrost_log::build_signed_dfrost_event(
+            sk,
+            marker_actor,
+            DfrostEventKind::ResetMarker,
+            &ResetMarkerPayload {
+                reset_proposal_id: reset_id,
+                reset_digest: [0u8; 32],
+                old_vk: [old_epoch as u8; 32],
+                old_epoch,
+                space_id: SpaceId([0xD8; 16]),
+            },
+            marker_hlc.clone(),
+        )
+        .expect("build rs marker");
+        log.insert_event_for_test(marker);
+        for (i, actor) in dk_actors.iter().enumerate() {
+            log.insert_event_for_test(zeb1038_dk_event(
+                sk,
+                *actor,
+                old_epoch + 1,
+                payload_members,
+                old_epoch * 1000 + 100 + i as u64,
+            ));
+        }
+        log.committee_state
+            .vk_history
+            .push(crate::community_dfrost_log::VkLineageEntry {
+                old_vk: [old_epoch as u8; 32],
+                old_epoch,
+                reset_id,
+                digest: [0u8; 32],
+                at: marker_hlc,
+            });
+    }
+
+    /// `n` distinct member addresses (supports n > 255 via two id bytes).
+    fn zeb1038_members(n: usize, tag: u8) -> Vec<OwnerAddr> {
+        let mut v: Vec<OwnerAddr> = (0..n)
+            .map(|i| {
+                let mut a = [0u8; 16];
+                a[0] = (i >> 8) as u8;
+                a[1] = i as u8;
+                a[2] = tag;
+                OwnerAddr(a)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    async fn zeb1038_engine(
+        log: crate::community_dfrost_log::DfrostLog,
+    ) -> Arc<DfrostLogEngine<tauri::test::MockRuntime>> {
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: SpaceId([0xD8; 16]),
+            dfrost_log: Arc::new(tokio::sync::Mutex::new(log)),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0xD8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: Arc::new(StaticResolver(HashMap::new())),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await
+    }
+
+    /// ZEB-1038 regression: a 3-reset lineage on a 20-member committee is
+    /// O(N²) bytes per link — the combined chain exceeds the 64KiB frame
+    /// cap (the pre-fix shape encoded ALL links into ONE frame and
+    /// dropped it whole, so this requester/responder pair never healed).
+    /// The fix serves ONE link per `ResetChain` frame, oldest-first,
+    /// each individually inside `encode_frame`'s wire cap.
+    #[tokio::test]
+    async fn reset_chain_served_one_link_per_frame_zeb1038() {
+        let (sk, marker_actor, _pub64) = fixture_identity(0xE1);
+        let members = zeb1038_members(20, 0x01);
+        let mut log = crate::community_dfrost_log::DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 4;
+        log.committee_state.joint_verifying_key = Some([0xE4; 32]);
+        log.committee_state.members = members.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = members.len() as u16;
+        for old_epoch in 1..=3u64 {
+            zeb1038_seed_reset(&mut log, &sk, marker_actor, old_epoch, &members, &members);
+        }
+
+        let engine = zeb1038_engine(log).await;
+        let frames = engine
+            .catchup_respond(CatchupRequest {
+                version: CATCHUP_VERSION,
+                epoch: 1,
+                active: true,
+                beacon_watermark: None,
+            })
+            .await
+            .expect("responder has a chain to serve");
+
+        let chain_frames: Vec<&CatchupFrame> = frames
+            .iter()
+            .filter(|f| matches!(f.body, CatchupBody::ResetChain(_)))
+            .collect();
+        assert_eq!(
+            chain_frames.len(),
+            3,
+            "one ResetChain frame per link (got {} of {} total frames)",
+            chain_frames.len(),
+            frames.len()
+        );
+        let mut old_epochs = Vec::new();
+        let mut combined_body_bytes = 0usize;
+        for f in &chain_frames {
+            assert!(
+                crate::community_dfrost_catchup::encode_frame(f).is_ok(),
+                "every served ResetChain frame must pass the wire cap"
+            );
+            let CatchupBody::ResetChain(b) = &f.body else {
+                unreachable!()
+            };
+            combined_body_bytes += b.len();
+            let links: Vec<ResetChainLink> = ciborium::de::from_reader(&b[..]).unwrap();
+            assert_eq!(links.len(), 1, "exactly one link per frame");
+            let payload: ResetMarkerPayload =
+                ciborium::de::from_reader(&links[0].marker.payload[..]).unwrap();
+            old_epochs.push(payload.old_epoch);
+        }
+        assert_eq!(old_epochs, vec![1, 2, 3], "links served oldest-first");
+        // Regression precondition: the same three links as ONE body
+        // exceed the frame cap — the fixture the pre-fix code dropped
+        // whole (per-link body bytes are a tight lower bound on the
+        // combined Vec encoding, which only adds array framing).
+        assert!(
+            combined_body_bytes > MAX_DFROST_CATCHUP_FRAME_BYTES,
+            "fixture must exceed the frame cap as one body (got {combined_body_bytes} bytes)"
+        );
+    }
+
+    /// ZEB-1038: a single link too large for the frame cap STOPS chain
+    /// serving (markers must apply in epoch order — links past a gap are
+    /// wasted verify work for the requester), rather than being skipped.
+    /// The rest of the reply (status, current-epoch dk evidence) still
+    /// serves.
+    #[tokio::test]
+    async fn reset_chain_single_oversize_link_stops_at_first_misfit_zeb1038() {
+        let (sk, marker_actor, _pub64) = fixture_identity(0xE2);
+        let huge = zeb1038_members(700, 0x02);
+        let small = zeb1038_members(3, 0x03);
+        let two_actors = &huge[..2];
+        let mut log = crate::community_dfrost_log::DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 3;
+        log.committee_state.joint_verifying_key = Some([0xE3; 32]);
+        log.committee_state.members = small.clone();
+        log.committee_state.threshold = 2;
+        log.committee_state.max_signers = small.len() as u16;
+        // Link 1 (old_epoch 1): two dk events, each with a 700-member
+        // payload — one link alone exceeds the 64KiB frame.
+        zeb1038_seed_reset(&mut log, &sk, marker_actor, 1, two_actors, &huge);
+        // Link 2 (old_epoch 2): tiny — would fit, must NOT be served
+        // past the gap.
+        zeb1038_seed_reset(&mut log, &sk, marker_actor, 2, &small, &small);
+
+        let engine = zeb1038_engine(log).await;
+        let frames = engine
+            .catchup_respond(CatchupRequest {
+                version: CATCHUP_VERSION,
+                epoch: 1,
+                active: true,
+                beacon_watermark: None,
+            })
+            .await
+            .expect("responder still serves status/dk evidence");
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f.body, CatchupBody::ResetChain(_))),
+            "an oversize FIRST link stops chain serving entirely (no skip-ahead)"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f.body, CatchupBody::Status(_))),
+            "the rest of the reply still serves"
+        );
+    }
+
+    /// ZEB-1038: the requester's link cap is GROUP-TOTAL, not per-frame —
+    /// per-link frames made multi-frame chains legitimate, so without a
+    /// group budget a hostile responder could pack every frame full and
+    /// multiply the per-link Ed25519 verify work the original per-frame
+    /// cap (ZEB-1031 review I3) was bounding.
+    #[tokio::test]
+    async fn reset_chain_group_total_link_cap_zeb1038() {
+        let (sk, marker_actor, marker_pub64) = fixture_identity(0xE3);
+        let marker = crate::community_dfrost_log::build_signed_dfrost_event(
+            &sk,
+            marker_actor,
+            DfrostEventKind::ResetMarker,
+            &ResetMarkerPayload {
+                reset_proposal_id: [0x0A; 16],
+                reset_digest: [0u8; 32],
+                old_vk: [0x0A; 32],
+                old_epoch: 1,
+                space_id: SpaceId([0xD8; 16]),
+            },
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "zeb1038-admin".into(),
+            },
+        )
+        .expect("build rs marker");
+        let link = ResetChainLink {
+            marker,
+            dk_events: Vec::new(),
+        };
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(marker_actor, marker_pub64);
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let engine = DfrostLogEngine::<tauri::test::MockRuntime>::start(DfrostLogEngineParams {
+            community_id: SpaceId([0xD8; 16]),
+            dfrost_log: Arc::new(tokio::sync::Mutex::new(
+                crate::community_dfrost_log::DfrostLog::new(),
+            )),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle: None,
+            self_addr: OwnerAddr([0xD9; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: Arc::new(StaticResolver(resolver_map)),
+            registry_weak: None,
+            driver: None,
+            membership_resolver: None,
+            orchestrator_config: Default::default(),
+            persist: None,
+        })
+        .await;
+
+        // 3 frames × 4 links = 12 links from one responder group; the
+        // group-total budget is MAX_RESET_CHAIN_LINKS_PER_RESPONSE (8).
+        let frames: Vec<CatchupFrame> = (0..3)
+            .map(|_| {
+                let mut buf = Vec::new();
+                ciborium::ser::into_writer(&vec![link.clone(); 4], &mut buf).unwrap();
+                CatchupFrame {
+                    version: CATCHUP_VERSION,
+                    responder_id: [0x77; 8],
+                    body: CatchupBody::ResetChain(buf),
+                }
+            })
+            .collect();
+
+        let (_dk, _vb, reset_chain) = engine.catchup_decode_and_verify(frames).await;
+        assert_eq!(
+            reset_chain.len(),
+            MAX_RESET_CHAIN_LINKS_PER_RESPONSE,
+            "group-total cap bounds links across ALL frames of the group"
         );
     }
 }
