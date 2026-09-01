@@ -30685,12 +30685,7 @@ async fn join_voice_channel(
             .dm_device_id
             .clone()
             .ok_or_else(|| "no device id".to_string())?;
-        let self_device = <[u8; 32]>::try_from(
-            hex::decode(&device_hex)
-                .map_err(|_| "device id not hex".to_string())?
-                .as_slice(),
-        )
-        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        let self_device = decode_id_32(&device_hex, "device_hex")?;
         // ZEB-350 Task 7: reserve the join-session HLC against the same
         // per-device tracker the DM / state-root paths use, so the presence
         // beacon's `joined_hlc` stays monotone with this device's other HLCs.
@@ -30945,12 +30940,7 @@ async fn get_self_voice_identity(
             .clone()
             .ok_or_else(|| "no device id".to_string())?
     };
-    let vk = <[u8; 32]>::try_from(
-        hex::decode(&device_hex)
-            .map_err(|_| "device id not hex".to_string())?
-            .as_slice(),
-    )
-    .map_err(|_| "device id must be 32 bytes".to_string())?;
+    let vk = decode_id_32(&device_hex, "device_hex")?;
     Ok(voice::self_voice_identity_from_vk(vk))
 }
 
@@ -31426,12 +31416,7 @@ async fn decline_group_call(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     let call = parse_call_id(&call_id)?;
-    let caller_bytes =
-        hex::decode(&caller_owner).map_err(|_| "caller_owner not hex".to_string())?;
-    let caller_arr: [u8; 16] = caller_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "caller_owner must be 16 bytes".to_string())?;
+    let caller_arr: [u8; 16] = decode_id_16(&caller_owner, "caller_owner")?;
     let caller = crate::owner_state_types::OwnerAddr(caller_arr);
     // `resolve_group_call_members` validates this is a GroupDm we're in and gives
     // us the signing key + self owner. Its member list is FILTERED to owners whose
@@ -31607,12 +31592,7 @@ async fn join_group_call(
             .dm_device_id
             .clone()
             .ok_or_else(|| "no device id".to_string())?;
-        let self_device = <[u8; 32]>::try_from(
-            hex::decode(&device_hex)
-                .map_err(|_| "device id not hex".to_string())?
-                .as_slice(),
-        )
-        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        let self_device = decode_id_32(&device_hex, "device_hex")?;
         let hlc_tracker = guard
             .hlc_tracker
             .clone()
@@ -31783,12 +31763,7 @@ async fn join_dm_call(
             .dm_device_id
             .clone()
             .ok_or_else(|| "no device id".to_string())?;
-        let self_device = <[u8; 32]>::try_from(
-            hex::decode(&device_hex)
-                .map_err(|_| "device id not hex".to_string())?
-                .as_slice(),
-        )
-        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        let self_device = decode_id_32(&device_hex, "device_hex")?;
         let hlc_tracker = guard
             .hlc_tracker
             .clone()
@@ -31945,10 +31920,7 @@ async fn send_mail(
     };
 
     // Parse sender address
-    let sender_bytes: [u8; 16] = hex::decode(&node_addr)
-        .map_err(|e| format!("bad node_addr: {e}"))?
-        .try_into()
-        .map_err(|_| "node_addr not 16 bytes".to_string())?;
+    let sender_bytes: [u8; 16] = decode_id_16(&node_addr, "node_addr")?;
 
     // Parse in_reply_to
     let in_reply_to = match &payload.reply_to {
@@ -32119,10 +32091,7 @@ async fn fetch_mail_body(
     };
 
     // Decode CID hex → 32-byte array.
-    let cid_bytes = hex::decode(&message_cid).map_err(|e| format!("bad cid hex: {e}"))?;
-    let cid_arr: [u8; 32] = cid_bytes
-        .try_into()
-        .map_err(|_| "cid must be 32 bytes".to_string())?;
+    let cid_arr: [u8; 32] = decode_id_32(&message_cid, "message_cid")?;
 
     // Trigger lazy fetch (no-op if already Local; writes blob + promotes entry).
     sync_arc.fetch_body(cid_arr).await?;
@@ -33414,11 +33383,7 @@ pub(crate) async fn list_community_members_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<Vec<MemberInfoDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry, profile_card_cache) = {
@@ -33650,11 +33615,7 @@ async fn list_community_forks(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<ForkDescendantDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry, self_owner) = {
@@ -33841,11 +33802,7 @@ async fn get_community_lineage(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<PhaseTwoCommunityLineageDto, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry, self_owner) = {
@@ -34827,11 +34784,7 @@ pub(crate) async fn create_channel_impl(
         ));
     }
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (
@@ -35177,18 +35130,10 @@ async fn modify_channel(
         }
     }
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let channel_id_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+    let channel_id_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
     let channel_id = crate::community_membership::ChannelId(channel_id_bytes);
 
     let (
@@ -35346,18 +35291,10 @@ async fn delete_channel(
     community_id: String,
     channel_id: String,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let channel_id_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+    let channel_id_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
     let channel_id = crate::community_membership::ChannelId(channel_id_bytes);
 
     let (
@@ -35643,11 +35580,7 @@ pub(crate) async fn list_channels_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<Vec<ChannelInfoDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     // ZEB-776: surface confirmed channels (real CRDT, syncing:false) merged with
@@ -35871,32 +35804,14 @@ pub(crate) async fn post_channel_message_impl(
     mentions: Option<Vec<String>>,
     attachments: Option<Vec<crate::community_channel_log_engine::ChannelAttachmentDto>>,
 ) -> Result<String, String> {
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    if channel_id.len() != 32 {
-        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
-    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
+    let chid_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
     let cid = crate::owner_state_types::SpaceId(cid_bytes);
     let chid = crate::community_membership::ChannelId(chid_bytes);
 
     let reply_to_msg_id = match reply_to {
         Some(s) => {
-            if s.len() != 32 {
-                return Err("reply_to must be 16 bytes (32 hex chars)".to_string());
-            }
-            let bytes: [u8; 16] = hex::decode(&s)
-                .map_err(|e| format!("invalid reply_to hex: {e}"))?
-                .try_into()
-                .map_err(|_| "reply_to length wrong".to_string())?;
+            let bytes: [u8; 16] = decode_id_16(&s, "reply_to")?;
             Some(crate::community_channel_log::MessageId(bytes))
         }
         None => None,
@@ -35919,13 +35834,7 @@ pub(crate) async fn post_channel_message_impl(
             }
             let mut out = Vec::with_capacity(list.len());
             for s in list {
-                if s.len() != 32 {
-                    return Err("each mention must be 16 bytes (32 hex chars)".to_string());
-                }
-                let bytes: [u8; 16] = hex::decode(&s)
-                    .map_err(|e| format!("invalid mention hex: {e}"))?
-                    .try_into()
-                    .map_err(|_| "mention length wrong".to_string())?;
+                let bytes: [u8; 16] = decode_id_16(&s, "mention")?;
                 out.push(crate::owner_state_types::OwnerAddr(bytes));
             }
             Some(out)
@@ -35953,13 +35862,7 @@ pub(crate) async fn post_channel_message_impl(
                     // A 32-byte CID is exactly 64 hex chars; without this guard a
                     // multi-MB hex string allocates ~half its length before the
                     // [u8; 32] conversion fails (memory/CPU DoS at the IPC edge).
-                    if a.cid.len() != 64 {
-                        return Err("invalid attachment cid hex".to_string());
-                    }
-                    let cid: [u8; 32] = hex::decode(&a.cid)
-                        .ok()
-                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                        .ok_or_else(|| "invalid attachment cid hex".to_string())?;
+                    let cid: [u8; 32] = decode_id_32(&a.cid, "attachment cid")?;
                     if a.name.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
                         || a.mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
                     {
@@ -36020,27 +35923,9 @@ pub(crate) async fn set_message_reaction_impl(
     add: bool,
     custom_emoji: Option<ReactionEmojiInput>,
 ) -> Result<(), String> {
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    if channel_id.len() != 32 {
-        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    if message_id.len() != 32 {
-        return Err("message_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
-    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "channel_id length wrong".to_string())?;
-    let mid_bytes: [u8; 16] = hex::decode(&message_id)
-        .map_err(|e| format!("invalid message_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "message_id length wrong".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
+    let chid_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
+    let mid_bytes: [u8; 16] = decode_id_16(&message_id, "message_id")?;
     let cid = crate::owner_state_types::SpaceId(cid_bytes);
     let chid = crate::community_membership::ChannelId(chid_bytes);
     let target = crate::community_channel_log::MessageId(mid_bytes);
@@ -36067,9 +35952,6 @@ pub(crate) async fn set_message_reaction_impl(
             // mime is bounded by MAX_ATTACHMENT_FIELD_BYTES, so an oversized IPC
             // input can't trigger a large allocation or sign an over-long mime
             // that peers would reject.
-            if input.cid.len() != 64 {
-                return Err("custom emoji cid must be 32 bytes (64 hex chars)".to_string());
-            }
             if input.mime.len() > crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES {
                 return Err(format!(
                     "custom emoji mime too long: {} > {}",
@@ -36077,10 +35959,7 @@ pub(crate) async fn set_message_reaction_impl(
                     crate::community_channel_log::MAX_ATTACHMENT_FIELD_BYTES
                 ));
             }
-            let emoji_cid: [u8; 32] = hex::decode(&input.cid)
-                .map_err(|e| format!("invalid custom emoji cid hex: {e}"))?
-                .try_into()
-                .map_err(|_| "custom emoji cid must be 32 bytes (64 hex chars)".to_string())?;
+            let emoji_cid: [u8; 32] = decode_id_32(&input.cid, "custom emoji cid")?;
             if !input.mime.starts_with("image/") {
                 return Err(format!("custom emoji must be an image, got {}", input.mime));
             }
@@ -36258,13 +36137,7 @@ pub(crate) async fn ingest_channel_artifact_impl(
 ) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
     use tokio::io::AsyncReadExt as _;
 
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
+    let cid_bytes16: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space = crate::owner_state_types::SpaceId(cid_bytes16);
 
     // 1. Stat + cap (cheap fast-reject before reading). Name/mime resolution +
@@ -36496,13 +36369,7 @@ pub(crate) async fn ingest_channel_artifact_bytes_impl(
     mime: String,
     encrypt: bool,
 ) -> Result<crate::community_channel_log_engine::ChannelAttachmentDto, String> {
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes16: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
+    let cid_bytes16: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space = crate::owner_state_types::SpaceId(cid_bytes16);
 
     if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
@@ -37178,20 +37045,8 @@ pub(crate) async fn list_channel_messages_impl(
             ));
         }
     };
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    if channel_id.len() != 32 {
-        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
-    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
+    let chid_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
     let cid = crate::owner_state_types::SpaceId(cid_bytes);
     let chid = crate::community_membership::ChannelId(chid_bytes);
 
@@ -37637,20 +37492,8 @@ async fn request_channel_backfill(
     channel_id: String,
     since: Option<crate::community_channel_log_engine::HlcDto>,
 ) -> Result<(), String> {
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    if channel_id.len() != 32 {
-        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
-    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
+    let chid_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
     let cid = crate::owner_state_types::SpaceId(cid_bytes);
     let chid = crate::community_membership::ChannelId(chid_bytes);
 
@@ -37751,11 +37594,7 @@ pub(crate) async fn generate_invite_impl(
     invitee_hint: Option<String>,
     ttl_ms: Option<u64>,
 ) -> Result<String, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, community_registry, dm_outbox) = {
@@ -48130,11 +47969,7 @@ async fn set_space_shared_in_profile(
     community_id: String,
     shared: bool,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let community_space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     // Capture `generation` paired-atomically with the Arcs. If stop_inner
@@ -48814,13 +48649,7 @@ pub(crate) async fn subscribe_community_presence_impl(
     state_lock: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<(), String> {
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let (request_tx, addrbook_tx) = {
         let g = state_lock
             .lock()
@@ -48871,13 +48700,7 @@ pub(crate) async fn unsubscribe_community_presence_impl(
     state_lock: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<(), String> {
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let (request_tx, addrbook_tx) = {
         let g = state_lock
             .lock()
@@ -49069,13 +48892,7 @@ pub(crate) async fn get_community_presence_impl(
     state_lock: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<Vec<crate::community_presence::PresenceMemberDto>, String> {
-    if community_id.len() != 32 {
-        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
-    }
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "community_id length wrong".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     // Pull the Arc out from under the std::sync::Mutex guard, then DROP the
     // guard before awaiting the tokio map lock (never hold a std guard across
     // an .await). Same lock discipline as the member-card get impl.
@@ -49294,13 +49111,7 @@ async fn get_fork_snapshot_metadata(
     // SECURITY: parse community_id as a typed SpaceId (16 raw bytes, 32 hex chars)
     // before using it as a path component. Rejects `../../etc/passwd` and other
     // path-traversal payloads at the boundary. (Fix: PR #122 bot review.)
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("get_fork_snapshot_metadata: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "get_fork_snapshot_metadata: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let safe_community_id = hex::encode(id_bytes); // canonical hex, no path components
     let identity_dir = crate::owner_commands::resolve_identity_dir()
         .map_err(|e| format!("get_fork_snapshot_metadata: resolve identity_dir: {e}"))?;
@@ -49390,13 +49201,7 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
     // SECURITY: parse community_id as a typed SpaceId (16 raw bytes, 32 hex chars)
     // before using it as a path component. Rejects path-traversal payloads at the
     // boundary. (Fix: PR #122 bot review.)
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("get_pre_fork_snapshot: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "get_pre_fork_snapshot: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let safe_community_id = hex::encode(id_bytes); // canonical hex, no path components
     let identity_dir = crate::owner_commands::resolve_identity_dir()
         .map_err(|e| format!("get_pre_fork_snapshot: resolve identity_dir: {e}"))?;
@@ -49677,11 +49482,7 @@ pub(crate) async fn leave_community_impl(
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     community_id: String,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (
@@ -52217,18 +52018,10 @@ pub(crate) async fn kick_from_community_impl(
     target_addr: String,
     reason: Option<String>,
 ) -> Result<AdminActionResult, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let target_bytes: [u8; 16] = hex::decode(&target_addr)
-        .map_err(|e| format!("invalid target_addr hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let target_bytes: [u8; 16] = decode_id_16(&target_addr, "target_addr")?;
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
     let (
@@ -52617,18 +52410,10 @@ async fn set_power_level(
     target_addr: String,
     level: u8,
 ) -> Result<AdminActionResult, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let target_bytes: [u8; 16] = hex::decode(&target_addr)
-        .map_err(|e| format!("invalid target_addr hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let target_bytes: [u8; 16] = decode_id_16(&target_addr, "target_addr")?;
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
     let (
@@ -52818,18 +52603,10 @@ pub(crate) async fn unban_from_community_impl(
     target_addr: String,
     reason: Option<String>,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let target_bytes: [u8; 16] = hex::decode(&target_addr)
-        .map_err(|e| format!("invalid target_addr hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let target_bytes: [u8; 16] = decode_id_16(&target_addr, "target_addr")?;
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
     let (
@@ -52959,11 +52736,7 @@ pub(crate) async fn list_recent_moderation_events_impl(
 ) -> Result<Vec<ModerationEventDto>, String> {
     let limit = limit.clamp(1, 100) as usize;
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (crdt_state, registry) = {
@@ -53106,11 +52879,7 @@ pub(crate) async fn list_pending_joins_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<Vec<PendingJoinDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner) = {
@@ -53286,11 +53055,7 @@ pub(crate) async fn list_recent_counter_signs_impl(
     community_id: String,
     limit: u32,
 ) -> Result<Vec<CounterSignDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
     // Bound the caller-supplied limit (parity with list_recent_moderation_events;
     // this verb is reachable over the headless API). 0 keeps the legacy default.
@@ -53486,11 +53251,7 @@ async fn get_community_governance(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<CommunityGovernanceDto, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner) = {
@@ -53604,11 +53365,7 @@ async fn list_pending_admin_proposals(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<PendingAdminProposalDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner) = {
@@ -53984,21 +53741,10 @@ pub(crate) async fn countersign_admin_proposal_impl(
     community_id: String,
     proposal_event_id: String,
 ) -> Result<CountersignResult, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let proposal_id_bytes: [u8; 16] = hex::decode(&proposal_event_id)
-        .map_err(|e| format!("countersign_admin_proposal: invalid proposal_event_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "countersign_admin_proposal: proposal_event_id must be 16 bytes (32 hex chars)"
-                .to_string()
-        })?;
+    let proposal_id_bytes: [u8; 16] = decode_id_16(&proposal_event_id, "proposal_event_id")?;
 
     let (
         hlc_tracker,
@@ -54229,11 +53975,7 @@ async fn propose_change_quorum(
         return Err("propose_change_quorum: new_quorum must be >= 1".to_string());
     }
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (
@@ -54727,11 +54469,7 @@ pub(crate) async fn get_recovery_state_impl(
     community_id: String,
     now_ms: Option<u64>,
 ) -> Result<RecoveryStateDto, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner) = {
@@ -54812,11 +54550,7 @@ pub(crate) async fn set_recovery_designates_impl(
         RECOVERY_VETO_WINDOW_CEILING_MS, RECOVERY_VETO_WINDOW_FLOOR_MS,
     };
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     // RD1 static halves before any locks: non-empty, deduped, and the
@@ -55039,28 +54773,12 @@ pub(crate) async fn initiate_admin_recovery_impl(
 ) -> Result<InitiateRecoveryResult, String> {
     use crate::community_membership::RecoveryPhase;
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let lost_bytes: [u8; 16] = hex::decode(&lost_admin_addr)
-        .map_err(|e| format!("initiate_admin_recovery: invalid lost_admin hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "initiate_admin_recovery: lost_admin must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let lost_bytes: [u8; 16] = decode_id_16(&lost_admin_addr, "lost_admin_addr")?;
     let lost_admin = crate::owner_state_types::OwnerAddr(lost_bytes);
-    let new_bytes: [u8; 16] = hex::decode(&new_admin_addr)
-        .map_err(|e| format!("initiate_admin_recovery: invalid new_admin hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "initiate_admin_recovery: new_admin must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let new_bytes: [u8; 16] = decode_id_16(&new_admin_addr, "new_admin_addr")?;
     let new_admin = crate::owner_state_types::OwnerAddr(new_bytes);
 
     if lost_admin == new_admin {
@@ -55271,20 +54989,10 @@ pub(crate) async fn cosign_admin_recovery_impl(
 ) -> Result<RecoveryCosignResult, String> {
     use crate::community_membership::RecoveryPhase;
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let proposal_id_bytes: [u8; 16] = hex::decode(&proposal_event_id)
-        .map_err(|e| format!("cosign_admin_recovery: invalid proposal_event_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "cosign_admin_recovery: proposal_event_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let proposal_id_bytes: [u8; 16] = decode_id_16(&proposal_event_id, "proposal_event_id")?;
 
     let (
         hlc_tracker,
@@ -55448,20 +55156,10 @@ pub(crate) async fn veto_admin_recovery_impl(
 ) -> Result<(), String> {
     use crate::community_membership::RecoveryPhase;
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let proposal_id_bytes: [u8; 16] = hex::decode(&proposal_event_id)
-        .map_err(|e| format!("veto_admin_recovery: invalid proposal_event_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "veto_admin_recovery: proposal_event_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let proposal_id_bytes: [u8; 16] = decode_id_16(&proposal_event_id, "proposal_event_id")?;
 
     let (
         hlc_tracker,
@@ -58502,18 +58200,10 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
     threshold_percent: Option<u8>,
     multi_winner: Option<u8>,
 ) -> Result<String, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+    let chid_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
     let channel = crate::community_membership::ChannelId(chid_bytes);
 
     let cfg = voting_build_tier1_config(
@@ -58692,11 +58382,7 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
     poll_id: String,
     approved_indices: Vec<u8>,
 ) -> Result<(), String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     let (hlc_tracker, adopt_floor, device_id, self_owner, dm_outbox, voting_logs) = {
@@ -58829,11 +58515,7 @@ async fn voting_list_active_polls(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<crate::community_voting_core::PollMeta>, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     let voting_logs = {
@@ -58870,11 +58552,7 @@ async fn voting_set_notify_on_delegate_signal(
     community_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     let (voting_logs, identity_dir) = {
@@ -58941,11 +58619,7 @@ async fn voting_get_poll(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     poll_id: String,
 ) -> Result<crate::community_voting_core::PollStateExport, String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     let (self_owner_opt, voting_logs) = {
@@ -59077,35 +58751,16 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
     // through validate_tier3_poll_config which already accepts both modes.
     privacy_mode: Option<String>,
 ) -> Result<String, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("voting_create_tier3_proposal: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_create_tier3_proposal: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("voting_create_tier3_proposal: invalid channel_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_create_tier3_proposal: channel_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let chid_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
     let channel = crate::community_membership::ChannelId(chid_bytes);
 
     let retry_of_pid: Option<crate::community_voting_core::PollId> = match retry_of {
         None => None,
         Some(hex_str) => {
-            let bytes: [u8; 32] = hex::decode(&hex_str)
-                .map_err(|e| format!("voting_create_tier3_proposal: invalid retry_of hex: {e}"))?
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    "voting_create_tier3_proposal: retry_of must be 32 bytes (64 hex chars)"
-                        .to_string()
-                })?;
+            let bytes: [u8; 32] = decode_id_32(&hex_str, "retry_of")?;
             Some(crate::community_voting_core::PollId(bytes))
         }
     };
@@ -59394,11 +59049,7 @@ pub(crate) async fn relaunch_voided_poll_raw(
     state_lock: &Mutex<NodeState>,
     poll_id: String,
 ) -> Result<String, String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("relaunch_voided_poll: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "relaunch_voided_poll: poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let old_poll_id = crate::community_voting_core::PollId(pid_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
@@ -59470,14 +59121,7 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
     poll_id: String,
     text: String,
 ) -> Result<String, String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("voting_submit_deliberation_statement: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_submit_deliberation_statement: poll_id must be 32 bytes (64 hex chars)"
-                .to_string()
-        })?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     // Spec §2.3: text is 1..=280 Unicode scalar values (matches Rust
@@ -59556,25 +59200,10 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
     statement_event_hash: String,
     vote: String,
 ) -> Result<(), String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("voting_cast_deliberation_vote: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_cast_deliberation_vote: poll_id must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    let stmt_hash_bytes: [u8; 32] = hex::decode(&statement_event_hash)
-        .map_err(|e| {
-            format!("voting_cast_deliberation_vote: invalid statement_event_hash hex: {e}")
-        })?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_cast_deliberation_vote: statement_event_hash must be 32 bytes (64 hex chars)"
-                .to_string()
-        })?;
+    let stmt_hash_bytes: [u8; 32] = decode_id_32(&statement_event_hash, "statement_event_hash")?;
 
     let vote_code = crate::community_voting_core::BridgingVoteCode::from_wire_str(&vote)
         .ok_or_else(|| {
@@ -59641,13 +59270,7 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
     poll_id: String,
     candidate_text: String,
 ) -> Result<String, String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("voting_propose_draft_candidate: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_propose_draft_candidate: poll_id must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     if candidate_text.is_empty() || candidate_text.len() > 512 {
@@ -59711,25 +59334,11 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
     poll_id: String,
     candidate_event_hash: String,
 ) -> Result<(), String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("voting_approve_draft_candidate: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_approve_draft_candidate: poll_id must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    let ceh: crate::community_voting_core::CandidateEventHash = hex::decode(&candidate_event_hash)
-        .map_err(|e| {
-            format!("voting_approve_draft_candidate: invalid candidate_event_hash hex: {e}")
-        })?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_approve_draft_candidate: candidate_event_hash must be 32 bytes (64 hex chars)"
-                .to_string()
-        })?;
+    let ceh: crate::community_voting_core::CandidateEventHash =
+        decode_id_32(&candidate_event_hash, "candidate_event_hash")?;
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
     let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
@@ -59818,13 +59427,7 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
     poll_id: String,
     reason: Option<String>,
 ) -> Result<(), String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("voting_decline_sortition: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_decline_sortition: poll_id must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     crate::community_voting_tier3::validate_decline_reason(&reason)
@@ -59884,13 +59487,7 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
     poll_id: String,
     scores: Vec<u8>,
 ) -> Result<(), String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("voting_cast_ratification_ballot: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_cast_ratification_ballot: poll_id must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
@@ -63590,22 +63187,14 @@ pub(crate) async fn voting_create_tier2_proposal_impl(
     min_power: Option<u32>,
 ) -> Result<String, String> {
     // ── 1. Decode hex ids ──────────────────────────────────────────────
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     // Decode channel_id for verification only; Tier 2 polls are NOT
     // channel-scoped (per Tier2PollConfig there's no channel_id field),
     // but the IPC accepts a channel_id so the UI can verify the user has
     // post permission in the channel they created the proposal in.
-    let _chid_bytes: [u8; 16] = hex::decode(&channel_id)
-        .map_err(|e| format!("invalid channel_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+    let _chid_bytes: [u8; 16] = decode_id_16(&channel_id, "channel_id")?;
 
     // ── 2. Build Tier2PollConfig with defaults ────────────────────────
     if proposal_text.is_empty() {
@@ -63802,11 +63391,7 @@ pub(crate) async fn voting_signal_tier2_impl(
     proposal_id: String,
     support: bool,
 ) -> Result<(), String> {
-    let pid_bytes: [u8; 32] = hex::decode(&proposal_id)
-        .map_err(|e| format!("invalid proposal_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "proposal_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid_bytes: [u8; 32] = decode_id_32(&proposal_id, "proposal_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper. Signal
@@ -63925,18 +63510,10 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     community_id: String,
     delegate: String,
 ) -> Result<(), String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let delegate_addr_bytes: [u8; 16] = hex::decode(&delegate)
-        .map_err(|e| format!("invalid delegate hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "delegate must be a 16-byte OwnerAddr (32 hex chars)".to_string())?;
+    let delegate_addr_bytes: [u8; 16] = decode_id_16(&delegate, "delegate")?;
     let to_addr = crate::owner_state_types::OwnerAddr(delegate_addr_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
@@ -64005,11 +63582,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     community_id: String,
 ) -> Result<(), String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
@@ -64080,11 +63653,7 @@ async fn voting_get_my_delegate(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Option<String>, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     let (self_owner, voting_logs) = {
@@ -64121,11 +63690,7 @@ async fn voting_list_delegations(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<DelegationEdgeExport>, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     let voting_logs = {
@@ -64164,11 +63729,7 @@ async fn voting_list_tier2_proposals(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<Tier2ProposalExport>, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     let (self_owner_opt, voting_logs) = {
@@ -64223,11 +63784,7 @@ pub(crate) async fn voting_get_tier2_proposal_impl(
     state_lock: &std::sync::Mutex<NodeState>,
     proposal_id: String,
 ) -> Result<Tier2ProposalExport, String> {
-    let pid_bytes: [u8; 32] = hex::decode(&proposal_id)
-        .map_err(|e| format!("invalid proposal_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "proposal_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid_bytes: [u8; 32] = decode_id_32(&proposal_id, "proposal_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     let (self_owner_opt, voting_logs) = {
@@ -64299,11 +63856,7 @@ async fn voting_get_tier3_poll_raw(
     state_lock: &Mutex<NodeState>,
     poll_id: String,
 ) -> Result<Tier3PollExport, String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     let (self_owner_opt, voting_logs) = {
@@ -64688,11 +64241,7 @@ async fn voting_list_tier3_polls_raw(
     state_lock: &Mutex<NodeState>,
     community_id: String,
 ) -> Result<Vec<Tier3PollSummary>, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let cid_bytes: [u8; 16] = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     let voting_logs = {
@@ -64808,13 +64357,7 @@ async fn voting_list_bridging_statements_raw(
     poll_id: String,
     top_n: u16,
 ) -> Result<Vec<BridgingScoreExport>, String> {
-    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
-        .map_err(|e| format!("voting_list_bridging_statements: invalid poll_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "voting_list_bridging_statements: poll_id must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let pid_bytes: [u8; 32] = decode_id_32(&poll_id, "poll_id")?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     let voting_logs = {
@@ -75236,10 +74779,7 @@ async fn unfriend(
     state: tauri::State<'_, Mutex<NodeState>>,
     peer_addr: String,
 ) -> Result<(), String> {
-    let addr_bytes: [u8; 16] = hex::decode(&peer_addr)
-        .map_err(|e| format!("invalid peer_addr hex: {e}"))?
-        .try_into()
-        .map_err(|_| "peer_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let addr_bytes: [u8; 16] = decode_id_16(&peer_addr, "peer_addr")?;
     let peer = crate::owner_state_types::OwnerAddr(addr_bytes);
 
     let (
@@ -75334,10 +74874,7 @@ async fn set_friend_referrable(
     owner_id_hex: String,
     referrable: bool,
 ) -> Result<(), String> {
-    let addr_bytes: [u8; 16] = hex::decode(&owner_id_hex)
-        .map_err(|e| format!("invalid owner_id_hex hex: {e}"))?
-        .try_into()
-        .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let addr_bytes: [u8; 16] = decode_id_16(&owner_id_hex, "owner_id_hex")?;
     let owner = crate::owner_state_types::OwnerAddr(addr_bytes);
 
     let (crdt_state, owner_state_detached, hlc_tracker, adopt_floor, device_id, sync_engine) = {
@@ -75425,10 +74962,7 @@ async fn connectivity_resolve_friend(
     state: tauri::State<'_, Mutex<NodeState>>,
     owner_id_hex: String,
 ) -> Result<Option<DiscoveredRecord>, String> {
-    let addr_bytes: [u8; 16] = hex::decode(&owner_id_hex)
-        .map_err(|e| format!("invalid owner_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "owner_id must be 16 bytes (32 hex chars)".to_string())?;
+    let addr_bytes: [u8; 16] = decode_id_16(&owner_id_hex, "owner_id")?;
 
     let (resolver, crdt_state, owner_keytree) = {
         let g = state
@@ -75578,10 +75112,7 @@ async fn browse_friend_referrals(
 
     // 2. Parse the friend's owner_id hex → OwnerAddr (same inline pattern as
     //    unfriend / set_friend_referrable).
-    let friend_owner_16: [u8; 16] = hex::decode(&owner_id_hex)
-        .map_err(|e| format!("invalid owner_id_hex hex: {e}"))?
-        .try_into()
-        .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let friend_owner_16: [u8; 16] = decode_id_16(&owner_id_hex, "owner_id_hex")?;
     let friend_owner = crate::owner_state_types::OwnerAddr(friend_owner_16);
 
     // 3. Read the friend's entry under the CRDT lock: require Active + a sealed
@@ -75874,15 +75405,9 @@ async fn request_introduction(
 
     // 2. Parse both hex owner ids → OwnerAddr (same inline pattern as unfriend /
     //    browse_friend_referrals).
-    let via_owner_16: [u8; 16] = hex::decode(&via_owner_id_hex)
-        .map_err(|e| format!("invalid via_owner_id_hex hex: {e}"))?
-        .try_into()
-        .map_err(|_| "via_owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let via_owner_16: [u8; 16] = decode_id_16(&via_owner_id_hex, "via_owner_id_hex")?;
     let via_owner = crate::owner_state_types::OwnerAddr(via_owner_16);
-    let target_owner_16: [u8; 16] = hex::decode(&target_owner_id_hex)
-        .map_err(|e| format!("invalid target_owner_id_hex hex: {e}"))?
-        .try_into()
-        .map_err(|_| "target_owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
+    let target_owner_16: [u8; 16] = decode_id_16(&target_owner_id_hex, "target_owner_id_hex")?;
     let target_owner = crate::owner_state_types::OwnerAddr(target_owner_16);
 
     // 3. Require the VIA friend (F) is Active with a sealed rendezvous secret —
@@ -85487,7 +85012,7 @@ mod channel_message_ipc_tests {
         )
         .await
         .expect_err("short mention must error");
-        assert!(err.contains("each mention must be 16 bytes"), "got: {err}");
+        assert!(err.contains("mention must be 16 bytes"), "got: {err}");
     }
 
     #[tokio::test]
@@ -85644,7 +85169,10 @@ mod channel_message_ipc_tests {
         )
         .await
         .expect_err("over-long attachment cid hex must error");
-        assert!(err.contains("invalid attachment cid hex"), "got: {err}");
+        assert!(
+            err.contains("attachment cid must be 32 bytes"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
