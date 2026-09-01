@@ -74,7 +74,8 @@ use harmony_app::community_dfrost_crypto::{verify_schnorr_signature, verifying_k
 use harmony_app::community_membership::{
     dfrost_reset_digest, dfrost_reset_message_hash, mint_test_owner, sign_event, EventId,
     EventPayload, MembershipEventKind, ProposalKind, ResetVerdict, SignedMembershipEvent,
-    TestOwner, DFROST_RESET_ENDORSE_DOMAIN, RESET_VETO_WINDOW_FLOOR_MS,
+    TestOwner, DFROST_RESET_CONSUMED_DOMAIN, DFROST_RESET_ENDORSE_DOMAIN, DFROST_RESET_VETO_DOMAIN,
+    RESET_VETO_WINDOW_FLOOR_MS,
 };
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
@@ -155,8 +156,15 @@ impl FrostCommittee {
 fn sorted_pair(a: OwnerAddr, b: OwnerAddr) -> Vec<OwnerAddr> {
     let mut v = vec![a, b];
     v.sort();
+    v.dedup();
     v
 }
+
+/// Proposal `target_epoch` / `new_threshold`, shared by every proposal and
+/// every response digest in this file — a single source so the digest the
+/// response signs can never drift from the proposal RS-R3 recomputes against.
+const TARGET_EPOCH: u64 = 1;
+const NEW_THRESHOLD: u16 = 2;
 
 // ─── Membership event minting (steady-state kinds: signer via enrolled key) ──
 
@@ -514,53 +522,134 @@ async fn spawn_wire_pair(seed_a: u8, seed_b: u8) -> WirePair {
     }
 }
 
-/// Build an Endorse `DfrostResetResponse` for `proposal_id` with a REAL
-/// threshold signature over the exact RS-R3 message hash. Returns the signed
-/// membership event, authored by `actor` (must be a Joined member).
+/// Build a `DfrostResetResponse` for `proposal_id` with a REAL threshold
+/// signature over the exact RS-R3 message hash, for any verdict:
+///
+///   * `Endorse` / `Veto` — `new_vk` is `None`; the OLD committee (the one
+///     the proposal pinned via `target_vk`) signs, and RS-R3 verifies against
+///     `old_committee.target_vk`. `sig_committee` is the old committee.
+///   * `Consumed` — `new_vk` is `Some(successor vk)`; the SUCCESSOR committee
+///     signs, and RS-R3 verifies against `new_vk`. `sig_committee` is the
+///     successor committee, and `new_vk` must equal `sig_committee.target_vk`.
+///
+/// The digest always binds the OLD `target_vk` (from `old_committee`) — only
+/// the verdict domain and the verify key differ. `tamper` flips a byte of the
+/// honest signature for the negative control; the honest signature is ALWAYS
+/// verified first, so a rejection can only be attributed to the tamper.
 #[allow(clippy::too_many_arguments)]
-fn mint_endorse_response(
+fn mint_response(
     community_id: SpaceId,
-    committee: &FrostCommittee,
+    old_committee: &FrostCommittee,
+    verdict: ResetVerdict,
+    sig_committee: &FrostCommittee,
+    new_vk: Option<[u8; 32]>,
     proposal_id: EventId,
-    target_epoch: u64,
     new_members: &[OwnerAddr],
-    new_threshold: u16,
     actor: OwnerAddr,
     at: Hlc,
     signing_key: &ed25519_dalek::SigningKey,
-    // Optionally corrupt the signature (negative control).
     tamper: bool,
 ) -> SignedMembershipEvent {
     let digest = dfrost_reset_digest(
         &community_id,
         &proposal_id,
-        &committee.target_vk,
-        target_epoch,
+        &old_committee.target_vk,
+        TARGET_EPOCH,
         new_members,
-        new_threshold,
+        NEW_THRESHOLD,
     )
     .expect("reset digest");
-    let message_hash = dfrost_reset_message_hash(DFROST_RESET_ENDORSE_DOMAIN, &digest, None);
-    let mut group_sig = committee.sign(&message_hash);
-    // Sanity: the honest signature verifies against the exact gate inputs.
-    if !tamper {
-        verify_schnorr_signature(&committee.target_vk, &message_hash, &group_sig)
-            .expect("honest group_sig must verify against target_vk");
-    } else {
+    let domain = match verdict {
+        ResetVerdict::Endorse => DFROST_RESET_ENDORSE_DOMAIN,
+        ResetVerdict::Veto => DFROST_RESET_VETO_DOMAIN,
+        ResetVerdict::Consumed => DFROST_RESET_CONSUMED_DOMAIN,
+    };
+    let message_hash = dfrost_reset_message_hash(domain, &digest, new_vk.as_ref());
+    // RS-R3 verifies against `new_vk` for Consumed, else the old `target_vk`.
+    let verify_vk = new_vk.unwrap_or(old_committee.target_vk);
+    let mut group_sig = sig_committee.sign(&message_hash);
+    // Always confirm the honest signature verifies against the exact gate
+    // inputs — so a negative-control rejection can only be the tamper below.
+    verify_schnorr_signature(&verify_vk, &message_hash, &group_sig)
+        .expect("honest group_sig must verify against the verdict's verify key");
+    if tamper {
         group_sig[0] ^= 0xff;
     }
     mint_event(
         community_id,
         MembershipEventKind::DfrostResetResponse {
             target_event_id: proposal_id,
-            verdict: ResetVerdict::Endorse,
+            verdict,
             group_sig,
-            new_vk: None,
+            new_vk,
         },
         actor,
         at,
         signing_key,
     )
+}
+
+/// Author the reset Proposal (A → B) then the Cosign (B → A) over the real
+/// wire, asserting each crosses and verifies, and return the proposal id.
+/// Shared setup for the per-verdict Response tests; the dedicated
+/// `reset_proposal_and_cosign_cross_real_wire` test pins the crossings
+/// explicitly. Leaves both engines at `event_count == 6` (the 4-event roster
+/// plus proposal and cosign), with the proposal materialized into each
+/// engine's `reset_proposals` view.
+async fn cross_proposal_and_cosign(
+    pair: &WirePair,
+    committee: &FrostCommittee,
+    new_members: &[OwnerAddr],
+) -> EventId {
+    let proposal = mint_event(
+        pair.community_id,
+        MembershipEventKind::DfrostResetProposal {
+            target_vk: committee.target_vk,
+            target_epoch: TARGET_EPOCH,
+            new_members: new_members.to_vec(),
+            new_threshold: NEW_THRESHOLD,
+            veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
+        },
+        pair.owner_a,
+        hlc(700_000, "a-dev"),
+        &pair.signing_a,
+    );
+    let proposal_id: EventId = proposal.id;
+    pair.engine_a
+        .insert_local_event(proposal)
+        .await
+        .expect("A insert proposal");
+    assert!(
+        wait_until(
+            || async { event_count(&pair.state_b).await == 5 },
+            Duration::from_secs(10),
+        )
+        .await,
+        "proposal must materialize on B before the Response"
+    );
+
+    let cosign = mint_event(
+        pair.community_id,
+        MembershipEventKind::DfrostResetCosign {
+            target_event_id: proposal_id,
+        },
+        pair.owner_b,
+        hlc(800_000, "b-dev"),
+        &pair.signing_b,
+    );
+    pair.engine_b
+        .insert_local_event(cosign)
+        .await
+        .expect("B insert cosign");
+    assert!(
+        wait_until(
+            || async { event_count(&pair.state_a).await == 6 },
+            Duration::from_secs(10),
+        )
+        .await,
+        "cosign must cross to A"
+    );
+    proposal_id
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -633,80 +722,10 @@ async fn reset_proposal_and_cosign_cross_real_wire() {
     pair.engine_b.shutdown().await.expect("shutdown b");
 }
 
-/// A `DfrostResetResponse` carrying a REAL 2-of-3 FROST threshold signature
-/// crosses the wire and passes RS-R1 (member) AND RS-R3 (Schnorr verify
-/// against the committee `target_vk`) on the receiver.
-#[tokio::test]
-async fn reset_response_with_real_group_sig_crosses_real_wire() {
-    let pair = spawn_wire_pair(0x2A, 0x2B).await;
-    let committee = FrostCommittee::generate();
-    let new_members = sorted_pair(pair.owner_a, pair.owner_b);
-
-    // Proposal crosses A → B first (RS-R3 needs it in B's reset_proposals).
-    let proposal = mint_event(
-        pair.community_id,
-        MembershipEventKind::DfrostResetProposal {
-            target_vk: committee.target_vk,
-            target_epoch: 1,
-            new_members: new_members.clone(),
-            new_threshold: 2,
-            veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
-        },
-        pair.owner_a,
-        hlc(700_000, "a-dev"),
-        &pair.signing_a,
-    );
-    let proposal_id: EventId = proposal.id;
-    pair.engine_a
-        .insert_local_event(proposal)
-        .await
-        .expect("A insert proposal");
-    assert!(
-        wait_until(
-            || async { event_count(&pair.state_b).await == 5 },
-            Duration::from_secs(10),
-        )
-        .await,
-        "proposal must materialize on B before the Response"
-    );
-
-    // B cosigns → proposal reaches quorum (Window); crosses B → A.
-    let cosign = mint_event(
-        pair.community_id,
-        MembershipEventKind::DfrostResetCosign {
-            target_event_id: proposal_id,
-        },
-        pair.owner_b,
-        hlc(800_000, "b-dev"),
-        &pair.signing_b,
-    );
-    pair.engine_b
-        .insert_local_event(cosign)
-        .await
-        .expect("B insert cosign");
-    assert!(
-        wait_until(
-            || async { event_count(&pair.state_a).await == 6 },
-            Duration::from_secs(10),
-        )
-        .await,
-        "cosign must cross to A"
-    );
-
-    // A authors the Endorse Response with a real threshold signature; it
-    // crosses A → B and passes RS-R1 + RS-R3 on B.
-    let response = mint_endorse_response(
-        pair.community_id,
-        &committee,
-        proposal_id,
-        1,
-        &new_members,
-        2,
-        pair.owner_a,
-        hlc(900_000, "a-dev"),
-        &pair.signing_a,
-        false,
-    );
+/// Author `response` on A, assert it verifies locally (RS-R1 + RS-R3), and
+/// assert it crosses A → B and verifies there too (both engines end at
+/// `event_count == 7`: 4 roster + proposal + cosign + response).
+async fn author_and_assert_response_crosses(pair: &WirePair, response: SignedMembershipEvent) {
     let outcome = pair
         .engine_a
         .insert_local_event(response)
@@ -725,6 +744,94 @@ async fn reset_response_with_real_group_sig_crosses_real_wire() {
         .await,
         "Response must cross the wire and verify on B (RS-R1 + RS-R3)"
     );
+}
+
+/// Endorse: a `DfrostResetResponse` carrying a REAL 2-of-3 FROST threshold
+/// signature crosses the wire and passes RS-R1 (member) + RS-R3 (Schnorr
+/// verify against the OLD committee `target_vk`) on the receiver.
+#[tokio::test]
+async fn reset_response_endorse_crosses_real_wire() {
+    let pair = spawn_wire_pair(0x2A, 0x2B).await;
+    let committee = FrostCommittee::generate();
+    let new_members = sorted_pair(pair.owner_a, pair.owner_b);
+    let proposal_id = cross_proposal_and_cosign(&pair, &committee, &new_members).await;
+
+    let response = mint_response(
+        pair.community_id,
+        &committee,
+        ResetVerdict::Endorse,
+        &committee, // Endorse: the OLD committee signs.
+        None,
+        proposal_id,
+        &new_members,
+        pair.owner_a,
+        hlc(900_000, "a-dev"),
+        &pair.signing_a,
+        false,
+    );
+    author_and_assert_response_crosses(&pair, response).await;
+
+    pair.engine_a.shutdown().await.expect("shutdown a");
+    pair.engine_b.shutdown().await.expect("shutdown b");
+}
+
+/// Veto: same wire path as Endorse but a DISTINCT RS-R3 branch — the veto
+/// domain (`DFROST_RESET_VETO_DOMAIN`), still verified against the OLD
+/// committee `target_vk` with `new_vk = None`.
+#[tokio::test]
+async fn reset_response_veto_crosses_real_wire() {
+    let pair = spawn_wire_pair(0x5A, 0x5B).await;
+    let committee = FrostCommittee::generate();
+    let new_members = sorted_pair(pair.owner_a, pair.owner_b);
+    let proposal_id = cross_proposal_and_cosign(&pair, &committee, &new_members).await;
+
+    let response = mint_response(
+        pair.community_id,
+        &committee,
+        ResetVerdict::Veto,
+        &committee, // Veto: the OLD committee signs.
+        None,
+        proposal_id,
+        &new_members,
+        pair.owner_a,
+        hlc(900_000, "a-dev"),
+        &pair.signing_a,
+        false,
+    );
+    author_and_assert_response_crosses(&pair, response).await;
+
+    pair.engine_a.shutdown().await.expect("shutdown a");
+    pair.engine_b.shutdown().await.expect("shutdown b");
+}
+
+/// Consumed: the successful-reset path and the most distinct RS-R3 branch —
+/// the SUCCESSOR committee signs, `new_vk = Some(successor vk)` is folded into
+/// the message hash (consumed domain), and RS-R3 verifies against `new_vk`
+/// (not the old `target_vk`). The authoring member (A) must be a pinned
+/// successor member (RS-R1 consumed half) — A is in `new_members`. RS-R4
+/// requires `new_vk` present iff Consumed.
+#[tokio::test]
+async fn reset_response_consumed_crosses_real_wire() {
+    let pair = spawn_wire_pair(0x4A, 0x4B).await;
+    let old_committee = FrostCommittee::generate();
+    let successor = FrostCommittee::generate();
+    let new_members = sorted_pair(pair.owner_a, pair.owner_b);
+    let proposal_id = cross_proposal_and_cosign(&pair, &old_committee, &new_members).await;
+
+    let response = mint_response(
+        pair.community_id,
+        &old_committee, // digest still binds the OLD target_vk
+        ResetVerdict::Consumed,
+        &successor, // Consumed: the SUCCESSOR committee signs
+        Some(successor.target_vk),
+        proposal_id,
+        &new_members,
+        pair.owner_a,
+        hlc(900_000, "a-dev"),
+        &pair.signing_a,
+        false,
+    );
+    author_and_assert_response_crosses(&pair, response).await;
 
     pair.engine_a.shutdown().await.expect("shutdown a");
     pair.engine_b.shutdown().await.expect("shutdown b");
@@ -739,42 +846,17 @@ async fn reset_response_bad_group_sig_is_rejected_by_verify_gate() {
     let pair = spawn_wire_pair(0x3A, 0x3B).await;
     let committee = FrostCommittee::generate();
     let new_members = sorted_pair(pair.owner_a, pair.owner_b);
+    // Cross the proposal so it is materialized on A (RS-R3 will fire, not skip).
+    let proposal_id = cross_proposal_and_cosign(&pair, &committee, &new_members).await;
 
-    let proposal = mint_event(
-        pair.community_id,
-        MembershipEventKind::DfrostResetProposal {
-            target_vk: committee.target_vk,
-            target_epoch: 1,
-            new_members: new_members.clone(),
-            new_threshold: 2,
-            veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
-        },
-        pair.owner_a,
-        hlc(700_000, "a-dev"),
-        &pair.signing_a,
-    );
-    let proposal_id: EventId = proposal.id;
-    pair.engine_a
-        .insert_local_event(proposal)
-        .await
-        .expect("A insert proposal");
-    // Ensure the proposal is materialized on A (so RS-R3 will fire, not skip).
-    assert!(
-        wait_until(
-            || async { event_count(&pair.state_a).await == 5 },
-            Duration::from_secs(10),
-        )
-        .await,
-        "proposal present on A"
-    );
-
-    let tampered = mint_endorse_response(
+    let tampered = mint_response(
         pair.community_id,
         &committee,
+        ResetVerdict::Endorse,
+        &committee,
+        None,
         proposal_id,
-        1,
         &new_members,
-        2,
         pair.owner_a,
         hlc(900_000, "a-dev"),
         &pair.signing_a,
