@@ -18,7 +18,6 @@ function callMessage(
       : { address: 'peer-hex', displayName: 'Peer' },
     text: 'fallback',
     timestamp: 1_700_000_000_000,
-    media: [],
     priority: 'standard',
     channel: 'space-1',
     hub: '',

@@ -8,7 +8,6 @@ function msg(id: string, priority: 'quiet' | 'standard' | 'loud' = 'standard', s
     sender: { address: sender.toLowerCase(), displayName: sender },
     text: `Message ${id}`,
     timestamp: Date.now(),
-    media: [],
     priority,
   };
 }
@@ -19,7 +18,6 @@ function threadMsg(id: string, replyTo: string, sender = 'Alice', priority: 'qui
     sender: { address: sender.toLowerCase(), displayName: sender },
     text: `Reply ${id}`,
     timestamp: Date.now(),
-    media: [],
     priority,
     replyTo,
   };

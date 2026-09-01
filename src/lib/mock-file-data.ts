@@ -1,8 +1,4 @@
-import type {
-  ContentItem,
-  PublishedItem,
-  CleanupRecommendation,
-} from './types';
+import type { ContentItem } from './types';
 
 const day = 86_400_000;
 const now = Date.now();
@@ -153,75 +149,5 @@ export const mockPrivateContent: ContentItem[] = [
     licensed: false,
     parentCid: null,
     isFolder: false,
-  },
-];
-
-// ── Published Content ───────────────────────────────────────────────
-
-export const mockPublishedContent: PublishedItem[] = [
-  {
-    cid: 'cid-pub-blog',
-    name: 'decentralized-identity-post.md',
-    category: 'text',
-    sizeBytes: 12_000,
-    publishedAt: now - 14 * day,
-    publishMode: 'durable',
-  },
-  {
-    cid: 'cid-pub-album',
-    name: 'ambient-loops-vol2.zip',
-    category: 'music',
-    sizeBytes: 120_000_000,
-    publishedAt: now - 7 * day,
-    publishMode: 'durable',
-  },
-  {
-    cid: 'cid-pub-status',
-    name: 'weekly-status-update.txt',
-    category: 'text',
-    sizeBytes: 3_500,
-    publishedAt: now - 1 * day,
-    publishMode: 'ephemeral',
-  },
-];
-
-// ── Cleanup Recommendations ─────────────────────────────────────────
-
-export const mockCleanupRecommendations: CleanupRecommendation[] = [
-  {
-    sidecarId: 'mock-sidecar-7',
-    cid: 'cid-training-data',
-    name: 'sensor-readings.parquet',
-    category: 'dataset',
-    sensitivity: 'private',
-    sizeBytes: 250_000_000,
-    reason: 'stale',
-    stalenessScore: 0.85,
-    spaceRecoverable: 250_000_000,
-    confidence: 0.92,
-  },
-  {
-    sidecarId: 'mock-sidecar-5',
-    cid: 'cid-video-lecture',
-    name: 'distributed-systems-lecture.mp4',
-    category: 'video',
-    sensitivity: 'public',
-    sizeBytes: 1_500_000_000,
-    reason: 'stale',
-    stalenessScore: 0.7,
-    spaceRecoverable: 1_500_000_000,
-    confidence: 0.78,
-  },
-  {
-    sidecarId: 'mock-sidecar-9',
-    cid: 'cid-family-photo',
-    name: 'family-reunion-2025.jpg',
-    category: 'image',
-    sensitivity: 'intimate',
-    sizeBytes: 8_500_000,
-    reason: 'over-replicated',
-    stalenessScore: 0.55,
-    spaceRecoverable: 8_500_000,
-    confidence: 0.65,
   },
 ];

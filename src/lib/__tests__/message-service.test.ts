@@ -17,8 +17,8 @@ function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
 const SENDER = 'cd'.repeat(16); // 32-char sender hex
 
 // ZEB-962: `wireToMessage` bakes `Message.sender.displayName`, read RAW by the
-// media/thread/collapse render surfaces (MediaCard, UntrustedMediaCard,
-// ThreadIndicator, QuietMessageGroup). The original `senderName || slice(0,8)`
+// thread/collapse render surfaces (ThreadIndicator, QuietMessageGroup). The
+// original `senderName || slice(0,8)`
 // only floors `""`; a whitespace-only broadcast name is truthy and gets baked,
 // then rendered blank by every raw consumer. `nonEmpty` floors it at the write.
 describe('MessageService wireToMessage sender name (ZEB-962)', () => {

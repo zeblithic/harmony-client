@@ -27,7 +27,6 @@ function renderBrowser(
     onSearchChange: vi.fn(),
     onSectionChange: vi.fn(),
     onUploadClick: vi.fn(),
-    onCleanupClick: vi.fn(),
   };
   const result = render(FileBrowser, {
     props: {
@@ -38,7 +37,6 @@ function renderBrowser(
       viewMode: 'list' as const,
       section: 'private' as const,
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       ...callbacks,
       ...overrides,

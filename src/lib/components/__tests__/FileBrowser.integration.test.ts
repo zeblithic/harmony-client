@@ -2,8 +2,8 @@
  * Integration test for the file manager subsystem.
  *
  * Tests the happy path end-to-end: browse files, select a file, view detail,
- * switch view modes, navigate into a folder, publish a file through
- * confirmation gates, and verify the service state changed.
+ * switch view modes, navigate into a folder, and verify the service state
+ * changed.
  *
  * Uses a real FileManagerService with mock data (no vi.fn() stubs for the
  * service itself), mirroring how App.svelte wires things together.
@@ -30,7 +30,6 @@ describe('File Manager Integration', () => {
       onSearchChange: vi.fn(),
       onSectionChange: vi.fn(),
       onUploadClick: vi.fn(),
-      onCleanupClick: vi.fn(),
     };
 
     const result = render(FileBrowser, {
@@ -41,7 +40,6 @@ describe('File Manager Integration', () => {
         viewMode: 'list' as FileViewMode,
         section: 'private' as ContentSection,
         searchQuery: '',
-        showCleanup: false,
         serviceVersion: 0,
         ...callbacks,
         ...overrides,
@@ -55,8 +53,6 @@ describe('File Manager Integration', () => {
   function renderDetail(detail: ContentDetail) {
     const callbacks = {
       onTierChange: vi.fn(),
-      onPublish: vi.fn(),
-      onRelease: vi.fn(),
       onBurn: vi.fn(),
       onArchive: vi.fn(),
       onPin: vi.fn(),
@@ -204,23 +200,16 @@ describe('File Manager Integration', () => {
     expect(screen.queryByText('distributed-systems-lecture.mp4')).toBeNull();
   });
 
-  // ── 8. Section switch (private/published) ────────────────────────
+  // ── 8. Section switch (private/sharedWithMe) ──────────────────────
 
-  it('fires onSectionChange when Published tab is clicked', async () => {
+  it('fires onSectionChange when Shared-with-me tab is clicked', async () => {
     const service = new FileManagerService();
     const { callbacks } = renderBrowser(service);
 
-    const publishedBtn = screen.getByText('Published');
-    await fireEvent.click(publishedBtn);
+    const sharedBtn = screen.getByText('Shared with me');
+    await fireEvent.click(sharedBtn);
 
-    expect(callbacks.onSectionChange).toHaveBeenCalledWith('published');
-  });
-
-  it('shows PublishedView when section is published', () => {
-    const service = new FileManagerService();
-    const { container } = renderBrowser(service, { section: 'published' });
-
-    expect(container.querySelector('.published-view')).toBeTruthy();
+    expect(callbacks.onSectionChange).toHaveBeenCalledWith('sharedWithMe');
   });
 
   // ── 9. Selected file detail panel ────────────────────────────────
@@ -242,8 +231,6 @@ describe('File Manager Integration', () => {
     expect(screen.getByText('×5 · copies seen (this device + peers)')).toBeTruthy();
 
     // Action buttons
-    expect(screen.getByLabelText('Publish (permanent)')).toBeTruthy();
-    expect(screen.getByLabelText('Release (ephemeral)')).toBeTruthy();
     expect(screen.getByLabelText('Burn')).toBeTruthy();
     expect(screen.getByLabelText('Export')).toBeTruthy();
   });
@@ -263,258 +250,6 @@ describe('File Manager Integration', () => {
     const unpinnedDetail = service.getContentDetail('cid-video-lecture')!;
     renderDetail(unpinnedDetail);
     expect(screen.getByLabelText('Pin')).toBeTruthy();
-  });
-
-  // ── 11. Full publish flow through confirmation gates ─────────────
-
-  describe('publish flow through confirmation gates', () => {
-    it('publishes a public file with double confirm and moves it to published catalog', async () => {
-      const service = new FileManagerService();
-
-      // Start with the software bundle (public sensitivity = double confirm)
-      const detail = service.getContentDetail('cid-app-build')!;
-      expect(detail).toBeDefined();
-      expect(detail.sensitivity).toBe('public');
-
-      // Record initial published count
-      const publishedBefore = service.getPublishedContent().length;
-
-      // Render the detail panel with a real publish handler
-      const onPublish = vi.fn((cid: string) => {
-        service.publish([cid]);
-      });
-
-      render(FileDetailPanel, {
-        props: {
-          detail,
-          onTierChange: vi.fn(),
-          onPublish,
-          onRelease: vi.fn(),
-          onBurn: vi.fn(),
-          onArchive: vi.fn(),
-          onPin: vi.fn(),
-          onUnpin: vi.fn(),
-          onExport: vi.fn(),
-        },
-      });
-
-      // Step 1: Click Publish button to start flow
-      await fireEvent.click(screen.getByLabelText('Publish (permanent)'));
-
-      // DoubleConfirmDialog should appear
-      expect(screen.getByRole('dialog')).toBeTruthy();
-      expect(
-        screen.getByText(/Publishing makes this content permanently public/),
-      ).toBeTruthy();
-
-      // Step 2: Gate 1 — Continue
-      await fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
-
-      // Gate 2 — second message should show filename
-      expect(
-        screen.getByText(/You are about to publish harmony-client-v0\.3\.tar\.gz/),
-      ).toBeTruthy();
-
-      // Step 3: Gate 2 — Confirm Publish
-      await fireEvent.click(
-        screen.getByRole('button', { name: /Confirm Publish/i }),
-      );
-
-      // onPublish callback should have fired
-      expect(onPublish).toHaveBeenCalledWith('cid-app-build');
-
-      // Verify service state: item moved from private to published
-      const publishedAfter = service.getPublishedContent();
-      expect(publishedAfter.length).toBe(publishedBefore + 1);
-
-      const publishedItem = publishedAfter.find((p) => p.cid === 'cid-app-build');
-      expect(publishedItem).toBeDefined();
-      expect(publishedItem!.name).toBe('harmony-client-v0.3.tar.gz');
-      expect(publishedItem!.publishMode).toBe('durable');
-
-      // Item should no longer be in private content
-      const privateAfter = service.getContents();
-      const stillPrivate = privateAfter.find((i) => i.cid === 'cid-app-build');
-      expect(stillPrivate).toBeUndefined();
-    });
-
-    it('releases a file with ephemeral mode via double confirm', async () => {
-      const service = new FileManagerService();
-      const detail = service.getContentDetail('cid-video-lecture')!;
-
-      const publishedBefore = service.getPublishedContent().length;
-
-      const onRelease = vi.fn((cid: string) => {
-        service.release([cid]);
-      });
-
-      render(FileDetailPanel, {
-        props: {
-          detail,
-          onTierChange: vi.fn(),
-          onPublish: vi.fn(),
-          onRelease,
-          onBurn: vi.fn(),
-          onArchive: vi.fn(),
-          onPin: vi.fn(),
-          onUnpin: vi.fn(),
-          onExport: vi.fn(),
-        },
-      });
-
-      // Click Release button
-      await fireEvent.click(screen.getByLabelText('Release (ephemeral)'));
-
-      // DoubleConfirmDialog with release messaging
-      expect(screen.getByRole('dialog')).toBeTruthy();
-      expect(
-        screen.getByText(/publicly available.*persist on the network or fade/i),
-      ).toBeTruthy();
-
-      // Gate 1: Continue
-      await fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
-
-      // Gate 2: Confirm Release
-      await fireEvent.click(
-        screen.getByRole('button', { name: /Confirm Release/i }),
-      );
-
-      expect(onRelease).toHaveBeenCalledWith('cid-video-lecture');
-
-      // Verify service state
-      const publishedAfter = service.getPublishedContent();
-      expect(publishedAfter.length).toBe(publishedBefore + 1);
-
-      const released = publishedAfter.find((p) => p.cid === 'cid-video-lecture');
-      expect(released).toBeDefined();
-      expect(released!.publishMode).toBe('ephemeral');
-    });
-
-    it('publishes an intimate file with triple confirm (double + type-to-confirm)', async () => {
-      const service = new FileManagerService();
-
-      // family-reunion-2025.jpg is intimate sensitivity
-      const detail = service.getContentDetail('cid-family-photo')!;
-      expect(detail.sensitivity).toBe('intimate');
-
-      const publishedBefore = service.getPublishedContent().length;
-
-      const onPublish = vi.fn((cid: string) => {
-        service.publish([cid]);
-      });
-
-      render(FileDetailPanel, {
-        props: {
-          detail,
-          onTierChange: vi.fn(),
-          onPublish,
-          onRelease: vi.fn(),
-          onBurn: vi.fn(),
-          onArchive: vi.fn(),
-          onPin: vi.fn(),
-          onUnpin: vi.fn(),
-          onExport: vi.fn(),
-        },
-      });
-
-      // Start publish flow
-      await fireEvent.click(screen.getByLabelText('Publish (permanent)'));
-
-      // Double confirm gates
-      await fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
-      await fireEvent.click(
-        screen.getByRole('button', { name: /Confirm Publish/i }),
-      );
-
-      // TypeToConfirmDialog should appear
-      expect(screen.getByRole('dialog')).toBeTruthy();
-      expect(screen.getByLabelText('Type to confirm')).toBeTruthy();
-
-      // Type wrong text first — button should be disabled
-      const input = screen.getByLabelText('Type to confirm');
-      await fireEvent.input(input, { target: { value: 'wrong' } });
-      const confirmBtn = screen.getByRole('button', { name: /Confirm Publish/i });
-      expect(confirmBtn.hasAttribute('disabled')).toBe(true);
-
-      // Type correct filename
-      await fireEvent.input(input, {
-        target: { value: 'family-reunion-2025.jpg' },
-      });
-
-      // Now confirm should work
-      await fireEvent.click(
-        screen.getByRole('button', { name: /Confirm Publish/i }),
-      );
-
-      expect(onPublish).toHaveBeenCalledWith('cid-family-photo');
-
-      // Verify state changed
-      const publishedAfter = service.getPublishedContent();
-      expect(publishedAfter.length).toBe(publishedBefore + 1);
-      expect(publishedAfter.find((p) => p.cid === 'cid-family-photo')).toBeDefined();
-    });
-
-    it('publishes a confidential file through all 4 gates (double + type + OOB)', async () => {
-      const service = new FileManagerService();
-
-      // key-backup.enc is confidential sensitivity
-      const detail = service.getContentDetail('cid-private-keys-backup')!;
-      expect(detail.sensitivity).toBe('confidential');
-
-      const publishedBefore = service.getPublishedContent().length;
-
-      const onPublish = vi.fn((cid: string) => {
-        service.publish([cid]);
-      });
-
-      render(FileDetailPanel, {
-        props: {
-          detail,
-          onTierChange: vi.fn(),
-          onPublish,
-          onRelease: vi.fn(),
-          onBurn: vi.fn(),
-          onArchive: vi.fn(),
-          onPin: vi.fn(),
-          onUnpin: vi.fn(),
-          onExport: vi.fn(),
-        },
-      });
-
-      // Gate 1: Start publish
-      await fireEvent.click(screen.getByLabelText('Publish (permanent)'));
-
-      // Gate 2: Double confirm - Continue
-      await fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
-
-      // Gate 3: Double confirm - Confirm Publish
-      await fireEvent.click(
-        screen.getByRole('button', { name: /Confirm Publish/i }),
-      );
-
-      // Gate 4: Type to confirm
-      const input = screen.getByLabelText('Type to confirm');
-      await fireEvent.input(input, { target: { value: 'key-backup.enc' } });
-      await fireEvent.click(
-        screen.getByRole('button', { name: /Confirm Publish/i }),
-      );
-
-      // Gate 5: OOB stub
-      expect(screen.getByRole('dialog')).toBeTruthy();
-      expect(screen.getByText(/future version/i)).toBeTruthy();
-      expect(onPublish).not.toHaveBeenCalled();
-
-      await fireEvent.click(screen.getByRole('button', { name: /Confirm/i }));
-
-      expect(onPublish).toHaveBeenCalledWith('cid-private-keys-backup');
-
-      // Verify state
-      const publishedAfter = service.getPublishedContent();
-      expect(publishedAfter.length).toBe(publishedBefore + 1);
-      expect(
-        publishedAfter.find((p) => p.cid === 'cid-private-keys-backup'),
-      ).toBeDefined();
-    });
   });
 
   // ── 12. Burn removes from private content ────────────────────────
@@ -541,17 +276,6 @@ describe('File Manager Integration', () => {
     const quotaAfter = service.getQuotaStatus().usedBytes;
     expect(quotaAfter).toBeLessThan(quotaBefore);
     expect(quotaBefore - quotaAfter).toBe(1_500_000_000);
-  });
-
-  it('quota decreases after publishing (moved out of private)', () => {
-    const service = new FileManagerService();
-    const quotaBefore = service.getQuotaStatus().usedBytes;
-
-    service.publish(['cid-song-favorite']);
-
-    const quotaAfter = service.getQuotaStatus().usedBytes;
-    expect(quotaAfter).toBeLessThan(quotaBefore);
-    expect(quotaBefore - quotaAfter).toBe(35_000_000);
   });
 
   // ── 14. Accessibility checks ─────────────────────────────────────
@@ -594,15 +318,14 @@ describe('File Manager Integration', () => {
       expect(nav!.getAttribute('aria-label')).toBe('File navigation');
     });
 
-    it('quota bar button has descriptive aria-label', () => {
+    it('quota bar has a descriptive aria-label', () => {
       const service = new FileManagerService();
-      renderBrowser(service);
+      const { container } = renderBrowser(service);
 
-      const buttons = screen.getAllByRole('button');
-      const quotaBtn = buttons.find(b => b.getAttribute('aria-label')?.includes('Storage:'));
-      expect(quotaBtn).toBeTruthy();
+      const quotaEl = container.querySelector('.quota-bar');
+      expect(quotaEl).toBeTruthy();
       // ZEB-612 S3: no invented total — the label reports real usage only.
-      expect(quotaBtn!.getAttribute('aria-label')).toMatch(/\d+.*stored locally/);
+      expect(quotaEl!.getAttribute('aria-label')).toMatch(/\d+.*stored locally/);
     });
 
     it('section toggle buttons have aria-pressed', () => {
@@ -610,10 +333,10 @@ describe('File Manager Integration', () => {
       renderBrowser(service);
 
       const privateBtn = screen.getByText('Private');
-      const publishedBtn = screen.getByText('Published');
+      const sharedBtn = screen.getByText('Shared with me');
 
       expect(privateBtn.getAttribute('aria-pressed')).toBe('true');
-      expect(publishedBtn.getAttribute('aria-pressed')).toBe('false');
+      expect(sharedBtn.getAttribute('aria-pressed')).toBe('false');
     });
 
     it('view mode buttons have aria-pressed', () => {
@@ -654,8 +377,6 @@ describe('File Manager Integration', () => {
         props: {
           detail,
           onTierChange: vi.fn(),
-          onPublish: vi.fn(),
-          onRelease: vi.fn(),
           onBurn: vi.fn(),
           onArchive: vi.fn(),
           onPin: vi.fn(),
@@ -664,7 +385,7 @@ describe('File Manager Integration', () => {
         },
       });
 
-      await fireEvent.click(screen.getByLabelText('Publish (permanent)'));
+      await fireEvent.click(screen.getByLabelText('Burn'));
 
       const dialog = screen.getByRole('dialog');
       expect(dialog).toBeTruthy();

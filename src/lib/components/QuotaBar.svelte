@@ -9,12 +9,10 @@
     usedBytes,
     pinnedUsedBytes,
     pinnedBudgetBytes,
-    onCleanupClick,
   }: {
     usedBytes: number;
     pinnedUsedBytes: number;
     pinnedBudgetBytes: number | null;
-    onCleanupClick: () => void;
   } = $props();
 
   // A known zero budget with non-zero usage is fully over budget — it must
@@ -31,12 +29,11 @@
   let warning = $derived(pinnedPercent >= 85);
 </script>
 
-<button
+<div
   class="quota-bar"
-  onclick={onCleanupClick}
   aria-label="Storage: {formatBytes(usedBytes)} stored locally{pinnedBudgetBytes != null
     ? `, pinned ${formatBytes(pinnedUsedBytes)} of ${formatBytes(pinnedBudgetBytes)} budget`
-    : ''} — click to manage"
+    : ''}"
 >
   <span class="quota-text used">{formatBytes(usedBytes)} stored locally</span>
   {#if pinnedBudgetBytes != null}
@@ -47,7 +44,7 @@
       Pinned {formatBytes(pinnedUsedBytes)} of {formatBytes(pinnedBudgetBytes)}
     </span>
   {/if}
-</button>
+</div>
 
 <style>
   .quota-bar {
@@ -57,23 +54,10 @@
     padding: 8px 12px;
     background: var(--bg-secondary);
     border-top: 1px solid var(--border);
-    cursor: pointer;
     width: 100%;
     text-align: left;
-    border-left: none;
-    border-right: none;
-    border-bottom: none;
     font: inherit;
     color: inherit;
-  }
-
-  .quota-bar:hover {
-    background: var(--bg-tertiary);
-  }
-
-  .quota-bar:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: -2px;
   }
 
   .quota-track {

@@ -7,7 +7,6 @@
     ContentCategory,
     ReplicationTier,
     ContentItem,
-    CleanupRecommendation,
     ReceivedFile,
   } from '../types';
   import { FileManagerService, type IngestFolderTreeResult } from '../file-manager-service';
@@ -21,9 +20,7 @@
   import FolderIngestProgressModal from './FolderIngestProgressModal.svelte';
   import FolderIngestSummaryModal from './FolderIngestSummaryModal.svelte';
   import QuotaBar from './QuotaBar.svelte';
-  import PublishedView from './PublishedView.svelte';
   import SharedWithMeList from './SharedWithMeList.svelte';
-  import CleanupView from './CleanupView.svelte';
 
   // ZEB-162: custom MIME for drag-drop content moves. Deliberately NOT
   // text/plain — that would invite OS-level text drops (URLs, snippets)
@@ -62,19 +59,12 @@
     section = 'private' as ContentSection,
     searchQuery = '',
     filters = {} as Record<string, unknown>,
-    showCleanup = false,
     onItemClick,
     onNavigateFolder,
     onViewModeChange,
     onSearchChange,
     onSectionChange,
     onUploadClick,
-    onCleanupClick,
-    onCleanupAction,
-    onBulkBurn,
-    onBulkArchive,
-    onBulkRelease,
-    onBulkPublish,
     serviceVersion = 0,
     receivedFiles = null,
     onDownloadReceived,
@@ -92,19 +82,12 @@
     section?: ContentSection;
     searchQuery?: string;
     filters?: Record<string, unknown>;
-    showCleanup?: boolean;
     onItemClick: (item: ContentItem) => void;
     onNavigateFolder: (cid: string | null) => void;
     onViewModeChange: (mode: FileViewMode) => void;
     onSearchChange: (query: string) => void;
     onSectionChange: (section: ContentSection) => void;
     onUploadClick: (encrypted?: boolean) => void;
-    onCleanupClick: () => void;
-    onCleanupAction?: (rec: CleanupRecommendation, action: string) => void;
-    onBulkBurn?: (recs: CleanupRecommendation[]) => void;
-    onBulkArchive?: (recs: CleanupRecommendation[]) => void;
-    onBulkRelease?: (cids: string[]) => void;
-    onBulkPublish?: (cids: string[]) => void;
     serviceVersion?: number;
     /** ZEB-723: files others have shared with this user. `null` until
      *  `list_received_grants` resolves (and on load FAILURE) — SharedWithMeList
@@ -353,11 +336,6 @@
       });
   });
 
-  let publishedItems = $derived.by(() => {
-    void serviceVersion;
-    return service.getPublishedContent();
-  });
-
   function applyFiltersAndSort(contents: ContentItem[]): ContentItem[] {
     // Defensive copy: callers may pass folderItems.items (a $state proxy)
     // directly when no filter is applied, and our trailing .sort() would
@@ -430,11 +408,6 @@
   let quota = $derived.by(() => {
     void serviceVersion;
     return service.getQuotaStatus();
-  });
-
-  let cleanupRecommendations = $derived.by(() => {
-    void serviceVersion;
-    return service.getCleanupRecommendations();
   });
 
   // Breadcrumb path = root sentinel + the explicit nav stack. No sidecar
@@ -1019,120 +992,103 @@
     {searchQuery}
     {onSearchChange}
     {onUploadClick}
-    {onCleanupClick}
-    onNewFolderClick={section === 'private' && !showCleanup
+    onNewFolderClick={section === 'private'
       ? handleNewFolder
       : undefined}
-    onAddFolderClick={section === 'private' && !showCleanup
+    onAddFolderClick={section === 'private'
       ? handleAddFolderClick
       : undefined}
-    {showCleanup}
     {section}
     {onSectionChange}
     {sharedUnreadCount}
   />
 
   {#if section === 'private'}
-    {#if showCleanup}
-      <CleanupView
-        {quota}
-        recommendations={cleanupRecommendations}
-        onAction={(rec, action) => onCleanupAction?.(rec, action)}
-        onBulkBurn={(recs) => onBulkBurn?.(recs)}
-        onBulkArchive={(recs) => onBulkArchive?.(recs)}
-        onBulkRelease={(cids) => onBulkRelease?.(cids)}
-        onBulkPublish={(cids) => onBulkPublish?.(cids)}
+    <Breadcrumbs
+      path={breadcrumbPath}
+      onNavigate={onNavigateFolder}
+      onSegmentDrop={handleBreadcrumbDrop}
+      dragMime={HARMONY_DRAG_MIME}
+    />
+
+    {#if error}
+      <div class="file-browser-error" role="alert">{error}</div>
+    {/if}
+
+    {#if renameError}
+      <div class="file-browser-error" role="alert">{renameError}</div>
+    {/if}
+
+    <FolderIngestProgressModal
+      open={!!activeIngestProgress}
+      jobId={activeIngestJobId}
+      completed={activeIngestProgress?.completed ?? 0}
+      total={activeIngestProgress?.total ?? -1}
+      currentPath={activeIngestProgress?.currentPath ?? ''}
+      {cancelRequested}
+      onCancel={handleCancelIngest}
+    />
+
+    <FolderIngestSummaryModal
+      open={!!ingestSummary}
+      result={ingestSummary}
+      onDismiss={dismissIngestSummary}
+    />
+
+    {#if folderLoadError && folderLoadError.cid === currentFolderCid}
+      <FolderLoadError
+        message={folderLoadError.message}
+        onRetry={retryFolderLoad}
+      />
+    {:else if viewMode === 'list'}
+      <FileList
+        {items}
+        {selectedCid}
+        {selectedSidecarId}
+        onItemClick={handleItemClick}
+        onRowDragStart={handleRowDragStart}
+        onRowDrop={handleRowDrop}
+        {editingItem}
+        bind:editingValue
+        {renameInFlight}
+        onBeginRename={beginRename}
+        onCommitRename={commitRename}
+        onCancelRename={cancelRename}
+        {creatingFolder}
+        bind:newFolderName
+        {newFolderError}
+        {creatingFolderInFlight}
+        onCommitCreateFolder={commitCreateFolder}
+        onCancelCreateFolder={cancelCreateFolder}
       />
     {:else}
-      <Breadcrumbs
-        path={breadcrumbPath}
-        onNavigate={onNavigateFolder}
-        onSegmentDrop={handleBreadcrumbDrop}
-        dragMime={HARMONY_DRAG_MIME}
-      />
-
-      {#if error}
-        <div class="file-browser-error" role="alert">{error}</div>
-      {/if}
-
-      {#if renameError}
-        <div class="file-browser-error" role="alert">{renameError}</div>
-      {/if}
-
-      <FolderIngestProgressModal
-        open={!!activeIngestProgress}
-        jobId={activeIngestJobId}
-        completed={activeIngestProgress?.completed ?? 0}
-        total={activeIngestProgress?.total ?? -1}
-        currentPath={activeIngestProgress?.currentPath ?? ''}
-        {cancelRequested}
-        onCancel={handleCancelIngest}
-      />
-
-      <FolderIngestSummaryModal
-        open={!!ingestSummary}
-        result={ingestSummary}
-        onDismiss={dismissIngestSummary}
-      />
-
-      {#if folderLoadError && folderLoadError.cid === currentFolderCid}
-        <FolderLoadError
-          message={folderLoadError.message}
-          onRetry={retryFolderLoad}
-        />
-      {:else if viewMode === 'list'}
-        <FileList
-          {items}
-          {selectedCid}
-          {selectedSidecarId}
-          onItemClick={handleItemClick}
-          onRowDragStart={handleRowDragStart}
-          onRowDrop={handleRowDrop}
-          {editingItem}
-          bind:editingValue
-          {renameInFlight}
-          onBeginRename={beginRename}
-          onCommitRename={commitRename}
-          onCancelRename={cancelRename}
-          {creatingFolder}
-          bind:newFolderName
-          {newFolderError}
-          {creatingFolderInFlight}
-          onCommitCreateFolder={commitCreateFolder}
-          onCancelCreateFolder={cancelCreateFolder}
-        />
-      {:else}
-        <FileGrid
-          {items}
-          {selectedCid}
-          {selectedSidecarId}
-          onItemClick={handleItemClick}
-          onRowDragStart={handleRowDragStart}
-          onRowDrop={handleRowDrop}
-          {editingItem}
-          bind:editingValue
-          {renameInFlight}
-          onBeginRename={beginRename}
-          onCommitRename={commitRename}
-          onCancelRename={cancelRename}
-          {creatingFolder}
-          bind:newFolderName
-          {newFolderError}
-          {creatingFolderInFlight}
-          onCommitCreateFolder={commitCreateFolder}
-          onCancelCreateFolder={cancelCreateFolder}
-        />
-      {/if}
-
-      <QuotaBar
-        usedBytes={quota.usedBytes}
-        pinnedUsedBytes={quota.pinnedUsedBytes}
-        pinnedBudgetBytes={quota.pinnedBudgetBytes}
-        {onCleanupClick}
+      <FileGrid
+        {items}
+        {selectedCid}
+        {selectedSidecarId}
+        onItemClick={handleItemClick}
+        onRowDragStart={handleRowDragStart}
+        onRowDrop={handleRowDrop}
+        {editingItem}
+        bind:editingValue
+        {renameInFlight}
+        onBeginRename={beginRename}
+        onCommitRename={commitRename}
+        onCancelRename={cancelRename}
+        {creatingFolder}
+        bind:newFolderName
+        {newFolderError}
+        {creatingFolderInFlight}
+        onCommitCreateFolder={commitCreateFolder}
+        onCancelCreateFolder={cancelCreateFolder}
       />
     {/if}
-  {:else if section === 'published'}
-    <PublishedView items={publishedItems} />
+
+    <QuotaBar
+      usedBytes={quota.usedBytes}
+      pinnedUsedBytes={quota.pinnedUsedBytes}
+      pinnedBudgetBytes={quota.pinnedBudgetBytes}
+    />
   {:else}
     <SharedWithMeList files={receivedFiles} onDownload={onDownloadReceived} {resolveNickname} {resolveCard} />
   {/if}

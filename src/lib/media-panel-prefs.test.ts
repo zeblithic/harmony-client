@@ -4,8 +4,6 @@ import {
   saveMediaPanelOpen,
   loadMediaPanelWidth,
   saveMediaPanelWidth,
-  loadRailTab,
-  saveRailTab,
   MEDIA_PANEL_MIN_WIDTH,
   MEDIA_PANEL_MAX_WIDTH,
   MEDIA_PANEL_DEFAULT_WIDTH,
@@ -72,24 +70,6 @@ describe('media-panel-prefs — ZEB-405 (WS-C)', () => {
     it('rounds fractional widths to whole pixels', () => {
       saveMediaPanelWidth(333.7);
       expect(loadMediaPanelWidth()).toBe(334);
-    });
-  });
-
-  describe('rail tab preference (ZEB-606)', () => {
-    it('defaults to assembly when nothing is stored', () => {
-      expect(loadRailTab()).toBe('assembly');
-    });
-
-    it('round-trips media', () => {
-      saveRailTab('media');
-      expect(loadRailTab()).toBe('media');
-      saveRailTab('assembly');
-      expect(loadRailTab()).toBe('assembly');
-    });
-
-    it('treats garbage as the assembly default', () => {
-      localStorage.setItem('harmony-rail-tab', 'blurple');
-      expect(loadRailTab()).toBe('assembly');
     });
   });
 });

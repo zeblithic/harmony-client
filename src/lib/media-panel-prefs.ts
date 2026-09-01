@@ -65,27 +65,3 @@ export function saveMediaPanelWidth(px: number): void {
     // localStorage unavailable — non-fatal.
   }
 }
-
-const RAIL_TAB_KEY = 'harmony-rail-tab';
-
-/** ZEB-606: which right-rail tab is selected in messages mode. */
-export type RailTab = 'assembly' | 'media';
-
-/** Last-selected rail tab. Defaults to 'assembly' (the design's "always one
- *  glance away"); any non-'media' stored value degrades to the default. */
-export function loadRailTab(): RailTab {
-  try {
-    return localStorage.getItem(RAIL_TAB_KEY) === 'media' ? 'media' : 'assembly';
-  } catch {
-    return 'assembly';
-  }
-}
-
-/** Persist the rail-tab choice. No-op if localStorage is unavailable. */
-export function saveRailTab(tab: RailTab): void {
-  try {
-    localStorage.setItem(RAIL_TAB_KEY, tab);
-  } catch {
-    // localStorage unavailable — non-fatal.
-  }
-}

@@ -16,7 +16,6 @@ export const messages: Message[] = [
     sender: peers[0],
     text: 'Hey everyone, just pushed the new transport layer changes.',
     timestamp: base,
-    media: [],
     priority: 'standard',
   },
   {
@@ -24,15 +23,6 @@ export const messages: Message[] = [
     sender: peers[1],
     text: 'Nice! Here is the PR for review.',
     timestamp: base + 5 * 60_000,
-    media: [
-      {
-        id: 'media-01',
-        type: 'link',
-        url: 'https://github.com/zeblithic/harmony/pull/35',
-        title: 'feat: durable workflow execution engine',
-        domain: 'github.com',
-      },
-    ],
     priority: 'standard',
   },
   // Thread reply to msg-02 (Bob's PR)
@@ -41,7 +31,6 @@ export const messages: Message[] = [
     sender: peers[2], // Carol
     text: 'Reviewed — looks good, left a few comments on the error handling.',
     timestamp: base + 8 * 60_000,
-    media: [],
     priority: 'standard',
     replyTo: 'msg-02',
   },
@@ -50,7 +39,6 @@ export const messages: Message[] = [
     sender: peers[0], // Alice
     text: 'Thanks Carol, I will address those today.',
     timestamp: base + 10 * 60_000,
-    media: [],
     priority: 'standard',
     replyTo: 'msg-02',
   },
@@ -59,14 +47,6 @@ export const messages: Message[] = [
     sender: peers[2],
     text: 'Looking at the benchmarks, throughput is up 3x on the routing tier.',
     timestamp: base + 12 * 60_000,
-    media: [
-      {
-        id: 'media-02',
-        type: 'image',
-        url: 'https://placehold.co/600x400/313338/f2f3f5?text=Benchmark+Chart',
-        title: 'Routing throughput comparison',
-      },
-    ],
     priority: 'standard',
   },
   {
@@ -74,7 +54,6 @@ export const messages: Message[] = [
     sender: peers[0],
     text: 'That looks great. The adaptive fuel scaling really helped.',
     timestamp: base + 15 * 60_000,
-    media: [],
     priority: 'quiet',
   },
   {
@@ -82,21 +61,6 @@ export const messages: Message[] = [
     sender: peers[3],
     text: 'Here is the config I used for the starvation test:',
     timestamp: base + 20 * 60_000,
-    media: [
-      {
-        id: 'media-03',
-        type: 'code',
-        title: 'tier_schedule.toml',
-        content: `[tier_schedule]
-router_max_per_tick = 10
-storage_max_per_tick = 5
-starvation_threshold = 8
-
-[adaptive_compute]
-high_water = 50
-floor_fraction = 0.1`,
-      },
-    ],
     priority: 'standard',
   },
   {
@@ -104,7 +68,6 @@ floor_fraction = 0.1`,
     sender: peers[1],
     text: 'I ran the same test with the W-TinyLFU cache enabled.',
     timestamp: base + 30 * 60_000,
-    media: [],
     priority: 'quiet',
   },
   {
@@ -112,14 +75,6 @@ floor_fraction = 0.1`,
     sender: peers[2],
     text: 'Check out the cache hit rates — much better with the frequency sketch.',
     timestamp: base + 35 * 60_000,
-    media: [
-      {
-        id: 'media-04',
-        type: 'image',
-        url: 'https://placehold.co/600x300/313338/f2f3f5?text=Cache+Hit+Rates',
-        title: 'W-TinyLFU cache hit rate over time',
-      },
-    ],
     priority: 'standard',
   },
   {
@@ -127,7 +82,6 @@ floor_fraction = 0.1`,
     sender: peers[0],
     text: 'Has anyone tested the Reticulum interop with the latest packet format changes?',
     timestamp: base + hour,
-    media: [],
     priority: 'loud',
   },
   // Thread reply to msg-08 (interop question)
@@ -136,7 +90,6 @@ floor_fraction = 0.1`,
     sender: peers[3], // Dave
     text: 'Running the full suite now, will post results shortly.',
     timestamp: base + hour + 2 * 60_000,
-    media: [],
     priority: 'standard',
     replyTo: 'msg-08',
   },
@@ -145,14 +98,6 @@ floor_fraction = 0.1`,
     sender: peers[2], // Carol
     text: 'I tested the identity path — byte-identical to Python.',
     timestamp: base + hour + 3 * 60_000,
-    media: [
-      {
-        id: 'media-08',
-        type: 'image',
-        url: 'https://placehold.co/600x300/313338/f2f3f5?text=Interop+Test+Results',
-        title: 'Identity derivation interop results',
-      },
-    ],
     priority: 'standard',
     replyTo: 'msg-08',
   },
@@ -161,7 +106,6 @@ floor_fraction = 0.1`,
     sender: peers[0], // Alice
     text: 'Excellent — that confirms the HKDF path is correct too.',
     timestamp: base + hour + 4 * 60_000,
-    media: [],
     priority: 'quiet',
     replyTo: 'msg-08',
   },
@@ -170,15 +114,6 @@ floor_fraction = 0.1`,
     sender: peers[3],
     text: 'Yes, all 14 cross-language tests pass. Here is the test output.',
     timestamp: base + hour + 5 * 60_000,
-    media: [
-      {
-        id: 'media-05',
-        type: 'link',
-        url: 'https://github.com/zeblithic/harmony/actions/runs/123456',
-        title: 'CI: All interop tests passing',
-        domain: 'github.com',
-      },
-    ],
     priority: 'standard',
   },
   {
@@ -186,7 +121,6 @@ floor_fraction = 0.1`,
     sender: peers[1],
     text: 'Perfect. The identity derivation path is byte-identical to Python Reticulum now.',
     timestamp: base + hour + 10 * 60_000,
-    media: [],
     priority: 'quiet',
   },
   {
@@ -194,21 +128,6 @@ floor_fraction = 0.1`,
     sender: peers[2],
     text: 'I documented the address derivation flow:',
     timestamp: base + hour + 20 * 60_000,
-    media: [
-      {
-        id: 'media-06',
-        type: 'code',
-        title: 'address_derivation.rs',
-        content: `// Address = SHA256(X25519_pub || Ed25519_pub)[:16]
-let mut hasher = Sha256::new();
-hasher.update(x25519_public.as_bytes());
-hasher.update(ed25519_public.as_bytes());
-let hash = hasher.finalize();
-let address: [u8; 16] = hash[..16]
-    .try_into()
-    .expect("SHA256 output is 32 bytes");`,
-      },
-    ],
     priority: 'standard',
   },
   {
@@ -216,7 +135,6 @@ let address: [u8; 16] = hash[..16]
     sender: peers[0],
     text: 'Clean. Next up is the Zenoh pub/sub integration for presence.',
     timestamp: base + 2 * hour,
-    media: [],
     priority: 'standard',
   },
   {
@@ -224,15 +142,6 @@ let address: [u8; 16] = hash[..16]
     sender: peers[3],
     text: 'I have a draft of the liveliness token flow.',
     timestamp: base + 2 * hour + 15 * 60_000,
-    media: [
-      {
-        id: 'media-07',
-        type: 'link',
-        url: 'https://github.com/zeblithic/harmony/wiki/Liveliness-Tokens',
-        title: 'Liveliness Token Design',
-        domain: 'github.com',
-      },
-    ],
     priority: 'standard',
   },
   {
@@ -240,7 +149,6 @@ let address: [u8; 16] = hash[..16]
     sender: peers[1],
     text: 'Looks solid. The key expression hierarchy makes sense for our namespace.',
     timestamp: base + 2 * hour + 25 * 60_000,
-    media: [],
     priority: 'quiet',
   },
   {
@@ -248,7 +156,6 @@ let address: [u8; 16] = hash[..16]
     sender: peers[2],
     text: 'Agreed. Let us get this merged and start on the voice engine next.',
     timestamp: base + 3 * hour,
-    media: [],
     priority: 'standard',
   },
 ];

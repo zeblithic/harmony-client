@@ -29,7 +29,6 @@ function renderBrowser(
     onSearchChange: vi.fn(),
     onSectionChange: vi.fn(),
     onUploadClick: vi.fn(),
-    onCleanupClick: vi.fn(),
   };
   const result = render(FileBrowser, {
     props: {
@@ -40,7 +39,6 @@ function renderBrowser(
       viewMode: 'list' as const,
       section: 'private' as const,
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       ...callbacks,
       ...overrides,
@@ -373,7 +371,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       viewMode: 'list',
       section: 'private',
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       onItemClick: vi.fn(),
       onNavigateFolder: vi.fn(),
@@ -381,7 +378,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       onSearchChange: vi.fn(),
       onSectionChange: vi.fn(),
       onUploadClick: vi.fn(),
-      onCleanupClick: vi.fn(),
     });
 
     await waitFor(() => {
@@ -552,7 +548,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       viewMode: 'list',
       section: 'private',
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       onItemClick: vi.fn(),
       onNavigateFolder: vi.fn(),
@@ -560,7 +555,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       onSearchChange: vi.fn(),
       onSectionChange: vi.fn(),
       onUploadClick: vi.fn(),
-      onCleanupClick: vi.fn(),
     });
 
     // FolderLoadError block must be gone.
@@ -610,7 +604,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
         viewMode: 'list' as const,
         section: 'private' as const,
         searchQuery: '',
-        showCleanup: false,
         serviceVersion: 0,
         onItemClick: vi.fn(),
         onNavigateFolder,
@@ -618,7 +611,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
         onSearchChange: vi.fn(),
         onSectionChange: vi.fn(),
         onUploadClick: vi.fn(),
-        onCleanupClick: vi.fn(),
       },
     });
 
@@ -652,7 +644,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       viewMode: 'list' as const,
       section: 'private' as const,
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       onItemClick: vi.fn(),
       onNavigateFolder,
@@ -660,7 +651,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       onSearchChange: vi.fn(),
       onSectionChange: vi.fn(),
       onUploadClick: vi.fn(),
-      onCleanupClick: vi.fn(),
     });
 
     // Now resolve the create IPC. Without the seq guard the success path
@@ -719,7 +709,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
         viewMode: 'list' as const,
         section: 'private' as const,
         searchQuery: '',
-        showCleanup: false,
         serviceVersion: 0,
         onItemClick: vi.fn(),
         onNavigateFolder: vi.fn(),
@@ -727,7 +716,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
         onSearchChange: vi.fn(),
         onSectionChange: vi.fn(),
         onUploadClick: vi.fn(),
-        onCleanupClick: vi.fn(),
       },
     });
 
@@ -758,7 +746,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       viewMode: 'list' as const,
       section: 'private' as const,
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       onItemClick: vi.fn(),
       onNavigateFolder: vi.fn(),
@@ -766,7 +753,6 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
       onSearchChange: vi.fn(),
       onSectionChange: vi.fn(),
       onUploadClick: vi.fn(),
-      onCleanupClick: vi.fn(),
     });
 
     // Session 2: open new placeholder. Without the per-session

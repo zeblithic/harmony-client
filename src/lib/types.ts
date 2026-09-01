@@ -23,19 +23,6 @@ export interface Profile extends Peer {
   notificationSounds?: SoundOverrides;
 }
 
-export interface MediaAttachment {
-  id: string;
-  type: 'image' | 'link' | 'code';
-  /** URL for images and links */
-  url?: string;
-  /** OG title or filename */
-  title?: string;
-  /** Extracted domain for link indicators (e.g. "github.com") */
-  domain?: string;
-  /** Source code for code blocks */
-  content?: string;
-}
-
 export type MessagePriority = 'quiet' | 'standard' | 'loud';
 
 export type NotificationAction = 'silent' | 'dot_only' | 'notify' | 'sound' | 'break_dnd';
@@ -60,8 +47,6 @@ export interface Message {
   text: string;
   /** Unix timestamp in milliseconds */
   timestamp: number;
-  /** Empty array for text-only messages */
-  media: MediaAttachment[];
   /** Message priority level, defaults to 'standard' */
   priority: MessagePriority;
   /** ID of the thread root message this is a reply to */
@@ -240,9 +225,7 @@ export type MailCounts = Record<MailFolderKind, MailFolderCounts>;
 export type ReplicationTier = 'expendable' | 'light' | 'default' | 'high' | 'ultra';
 export type ContentSensitivity = 'public' | 'private' | 'intimate' | 'confidential';
 export type FileViewMode = 'list' | 'grid';
-export type ContentSection = 'private' | 'published' | 'sharedWithMe';
-export type PublishMode = 'durable' | 'ephemeral';
-export type CleanupReason = 'stale' | 'duplicate-of-public' | 'over-replicated' | 'expired';
+export type ContentSection = 'private' | 'sharedWithMe';
 
 /** Mirrors harmony-roxy ContentCategory. */
 export type ContentCategory = 'music' | 'video' | 'text' | 'image' | 'software' | 'dataset' | 'bundle';
@@ -323,34 +306,6 @@ export interface QuotaStatus {
   pinnedBudgetBytes: number | null;
 }
 
-export interface CleanupRecommendation {
-  /**
-   * ZEB-164: per-entry stable identity matching the ContentItem.sidecarId
-   * that backs this recommendation. Required so action handlers can route
-   * sidecar mutations (burn/archive/pin) without a CID re-lookup, which
-   * would be non-deterministic when two entries share a CID.
-   */
-  sidecarId: string;
-  cid: string;
-  name: string;
-  category: ContentCategory;
-  sensitivity: ContentSensitivity;
-  sizeBytes: number;
-  reason: CleanupReason;
-  stalenessScore: number;
-  spaceRecoverable: number;
-  confidence: number;
-}
-
-export interface PublishedItem {
-  cid: string;
-  name: string;
-  category: ContentCategory;
-  sizeBytes: number;
-  publishedAt: number;
-  publishMode: PublishMode;
-}
-
 export interface UploadCandidate {
   file: File;
   sensitivity: ContentSensitivity;
@@ -401,7 +356,6 @@ export interface ReceivedFile {
 export interface FileManagerSettings {
   defaultReplicationTier: ReplicationTier;
   defaultViewMode: FileViewMode;
-  confirmationOverrides: Partial<Record<ContentSensitivity, number>>;
 }
 
 // ── Community types (ZEB-263) ─────────────────────────────────────

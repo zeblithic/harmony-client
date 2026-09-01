@@ -5,8 +5,6 @@ import type {
   ContentItem,
   ContentDetail,
   QuotaStatus,
-  CleanupRecommendation,
-  PublishedItem,
 } from './types';
 
 describe('File manager types', () => {
@@ -67,34 +65,5 @@ describe('File manager types', () => {
       pinnedBudgetBytes: 50_000_000,
     };
     expect(quota.pinnedUsedBytes).toBeLessThan(quota.pinnedBudgetBytes!);
-  });
-
-  it('CleanupRecommendation has action-relevant fields', () => {
-    const rec: CleanupRecommendation = {
-      sidecarId: 'sidecar-abc',
-      cid: 'abc123',
-      name: 'old-doc.txt',
-      category: 'text',
-      sensitivity: 'private',
-      sizeBytes: 50_000,
-      reason: 'stale',
-      stalenessScore: 0.87,
-      spaceRecoverable: 150_000,
-      confidence: 0.87,
-    };
-    expect(rec.reason).toBe('stale');
-    expect(rec.confidence).toBeGreaterThan(0.8);
-  });
-
-  it('PublishedItem includes publish mode', () => {
-    const item: PublishedItem = {
-      cid: 'pub1',
-      name: 'my-song.mp3',
-      category: 'music',
-      sizeBytes: 8_000_000,
-      publishedAt: 1000,
-      publishMode: 'durable',
-    };
-    expect(item.publishMode).toBe('durable');
   });
 });

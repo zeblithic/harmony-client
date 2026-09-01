@@ -7,10 +7,8 @@
     searchQuery,
     onSearchChange,
     onUploadClick,
-    onCleanupClick,
     onNewFolderClick,
     onAddFolderClick,
-    showCleanup = false,
     section,
     onSectionChange,
     sharedUnreadCount = 0,
@@ -20,10 +18,8 @@
     searchQuery: string;
     onSearchChange: (query: string) => void;
     onUploadClick: (encrypted?: boolean) => void;
-    onCleanupClick: () => void;
     onNewFolderClick?: () => void;
     onAddFolderClick?: () => void;
-    showCleanup?: boolean;
     section: ContentSection;
     onSectionChange: (section: ContentSection) => void;
     /** ZEB-723: count of shared-with-me files newer than last-seen; a
@@ -51,19 +47,13 @@
     >Private</button>
     <button
       class="section-btn"
-      class:active={section === 'published'}
-      aria-pressed={section === 'published'}
-      onclick={() => onSectionChange('published')}
-    >Published</button>
-    <button
-      class="section-btn"
       class:active={section === 'sharedWithMe'}
       aria-pressed={section === 'sharedWithMe'}
       onclick={() => onSectionChange('sharedWithMe')}
     >Shared with me{#if sharedUnreadCount > 0}<span class="section-badge">{sharedUnreadCount}</span>{/if}</button>
   </div>
 
-  {#if section === 'private' && !showCleanup}
+  {#if section === 'private'}
     <input
       class="search-input"
       type="search"
@@ -78,44 +68,41 @@
 
   <div class="toolbar-right">
     {#if section === 'private'}
-      {#if !showCleanup}
-        <button
-          class="view-btn"
-          aria-label="List view"
-          aria-pressed={viewMode === 'list'}
-          onclick={() => onViewModeChange('list')}
-        >☰</button>
-        <button
-          class="view-btn"
-          aria-label="Grid view"
-          aria-pressed={viewMode === 'grid'}
-          onclick={() => onViewModeChange('grid')}
-        >⊞</button>
-        <button class="action-btn" onclick={() => onUploadClick(encryptOnUpload)} aria-label="Add files">⤓ Add files</button>
-        <label
-          class="encrypt-toggle"
-          title="Encrypted files are private and can be shared with specific people via &quot;Shared with&quot;. Unencrypted files are public once published."
-        >
-          <input
-            type="checkbox"
-            checked={encryptOnUpload}
-            onchange={(e) => { encryptOnUpload = e.currentTarget.checked; }}
-          />
-          Encrypt (private)
-        </label>
-        {#if onNewFolderClick}
-          <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
-        {/if}
-        {#if onAddFolderClick}
-          <button
-            class="action-btn"
-            onclick={onAddFolderClick}
-            aria-label="Add folder from disk"
-            title="Add folder from disk"
-          >📥 Add folder…</button>
-        {/if}
+      <button
+        class="view-btn"
+        aria-label="List view"
+        aria-pressed={viewMode === 'list'}
+        onclick={() => onViewModeChange('list')}
+      >☰</button>
+      <button
+        class="view-btn"
+        aria-label="Grid view"
+        aria-pressed={viewMode === 'grid'}
+        onclick={() => onViewModeChange('grid')}
+      >⊞</button>
+      <button class="action-btn" onclick={() => onUploadClick(encryptOnUpload)} aria-label="Add files">⤓ Add files</button>
+      <label
+        class="encrypt-toggle"
+        title="Encrypted files are private and can be shared with specific people via &quot;Shared with&quot;. Unencrypted files are public once published."
+      >
+        <input
+          type="checkbox"
+          checked={encryptOnUpload}
+          onchange={(e) => { encryptOnUpload = e.currentTarget.checked; }}
+        />
+        Encrypt (private)
+      </label>
+      {#if onNewFolderClick}
+        <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
       {/if}
-      <button class="action-btn" class:active={showCleanup} onclick={onCleanupClick} aria-label="Cleanup" aria-pressed={showCleanup}>🧹 Cleanup</button>
+      {#if onAddFolderClick}
+        <button
+          class="action-btn"
+          onclick={onAddFolderClick}
+          aria-label="Add folder from disk"
+          title="Add folder from disk"
+        >📥 Add folder…</button>
+      {/if}
     {/if}
   </div>
 </div>

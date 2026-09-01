@@ -13,7 +13,6 @@ function baseProps(overrides: Record<string, unknown> = {}) {
     searchQuery: '',
     onSearchChange: vi.fn(),
     onUploadClick: vi.fn(),
-    onCleanupClick: vi.fn(),
     section: 'private' as ContentSection,
     onSectionChange: vi.fn(),
     ...overrides,

@@ -1,13 +1,9 @@
 <script lang="ts">
-  import type { ContentDetail, ContentSensitivity } from '../types';
-  import PublishButton from './PublishButton.svelte';
+  import type { ContentDetail } from '../types';
   import ConfirmDialog from './ConfirmDialog.svelte';
 
   let {
     item,
-    confirmationOverrides = {},
-    onPublish,
-    onRelease,
     onBurn,
     onArchive,
     onPin,
@@ -15,9 +11,6 @@
     onExport,
   }: {
     item: ContentDetail;
-    confirmationOverrides?: Partial<Record<ContentSensitivity, number>>;
-    onPublish?: (cid: string) => void;
-    onRelease?: (cid: string) => void;
     onBurn?: () => void;
     onArchive?: () => void;
     onPin?: () => void;
@@ -34,15 +27,6 @@
 </script>
 
 <div class="file-actions">
-  <PublishButton
-    filename={item.name}
-    cid={item.cid}
-    sensitivity={item.sensitivity}
-    {confirmationOverrides}
-    onPublish={(cid) => onPublish?.(cid)}
-    onRelease={(cid) => onRelease?.(cid)}
-  />
-
   <button class="action-btn destructive" onclick={() => { showBurnConfirm = true; }} aria-label="Burn">
     <span class="action-icon" aria-hidden="true">{'\u{1F525}'}</span>
     Burn

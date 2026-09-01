@@ -9,7 +9,6 @@ function makeMsg(id: string, sender: string): Message {
     sender: { address: sender.toLowerCase(), displayName: sender },
     text: `Quiet message ${id}`,
     timestamp: Date.now(),
-    media: [],
     priority: 'quiet',
   };
 }
@@ -82,7 +81,6 @@ describe('QuietMessageGroup', () => {
       sender: { address: PEER, displayName: '' },
       text: 'quiet',
       timestamp: Date.now(),
-      media: [],
       priority: 'quiet',
     };
     const { container } = render(QuietMessageGroup, {
@@ -101,7 +99,6 @@ describe('QuietMessageGroup', () => {
       sender: { address: PEER, displayName: '' },
       text: 'quiet',
       timestamp: Date.now(),
-      media: [],
       priority: 'quiet',
     };
     const { container } = render(QuietMessageGroup, {

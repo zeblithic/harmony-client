@@ -63,7 +63,6 @@ describe('TextFeed read-receipt toggle', () => {
       id,
       text: id,
       timestamp: ts,
-      media: [],
       priority: 'standard' as const,
       sender: { address: self ? 'self' : 'peer', displayName: self ? 'Me' : 'Them' },
     });

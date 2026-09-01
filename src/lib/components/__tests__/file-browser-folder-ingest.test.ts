@@ -41,7 +41,6 @@ function renderBrowser(
     onSearchChange: vi.fn(),
     onSectionChange: vi.fn(),
     onUploadClick: vi.fn(),
-    onCleanupClick: vi.fn(),
   };
   const result = render(FileBrowser, {
     props: {
@@ -53,7 +52,6 @@ function renderBrowser(
       viewMode: 'list' as const,
       section: 'private' as const,
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       ...callbacks,
       ...overrides,
@@ -657,7 +655,6 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
       viewMode: 'list',
       section: 'private',
       searchQuery: '',
-      showCleanup: false,
       serviceVersion: 0,
       onItemClick: vi.fn(),
       onNavigateFolder: vi.fn(),
@@ -665,7 +662,6 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
       onSearchChange: vi.fn(),
       onSectionChange: vi.fn(),
       onUploadClick: vi.fn(),
-      onCleanupClick: vi.fn(),
     });
 
     // Progress modal stays open across the navigation.

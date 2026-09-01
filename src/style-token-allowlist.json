@@ -2,6 +2,5 @@
   "lib/components/DiagnosticExportModal.svelte": 1,
   "lib/components/FileActions.svelte": 1,
   "lib/components/LibraryDirectoryBrowser.svelte": 3,
-  "lib/components/MediaCard.svelte": 1,
   "lib/components/MintLedger.svelte": 1
 }

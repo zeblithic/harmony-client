@@ -1,12 +1,8 @@
-import type { MediaAttachment, TrustLevel, TrustSettings } from './types';
+import type { TrustLevel, TrustSettings } from './types';
 import type { TrustGraphService } from './trust-graph-service';
 
 export class TrustService {
   readonly settings: TrustSettings;
-  // Session-scoped: tracks which attachments the user has manually confirmed.
-  // Intentionally never pruned — entries are small strings and the set resets
-  // when the app restarts. clearLoaded() exists for testing.
-  private loadedAttachments = new Set<string>();
   private trustGraph: TrustGraphService | null;
 
   constructor(trustGraph?: TrustGraphService) {
@@ -53,21 +49,5 @@ export class TrustService {
 
   clearCommunityTrust(id: string): void {
     this.settings.perCommunity.delete(id);
-  }
-
-  isLoaded(attachmentId: string): boolean {
-    return this.loadedAttachments.has(attachmentId);
-  }
-
-  markLoaded(attachmentId: string): void {
-    this.loadedAttachments.add(attachmentId);
-  }
-
-  clearLoaded(): void {
-    this.loadedAttachments.clear();
-  }
-
-  static isGated(attachment: MediaAttachment): boolean {
-    return attachment.type === 'image' || attachment.type === 'link';
   }
 }

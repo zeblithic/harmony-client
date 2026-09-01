@@ -51,39 +51,6 @@ describe('TrustService', () => {
   });
 });
 
-describe('TrustService.loadedAttachments', () => {
-  it('tracks loaded attachment IDs', () => {
-    const svc = new TrustService();
-    expect(svc.isLoaded('att-1')).toBe(false);
-    svc.markLoaded('att-1');
-    expect(svc.isLoaded('att-1')).toBe(true);
-    expect(svc.isLoaded('att-2')).toBe(false);
-  });
-
-  it('clearLoaded resets all loaded state', () => {
-    const svc = new TrustService();
-    svc.markLoaded('att-1');
-    svc.markLoaded('att-2');
-    svc.clearLoaded();
-    expect(svc.isLoaded('att-1')).toBe(false);
-    expect(svc.isLoaded('att-2')).toBe(false);
-  });
-});
-
-describe('TrustService.isGated', () => {
-  it('gates image attachments', () => {
-    expect(TrustService.isGated({ id: '1', type: 'image', url: 'https://example.com/img.png' })).toBe(true);
-  });
-
-  it('gates link attachments', () => {
-    expect(TrustService.isGated({ id: '2', type: 'link', url: 'https://example.com' })).toBe(true);
-  });
-
-  it('does not gate code attachments', () => {
-    expect(TrustService.isGated({ id: '3', type: 'code', content: 'console.log("hi")' })).toBe(false);
-  });
-});
-
 describe('TrustService with trust graph fallback', () => {
   it('falls back to trust graph when no override exists', () => {
     const graph = new MockTrustGraphService('local', ['peer-1']);

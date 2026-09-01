@@ -31,8 +31,6 @@ function renderPanel(
     props: {
       detail: { ...mockDetail, ...detailOverrides },
       onTierChange: vi.fn(),
-      onPublish: vi.fn(),
-      onRelease: vi.fn(),
       onBurn: vi.fn(),
       onArchive: vi.fn(),
       onPin: vi.fn(),
@@ -119,8 +117,6 @@ describe('FileDetailPanel', () => {
 
   it('renders action buttons', () => {
     renderPanel();
-    expect(screen.getByLabelText('Publish (permanent)')).toBeTruthy();
-    expect(screen.getByLabelText('Release (ephemeral)')).toBeTruthy();
     expect(screen.getByLabelText('Burn')).toBeTruthy();
     expect(screen.getByLabelText('Archive')).toBeTruthy();
     expect(screen.getByLabelText('Export')).toBeTruthy();

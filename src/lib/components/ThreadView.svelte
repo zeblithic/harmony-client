@@ -1,17 +1,14 @@
 <script lang="ts">
   import type { Message, MessagePriority } from '../types';
-  import type { TrustService } from '../trust-service';
   import TextMessage from './TextMessage.svelte';
   import ComposeBar from './ComposeBar.svelte';
 
-  let { rootMessage, replies, onClose, onSend, onAvatarClick, trustService, trustVersion = 0, onScrollToMessage }: {
+  let { rootMessage, replies, onClose, onSend, onAvatarClick, onScrollToMessage }: {
     rootMessage: Message;
     replies: Message[];
     onClose?: () => void;
     onSend?: (text: string, priority: MessagePriority) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
-    trustService?: TrustService;
-    trustVersion?: number;
     onScrollToMessage?: (messageId: string) => void;
   } = $props();
 
@@ -34,11 +31,11 @@
 
   <div class="thread-messages">
     <div class="thread-root">
-      <TextMessage message={rootMessage} {onAvatarClick} {trustService} {trustVersion} />
+      <TextMessage message={rootMessage} {onAvatarClick} />
     </div>
 
     {#each replies as reply (reply.id)}
-      <TextMessage message={reply} {onAvatarClick} {trustService} {trustVersion} allMessages={allThreadMessages} {onScrollToMessage} />
+      <TextMessage message={reply} {onAvatarClick} allMessages={allThreadMessages} {onScrollToMessage} />
     {/each}
   </div>
 

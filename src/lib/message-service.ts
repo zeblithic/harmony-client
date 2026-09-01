@@ -224,7 +224,6 @@ export class MessageService {
           sender,
           text,
           timestamp: payload.sentAt,
-          media: [],
           priority: 'standard',
           channel: payload.spaceId,
           // App.svelte's feed filter checks `m.hub === activeHub`. Top-level
@@ -351,7 +350,6 @@ export class MessageService {
       sender: { address: 'self', displayName: this.selfDisplayName() },
       text,
       timestamp: Date.now(),
-      media: [],
       priority,
       replyTo,
       channel,
@@ -496,7 +494,6 @@ export class MessageService {
           sender,
           text,
           timestamp: r.sentAt,
-          media: [],
           priority: 'standard',
           channel: spaceId,
           // Fix A from PR #81 review: top-level DMs use activeHub='' in
@@ -562,7 +559,6 @@ export class MessageService {
       sender,
       text: wire.text,
       timestamp: wire.timestamp,
-      media: [],
       priority: (wire.priority as MessagePriority) || 'standard',
       replyTo: wire.replyTo,
       channel: wire.channel,

@@ -1,26 +1,17 @@
 <script lang="ts">
   import type { Message } from '../types';
-  import type { TrustService } from '../trust-service';
   import TextMessage from './TextMessage.svelte';
   import { resolveAuthorLabel } from '../mention-render';
   import type { ResolvedCard } from '../member-card-service';
 
   let {
     messages,
-    collapsed = false,
-    onMediaClick,
     onAvatarClick,
-    trustService,
-    trustVersion = 0,
     resolveNickname,
     resolveCard,
   }: {
     messages: Message[];
-    collapsed?: boolean;
-    onMediaClick?: (mediaId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
-    trustService?: TrustService;
-    trustVersion?: number;
     // ZEB-962: resolve author names for the summary AND forward to child
     // TextMessages, so a blank DM sender name never renders raw.
     resolveNickname?: (ownerIdHex: string) => string | undefined;
@@ -59,7 +50,7 @@
   {#if expanded}
     <div class="quiet-expanded">
       {#each messages as message (message.id)}
-        <TextMessage {message} {collapsed} {onMediaClick} {onAvatarClick} {trustService} {trustVersion} {resolveNickname} {resolveCard} />
+        <TextMessage {message} {onAvatarClick} {resolveNickname} {resolveCard} />
       {/each}
     </div>
   {/if}

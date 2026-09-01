@@ -2,16 +2,12 @@
  * Integration test for the TextFeed subsystem.
  *
  * Tests end-to-end: render messages with grouping, compose + send,
- * thread indicators, thread panel open/close, trust gating, priority
- * handling, and channel-aware placeholders.
- *
- * Uses a real TrustService with controlled state (no vi.fn() stubs for
- * the service), mirroring how App.svelte wires things together.
+ * thread indicators, thread panel open/close, priority handling, and
+ * channel-aware placeholders.
  */
 import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import TextFeed from '../TextFeed.svelte';
-import { TrustService } from '../../trust-service';
 import type { Message, Peer } from '../../types';
 import type { ThreadMetaEntry } from '../../feed-utils';
 
@@ -46,7 +42,6 @@ function msg(overrides: Partial<Message> & Pick<Message, 'id' | 'text'>): Messag
   return {
     sender: alice,
     timestamp: base,
-    media: [],
     priority: 'standard',
     ...overrides,
   };
@@ -58,10 +53,6 @@ const MESSAGES: Message[] = [
   msg({ id: 'm3', sender: carol, text: 'quiet ack', timestamp: base + 120_000, priority: 'quiet' }),
   msg({ id: 'm4', sender: alice, text: 'another quiet', timestamp: base + 180_000, priority: 'quiet' }),
   msg({ id: 'm5', sender: bob, text: 'Important update!', timestamp: base + 240_000, priority: 'loud' }),
-  msg({
-    id: 'm6', sender: carol, text: 'Check this image', timestamp: base + 300_000,
-    media: [{ id: 'img-1', type: 'image', url: 'https://example.com/pic.png', title: 'Screenshot' }],
-  }),
 ];
 
 // Thread meta: m2 has 2 replies from Carol and Alice
@@ -80,7 +71,6 @@ const THREAD_REPLIES: Message[] = [
 function renderFeed(overrides: Record<string, unknown> = {}) {
   const callbacks = {
     onSend: vi.fn(),
-    onMediaClick: vi.fn(),
     onAvatarClick: vi.fn(),
     onThreadOpen: vi.fn(),
     onThreadClose: vi.fn(),
@@ -93,8 +83,6 @@ function renderFeed(overrides: Record<string, unknown> = {}) {
       messages: MESSAGES,
       channelName: 'general',
       channelType: 'channel' as const,
-      trustService: new TrustService(),
-      trustVersion: 0,
       threadMeta: THREAD_META,
       threadRoot: null as Message | null,
       threadReplies: [] as Message[],
@@ -267,66 +255,6 @@ describe('TextFeed Integration', () => {
     });
 
     expect(screen.getByLabelText('Resize thread panel')).toBeTruthy();
-  });
-
-  // ── 6. Media & Trust ──────────────────────────────────────────────
-
-  it('shows media pills for messages with attachments (trusted)', () => {
-    const trustService = new TrustService();
-    trustService.setGlobalTrust('trusted');
-    renderFeed({ trustService, trustVersion: 1 });
-    // m6 has an image attachment — shows title in pill when trusted
-    expect(screen.getByText('Screenshot')).toBeTruthy();
-  });
-
-  it('fires onMediaClick when a media pill is clicked', async () => {
-    const trustService = new TrustService();
-    trustService.setGlobalTrust('trusted');
-    const { callbacks } = renderFeed({ trustService, trustVersion: 1 });
-    const pill = screen.getByText('Screenshot');
-    await fireEvent.click(pill.closest('button')!);
-
-    expect(callbacks.onMediaClick).toHaveBeenCalledWith('img-1');
-  });
-
-  it('blocks untrusted media by default', () => {
-    // Default TrustService is 'untrusted' globally
-    renderFeed();
-    // Image should be gated — shows "blocked" text
-    expect(screen.getByText(/blocked image/i)).toBeTruthy();
-  });
-
-  it('shows media when trust level is trusted', () => {
-    const trustService = new TrustService();
-    trustService.setGlobalTrust('trusted');
-    renderFeed({ trustService, trustVersion: 1 });
-
-    // No blocked indicators
-    expect(screen.queryByText(/blocked image/i)).toBeNull();
-    // Shows the actual media pill
-    expect(screen.getByText('Screenshot')).toBeTruthy();
-  });
-
-  it('unblocks individual attachment after markLoaded', () => {
-    const trustService = new TrustService();
-    // Global is untrusted, but we manually load img-1
-    trustService.markLoaded('img-1');
-    renderFeed({ trustService, trustVersion: 1 });
-
-    // Should show the image, not blocked
-    expect(screen.queryByText(/blocked image/i)).toBeNull();
-  });
-
-  // ── 7. Collapsed mode ─────────────────────────────────────────────
-
-  it('renders inline embeds in collapsed mode', () => {
-    const trustService = new TrustService();
-    trustService.setGlobalTrust('trusted');
-    renderFeed({ collapsed: true, trustService, trustVersion: 1 });
-
-    // In collapsed mode, images render inline rather than as pills
-    const img = screen.getByAltText('Screenshot');
-    expect(img).toBeTruthy();
   });
 
   // ── 8. DM header Call button (ZEB-352) ────────────────────────────

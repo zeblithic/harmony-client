@@ -4,8 +4,6 @@ import type {
   ContentDetail,
   ContentOriginInfo,
   QuotaStatus,
-  CleanupRecommendation,
-  PublishedItem,
   FileManagerSettings,
   ReplicationTier,
   ContentCategory,
@@ -14,11 +12,7 @@ import type {
   ReceivedFile,
   ReceivedGrantWire,
 } from './types';
-import {
-  mockPrivateContent,
-  mockPublishedContent,
-  mockCleanupRecommendations,
-} from './mock-file-data';
+import { mockPrivateContent } from './mock-file-data';
 import { nonEmpty } from './display-label';
 import { shortId } from './short-addr';
 
@@ -215,21 +209,16 @@ export class FileManagerService {
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
   private privateContent: ContentItem[];
-  private publishedContent: PublishedItem[];
-  private cleanupRecommendations: CleanupRecommendation[];
 
   constructor(overrides?: Partial<FileManagerSettings>) {
     this.settings = {
       defaultReplicationTier: 'default',
       defaultViewMode: 'list',
-      confirmationOverrides: {},
       ...overrides,
     };
 
     // Each instance gets its own deep copy so mutations are isolated
     this.privateContent = structuredClone(mockPrivateContent);
-    this.publishedContent = structuredClone(mockPublishedContent);
-    this.cleanupRecommendations = structuredClone(mockCleanupRecommendations);
   }
 
   /** Connect a Tauri adapter and start listening for content announcements. */
@@ -346,28 +335,6 @@ export class FileManagerService {
     };
   }
 
-  /** Returns cleanup recommendations, filtering out burned items, sorted by confidence desc.
-   *  TODO: Re-evaluate recommendation reasons dynamically (e.g., drop 'over-replicated'
-   *  after tier change) once real replication backends are wired in. */
-  getCleanupRecommendations(): CleanupRecommendation[] {
-    // Key by sidecarId, not cid: with symlink-style sidecars, multiple entries
-    // can share a CID, so a CID-keyed Map collapses them to "whichever the
-    // iterator visited last" and would route the action to the wrong entry.
-    const activeBySidecar = new Map(this.privateContent.map((i) => [i.sidecarId, i]));
-    return this.cleanupRecommendations
-      .filter((r) => activeBySidecar.has(r.sidecarId))
-      .map((r) => ({
-        ...r,
-        sensitivity: activeBySidecar.get(r.sidecarId)!.sensitivity,
-      }))
-      .sort((a, b) => b.confidence - a.confidence);
-  }
-
-  /** Returns published content. */
-  getPublishedContent(): PublishedItem[] {
-    return [...this.publishedContent];
-  }
-
   /**
    * Permanently removes content items. With ZEB-164's symlink-style sidecar,
    * burn is "remove this entry from my list" — quota only frees on the
@@ -414,16 +381,6 @@ export class FileManagerService {
     );
     this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.sidecarId));
     this.onChange?.();
-  }
-
-  /** Moves content from private to published with durable publish mode. */
-  publish(cids: string[]): void {
-    this.moveToPublished(cids, 'durable');
-  }
-
-  /** Moves content from private to published with ephemeral publish mode. */
-  release(cids: string[]): void {
-    this.moveToPublished(cids, 'ephemeral');
   }
 
   /** Sets the pinned flag on a content item. */
@@ -859,23 +816,5 @@ export class FileManagerService {
       ? raw.filter((w) => !w.archived).map(wireToContentItem)
       : [];
     this.onChange?.();
-  }
-
-  private moveToPublished(cids: string[], publishMode: 'durable' | 'ephemeral'): void {
-    const cidSet = new Set(cids);
-    const toMove = this.privateContent.filter((i) => cidSet.has(i.cid));
-
-    for (const item of toMove) {
-      this.publishedContent.push({
-        cid: item.cid,
-        name: item.name,
-        category: item.category,
-        sizeBytes: item.sizeBytes,
-        publishedAt: Date.now(),
-        publishMode,
-      });
-    }
-
-    this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
   }
 }

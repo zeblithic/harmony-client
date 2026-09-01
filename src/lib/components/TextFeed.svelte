@@ -1,6 +1,5 @@
 <script lang="ts">
   import type { Message, MessagePriority } from '../types';
-  import type { TrustService } from '../trust-service';
   import type { ThreadMetaEntry } from '../feed-utils';
   import type { ResolvedCard } from '../member-card-service';
   import { groupMessages } from '../feed-utils';
@@ -17,11 +16,9 @@
 
   let {
     messages,
-    collapsed = false,
     channelName = 'general',
     channelType = 'channel',
     channelId = '',
-    onMediaClick,
     onSend,
     onAvatarClick,
     onStartCall,
@@ -32,8 +29,6 @@
     groupCallBusy = false,
     groupCall = null,
     groupCallInvoke,
-    trustService,
-    trustVersion = 0,
     threadRoot = null,
     threadReplies = [],
     threadMeta = new Map(),
@@ -53,12 +48,10 @@
     peerSeenAtMs,
   }: {
     messages: Message[];
-    collapsed?: boolean;
     channelName?: string;
     channelType?: 'channel' | 'dm' | 'group-chat';
     /** The space/channel id for this feed. Used to initiate a DM call. */
     channelId?: string;
-    onMediaClick?: (mediaId: string) => void;
     onSend?: (text: string, priority: MessagePriority) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     /** ZEB-352: invoked when the user clicks "Call" in the DM header. Only
@@ -83,8 +76,6 @@
     groupCall?: GroupCallSession | null;
     /** ZEB-360 T13: Tauri invoke, threaded to the banner's Join path. */
     groupCallInvoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
-    trustService?: TrustService;
-    trustVersion?: number;
     threadRoot?: Message | null;
     threadReplies?: Message[];
     threadMeta?: Map<string, ThreadMetaEntry>;
@@ -311,11 +302,7 @@
           {:else}
           <TextMessage
             message={item.message}
-            {collapsed}
-            {onMediaClick}
             {onAvatarClick}
-            {trustService}
-            {trustVersion}
             allMessages={messages}
             {onScrollToMessage}
             isSelf={item.message.sender.address === 'self' || (ownAddress !== '' && item.message.sender.address === ownAddress)}
@@ -341,7 +328,7 @@
             />
           {/if}
         {:else}
-          <QuietMessageGroup messages={item.messages} {collapsed} {onMediaClick} {onAvatarClick} {trustService} {trustVersion} {resolveNickname} {resolveCard} />
+          <QuietMessageGroup messages={item.messages} {onAvatarClick} {resolveNickname} {resolveCard} />
         {/if}
       {/each}
     </div>
@@ -370,8 +357,6 @@
         onClose={onThreadClose}
         onSend={onThreadSend}
         {onAvatarClick}
-        {trustService}
-        {trustVersion}
         {onScrollToMessage}
       />
     </div>

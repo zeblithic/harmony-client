@@ -8,7 +8,6 @@ function msg(id: string, addr: string): Message {
     sender: { address: addr, displayName: '' },
     text: '',
     timestamp: 1,
-    media: [],
     priority: 'standard',
   };
 }

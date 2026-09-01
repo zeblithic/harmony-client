@@ -30,7 +30,6 @@ function callMessageAt(ts: number): { message: Message; isSelf: boolean } {
     sender: { address: 'peer', displayName: 'Peer' },
     text: 'fallback',
     timestamp: ts,
-    media: [],
     priority: 'standard',
     channel: 'space-1',
     hub: '',

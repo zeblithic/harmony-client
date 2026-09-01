@@ -8,7 +8,6 @@ const baseProps = {
   searchQuery: '',
   onSearchChange: vi.fn(),
   onUploadClick: vi.fn(),
-  onCleanupClick: vi.fn(),
   section: 'private' as const,
   onSectionChange: vi.fn(),
 };
@@ -29,16 +28,14 @@ describe('BrowserToolbar', () => {
     expect(onViewModeChange).toHaveBeenCalledWith('grid');
   });
 
-  it('hides upload button when section is published', () => {
-    render(BrowserToolbar, { props: { ...baseProps, section: 'published' as const } });
+  it('hides upload button when section is sharedWithMe', () => {
+    render(BrowserToolbar, { props: { ...baseProps, section: 'sharedWithMe' as const } });
     expect(screen.queryByLabelText('Add files')).toBeNull();
-    expect(screen.queryByLabelText('Cleanup')).toBeNull();
   });
 
-  it('shows upload and cleanup buttons for private section', () => {
+  it('shows the upload button for private section', () => {
     render(BrowserToolbar, { props: baseProps });
     expect(screen.getByLabelText('Add files')).toBeTruthy();
-    expect(screen.getByLabelText('Cleanup')).toBeTruthy();
   });
 
   it('marks current view mode as pressed', () => {
@@ -60,9 +57,9 @@ describe('BrowserToolbar', () => {
   it('calls onSectionChange when clicking section toggle', async () => {
     const onSectionChange = vi.fn();
     render(BrowserToolbar, { props: { ...baseProps, onSectionChange } });
-    const pubBtn = screen.getByText('Published');
-    await fireEvent.click(pubBtn);
-    expect(onSectionChange).toHaveBeenCalledWith('published');
+    const sharedBtn = screen.getByText('Shared with me');
+    await fireEvent.click(sharedBtn);
+    expect(onSectionChange).toHaveBeenCalledWith('sharedWithMe');
   });
 
   // ── ZEB-674 Gap A: encrypt-on-upload toggle ─────────────────────────
@@ -74,8 +71,8 @@ describe('BrowserToolbar', () => {
     expect(toggle.checked).toBe(false);
   });
 
-  it('hides the encrypt toggle when section is published', () => {
-    render(BrowserToolbar, { props: { ...baseProps, section: 'published' as const } });
+  it('hides the encrypt toggle when section is sharedWithMe', () => {
+    render(BrowserToolbar, { props: { ...baseProps, section: 'sharedWithMe' as const } });
     expect(screen.queryByLabelText('Encrypt (private)')).toBeNull();
   });
 

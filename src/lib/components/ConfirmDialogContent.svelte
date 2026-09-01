@@ -1,12 +1,11 @@
 <script lang="ts">
   /**
-   * ZEB-656 — shared inner content for the two byte-identical confirm dialogs
-   * (ConfirmDialog + DoubleConfirmDialog). Collapses the previously-duplicated
-   * `<style>` block into one Commons-aligned definition; the rendered DOM
-   * matches the pre-refactor markup, so those dialogs' existing tests are the
-   * regression net. The `<Modal>` wrapper stays in each parent —
-   * DoubleConfirmDialog wraps a single Modal around both gates, so the
-   * elevation must not live here.
+   * ZEB-656 — shared inner content for ConfirmDialog. (Originally also backed
+   * DoubleConfirmDialog, removed in ZEB-1019 alongside the mock publish
+   * surfaces that were its only consumers.) Collapses the `<style>` block into
+   * one Commons-aligned definition; the rendered DOM matches the pre-refactor
+   * markup, so ConfirmDialog's existing tests are the regression net. The
+   * `<Modal>` wrapper stays in the parent.
    */
   let {
     title,

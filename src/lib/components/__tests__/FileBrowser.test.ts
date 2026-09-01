@@ -11,14 +11,12 @@ function makeProps(overrides: Record<string, unknown> = {}) {
     viewMode: 'list' as const,
     section: 'private' as const,
     searchQuery: '',
-    showCleanup: false,
     onItemClick: vi.fn(),
     onNavigateFolder: vi.fn(),
     onViewModeChange: vi.fn(),
     onSearchChange: vi.fn(),
     onSectionChange: vi.fn(),
     onUploadClick: vi.fn(),
-    onCleanupClick: vi.fn(),
     serviceVersion: 0,
     ...overrides,
   };
@@ -42,11 +40,10 @@ describe('FileBrowser', () => {
   });
 
   it('shows QuotaBar with correct usage', () => {
-    render(FileBrowser, { props: makeProps() });
-    // QuotaBar renders a button with storage info in aria-label
-    const buttons = screen.getAllByRole('button');
-    const quotaBtn = buttons.find(b => b.getAttribute('aria-label')?.includes('Storage:'));
-    expect(quotaBtn).toBeTruthy();
+    const { container } = render(FileBrowser, { props: makeProps() });
+    // QuotaBar renders an element with storage info in aria-label
+    const quotaEl = container.querySelector('.quota-bar');
+    expect(quotaEl?.getAttribute('aria-label')).toContain('Storage:');
   });
 
   it('shows folders before files', () => {
@@ -56,18 +53,6 @@ describe('FileBrowser', () => {
     // First row should be the "Projects" folder
     const firstRowName = rows[0]?.querySelector('.file-row-name');
     expect(firstRowName?.textContent).toBe('Projects');
-  });
-
-  it('shows PublishedView when section is published', () => {
-    const { container } = render(FileBrowser, { props: makeProps({ section: 'published' }) });
-    expect(container.querySelector('.published-view')).toBeTruthy();
-    // No file list or breadcrumbs in published mode
-    expect(container.querySelector('.breadcrumbs')).toBeNull();
-  });
-
-  it('shows CleanupView when showCleanup is true', () => {
-    const { container } = render(FileBrowser, { props: makeProps({ showCleanup: true }) });
-    expect(container.querySelector('.cleanup-view')).toBeTruthy();
   });
 
   it('renders breadcrumbs with root at minimum', () => {

@@ -1,22 +1,16 @@
 <script lang="ts">
   import type { Message } from '../types';
   import type { ResolvedCard } from '../member-card-service';
-  import { TrustService } from '../trust-service';
   import { resolveAuthorLabel } from '../mention-render';
-  import { sanitizeHref } from '../url-sanitize';
   import { formatMessageTimestamp, formatFullTimestamp, formatClockTime } from '../time-format';
   import { dayClock } from '../day-clock';
   import { timeFormatPrefs } from '../time-format-service';
   import Avatar from './Avatar.svelte';
   import PeerName from './PeerName.svelte';
 
-  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete, resolveNickname, resolveCard, seenAt }: {
+  let { message, onAvatarClick, allMessages = [], onScrollToMessage, isSelf = false, onDelete, resolveNickname, resolveCard, seenAt }: {
     message: Message;
-    collapsed?: boolean;
-    onMediaClick?: (mediaId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
-    trustService?: TrustService;
-    trustVersion?: number;
     allMessages?: Message[];
     onScrollToMessage?: (messageId: string) => void;
     /** ZEB-228 Phase 4: true when the message was sent by the local
@@ -100,14 +94,6 @@
     parentMessage ? resolveAuthorLabel(parentMessage.sender, resolveNickname, resolveCard).label : ''
   );
 
-  function isBlocked(attachment: import('../types').MediaAttachment): boolean {
-    void trustVersion;
-    if (!TrustService.isGated(attachment)) return false;
-    if (!trustService) return true;  // fail-closed: no trust service means block
-    const level = trustService.resolve(message.sender.address);
-    if (level === 'trusted') return false;
-    return !trustService.isLoaded(attachment.id);
-  }
 </script>
 
 <div class="text-message" class:loud={message.priority === 'loud'} id="msg-{message.id}">
@@ -148,59 +134,6 @@
     {#if seenAt !== undefined}
       <!-- ZEB-214: peer read up to (at least) this message. -->
       <div class="seen-indicator" data-testid="seen-indicator">Seen {seenStr}</div>
-    {/if}
-    {#if message.media.length > 0}
-      <div class="media-indicators">
-        {#each message.media as attachment (attachment.id)}
-          {#if collapsed}
-            {#if isBlocked(attachment)}
-              <div class="inline-embed inline-blocked">
-                <span class="blocked-inline-icon">&#128274;</span>
-                <span class="blocked-inline-label">Blocked {attachment.type}</span>
-              </div>
-            {:else}
-              <div class="inline-embed">
-                {#if attachment.type === 'image'}
-                  <img src={attachment.url} alt={attachment.title ?? 'image'} class="inline-image" referrerpolicy="no-referrer" />
-                {:else if attachment.type === 'link'}
-                  {@const href = sanitizeHref(attachment.url)}
-                  {#if href}
-                    <a {href} class="inline-link" target="_blank" rel="noopener noreferrer">
-                      {attachment.title ?? attachment.url}
-                    </a>
-                  {:else}
-                    <span class="inline-link-blocked">{attachment.title ?? attachment.url}</span>
-                  {/if}
-                {:else if attachment.type === 'code'}
-                  <pre class="inline-code"><code>{attachment.content}</code></pre>
-                {/if}
-              </div>
-            {/if}
-          {:else}
-            {#if isBlocked(attachment)}
-              <button
-                class="media-pill blocked"
-                onclick={() => onMediaClick?.(attachment.id)}
-              >
-                <span class="pill-icon">&#128274;</span> blocked {attachment.type}
-              </button>
-            {:else}
-              <button
-                class="media-pill"
-                onclick={() => onMediaClick?.(attachment.id)}
-              >
-                {#if attachment.type === 'image'}
-                  <span class="pill-icon">&#128444;</span> {attachment.title ?? 'image'}
-                {:else if attachment.type === 'link'}
-                  <span class="pill-icon">&#128279;</span> {attachment.domain ?? 'link'}
-                {:else if attachment.type === 'code'}
-                  <span class="pill-icon">&lt;/&gt;</span> {attachment.title ?? 'code'}
-                {/if}
-              </button>
-            {/if}
-          {/if}
-        {/each}
-      </div>
     {/if}
   </div>
 </div>
@@ -272,93 +205,6 @@
     color: var(--text-muted, var(--text-secondary));
     text-align: right;
     opacity: 0.8;
-  }
-
-  .media-indicators {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin-top: 4px;
-  }
-
-  .media-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 8px;
-    border: none;
-    border-radius: 10px;
-    background: var(--bg-tertiary);
-    color: var(--text-muted);
-    font-size: 12px;
-    cursor: pointer;
-  }
-
-  .media-pill:hover {
-    color: var(--accent);
-    background: var(--bg-secondary);
-  }
-
-  .media-pill.blocked {
-    color: var(--text-muted);
-    font-style: italic;
-  }
-
-  .pill-icon {
-    font-size: 12px;
-  }
-
-  .inline-embed {
-    margin-top: 8px;
-  }
-
-  .inline-blocked {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 8px 12px;
-    background: var(--bg-tertiary);
-    border-radius: 6px;
-    color: var(--text-muted);
-    font-size: 12px;
-    font-style: italic;
-  }
-
-  .blocked-inline-icon {
-    font-size: 14px;
-  }
-
-  .blocked-inline-label {
-    font-size: 12px;
-  }
-
-  .inline-image {
-    max-width: 100%;
-    max-height: 300px;
-    border-radius: 8px;
-  }
-
-  .inline-link {
-    color: var(--accent);
-    text-decoration: none;
-  }
-
-  .inline-link:hover {
-    text-decoration: underline;
-  }
-
-  .inline-link-blocked {
-    color: var(--text-muted);
-    font-size: 12px;
-  }
-
-  .inline-code {
-    background: var(--bg-tertiary);
-    padding: 8px 12px;
-    border-radius: 6px;
-    font-size: 13px;
-    overflow-x: auto;
-    color: var(--text-secondary);
   }
 
   .reply-to-header {

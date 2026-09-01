@@ -102,7 +102,7 @@
   import { ChannelNavSyncService } from './lib/channel-nav-sync';
   import { AvatarResolver } from './lib/avatar-resolver';
   import { ProfilePageResolver } from './lib/profile-page-resolver';
-  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant, ReceivedFile } from './lib/types';
+  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, FileGrant, ReceivedFile } from './lib/types';
   import { getThreadMeta, feedAuthorOwnerIds } from './lib/feed-utils';
   import { resolveAuthorLabel } from './lib/mention-render';
   import { resolveMemberName, hexName, type ResolvedName } from './lib/display-label';
@@ -506,7 +506,6 @@
       sender: { address: 'self', displayName: 'You' },
       text: describeCallEvent(payload, 'author'),
       timestamp: Date.now(),
-      media: [],
       priority: 'standard',
       channel: spaceId,
       hub: '',
@@ -3339,7 +3338,6 @@
   let selectedFileSidecarId = $state<string | null>(null);
   let currentFolderCid = $state<string | null>(null);
   let fileViewMode = $state<FileViewMode>('list');
-  let showCleanup = $state(false);
   let fileSection = $state<ContentSection>('private');
   let fileSearchQuery = $state('');
   let fileFilters = $state<Record<string, unknown>>({});
@@ -3530,7 +3528,6 @@
     currentFolderCid = cid;
     selectedFileCid = null;
     selectedFileSidecarId = null;
-    showCleanup = false;
   }
 
   async function handleFileBurn() {
@@ -3555,20 +3552,6 @@
     } catch (err) {
       console.error('File archive failed:', err);
     }
-  }
-
-  function handleFilePublish(cid: string) {
-    fileManagerService.publish([cid]);
-    fileManagerVersion++;
-    selectedFileCid = null;
-    selectedFileSidecarId = null;
-  }
-
-  function handleFileRelease(cid: string) {
-    fileManagerService.release([cid]);
-    fileManagerVersion++;
-    selectedFileCid = null;
-    selectedFileSidecarId = null;
   }
 
   async function handleFilePin() {
@@ -3625,81 +3608,6 @@
       if (!msg.includes('upload cancelled')) {
         console.error('File upload failed:', msg);
       }
-    }
-  }
-
-  function handleFileCleanupClick() {
-    showCleanup = !showCleanup;
-  }
-
-  async function handleCleanupAction(rec: CleanupRecommendation, action: string) {
-    try {
-      if (action === 'burn') {
-        await fileManagerService.burn([rec.sidecarId]);
-      } else if (action === 'archive') {
-        await fileManagerService.archive([rec.sidecarId]);
-      } else if (action === 'release') {
-        fileManagerService.release([rec.cid]);
-      } else if (action === 'publish') {
-        fileManagerService.publish([rec.cid]);
-      } else if (action === 'pin') {
-        await fileManagerService.pin(rec.sidecarId);
-      }
-      fileManagerVersion++;
-      if (selectedFileCid === rec.cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
-        selectedFileCid = null;
-        selectedFileSidecarId = null;
-      }
-    } catch (err) {
-      console.error(`Cleanup ${action} failed:`, err);
-    }
-  }
-
-  async function handleBulkBurn(recs: CleanupRecommendation[]) {
-    try {
-      const sidecarIds = recs.map((r) => r.sidecarId).filter(Boolean);
-      if (sidecarIds.length === 0) return;
-      await fileManagerService.burn(sidecarIds);
-      fileManagerVersion++;
-      if (selectedFileCid && recs.some((r) => r.cid === selectedFileCid)) {
-        selectedFileCid = null;
-        selectedFileSidecarId = null;
-      }
-    } catch (err) {
-      console.error('Bulk burn failed:', err);
-    }
-  }
-
-  async function handleBulkArchive(recs: CleanupRecommendation[]) {
-    try {
-      const sidecarIds = recs.map((r) => r.sidecarId).filter(Boolean);
-      if (sidecarIds.length === 0) return;
-      await fileManagerService.archive(sidecarIds);
-      fileManagerVersion++;
-      if (selectedFileCid && recs.some((r) => r.cid === selectedFileCid)) {
-        selectedFileCid = null;
-        selectedFileSidecarId = null;
-      }
-    } catch (err) {
-      console.error('Bulk archive failed:', err);
-    }
-  }
-
-  function handleBulkRelease(cids: string[]) {
-    fileManagerService.release(cids);
-    fileManagerVersion++;
-    if (selectedFileCid && cids.includes(selectedFileCid)) {
-      selectedFileCid = null;
-      selectedFileSidecarId = null;
-    }
-  }
-
-  function handleBulkPublish(cids: string[]) {
-    fileManagerService.publish(cids);
-    fileManagerVersion++;
-    if (selectedFileCid && cids.includes(selectedFileCid)) {
-      selectedFileCid = null;
-      selectedFileSidecarId = null;
     }
   }
 
@@ -3829,7 +3737,6 @@
   function switchMode(mode: AppMode) {
     appMode = mode;
     showSettings = false;
-    showCleanup = false;
     fileFilters = {};
     fileSearchQuery = '';
     selectedFileCid = null;
@@ -4046,12 +3953,6 @@
       : []
   );
 
-  let threadMessageIds = $derived(
-    openThreadId
-      ? new Set(threadReplies.map(m => m.id))
-      : new Set<string>()
-  );
-
   // Main feed: exclude replies for panel/muted threads, keep inline
   let mainFeedMessages = $derived(
     channelMessages.filter(m => {
@@ -4060,26 +3961,6 @@
       return mode === 'inline';
     })
   );
-
-  // Media feed: main + open thread replies (exclude muted)
-  let mediaMessages = $derived.by(() => {
-    const base = channelMessages.filter(m => {
-      if (!m.replyTo) return true;
-      const mode = threadModes.get(m.replyTo) ?? 'panel';
-      if (mode === 'muted') return false;
-      if (mode === 'inline') return true;
-      // panel mode: only include if this thread is open
-      return m.replyTo === openThreadId;
-    });
-    return base;
-  });
-
-  function scrollToMedia(mediaId: string) {
-    document.getElementById(`media-${mediaId}`)?.scrollIntoView({
-      behavior: 'smooth',
-      block: 'center',
-    });
-  }
 
   function scrollToMessage(messageId: string) {
     let el = document.getElementById(`msg-${messageId}`);
@@ -4120,7 +4001,6 @@
         sender: { address: 'self', displayName: 'You' },
         text,
         timestamp: Date.now(),
-        media: [],
         priority,
         channel: activeChannel,
         // Fix A from PR #81 review: top-level DMs have activeHub=''; the
@@ -4536,7 +4416,6 @@
     {:else}
       <TextFeed
         messages={mainFeedMessages}
-        {collapsed}
         channelName={activeChannelName}
         channelType={activeChannelType}
         channelId={activeChannel}
@@ -4552,11 +4431,8 @@
         {groupCallBusy}
         {groupCall}
         groupCallInvoke={groupCallInvoke}
-        onMediaClick={scrollToMedia}
         onSend={handleSend}
         onAvatarClick={handleAvatarClick}
-        {trustService}
-        {trustVersion}
         {threadRoot}
         {threadReplies}
         {threadMeta}
@@ -4580,15 +4456,6 @@
       myAddr={selfOwnerId ?? ''}
       {communityMembers}
       onViewAllProposals={openCommunityProposals}
-      messages={mediaMessages}
-      {trustService}
-      {trustVersion}
-      onLinkBack={scrollToMessage}
-      onAvatarClick={handleAvatarClick}
-      onTrustChange={handleTrustChange}
-      {threadMessageIds}
-      {resolveCard}
-      {resolveNickname}
     />
   {/snippet}
   {#snippet settingsPanel()}
@@ -4657,19 +4524,12 @@
       section={fileSection}
       searchQuery={fileSearchQuery}
       filters={fileFilters}
-      {showCleanup}
       onItemClick={handleFileItemClick}
       onNavigateFolder={handleNavigateFolder}
       onViewModeChange={(mode) => { fileViewMode = mode; }}
       onSearchChange={(query) => { fileSearchQuery = query; }}
-      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; showCleanup = false; fileFilters = {}; fileSearchQuery = ''; }}
+      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; fileFilters = {}; fileSearchQuery = ''; }}
       onUploadClick={handleFileUploadClick}
-      onCleanupClick={handleFileCleanupClick}
-      onCleanupAction={handleCleanupAction}
-      onBulkBurn={handleBulkBurn}
-      onBulkArchive={handleBulkArchive}
-      onBulkRelease={handleBulkRelease}
-      onBulkPublish={handleBulkPublish}
       serviceVersion={fileManagerVersion}
       receivedFiles={receivedFiles}
       sharedUnreadCount={sharedUnreadCount}
@@ -4681,10 +4541,7 @@
       <FileDetailPanel
         detail={selectedFileDetail}
         usedByVines={selectedFileVineCount}
-        confirmationOverrides={fileManagerService.settings.confirmationOverrides}
         onTierChange={handleFileTierChange}
-        onPublish={handleFilePublish}
-        onRelease={handleFileRelease}
         onBurn={handleFileBurn}
         onArchive={handleFileArchive}
         onPin={handleFilePin}

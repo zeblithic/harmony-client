@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ContentDetail, ContentOriginInfo, ContentSensitivity, FileGrant, ReplicationTier } from '../types';
+  import type { ContentDetail, ContentOriginInfo, FileGrant, ReplicationTier } from '../types';
   import FileMetadata from './FileMetadata.svelte';
   import SensitivityBadge from './SensitivityBadge.svelte';
   import ReplicationStatus from './ReplicationStatus.svelte';
@@ -14,10 +14,7 @@
   let {
     detail,
     usedByVines = 0,
-    confirmationOverrides = {},
     onTierChange,
-    onPublish,
-    onRelease,
     onBurn,
     onArchive,
     onPin,
@@ -34,10 +31,7 @@
     detail: ContentDetail;
     /** Vines referencing this CID (client-computed, real descriptors). */
     usedByVines?: number;
-    confirmationOverrides?: Partial<Record<ContentSensitivity, number>>;
     onTierChange: (tier: ReplicationTier) => void;
-    onPublish: (cid: string) => void;
-    onRelease: (cid: string) => void;
     onBurn: () => void;
     onArchive: () => void;
     onPin: () => void;
@@ -244,9 +238,6 @@
   <section class="panel-section">
     <FileActions
       item={detail}
-      {confirmationOverrides}
-      {onPublish}
-      {onRelease}
       {onBurn}
       {onArchive}
       {onPin}

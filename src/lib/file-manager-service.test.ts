@@ -242,21 +242,6 @@ describe('FileManagerService', () => {
     expect(svc.getQuotaStatus().pinnedBudgetBytes).toBeNull();
   });
 
-  it('returns cleanup recommendations sorted by confidence descending', () => {
-    const svc = new FileManagerService();
-    const recs = svc.getCleanupRecommendations();
-    expect(recs.length).toBeGreaterThan(0);
-    for (let i = 1; i < recs.length; i++) {
-      expect(recs[i - 1].confidence).toBeGreaterThanOrEqual(recs[i].confidence);
-    }
-  });
-
-  it('returns published content', () => {
-    const svc = new FileManagerService();
-    const published = svc.getPublishedContent();
-    expect(published.length).toBe(3);
-  });
-
   it('burn removes content and frees quota', () => {
     const svc = new FileManagerService();
     const before = svc.getQuotaStatus();
@@ -269,13 +254,6 @@ describe('FileManagerService', () => {
     expect(after.usedBytes).toBe(before.usedBytes - target!.sizeBytes);
     // Item should no longer appear in contents
     expect(svc.getContents().find((i) => i.cid === 'cid-training-data')).toBeUndefined();
-  });
-
-  it('burn filters out burned items from cleanup recommendations', () => {
-    const svc = new FileManagerService();
-    svc.burn(['mock-sidecar-7']);
-    const recs = svc.getCleanupRecommendations();
-    expect(recs.find((r) => r.cid === 'cid-training-data')).toBeUndefined();
   });
 
   it('pin toggles pinned state on', () => {
@@ -299,36 +277,6 @@ describe('FileManagerService', () => {
 
     const updated = svc.getContents().find((i) => i.cid === 'cid-song-favorite');
     expect(updated!.pinned).toBe(false);
-  });
-
-  it('publish moves content to published as durable and removes from private', () => {
-    const svc = new FileManagerService();
-    const beforePrivate = svc.getContents().length;
-    const beforePublished = svc.getPublishedContent().length;
-
-    svc.publish(['cid-app-build']);
-
-    expect(svc.getContents().length).toBe(beforePrivate - 1);
-    expect(svc.getPublishedContent().length).toBe(beforePublished + 1);
-    // Should not be in private anymore
-    expect(svc.getContents().find((i) => i.cid === 'cid-app-build')).toBeUndefined();
-    // Should be in published with durable mode
-    const pub = svc.getPublishedContent().find((i) => i.cid === 'cid-app-build');
-    expect(pub).toBeDefined();
-    expect(pub!.publishMode).toBe('durable');
-  });
-
-  it('release moves content to published as ephemeral', () => {
-    const svc = new FileManagerService();
-    const beforePublished = svc.getPublishedContent().length;
-
-    svc.release(['cid-design-doc']);
-
-    const pub = svc.getPublishedContent().find((i) => i.cid === 'cid-design-doc');
-    expect(pub).toBeDefined();
-    expect(pub!.publishMode).toBe('ephemeral');
-    expect(svc.getPublishedContent().length).toBe(beforePublished + 1);
-    expect(svc.getContents().find((i) => i.cid === 'cid-design-doc')).toBeUndefined();
   });
 
   it('setReplicationTier updates tier for specified items', () => {

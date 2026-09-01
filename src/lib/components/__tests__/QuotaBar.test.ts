@@ -1,5 +1,5 @@
-import { render, screen, fireEvent } from '@testing-library/svelte';
-import { describe, it, expect, vi } from 'vitest';
+import { render, screen } from '@testing-library/svelte';
+import { describe, it, expect } from 'vitest';
 import QuotaBar from '../QuotaBar.svelte';
 
 // ZEB-612 S3: no overall storage quota exists — the bar shows real used
@@ -9,7 +9,6 @@ describe('QuotaBar', () => {
     usedBytes: 5_000_000_000,
     pinnedUsedBytes: 10_000_000,
     pinnedBudgetBytes: 50_000_000 as number | null,
-    onCleanupClick: vi.fn(),
     ...over,
   });
 
@@ -28,13 +27,6 @@ describe('QuotaBar', () => {
     const { container } = render(QuotaBar, { props: props({ pinnedBudgetBytes: null }) });
     expect(screen.queryByText(/Pinned/)).toBeNull();
     expect(container.querySelector('.quota-track')).toBeNull();
-  });
-
-  it('calls onCleanupClick when clicked', async () => {
-    const onClick = vi.fn();
-    render(QuotaBar, { props: props({ onCleanupClick: onClick }) });
-    await fireEvent.click(screen.getByRole('button'));
-    expect(onClick).toHaveBeenCalledOnce();
   });
 
   it('shows warning color when pinned usage exceeds 85% of the budget', () => {
