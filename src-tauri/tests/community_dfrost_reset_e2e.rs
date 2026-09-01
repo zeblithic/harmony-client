@@ -1562,8 +1562,9 @@ async fn flow3_cooperative_endorse() {
         "endorse ceremony authored exactly one response"
     );
 
-    // now_ms is still 10_000-ish (no advance at all) — cooperative
-    // authorization is a function of the events' own wall_ms, not read time.
+    // now_ms is still at base_ms (no advance) — cooperative authorization is
+    // a function of the events' own wall_ms, not read time, so the endorse
+    // reads as Authorized regardless of the (backdated) read clock.
     let view = reset_view(
         &state_a,
         alice.owner,
@@ -1578,7 +1579,7 @@ async fn flow3_cooperative_endorse() {
         "endorse authorizes immediately, no window wait"
     );
 
-    // ── From here on, identical to flow 1: marker auto-applies, drive successor DKG, Consumed auto-drives round-1, manual round-2 completes it ──
+    // ── From here on, identical to flow 1: marker auto-applies, drive successor DKG, Consumed auto-drives round-1, the production core completes it ──
     poll_until(
         "both nodes deactivate the old committee via auto-authored marker",
         Duration::from_secs(10),
