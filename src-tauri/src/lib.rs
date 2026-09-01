@@ -55709,11 +55709,7 @@ pub(crate) async fn get_dfrost_reset_state_impl(
     community_id: String,
     now_ms: Option<u64>,
 ) -> Result<Vec<ResetProposalDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (registry, self_owner) = {
@@ -55965,31 +55961,15 @@ pub(crate) async fn propose_dfrost_reset_impl(
 ) -> Result<ProposeDfrostResetResult, String> {
     use crate::community_membership::{MemberStatus, ResetPhase};
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let target_vk: [u8; 32] = hex::decode(&target_vk_hex)
-        .map_err(|e| format!("propose_dfrost_reset: invalid target_vk hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "propose_dfrost_reset: target_vk must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let target_vk = decode_id_32(&target_vk_hex, "target_vk")?;
 
     let mut member_addrs: Vec<crate::owner_state_types::OwnerAddr> = new_members
         .iter()
         .map(|hex_str| {
-            let bytes: [u8; 16] = hex::decode(hex_str)
-                .map_err(|e| format!("propose_dfrost_reset: invalid member hex: {e}"))?
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    "propose_dfrost_reset: member must be 16 bytes (32 hex chars)".to_string()
-                })?;
+            let bytes = decode_id_16(hex_str, "member")?;
             Ok(crate::owner_state_types::OwnerAddr(bytes))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -56241,20 +56221,10 @@ pub(crate) async fn cosign_dfrost_reset_impl(
 ) -> Result<CosignDfrostResetResult, String> {
     use crate::community_membership::{MemberStatus, ResetPhase};
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let proposal_id_bytes: [u8; 16] = hex::decode(&target_event_id)
-        .map_err(|e| format!("cosign_dfrost_reset: invalid target_event_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "cosign_dfrost_reset: target_event_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let proposal_id_bytes = decode_id_16(&target_event_id, "target_event_id")?;
 
     let (
         hlc_tracker,
@@ -56434,20 +56404,10 @@ pub(crate) async fn respond_dfrost_reset_impl(
 ) -> Result<(), String> {
     let verdict = parse_dfrost_reset_verdict(&verdict)?;
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let proposal_id_bytes: [u8; 16] = hex::decode(&target_event_id)
-        .map_err(|e| format!("respond_dfrost_reset: invalid target_event_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "respond_dfrost_reset: target_event_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let proposal_id_bytes = decode_id_16(&target_event_id, "target_event_id")?;
 
     let dfrost_log_registry = {
         let g = state
@@ -56522,21 +56482,10 @@ pub(crate) async fn author_dfrost_reset_marker_impl(
     community_id: String,
     target_event_id: String,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let id_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let proposal_id_bytes: [u8; 16] = hex::decode(&target_event_id)
-        .map_err(|e| format!("author_dfrost_reset_marker: invalid target_event_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "author_dfrost_reset_marker: target_event_id must be 16 bytes (32 hex chars)"
-                .to_string()
-        })?;
+    let proposal_id_bytes = decode_id_16(&target_event_id, "target_event_id")?;
 
     let (
         hlc_tracker,
@@ -65776,25 +65725,13 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
     threshold: u16,
 ) -> Result<String, String> {
     // Decode hex args (IPC-boundary concern); the core takes typed args.
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_initiate_dkg: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_initiate_dkg: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     let member_addrs: Vec<crate::owner_state_types::OwnerAddr> = members
         .iter()
         .map(|hex_str| {
-            let bytes: [u8; 16] = hex::decode(hex_str)
-                .map_err(|e| format!("dfrost_initiate_dkg: invalid member hex: {e}"))?
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    "dfrost_initiate_dkg: member must be 16 bytes (32 hex chars)".to_string()
-                })?;
+            let bytes = decode_id_16(hex_str, "member")?;
             Ok(crate::owner_state_types::OwnerAddr(bytes))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -66123,22 +66060,10 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     round_num: u8,
 ) -> Result<(), String> {
     // Decode hex args (IPC-boundary concern); the core takes typed args.
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_contribute_dkg_round: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_dkg_round: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
-        .map_err(|e| format!("dfrost_contribute_dkg_round: invalid ceremony_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_dkg_round: ceremony_id must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let ceremony_bytes = decode_id_32(&ceremony_id, "ceremony_id")?;
 
     let handles = dfrost_core_handles_from_state(&state_lock).await?;
     dfrost_contribute_dkg_round_core::<R, _>(
@@ -66915,22 +66840,10 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     let _ = app;
 
     // 1. Decode hex args.
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_request_vrf_beacon: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_request_vrf_beacon: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let seed_bytes: [u8; 32] = hex::decode(&seed_hex)
-        .map_err(|e| format!("dfrost_request_vrf_beacon: invalid seed hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_request_vrf_beacon: seed must be 32 bytes (64 hex chars)".to_string()
-        })?;
+    let seed_bytes = decode_id_32(&seed_hex, "seed")?;
 
     dfrost_request_vrf_beacon_inner(&state_lock, space_id, seed_bytes, epoch).await
 }
@@ -67508,24 +67421,10 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     community_id: String,
     ceremony_id: String,
 ) -> Result<(), String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_contribute_threshold_sign: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_threshold_sign: community_id must be 16 bytes (32 hex chars)"
-                .to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
-        .map_err(|e| format!("dfrost_contribute_threshold_sign: invalid ceremony_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_threshold_sign: ceremony_id must be 32 bytes (64 hex chars)"
-                .to_string()
-        })?;
+    let ceremony_bytes = decode_id_32(&ceremony_id, "ceremony_id")?;
 
     let handles = dfrost_core_handles_from_state(&state_lock).await?;
 
@@ -68373,13 +68272,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     threshold: u16,
 ) -> Result<String, String> {
     // 1. Decode community_id hex → SpaceId.
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_propose_refresh: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_propose_refresh: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     // 2. Decode + sort the proposed member list. Sorting + dedup is
@@ -68388,13 +68281,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     let mut member_addrs: Vec<crate::owner_state_types::OwnerAddr> = new_members
         .iter()
         .map(|hex_str| {
-            let bytes: [u8; 16] = hex::decode(hex_str)
-                .map_err(|e| format!("dfrost_propose_refresh: invalid member hex: {e}"))?
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    "dfrost_propose_refresh: member must be 16 bytes (32 hex chars)".to_string()
-                })?;
+            let bytes = decode_id_16(hex_str, "member")?;
             Ok(crate::owner_state_types::OwnerAddr(bytes))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -68875,22 +68762,8 @@ async fn dfrost_contribute_refresh_round<R: tauri::Runtime>(
     ceremony_id: String,
     round_num: u8,
 ) -> Result<(), String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_contribute_refresh_round: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_refresh_round: community_id must be 16 bytes (32 hex chars)"
-                .to_string()
-        })?;
-    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
-        .map_err(|e| format!("dfrost_contribute_refresh_round: invalid ceremony_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_refresh_round: ceremony_id must be 32 bytes (64 hex chars)"
-                .to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
+    let ceremony_bytes = decode_id_32(&ceremony_id, "ceremony_id")?;
     let handles = dfrost_core_handles_from_state(&state_lock).await?;
     dfrost_contribute_refresh_round_core::<R, _>(
         &handles,
@@ -69458,26 +69331,13 @@ async fn dfrost_request_share_repair<R: tauri::Runtime>(
     community_id: String,
     helpers: Option<Vec<String>>,
 ) -> Result<String, String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_request_share_repair: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_request_share_repair: community_id must be 16 bytes (32 hex chars)".to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
     let helper_addrs: Option<Vec<crate::owner_state_types::OwnerAddr>> = match helpers {
         None => None,
         Some(list) => {
             let mut out = Vec::with_capacity(list.len());
             for h in &list {
-                let bytes: [u8; 16] = hex::decode(h)
-                    .map_err(|e| format!("dfrost_request_share_repair: invalid helper hex: {e}"))?
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| {
-                        "dfrost_request_share_repair: helper must be 16 bytes (32 hex chars)"
-                            .to_string()
-                    })?;
+                let bytes = decode_id_16(h, "helper")?;
                 out.push(crate::owner_state_types::OwnerAddr(bytes));
             }
             Some(out)
@@ -69760,22 +69620,8 @@ async fn dfrost_contribute_repair_round<R: tauri::Runtime>(
     ceremony_id: String,
     round_num: u8,
 ) -> Result<(), String> {
-    let cid_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("dfrost_contribute_repair_round: invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_repair_round: community_id must be 16 bytes (32 hex chars)"
-                .to_string()
-        })?;
-    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
-        .map_err(|e| format!("dfrost_contribute_repair_round: invalid ceremony_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            "dfrost_contribute_repair_round: ceremony_id must be 32 bytes (64 hex chars)"
-                .to_string()
-        })?;
+    let cid_bytes = decode_id_16(&community_id, "community_id")?;
+    let ceremony_bytes = decode_id_32(&ceremony_id, "ceremony_id")?;
     let handles = dfrost_core_handles_from_state(&state_lock).await?;
     dfrost_contribute_repair_round_core::<R, _>(
         &handles,
@@ -76361,6 +76207,22 @@ pub(crate) fn decode_id_16(hex_str: &str, field: &str) -> Result<[u8; 16], Strin
     Ok(bytes)
 }
 
+/// Decode a 64-hex-char ID into a fixed 32-byte array — the 32-byte sibling of
+/// [`decode_id_16`]. Same length-precheck-before-decode discipline: an
+/// oversized, attacker-controlled hex string is rejected before any
+/// input-proportional allocation, and the decode goes straight into the fixed
+/// buffer with no intermediate `Vec`. Used by the DFROST IPC surface for the
+/// 32-byte `ceremony_id`, `target_vk`, and VRF `seed` (ZEB-1044). `field` names
+/// the ID in error messages.
+pub(crate) fn decode_id_32(hex_str: &str, field: &str) -> Result<[u8; 32], String> {
+    if hex_str.len() != 64 {
+        return Err(format!("{field} must be 32 bytes (64 hex chars)"));
+    }
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(hex_str, &mut bytes).map_err(|e| format!("invalid {field} hex: {e}"))?;
+    Ok(bytes)
+}
+
 /// Decode a 16-byte owner_id from hex, shared by the accept/decline IPCs.
 fn decode_owner_id_16(owner_id_hex: &str) -> Result<crate::owner_state_types::OwnerAddr, String> {
     Ok(crate::owner_state_types::OwnerAddr(decode_id_16(
@@ -79292,6 +79154,40 @@ mod friend_ipc_tests {
         assert!(super::decode_id_16("", "owner_id")
             .unwrap_err()
             .contains("owner_id must be 16 bytes"));
+    }
+
+    #[test]
+    fn decode_id_32_prechecks_length_before_decoding() {
+        // Canonical happy path: 64 hex chars → the 32 decoded bytes.
+        let ok = "ab".repeat(32);
+        assert_eq!(
+            super::decode_id_32(&ok, "ceremony_id").expect("decode"),
+            [0xAB; 32]
+        );
+        // Oversized, attacker-controlled input is rejected by the cheap length
+        // precheck — the message is the LENGTH error, not a hex-parse error,
+        // which proves control never reached `hex::decode_to_slice` (so no
+        // input-proportional allocation happened). ZEB-1044.
+        let huge = "ab".repeat(8192);
+        let err = super::decode_id_32(&huge, "ceremony_id").unwrap_err();
+        assert!(
+            err.contains("ceremony_id must be 32 bytes"),
+            "oversized input must fail the precheck, got: {err}"
+        );
+        // Short-by-one (63 chars) is a length failure, not an odd-digit hex failure.
+        let short = "a".repeat(63);
+        assert!(super::decode_id_32(&short, "target_vk")
+            .unwrap_err()
+            .contains("must be 32 bytes"));
+        // Correct length but non-hex → decode error (precheck passed, decode ran).
+        let nonhex = "zz".repeat(32);
+        assert!(super::decode_id_32(&nonhex, "seed")
+            .unwrap_err()
+            .contains("invalid seed hex"));
+        // The `field` label is threaded into the error messages.
+        assert!(super::decode_id_32("", "target_vk")
+            .unwrap_err()
+            .contains("target_vk must be 32 bytes"));
     }
 
     #[test]
