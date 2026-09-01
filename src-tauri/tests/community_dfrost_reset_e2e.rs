@@ -671,190 +671,42 @@ fn contribute_round2(
     (event, signing_package)
 }
 
-/// Once `log`'s `pending_sign[ceremony_id]` holds `threshold` share-bearing
-/// contributions, aggregate + mint the `DfrostResetResponse` membership
-/// event and insert it on BOTH membership states. Returns `Some(group_sig)`
-/// when aggregation actually ran (the caller on whichever side crosses
-/// threshold first).
-#[allow(clippy::too_many_arguments)]
-async fn maybe_complete_reset_response(
-    log: &Arc<Mutex<DfrostLog>>,
-    members: &[OwnerAddr],
-    pub_key_package: &PublicKeyPackage,
+/// Complete a reset-response ceremony whose round-1 has already landed on
+/// both nodes (a share-less contribution from each side is present) THROUGH
+/// THE PRODUCTION CORE (`dfrost_complete_threshold_sign_core`): alice posts
+/// her round-2 share (canonical set not yet share-complete → no aggregate,
+/// no author), then bob crosses threshold and the completion arm authors
+/// the membership event via `author` + clears his own session. Used both by
+/// `drive_reset_response` (which fires round-1 first) and directly by the
+/// Consumed-ceremony sites (whose round-1 is auto-driven by the reset
+/// orchestrator).
+async fn complete_reset_response_via_core(
     ceremony_id: [u8; 32],
-    proposal_id: EventId,
-    verdict: ResetVerdict,
-    new_vk: Option<[u8; 32]>,
-    aggregator_addr: OwnerAddr,
-    aggregator_signing_key: &ed25519_dalek::SigningKey,
-    at: Hlc,
-    state_a: &Arc<Mutex<CommunityState>>,
-    state_b: &Arc<Mutex<CommunityState>>,
-) -> Option<[u8; 64]> {
-    let (threshold, shares_map, signing_package) = {
-        let g = log.lock().await;
-        let pending = g.committee_state.pending_sign.get(&ceremony_id)?;
-        let threshold = g.committee_state.threshold as usize;
-        let with_share: Vec<_> = pending
-            .contributions
-            .iter()
-            .filter(|(_, (_, s))| !s.is_empty())
-            .collect();
-        if with_share.len() < threshold {
-            return None;
-        }
-        let mut shares_map = BTreeMap::new();
-        let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
-            BTreeMap::new();
-        for (addr, (commit_b, share_b)) in &pending.contributions {
-            if share_b.is_empty() {
-                continue;
-            }
-            let idx = members
-                .iter()
-                .position(|a| a == addr)
-                .expect("committee member");
-            let id = identifier_for_index(idx);
-            let share: frost::round2::SignatureShare =
-                ciborium::from_reader(&share_b[..]).expect("decode SignatureShare");
-            let commit: frost::round1::SigningCommitments =
-                ciborium::from_reader(&commit_b[..]).expect("decode SigningCommitments");
-            shares_map.insert(id, share);
-            commitments_map.insert(id, commit);
-        }
-        let signing_package = frost::SigningPackage::new(commitments_map, &pending.message_hash);
-        (threshold, shares_map, signing_package)
-    };
-    let _ = threshold;
-
-    let group_signature = frost::aggregate(&signing_package, &shares_map, pub_key_package)
-        .expect("aggregate threshold signature");
-    let sig_bytes: Vec<u8> = group_signature.serialize().expect("serialize signature");
-    let group_sig: [u8; 64] = sig_bytes.try_into().expect("Schnorr signature is 64 bytes");
-
-    let response_event = mint(
-        MembershipEventKind::DfrostResetResponse {
-            target_event_id: proposal_id,
-            verdict,
-            group_sig,
-            new_vk,
-        },
-        aggregator_addr,
-        at,
-        aggregator_signing_key,
-    );
-    insert_both(state_a, state_b, response_event).await;
-
-    // Mirror production's success-only clear (`dfrost_contribute_threshold_sign`).
-    log.lock()
-        .await
-        .committee_state
-        .pending_sign
-        .remove(&ceremony_id);
-    Some(group_sig)
-}
-
-/// Drive a full endorse/veto/consumed reset-response ceremony to
-/// completion across the two orchestrated nodes: round-1 auto-fires from
-/// `initiate_reset_response_ceremony` (already wired via the orchestrator
-/// membership_resolver), this drives round-2 on both sides and completes
-/// the ceremony on whichever side crosses threshold.
-#[allow(clippy::too_many_arguments)]
-async fn drive_reset_response(
-    proposal_id: EventId,
-    verdict: ResetVerdict,
-    new_vk: Option<[u8; 32]>,
     alice: &Person,
     bob: &Person,
-    log_a: &Arc<Mutex<DfrostLog>>,
-    log_b: &Arc<Mutex<DfrostLog>>,
-    engine_a: &Arc<DfrostLogEngine<MockRt>>,
-    engine_b: &Arc<DfrostLogEngine<MockRt>>,
-    members: &[OwnerAddr],
-    pub_key_package: &PublicKeyPackage,
-    key_pkg_alice: &KeyPackage,
-    key_pkg_bob: &KeyPackage,
-    at_ms: u64,
-    state_a: &Arc<Mutex<CommunityState>>,
-    state_b: &Arc<Mutex<CommunityState>>,
-) -> [u8; 64] {
-    // Alice initiates round-1 (or, for the auto-driven Consumed case, this
-    // may already be in flight — `initiate_reset_response_ceremony` is
-    // idempotent-safe to call again only via a fresh id, so callers that
-    // know round-1 already fired should skip straight to convergence-wait).
-    engine_a
-        .initiate_reset_response_ceremony(proposal_id, verdict)
-        .await
-        .expect("alice initiates the reset-response ceremony");
-    if let Err(e) = engine_b
-        .initiate_reset_response_ceremony(proposal_id, verdict)
-        .await
-    {
-        // Benign when bob's inbound apply already seeded the session.
-        eprintln!("bob's initiate returned: {e}");
-    }
-
-    poll_until(
-        "both sides see 2 round-1 contributions",
-        Duration::from_secs(10),
-        || async {
-            let a2 = log_a
-                .lock()
-                .await
-                .committee_state
-                .pending_sign
-                .values()
-                .any(|p| p.contributions.len() >= 2);
-            let b2 = log_b
-                .lock()
-                .await
-                .committee_state
-                .pending_sign
-                .values()
-                .any(|p| p.contributions.len() >= 2);
-            a2 && b2
-        },
+    node_a: &OrchestratedNode,
+    node_b: &OrchestratedNode,
+    author: &InsertBothAuthor,
+) {
+    // Alice's core call posts her round-2 share; her canonical set is not
+    // yet share-complete, so no aggregation and no author fires.
+    dfrost_complete_threshold_sign_core::<MockRt, MockRt>(
+        &node_a.handles,
+        None,
+        SPACE_ID,
+        ceremony_id,
+        &alice.signing_key,
+        author,
     )
     .await
-    .expect("round-1 convergence");
-
-    let ceremony_id = {
-        let g = log_a.lock().await;
-        *g.committee_state
-            .pending_sign
-            .iter()
-            .find(|(_, p)| p.contributions.len() >= 2)
-            .map(|(id, _)| id)
-            .expect("ceremony present")
-    };
-
-    let (event_a, _sp_a) = {
-        let mut g = log_a.lock().await;
-        contribute_round2(
-            &mut g,
-            alice.owner,
-            ceremony_id,
-            members,
-            key_pkg_alice,
-            hlc(at_ms, "alice"),
-            &alice.signing_key,
-        )
-    };
-    log_a
-        .lock()
-        .await
-        .apply_with_identity(event_a.clone(), &alice.owner, &alice.x25519_priv)
-        .expect("alice applies own round-2 ts");
-    engine_a
-        .publish_event(event_a)
-        .await
-        .expect("alice broadcasts round-2 ts");
+    .expect("alice's contribute succeeds without aggregating");
 
     poll_until(
         "bob sees alice's round-2 share",
         Duration::from_secs(10),
         || async {
-            log_b
+            node_b
+                .log
                 .lock()
                 .await
                 .committee_state
@@ -872,81 +724,100 @@ async fn drive_reset_response(
     .await
     .expect("alice's round-2 share converges to bob");
 
-    let (event_b, _sp_b) = {
-        let mut g = log_b.lock().await;
-        contribute_round2(
-            &mut g,
-            bob.owner,
-            ceremony_id,
-            members,
-            key_pkg_bob,
-            hlc(at_ms + 100, "bob"),
-            &bob.signing_key,
-        )
-    };
-    log_b
-        .lock()
+    // Bob's core call crosses threshold: round-2 + canonical-set aggregate
+    // + the ResetResponse completion arm author the membership event and
+    // clear his own session. Alice's lingering session is inert (the phase
+    // is decided by the authored membership event, not the dfrost session).
+    dfrost_complete_threshold_sign_core::<MockRt, MockRt>(
+        &node_b.handles,
+        None,
+        SPACE_ID,
+        ceremony_id,
+        &bob.signing_key,
+        author,
+    )
+    .await
+    .expect("bob's contribute aggregates and authors the response");
+}
+
+/// Drive a full endorse/veto reset-response ceremony to completion across
+/// the two orchestrated nodes THROUGH THE PRODUCTION CORE
+/// (`dfrost_complete_threshold_sign_core`): round-1 auto-fires from
+/// `initiate_reset_response_ceremony` (wired via the orchestrator
+/// membership_resolver), then BOTH nodes run round-2 + the canonical-set
+/// aggregate + the `SignPurpose::ResetResponse` completion arm through the
+/// extracted IPC code — no hand-mirror. The authored membership event
+/// crosses the layer boundary through `author` (production adapts the same
+/// seam onto `insert_local_event`).
+///
+/// Preconditions the caller owns: `install_pub_key_package` has run on both
+/// logs (the `seed_old_committee` dealer shortcut leaves
+/// `local_pub_key_package` unset, and the core reads it), and the
+/// membership timeline is real-wall-clock-based — the core stamps the
+/// response with a real `SystemTime::now()` HLC, and `evaluate_reset_phases`
+/// only counts an e/v response whose wall falls in `[t0, response_window_end]`.
+#[allow(clippy::too_many_arguments)]
+async fn drive_reset_response(
+    proposal_id: EventId,
+    verdict: ResetVerdict,
+    alice: &Person,
+    bob: &Person,
+    node_a: &OrchestratedNode,
+    node_b: &OrchestratedNode,
+    engine_a: &Arc<DfrostLogEngine<MockRt>>,
+    engine_b: &Arc<DfrostLogEngine<MockRt>>,
+    author: &InsertBothAuthor,
+) {
+    // Round-1 auto-fires from the production initiate on both engines.
+    engine_a
+        .initiate_reset_response_ceremony(proposal_id, verdict)
         .await
-        .apply_with_identity(event_b.clone(), &bob.owner, &bob.x25519_priv)
-        .expect("bob applies own round-2 ts");
-    engine_b
-        .publish_event(event_b)
+        .expect("alice initiates the reset-response ceremony");
+    if let Err(e) = engine_b
+        .initiate_reset_response_ceremony(proposal_id, verdict)
         .await
-        .expect("bob broadcasts round-2 ts");
+    {
+        // Benign when bob's inbound apply already seeded the session.
+        eprintln!("bob's initiate returned: {e}");
+    }
 
     poll_until(
-        "alice sees bob's round-2 share",
+        "both sides see 2 round-1 contributions",
         Duration::from_secs(10),
         || async {
-            log_a
+            let a2 = node_a
+                .log
                 .lock()
                 .await
                 .committee_state
                 .pending_sign
-                .get(&ceremony_id)
-                .map(|p| {
-                    !p.contributions
-                        .get(&bob.owner)
-                        .map(|(_, s)| s.is_empty())
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false)
+                .values()
+                .any(|p| p.contributions.len() >= 2);
+            let b2 = node_b
+                .log
+                .lock()
+                .await
+                .committee_state
+                .pending_sign
+                .values()
+                .any(|p| p.contributions.len() >= 2);
+            a2 && b2
         },
     )
     .await
-    .expect("bob's round-2 share converges to alice");
+    .expect("round-1 convergence");
 
-    // Bob crosses threshold last on his own log (he applied his own share
-    // there directly) — aggregate on his side.
-    let sig = maybe_complete_reset_response(
-        log_b,
-        members,
-        pub_key_package,
-        ceremony_id,
-        proposal_id,
-        verdict,
-        new_vk,
-        bob.owner,
-        &bob.signing_key,
-        hlc(at_ms + 200, "bob"),
-        state_a,
-        state_b,
-    )
-    .await
-    .expect("threshold reached — aggregate must produce a signature");
+    let ceremony_id = {
+        let g = node_a.log.lock().await;
+        *g.committee_state
+            .pending_sign
+            .iter()
+            .find(|(_, p)| p.contributions.len() >= 2)
+            .map(|(id, _)| id)
+            .expect("ceremony present")
+    };
 
-    // Clear the mirrored session on alice's log too (production's
-    // per-node clear happens on whichever node calls
-    // `dfrost_contribute_threshold_sign`; here both sides drove round-2
-    // manually, so both sides' sessions are cleared explicitly).
-    log_a
-        .lock()
-        .await
-        .committee_state
-        .pending_sign
-        .remove(&ceremony_id);
-
-    sig
+    complete_reset_response_via_core(ceremony_id, alice, bob, node_a, node_b, author).await;
 }
 
 // ─── Flow 1: disaster to completion ────────────────────────────────────────
@@ -981,7 +852,22 @@ async fn flow1_disaster_to_completion() {
         &carol,
     );
 
-    let now_ms = Arc::new(AtomicU64::new(10_000));
+    // The disaster path authorizes at `deadline + FINALITY` — 72h after the
+    // proposal. The production core stamps the Consumed response at real
+    // wall-clock now, and `evaluate_reset_phases` only overlays Consumed
+    // when that response's wall sits in `[authorized_at, authorized_at +
+    // LAPSE)`. So the membership timeline is BACKDATED by the veto window +
+    // finality (plus slack) — putting `authorized_at` at ~real-now, exactly
+    // where the core's stamp lands. (The old committee never runs a
+    // threshold-sign here, so no `install_pub_key_package` is needed; the
+    // only ceremony is the Consumed one on the successor-DKG committee,
+    // which already carries `local_pub_key_package`.)
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after epoch")
+        .as_millis() as u64;
+    let base_ms = real_now - (RESET_VETO_WINDOW_FLOOR_MS + RESET_FINALITY_MS + 60_000);
+    let now_ms = Arc::new(AtomicU64::new(base_ms));
     let members_all = {
         let mut m = vec![alice.owner, bob.owner, carol.owner];
         m.sort();
@@ -1033,7 +919,7 @@ async fn flow1_disaster_to_completion() {
             veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
         },
         alice.owner,
-        hlc(10_000, "alice"),
+        hlc(base_ms, "alice"),
         &alice.signing_key,
     );
     let proposal_id = proposal.id;
@@ -1044,7 +930,7 @@ async fn flow1_disaster_to_completion() {
             target_event_id: proposal_id,
         },
         bob.owner,
-        hlc(10_100, "bob"),
+        hlc(base_ms + 100, "bob"),
         &bob.signing_key,
     );
     insert_both(&state_a, &state_b, cosign).await;
@@ -1065,7 +951,7 @@ async fn flow1_disaster_to_completion() {
     assert_eq!(view.signers.len(), 2);
 
     // ── Advance past veto window + 48h finality — no real sleeping ──
-    let authorize_at = 10_100 + RESET_VETO_WINDOW_FLOOR_MS + RESET_FINALITY_MS + 1;
+    let authorize_at = base_ms + 100 + RESET_VETO_WINDOW_FLOOR_MS + RESET_FINALITY_MS + 1;
     now_ms.store(authorize_at, Ordering::SeqCst);
 
     let view = reset_view(&state_a, alice.owner, authorize_at, proposal_id)
@@ -1137,7 +1023,11 @@ async fn flow1_disaster_to_completion() {
     .await
     .expect("successor DKG convergence");
 
-    let (new_vk, _new_epoch, new_pub_key_package, new_key_pkg_alice, new_key_pkg_bob) = {
+    // The successor DKG installed the new committee (incl.
+    // `local_key_package` + `local_pub_key_package`) on both logs — the core
+    // reads both. The test only needs the new vk (to match the auto-driven
+    // Consumed session purpose) and the epoch assertions.
+    let new_vk = {
         let la = node_a.log.lock().await;
         let lb = node_b.log.lock().await;
         assert_eq!(
@@ -1150,34 +1040,9 @@ async fn flow1_disaster_to_completion() {
             "successor epoch is old+1"
         );
         assert_eq!(lb.committee_state.current_epoch, target_epoch + 1);
-        let vk = la
-            .committee_state
+        la.committee_state
             .joint_verifying_key
-            .expect("new vk present");
-        let pkp = PublicKeyPackage::new(
-            {
-                let mut m = BTreeMap::new();
-                for (addr, bytes) in &la.committee_state.verifying_shares {
-                    let id = la.committee_state.identifier_map.get(addr).unwrap();
-                    m.insert(
-                        *id,
-                        frost::keys::VerifyingShare::deserialize(bytes).expect("verifying share"),
-                    );
-                }
-                m
-            },
-            frost::VerifyingKey::deserialize(&vk).expect("verifying key"),
-            None,
-        );
-        (
-            vk,
-            la.committee_state.current_epoch,
-            pkp,
-            la.local_key_package
-                .clone()
-                .expect("alice's new key package"),
-            lb.local_key_package.clone().expect("bob's new key package"),
-        )
+            .expect("new vk present")
     };
 
     // ── Consumed response — round-1 is auto-driven by maybe_auto_drive_reset ──
@@ -1220,12 +1085,6 @@ async fn flow1_disaster_to_completion() {
     )
     .await
     .expect("Consumed ceremony auto-drive round-1");
-
-    let new_members = {
-        let mut m = vec![alice.owner, bob.owner];
-        m.sort();
-        m
-    };
 
     poll_until(
         "both sides see 2 round-1 contributions on the Consumed ceremony",
@@ -1286,121 +1145,30 @@ async fn flow1_disaster_to_completion() {
             .expect("consumed ceremony present")
     };
 
-    let (event_a, _) = {
-        let mut g = node_a.log.lock().await;
-        contribute_round2(
-            &mut g,
-            alice.owner,
-            consumed_ceremony_id,
-            &new_members,
-            &new_key_pkg_alice,
-            hlc(authorize_at + 1_000, "alice"),
-            &alice.signing_key,
-        )
+    // The Consumed ceremony completes through the production core; its
+    // response is stamped at real-now, which sits in `[authorized_at,
+    // authorized_at + LAPSE)` thanks to the backdated timeline above, so
+    // `evaluate_reset_phases` overlays Consumed.
+    let author_calls = Arc::new(AtomicU64::new(0));
+    let author = InsertBothAuthor {
+        state_a: state_a.clone(),
+        state_b: state_b.clone(),
+        calls: author_calls.clone(),
     };
-    node_a
-        .log
-        .lock()
-        .await
-        .apply_with_identity(event_a.clone(), &alice.owner, &alice.x25519_priv)
-        .expect("alice applies own consumed round-2");
-    engine_a
-        .publish_event(event_a)
-        .await
-        .expect("alice broadcasts consumed round-2");
-
-    poll_until(
-        "bob sees alice's consumed round-2 share",
-        Duration::from_secs(10),
-        || async {
-            node_b
-                .log
-                .lock()
-                .await
-                .committee_state
-                .pending_sign
-                .get(&consumed_ceremony_id)
-                .map(|p| {
-                    !p.contributions
-                        .get(&alice.owner)
-                        .map(|(_, s)| s.is_empty())
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false)
-        },
-    )
-    .await
-    .expect("alice's consumed round-2 converges to bob");
-
-    let (event_b, _) = {
-        let mut g = node_b.log.lock().await;
-        contribute_round2(
-            &mut g,
-            bob.owner,
-            consumed_ceremony_id,
-            &new_members,
-            &new_key_pkg_bob,
-            hlc(authorize_at + 1_100, "bob"),
-            &bob.signing_key,
-        )
-    };
-    node_b
-        .log
-        .lock()
-        .await
-        .apply_with_identity(event_b.clone(), &bob.owner, &bob.x25519_priv)
-        .expect("bob applies own consumed round-2");
-    engine_b
-        .publish_event(event_b)
-        .await
-        .expect("bob broadcasts consumed round-2");
-
-    poll_until(
-        "alice sees bob's consumed round-2 share",
-        Duration::from_secs(10),
-        || async {
-            node_a
-                .log
-                .lock()
-                .await
-                .committee_state
-                .pending_sign
-                .get(&consumed_ceremony_id)
-                .map(|p| {
-                    !p.contributions
-                        .get(&bob.owner)
-                        .map(|(_, s)| s.is_empty())
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false)
-        },
-    )
-    .await
-    .expect("bob's consumed round-2 converges to alice");
-
-    maybe_complete_reset_response(
-        &node_b.log,
-        &new_members,
-        &new_pub_key_package,
+    complete_reset_response_via_core(
         consumed_ceremony_id,
-        proposal_id,
-        ResetVerdict::Consumed,
-        Some(new_vk),
-        bob.owner,
-        &bob.signing_key,
-        hlc(authorize_at + 1_200, "bob"),
-        &state_a,
-        &state_b,
+        &alice,
+        &bob,
+        &node_a,
+        &node_b,
+        &author,
     )
-    .await
-    .expect("Consumed threshold reached — aggregate must produce a signature");
-    node_a
-        .log
-        .lock()
-        .await
-        .committee_state
-        .pending_sign
-        .remove(&consumed_ceremony_id);
+    .await;
+    assert_eq!(
+        author_calls.load(Ordering::SeqCst),
+        1,
+        "the Consumed ceremony authored exactly one response"
+    );
 
     // ── Final assertions ──
     {
@@ -1465,7 +1233,20 @@ async fn flow2_disaster_vetoed() {
         &carol,
     );
 
-    let now_ms = Arc::new(AtomicU64::new(10_000));
+    // The production core stamps the authored veto response with a real
+    // wall-clock HLC, and `evaluate_reset_phases` only counts an e/v
+    // response whose wall falls in `[t0, t_q + veto_window]` — so this
+    // test's membership timeline runs on real wall-clock, not the synthetic
+    // ~10_000ms base the pre-ZEB-1046 hand-mirror used.
+    let base_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after epoch")
+        .as_millis() as u64;
+    let now_ms = Arc::new(AtomicU64::new(base_ms));
+    // The core reads `local_pub_key_package`; the `seed_old_committee`
+    // dealer shortcut leaves it unset (a real DKG would store it).
+    install_pub_key_package(&node_a.log, &old.joint_vk).await;
+    install_pub_key_package(&node_b.log, &old.joint_vk).await;
     let members_all = {
         let mut m = vec![alice.owner, bob.owner, carol.owner];
         m.sort();
@@ -1516,7 +1297,7 @@ async fn flow2_disaster_vetoed() {
             veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
         },
         alice.owner,
-        hlc(10_000, "alice"),
+        hlc(base_ms, "alice"),
         &alice.signing_key,
     );
     let proposal_id = proposal.id;
@@ -1526,50 +1307,35 @@ async fn flow2_disaster_vetoed() {
             target_event_id: proposal_id,
         },
         bob.owner,
-        hlc(10_100, "bob"),
+        hlc(base_ms + 100, "bob"),
         &bob.signing_key,
     );
     insert_both(&state_a, &state_b, cosign).await;
 
-    let pub_key_package = {
-        let g = node_a.log.lock().await;
-        PublicKeyPackage::new(
-            {
-                let mut m = BTreeMap::new();
-                for (addr, bytes) in &g.committee_state.verifying_shares {
-                    let id = g.committee_state.identifier_map.get(addr).unwrap();
-                    m.insert(
-                        *id,
-                        frost::keys::VerifyingShare::deserialize(bytes).expect("verifying share"),
-                    );
-                }
-                m
-            },
-            frost::VerifyingKey::deserialize(&old.joint_vk).expect("verifying key"),
-            None,
-        )
+    // ── Mid-window: committee runs the veto ceremony via the production core ──
+    let author_calls = Arc::new(AtomicU64::new(0));
+    let author = InsertBothAuthor {
+        state_a: state_a.clone(),
+        state_b: state_b.clone(),
+        calls: author_calls.clone(),
     };
-
-    // ── Mid-window: committee runs the veto ceremony ──
     drive_reset_response(
         proposal_id,
         ResetVerdict::Veto,
-        None,
         &alice,
         &bob,
-        &node_a.log,
-        &node_b.log,
+        &node_a,
+        &node_b,
         &engine_a,
         &engine_b,
-        &members_all,
-        &pub_key_package,
-        &old.key_pkg_alice,
-        &old.key_pkg_bob,
-        10_500,
-        &state_a,
-        &state_b,
+        &author,
     )
     .await;
+    assert_eq!(
+        author_calls.load(Ordering::SeqCst),
+        1,
+        "exactly one DfrostResetResponse authored (bob's aggregate)"
+    );
 
     let view_a = reset_view(
         &state_a,
@@ -1601,7 +1367,7 @@ async fn flow2_disaster_vetoed() {
     // Even advancing far past the disaster deadline, a terminal veto never
     // re-litigates into Authorized (fix-round-2 M1 regression guard).
     now_ms.store(
-        10_100 + RESET_VETO_WINDOW_FLOOR_MS + RESET_FINALITY_MS + 1,
+        base_ms + 100 + RESET_VETO_WINDOW_FLOOR_MS + RESET_FINALITY_MS + 1,
         Ordering::SeqCst,
     );
     let view_a_later = reset_view(
@@ -1681,7 +1447,28 @@ async fn flow3_cooperative_endorse() {
         &carol,
     );
 
-    let now_ms = Arc::new(AtomicU64::new(10_000));
+    // The production core stamps every authored response with a real
+    // wall-clock HLC. The cooperative endorse authorizes immediately at
+    // `max(endorse_wall, t_q)`, and the later Consumed response must satisfy
+    // `wall ∈ [authorized_at, authorized_at + LAPSE)`. Backdate the
+    // membership timeline so the synthetic proposal/cosign land safely
+    // before the core's real-now stamps: that pins `t_q` below `endorse_wall`
+    // (real-now), so `authorized_at = endorse_wall`, and the Consumed
+    // response — authored by the SAME device, hence HLC-monotonic and
+    // strictly later — always clears `wall >= authorized_at`. Without the
+    // backdate a sub-100ms run stamps Consumed before `t_q = base_ms + 100`
+    // and misses the gate.
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after epoch")
+        .as_millis() as u64;
+    let base_ms = real_now - 60_000;
+    let now_ms = Arc::new(AtomicU64::new(base_ms));
+    // The core reads `local_pub_key_package`; the `seed_old_committee`
+    // dealer shortcut leaves it unset on the OLD committee (the successor
+    // DKG stores it on the new one, so no install is needed there).
+    install_pub_key_package(&node_a.log, &old.joint_vk).await;
+    install_pub_key_package(&node_b.log, &old.joint_vk).await;
     let members_all = {
         let mut m = vec![alice.owner, bob.owner, carol.owner];
         m.sort();
@@ -1732,7 +1519,7 @@ async fn flow3_cooperative_endorse() {
             veto_window_ms: RESET_VETO_WINDOW_FLOOR_MS,
         },
         alice.owner,
-        hlc(10_000, "alice"),
+        hlc(base_ms, "alice"),
         &alice.signing_key,
     );
     let proposal_id = proposal.id;
@@ -1742,53 +1529,42 @@ async fn flow3_cooperative_endorse() {
             target_event_id: proposal_id,
         },
         bob.owner,
-        hlc(10_100, "bob"),
+        hlc(base_ms + 100, "bob"),
         &bob.signing_key,
     );
     insert_both(&state_a, &state_b, cosign).await;
 
-    let pub_key_package = {
-        let g = node_a.log.lock().await;
-        PublicKeyPackage::new(
-            {
-                let mut m = BTreeMap::new();
-                for (addr, bytes) in &g.committee_state.verifying_shares {
-                    let id = g.committee_state.identifier_map.get(addr).unwrap();
-                    m.insert(
-                        *id,
-                        frost::keys::VerifyingShare::deserialize(bytes).expect("verifying share"),
-                    );
-                }
-                m
-            },
-            frost::VerifyingKey::deserialize(&old.joint_vk).expect("verifying key"),
-            None,
-        )
+    // One author seam spans both this test's ceremonies (endorse, then the
+    // post-DKG Consumed) — its call counter climbs 0 → 1 → 2.
+    let author_calls = Arc::new(AtomicU64::new(0));
+    let author = InsertBothAuthor {
+        state_a: state_a.clone(),
+        state_b: state_b.clone(),
+        calls: author_calls.clone(),
     };
 
     // ── Endorse ceremony — no window wait: authorizes immediately ──
     drive_reset_response(
         proposal_id,
         ResetVerdict::Endorse,
-        None,
         &alice,
         &bob,
-        &node_a.log,
-        &node_b.log,
+        &node_a,
+        &node_b,
         &engine_a,
         &engine_b,
-        &members_all,
-        &pub_key_package,
-        &old.key_pkg_alice,
-        &old.key_pkg_bob,
-        10_500,
-        &state_a,
-        &state_b,
+        &author,
     )
     .await;
+    assert_eq!(
+        author_calls.load(Ordering::SeqCst),
+        1,
+        "endorse ceremony authored exactly one response"
+    );
 
-    // now_ms is still 10_000-ish (no advance at all) — cooperative
-    // authorization is a function of the events' own wall_ms, not read time.
+    // now_ms is still at base_ms (no advance) — cooperative authorization is
+    // a function of the events' own wall_ms, not read time, so the endorse
+    // reads as Authorized regardless of the (backdated) read clock.
     let view = reset_view(
         &state_a,
         alice.owner,
@@ -1803,7 +1579,7 @@ async fn flow3_cooperative_endorse() {
         "endorse authorizes immediately, no window wait"
     );
 
-    // ── From here on, identical to flow 1: marker auto-applies, drive successor DKG, Consumed auto-drives round-1, manual round-2 completes it ──
+    // ── From here on, identical to flow 1: marker auto-applies, drive successor DKG, Consumed auto-drives round-1, the production core completes it ──
     poll_until(
         "both nodes deactivate the old committee via auto-authored marker",
         Duration::from_secs(10),
@@ -1839,40 +1615,20 @@ async fn flow3_cooperative_endorse() {
     .await
     .expect("successor DKG convergence");
 
-    let (new_vk, new_pub_key_package, new_key_pkg_alice, new_key_pkg_bob) = {
+    // The successor DKG installed the new committee (incl.
+    // `local_key_package` + `local_pub_key_package`) on both logs — the core
+    // reads both, so the test only needs the new vk to match the auto-driven
+    // Consumed ceremony's session purpose.
+    let new_vk = {
         let la = node_a.log.lock().await;
         let lb = node_b.log.lock().await;
         assert_eq!(
             la.committee_state.joint_verifying_key,
             lb.committee_state.joint_verifying_key
         );
-        let vk = la
-            .committee_state
+        la.committee_state
             .joint_verifying_key
-            .expect("new vk present");
-        let pkp = PublicKeyPackage::new(
-            {
-                let mut m = BTreeMap::new();
-                for (addr, bytes) in &la.committee_state.verifying_shares {
-                    let id = la.committee_state.identifier_map.get(addr).unwrap();
-                    m.insert(
-                        *id,
-                        frost::keys::VerifyingShare::deserialize(bytes).expect("verifying share"),
-                    );
-                }
-                m
-            },
-            frost::VerifyingKey::deserialize(&vk).expect("verifying key"),
-            None,
-        );
-        (
-            vk,
-            pkp,
-            la.local_key_package
-                .clone()
-                .expect("alice's new key package"),
-            lb.local_key_package.clone().expect("bob's new key package"),
-        )
+            .expect("new vk present")
     };
 
     poll_until(
@@ -1914,12 +1670,6 @@ async fn flow3_cooperative_endorse() {
     )
     .await
     .expect("Consumed ceremony auto-drive round-1");
-
-    let new_members = {
-        let mut m = vec![alice.owner, bob.owner];
-        m.sort();
-        m
-    };
 
     poll_until(
         "both sides see 2 round-1 contributions on the Consumed ceremony",
@@ -1980,129 +1730,43 @@ async fn flow3_cooperative_endorse() {
             .expect("consumed ceremony present")
     };
 
-    let (event_a, _) = {
-        let mut g = node_a.log.lock().await;
-        contribute_round2(
-            &mut g,
-            alice.owner,
-            consumed_ceremony_id,
-            &new_members,
-            &new_key_pkg_alice,
-            hlc(20_000, "alice"),
-            &alice.signing_key,
-        )
-    };
-    node_a
-        .log
-        .lock()
-        .await
-        .apply_with_identity(event_a.clone(), &alice.owner, &alice.x25519_priv)
-        .expect("alice applies own consumed round-2");
-    engine_a
-        .publish_event(event_a)
-        .await
-        .expect("alice broadcasts consumed round-2");
-
-    poll_until(
-        "bob sees alice's consumed round-2 share",
-        Duration::from_secs(10),
-        || async {
-            node_b
-                .log
-                .lock()
-                .await
-                .committee_state
-                .pending_sign
-                .get(&consumed_ceremony_id)
-                .map(|p| {
-                    !p.contributions
-                        .get(&alice.owner)
-                        .map(|(_, s)| s.is_empty())
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false)
-        },
-    )
-    .await
-    .expect("alice's consumed round-2 converges to bob");
-
-    let (event_b, _) = {
-        let mut g = node_b.log.lock().await;
-        contribute_round2(
-            &mut g,
-            bob.owner,
-            consumed_ceremony_id,
-            &new_members,
-            &new_key_pkg_bob,
-            hlc(20_100, "bob"),
-            &bob.signing_key,
-        )
-    };
-    node_b
-        .log
-        .lock()
-        .await
-        .apply_with_identity(event_b.clone(), &bob.owner, &bob.x25519_priv)
-        .expect("bob applies own consumed round-2");
-    engine_b
-        .publish_event(event_b)
-        .await
-        .expect("bob broadcasts consumed round-2");
-
-    poll_until(
-        "alice sees bob's consumed round-2 share",
-        Duration::from_secs(10),
-        || async {
-            node_a
-                .log
-                .lock()
-                .await
-                .committee_state
-                .pending_sign
-                .get(&consumed_ceremony_id)
-                .map(|p| {
-                    !p.contributions
-                        .get(&bob.owner)
-                        .map(|(_, s)| s.is_empty())
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false)
-        },
-    )
-    .await
-    .expect("bob's consumed round-2 converges to alice");
-
-    maybe_complete_reset_response(
-        &node_b.log,
-        &new_members,
-        &new_pub_key_package,
+    // The Consumed ceremony completes through the SAME production core; its
+    // response is stamped at real-now, which sits in
+    // `[authorized_at ≈ base_ms, authorized_at + LAPSE)` (the endorse
+    // authorized immediately at ~base_ms), so `evaluate_reset_phases`
+    // overlays Consumed.
+    complete_reset_response_via_core(
         consumed_ceremony_id,
-        proposal_id,
-        ResetVerdict::Consumed,
-        Some(new_vk),
-        bob.owner,
-        &bob.signing_key,
-        hlc(20_200, "bob"),
+        &alice,
+        &bob,
+        &node_a,
+        &node_b,
+        &author,
+    )
+    .await;
+    assert_eq!(
+        author_calls.load(Ordering::SeqCst),
+        2,
+        "the Consumed ceremony authored the second response"
+    );
+
+    let final_view = reset_view(
         &state_a,
-        &state_b,
+        alice.owner,
+        now_ms.load(Ordering::SeqCst),
+        proposal_id,
     )
     .await
-    .expect("Consumed threshold reached — aggregate must produce a signature");
-    node_a
-        .log
-        .lock()
-        .await
-        .committee_state
-        .pending_sign
-        .remove(&consumed_ceremony_id);
-
-    let final_view = reset_view(&state_a, alice.owner, 20_500, proposal_id)
-        .await
-        .expect("proposal present");
+    .expect("proposal present");
     assert_eq!(final_view.phase, ResetPhase::Consumed);
-    let final_view_b = reset_view(&state_b, alice.owner, 20_500, proposal_id)
-        .await
-        .expect("proposal present on b");
+    let final_view_b = reset_view(
+        &state_b,
+        alice.owner,
+        now_ms.load(Ordering::SeqCst),
+        proposal_id,
+    )
+    .await
+    .expect("proposal present on b");
     assert_eq!(final_view_b.phase, ResetPhase::Consumed);
 }
 
@@ -2322,10 +1986,14 @@ async fn flow4_joiner_bootstrap_post_reset() {
 // `dfrost_contribute_threshold_sign` was the one dfrost ceremony round
 // with no `_core` seam — its round-2 + aggregate + completion-sink half
 // (the `match purpose` between minting `vb` and authoring a
-// `DfrostResetResponse`) had never been EXECUTED by a test, only mirrored
-// by hand (`contribute_round2` / `maybe_complete_reset_response` above).
+// `DfrostResetResponse`) had never been EXECUTED by a test until ZEB-1040.
 // These tests drive the extracted `dfrost_complete_threshold_sign_core`
-// itself. The membership author step crosses the layer boundary through
+// directly; ZEB-1046 then routed the flow1–3 lifecycle tests above through
+// the same core (via `drive_reset_response` /
+// `complete_reset_response_via_core`), retiring the round-2/aggregate
+// hand-mirror (`contribute_round2` survives only as a round-2 share
+// producer for the failed-author test below).
+// The membership author step crosses the layer boundary through
 // the `ResetResponseAuthor` seam: production adapts it onto
 // `CommunitySyncEngine::insert_local_event`; here it adapts onto the
 // trusted-write seam, for exactly the dual-derivation reason the module
