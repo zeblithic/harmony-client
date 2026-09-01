@@ -32,8 +32,7 @@
   // instead of the default unencrypted one. Defaults OFF so existing
   // behavior is unchanged unless a user opts in. Encrypted files stay
   // private and can be shared with specific people via the file detail
-  // panel's "Shared with" list; unencrypted files become public once
-  // published.
+  // panel's "Shared with" list.
   let encryptOnUpload = $state(false);
 </script>
 
@@ -83,7 +82,7 @@
       <button class="action-btn" onclick={() => onUploadClick(encryptOnUpload)} aria-label="Add files">⤓ Add files</button>
       <label
         class="encrypt-toggle"
-        title="Encrypted files are private and can be shared with specific people via &quot;Shared with&quot;. Unencrypted files are public once published."
+        title="Encrypted files are private and can be shared with specific people via &quot;Shared with&quot;."
       >
         <input
           type="checkbox"
